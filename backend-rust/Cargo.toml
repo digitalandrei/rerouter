@@ -1,0 +1,37 @@
+[package]
+name = "rerouter-controller"
+version = "0.1.0"
+edition = "2021"
+description = "Rerouter controller — traffic telemetry, DDoS detection, and safe reroute execution"
+license = "proprietary"
+
+[[bin]]
+name = "rerouter-controller"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
+tower-http = { version = "0.6", features = ["trace"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "uuid", "macros", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
+toml = "0.8"
+# Auth: Argon2id password hashing + RFC 6238 TOTP (30s / 6 digits / issuer "Rerouter").
+argon2 = "0.5"
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+rand = "0.9"
+# Email alerts: SMTP over rustls only (no openssl anywhere in the tree).
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname", "pool"] }
+
+[dev-dependencies]
+# fixtures + parser tests live under tests/

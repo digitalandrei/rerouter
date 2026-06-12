@@ -1,0 +1,24 @@
+[Unit]
+Description=Rerouter Controller
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rerouter
+Group=rerouter
+EnvironmentFile=/etc/rerouter/rerouter.env
+ExecStart=/usr/local/bin/rerouter-controller --config /etc/rerouter/config.toml
+Restart=always
+RestartSec=5
+WorkingDirectory=/var/lib/rerouter
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rerouter /var/log/rerouter
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

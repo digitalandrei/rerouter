@@ -1,0 +1,74 @@
+# Rerouter controller configuration — install at /etc/rerouter/config.toml
+# Secrets (DB URL, provider tokens) come from the environment / EnvironmentFile,
+# not this file. See deploy/env/rerouter.example.env.
+
+[server]
+# Localhost only — the API is public ONLY via the Nginx /api reverse proxy
+# (behind Cloudflare). Never bind or expose this address directly.
+bind = "127.0.0.1:9277"
+
+[database]
+# Set DATABASE_URL in the environment (mysql://user:pass@host:3306/rerouter).
+url_env = "DATABASE_URL"
+
+[auth]
+# Session cookies are backed by the DB sessions table. SESSION_SECRET and
+# SECRETS_KEY come from the environment; TWO_FACTOR_ISSUER=Rerouter.
+session_ttl_hours = 12
+# Failed logins (per email + real client IP) before account lockout.
+lockout_threshold = 5
+lockout_minutes = 15
+
+# Email alerts are configured entirely via the environment:
+# SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM
+# (see deploy/env/rerouter.example.env). No [smtp] section here.
+
+[telemetry]
+flow_listen = "0.0.0.0:2055"        # NetFlow/IPFIX collector (sFlow: 6343)
+default_sampling_rate = 1000        # override per-exporter once known
+metrics_rollup_seconds = 15
+reachability_interval_seconds = 15
+cloudflare_poll_seconds = 60
+stale_after_seconds = 90
+jitter_percent = 15
+
+[detection]
+default_consecutive_samples = 3
+default_min_duration_seconds = 30
+hysteresis_seconds = 30
+
+[safety]
+# Operating mode: "observe" (default) = safe read-only / alert-only — NO reroute
+# executes, automatic or manual; rule fires alert with the actions that WOULD
+# have run. "enforce" allows execution (still gated by every other safety rule).
+# This is only the startup fallback: the authoritative runtime value is
+# system_settings.operating_mode, changed from /settings by an admin (audited).
+operating_mode = "observe"
+# Master switch — automatic reroutes are OFF by default (applies in enforce mode).
+automatic_actions_enabled = false
+global_action_rate_limit_count = 3
+global_action_rate_limit_window_seconds = 600
+same_rule_cooldown_seconds = 900
+same_asset_cooldown_seconds = 300
+same_prefix_provider_cooldown_seconds = 1800
+mark_running_actions_uncertain_on_startup = true
+
+[reroute]
+# Default auto-expiry for disruptive mitigations (blackhole/divert) unless the
+# template overrides it. 0 = no expiry (not recommended).
+default_blackhole_expiry_seconds = 1800
+require_verification = true
+
+[providers.cloudflare]
+api_base = "https://api.cloudflare.com/client/v4"
+# token comes from the environment per provider credential reference
+
+[providers.bgp]
+# Controlled BGP speaker (e.g. ExaBGP). The controller drives it over a narrow
+# command interface; it never crafts arbitrary BGP from free text.
+speaker = "exabgp"
+
+[retention]
+traffic_samples_days = 7
+rule_events_days = 90
+reroute_logs_days = 365

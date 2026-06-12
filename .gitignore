@@ -1,0 +1,11 @@
+# Rust
+backend-rust/target/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Secrets / local
+*.env
+!deploy/env/rerouter.example.env
+/etc/rerouter/
