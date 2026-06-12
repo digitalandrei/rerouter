@@ -150,12 +150,25 @@ pub async fn expire(pool: &MySqlPool, session_id: u64) -> Result<()> {
     Ok(())
 }
 
-/// Build the session cookie carrying `token`. HttpOnly + Secure + SameSite=Lax,
-/// path=/; the SignedCookieJar adds the SESSION_SECRET signature on the way out.
+/// Whether to set the `Secure` cookie attribute. Defaults to **true** (a Secure
+/// cookie is the correct production posture behind HTTPS/Cloudflare). Set
+/// `COOKIE_SECURE=false` ONLY for an HTTP-only origin (e.g. before Let's Encrypt
+/// is in place) — a browser silently drops a Secure cookie over plain HTTP, so
+/// login would not persist. Flip back to true once the origin serves HTTPS.
+fn cookie_secure() -> bool {
+    !matches!(
+        std::env::var("COOKIE_SECURE").ok().as_deref(),
+        Some("false") | Some("0") | Some("no")
+    )
+}
+
+/// Build the session cookie carrying `token`. HttpOnly + SameSite=Lax, path=/,
+/// Secure per `cookie_secure()`; the SignedCookieJar adds the SESSION_SECRET
+/// signature on the way out.
 pub fn build_cookie(token: String, ttl_hours: i64) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, token))
         .http_only(true)
-        .secure(true)
+        .secure(cookie_secure())
         .same_site(SameSite::Lax)
         .path("/")
         .max_age(time::Duration::hours(ttl_hours))
@@ -166,7 +179,7 @@ pub fn build_cookie(token: String, ttl_hours: i64) -> Cookie<'static> {
 pub fn removal_cookie() -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, ""))
         .http_only(true)
-        .secure(true)
+        .secure(cookie_secure())
         .same_site(SameSite::Lax)
         .path("/")
         .max_age(time::Duration::seconds(0))
