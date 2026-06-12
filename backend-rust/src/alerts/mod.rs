@@ -5,6 +5,7 @@
 //! Producers (detection, reroute engine, auth) only INSERT alerts rows — they
 //! never block on SMTP. The dispatcher is the single consumer.
 
+pub mod body;
 pub mod dispatcher;
 pub mod mailer;
 

@@ -15,19 +15,7 @@
 //! `uncertain` and its asset is locked until verified or acknowledged. Automatic
 //! reroutes are disabled by default. See ../docs/state-recovery.md.
 
-mod config;
-mod db;
-mod auth;
-mod alerts;
-mod telemetry;
-mod detection;
-mod reroute;
-mod providers;
-mod api;
-mod scheduler;
-mod install;
-#[cfg(feature = "embed-ui")]
-mod ui;
+use rerouter_controller::{alerts, api, config, db, install, reroute, scheduler};
 
 use anyhow::Result;
 use clap::Parser;

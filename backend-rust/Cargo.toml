@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 tower-http = { version = "0.6", features = ["trace"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "uuid", "macros", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "mysql", "chrono", "uuid", "macros", "migrate", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -45,6 +45,17 @@ totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 rand = "0.9"
 # Email alerts: SMTP over rustls only (no openssl anywhere in the tree).
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname", "pool"] }
+# v1 telemetry: SNMP v2c interface polling (pure-Rust async, GETBULK table walks;
+# no openssl). v3 is a typed stub in this milestone.
+csnmp = "0.6"
+# Encryption at rest for device community strings + provider credentials
+# (AES-256-GCM, key from SECRETS_KEY). Pure Rust — no openssl.
+aes-gcm = "0.10"
+hex = "0.4"
+# Session token hashing (cookie carries the token; DB stores only the SHA-256).
+sha2 = "0.10"
+# Cookie max-age durations for axum-extra cookies.
+time = "0.3"
 
 [dev-dependencies]
 # fixtures + parser tests live under tests/

@@ -1,18 +1,138 @@
-//! Per-asset async scheduler + shared collectors. Avoids one giant loop; uses
-//! jitter to de-synchronize polling across assets. See ../docs/architecture.md.
+//! Per-device async SNMP poller + detection driver.
+//!
+//! One supervised task per enabled device runs an independent loop: SNMP poll
+//! (store interface_metrics_current + interface_samples) -> run detection for
+//! that device's monitored interfaces. Each loop uses the device's
+//! `poll_interval_seconds` plus +/- jitter (telemetry.jitter_percent) so polls
+//! de-synchronize across devices. A per-device failure is logged and the loop
+//! keeps going (the device is marked unreachable by the poller).
+//!
+//! A supervisor reloads the enabled-device set every RELOAD_INTERVAL and spawns
+//! loops for new devices / drops loops for removed-or-disabled ones, so adding a
+//! device from the API starts polling it without a restart.
+//!
+//! `run` spawns the supervisor and returns immediately so the caller can then
+//! start the API server (the loops live for the process lifetime).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use rand::Rng;
 use sqlx::MySqlPool;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::detection;
+use crate::telemetry::snmp;
 
-pub async fn run(_pool: MySqlPool, _cfg: Config) -> Result<()> {
-    // TODO(milestone 1):
-    //   - spawn shared flow collector + BGP feed + Cloudflare poller
-    //   - spawn one task per enabled asset:
-    //       reachability -> normalize metrics -> evaluate rules ->
-    //       (gated) reroute scheduling
-    //   - apply jitter_percent to each interval
-    tracing::info!(event_type = "scheduler_started", "scheduler spawned (skeleton)");
+/// How often the supervisor reconciles the running loops against the DB.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Spawn the scheduler supervisor and return. Never blocks the control plane.
+pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
+    let cfg = Arc::new(cfg);
+    tokio::spawn(supervise(pool, cfg));
+    tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
     Ok(())
+}
+
+/// Reconcile per-device poll loops with the set of enabled devices, forever.
+async fn supervise(pool: MySqlPool, cfg: Arc<Config>) {
+    let mut running: HashMap<u64, JoinHandle<()>> = HashMap::new();
+
+    loop {
+        match snmp::load_enabled_devices(&pool).await {
+            Ok(devices) => {
+                let enabled_ids: std::collections::HashSet<u64> = devices.iter().map(|d| d.id).collect();
+
+                // Drop loops for devices that are gone, disabled, or finished.
+                running.retain(|id, handle| {
+                    if !enabled_ids.contains(id) || handle.is_finished() {
+                        handle.abort();
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // Spawn loops for newly enabled devices.
+                for dev in devices {
+                    running.entry(dev.id).or_insert_with(|| {
+                        let pool = pool.clone();
+                        let cfg = cfg.clone();
+                        let device_id = dev.id;
+                        let interval = dev.poll_interval_seconds.max(5);
+                        tracing::info!(
+                            event_type = "device_loop_started",
+                            device_id,
+                            interval_seconds = interval,
+                            "starting SNMP poll loop"
+                        );
+                        tokio::spawn(device_loop(pool, cfg, device_id, interval))
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(event_type = "scheduler_reload_failed", error = %e, "could not reload device list");
+            }
+        }
+        tokio::time::sleep(RELOAD_INTERVAL).await;
+    }
+}
+
+/// One device's poll+detect loop. Tolerates per-tick failure; a poll error is
+/// already recorded as the device's last_error by the poller.
+async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_interval_secs: u32) {
+    // Small initial spread so freshly-spawned loops don't all fire at t=0.
+    let initial = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
+    tokio::time::sleep(Duration::from_millis((initial * 1000.0) as u64 / 4)).await;
+
+    loop {
+        let tick = poll_and_detect(&pool, &cfg, device_id).await;
+        if let Err(e) = tick {
+            tracing::warn!(event_type = "device_tick_failed", device_id, error = %e, "device poll/detect tick failed");
+        }
+        let secs = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
+        tokio::time::sleep(Duration::from_millis((secs * 1000.0) as u64)).await;
+    }
+}
+
+/// One poll + detection pass for a device. Detection runs even if some
+/// interfaces had no fresh sample (the engine filters stale/invalid itself).
+async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<()> {
+    // Poll: stores interface_metrics_current + interface_samples. A transport
+    // failure marks the device unreachable and returns Err — detection then has
+    // nothing fresh and harmlessly no-ops.
+    match snmp::poll(pool, device_id).await {
+        Ok(updated) => {
+            tracing::debug!(event_type = "device_polled", device_id, interfaces = updated, "poll complete");
+        }
+        Err(e) => {
+            // Already recorded as last_error; surface and skip detection.
+            return Err(e);
+        }
+    }
+
+    // Detection for this device's monitored interfaces.
+    match detection::engine::evaluate_device(pool, cfg, device_id).await {
+        Ok(fired) if fired > 0 => {
+            tracing::info!(event_type = "device_detection", device_id, fired, "rules fired on poll");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(event_type = "detection_failed", device_id, error = %e, "detection pass failed"),
+    }
+    Ok(())
+}
+
+/// Apply +/- jitter_percent to an interval (seconds), clamped to a sane floor.
+fn jittered(base_secs: u32, jitter_percent: u8) -> f64 {
+    let base = base_secs.max(1) as f64;
+    if jitter_percent == 0 {
+        return base;
+    }
+    let frac = jitter_percent.min(90) as f64 / 100.0;
+    let delta = rand::rng().random_range(-frac..=frac);
+    (base * (1.0 + delta)).max(1.0)
 }

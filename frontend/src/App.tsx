@@ -1,14 +1,15 @@
 /**
  * App shell: React Router with an auth-gated layout.
  *
- * Route map mirrors the canonical page list (docs/doctrine.md §5.3):
- * /login, /dashboard, /assets, /assets/:id, /providers, /rules, /reroutes,
+ * Route map:
+ * /login, /dashboard, /devices, /devices/:id, /rules, /reroutes,
  * /reroutes/manual, /alerts, /audit, /settings.
  *
  * Everything except /login sits behind <RequireAuth>; the session itself is
  * an HttpOnly cookie validated server-side on every request, so this gate is
  * UX only — authorization is enforced by the controller (RBAC middleware).
  */
+import { useEffect, useState } from "react";
 import {
   BrowserRouter,
   Link,
@@ -19,13 +20,13 @@ import {
   Routes,
 } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
+import { api, type SystemStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
-import Assets from "@/pages/Assets";
-import AssetDetail from "@/pages/AssetDetail";
-import Providers from "@/pages/Providers";
+import Devices from "@/pages/Devices";
+import DeviceDetail from "@/pages/DeviceDetail";
 import Rules from "@/pages/Rules";
 import Reroutes from "@/pages/Reroutes";
 import ManualReroute from "@/pages/ManualReroute";
@@ -35,14 +36,33 @@ import Settings from "@/pages/Settings";
 
 const NAV_ITEMS: Array<{ to: string; label: string }> = [
   { to: "/dashboard", label: "Dashboard" },
-  { to: "/assets", label: "Assets" },
-  { to: "/providers", label: "Providers" },
+  { to: "/devices", label: "Devices" },
   { to: "/rules", label: "Rules" },
   { to: "/reroutes", label: "Reroutes" },
   { to: "/alerts", label: "Alerts" },
   { to: "/audit", label: "Audit" },
   { to: "/settings", label: "Settings" },
 ];
+
+function ObserveBanner() {
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+
+  useEffect(() => {
+    api
+      .status()
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  }, []);
+
+  if (!status || status.operating_mode === "enforce") return null;
+
+  return (
+    <div className="border-b border-yellow-400 bg-yellow-50 px-4 py-2 text-center text-sm font-semibold text-yellow-800">
+      OBSERVE MODE — read-only / alert-only. No reroutes will execute. Alerts
+      show the actions that WOULD run.
+    </div>
+  );
+}
 
 function RequireAuth() {
   const { stage } = useAuth();
@@ -67,6 +87,7 @@ function AppLayout() {
 
   return (
     <div className="flex min-h-screen flex-col">
+      <ObserveBanner />
       <header className="border-b">
         <div className="mx-auto flex w-full max-w-6xl items-center gap-6 px-4 py-3">
           <Link to="/dashboard" className="text-lg font-bold tracking-tight">
@@ -111,9 +132,8 @@ export default function App() {
           <Route path="/login" element={<Login />} />
           <Route element={<RequireAuth />}>
             <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/assets" element={<Assets />} />
-            <Route path="/assets/:id" element={<AssetDetail />} />
-            <Route path="/providers" element={<Providers />} />
+            <Route path="/devices" element={<Devices />} />
+            <Route path="/devices/:id" element={<DeviceDetail />} />
             <Route path="/rules" element={<Rules />} />
             <Route path="/reroutes" element={<Reroutes />} />
             <Route path="/reroutes/manual" element={<ManualReroute />} />

@@ -15,6 +15,7 @@ of schema truth.
 auth        users, roles, permissions, role_user, permission_role, sessions
 assets      protected_assets, asset_statuses, asset_provider
 providers   reroute_providers, provider_credentials
+devices     devices, device_interfaces, interface_metrics_current, interface_samples
 telemetry   asset_metrics_current, traffic_samples
 detection   rules, rule_states, rule_events
 reroute     reroute_templates, reroutes, reroute_steps, reroute_outputs,
@@ -118,6 +119,66 @@ new_conns_per_sec, syn_rate, syn_ack_ratio, unique_src_count,
 top_src_asn, top_dst_port, telemetry_stale, updated_at
 ```
 
+## devices (SNMP)
+
+The v1 telemetry source: polled SNMP v2c devices (routers). See
+[device-enrollment.md](device-enrollment.md). The community / v3 key material is
+AES-256-GCM ciphertext (key from `SECRETS_KEY`); only ciphertext is stored and it
+is never returned by the API.
+
+```text
+id, name (unique), hostname, snmp_version(v2c|v3), snmp_port,
+community_encrypted (VARBINARY, nullable), v3_* (reserved, nullable),
+poll_interval_seconds, enabled,
+vendor, model, os_version, sys_name, sys_uptime,   -- learned from sysDescr
+reachable (default 0), last_poll_at, last_error,
+-- SSH access (captured at onboarding for future CLI reroute actions; unused in
+-- observe mode). Password XOR key; all secrets AES-256-GCM, never returned.
+ssh_username, ssh_port (default 22), ssh_auth_method(password|key, nullable),
+ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted,
+ssh_host_fingerprint (reserved),
+created_at, updated_at
+```
+
+## device_interfaces
+
+Interfaces discovered on a device (ifXTable + ifTable), reconciled by
+`(device_id, if_index)`. Only `enabled_for_monitoring = 1` rows are polled and
+rule-evaluated.
+
+```text
+id, device_id, if_index, if_name, if_descr, if_alias, if_speed_bps,
+admin_status, oper_status, is_physical, enabled_for_monitoring (default 0),
+display_order, first_seen_at, last_seen_at
+UNIQUE (device_id, if_index)
+```
+
+## interface_metrics_current
+
+Exactly one row per interface. The raw `*_octets` / `*_pkts` columns are the
+counters from the last valid poll and form the baseline for the next delta —
+raw and derived are kept strictly separate. `valid_sample = 0` marks a
+wrapped/reset/failed read whose rates detection must not trust.
+
+```text
+interface_id (PK), device_id, sampled_at, valid_sample,
+in_octets, out_octets, in_ucast_pkts, out_ucast_pkts,   -- raw (next baseline)
+rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent,  -- derived
+in_errors, out_errors, in_discards, out_discards,
+admin_status, oper_status, updated_at
+```
+
+## interface_samples
+
+Retained per-interface rate history (default 7-day retention, like
+`traffic_samples`). Only derived rates; raw counters stay in
+`interface_metrics_current`.
+
+```text
+id, interface_id, device_id, sampled_at, valid_sample,
+rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, created_at
+```
+
 ## traffic_samples
 
 High volume; retention-controlled (default 7 days).
@@ -130,8 +191,14 @@ unique_src_count, raw_ref, created_at
 
 ## rules
 
+A rule targets a protected **asset** XOR a monitored **interface** (the
+interface path was added with the SNMP device tables; `asset_id` is now
+nullable, and `interface_id`/`device_id` are the alternative target — enforced in
+application code).
+
 ```text
-id, asset_id, name, metric, operator, threshold_value, threshold_unit,
+id, asset_id (nullable), interface_id (nullable), device_id (nullable),
+name, metric, operator, threshold_value, threshold_unit,
 duration_seconds, consecutive_samples, severity, schedule_json,
 enabled, automatic_reroute_enabled (default 0), reroute_template_id,
 alert_enabled (default 1), cooldown_seconds,
@@ -201,7 +268,8 @@ cooldowns: id, scope(rule|asset|prefix_provider|global), scope_ref,
 ## alerts / delivery
 
 ```text
-alerts:              id, event_type, severity, asset_id, rule_id, reroute_id,
+alerts:              id, event_type, severity, asset_id, device_id, interface_id,
+                     rule_id, reroute_id,
                      payload_json, dedup_key, occurrence_count, created_at
 alert_recipients:    id, user_id, email, verified_at, created_at
 alert_subscriptions: id, recipient_id, asset_id(null=all), event_type(null=all),

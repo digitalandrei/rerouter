@@ -49,16 +49,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [enrollment, setEnrollment] =
     useState<LoginResponse["totp_enrollment"] | null>(null);
 
-  // Probe for an existing session on mount. /api/status is authenticated, so
-  // a 200 means the cookie is valid; the api wrapper's 401 redirect is
-  // bypassed here because we catch before it matters (we're already heading
-  // to /login via stage = anonymous).
+  // Probe for an existing session on mount via GET /api/auth/me.
+  // A 200 means the cookie is valid and returns the SessionUser.
+  // A 401 means no session — go to anonymous/login.
   useEffect(() => {
     let cancelled = false;
-    api
-      .status()
-      .then(() => {
-        if (!cancelled) setStage("authenticated");
+    api.auth
+      .me()
+      .then((sessionUser) => {
+        if (!cancelled) {
+          setUser(sessionUser);
+          setStage("authenticated");
+        }
       })
       .catch(() => {
         if (!cancelled) setStage("anonymous");

@@ -23,8 +23,7 @@ export class ApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Domain types (shape mirrors backend-rust API responses; refine as the
-// controller endpoints solidify).
+// Domain types — exact field names from the API contract
 // ---------------------------------------------------------------------------
 
 export interface SessionUser {
@@ -49,34 +48,159 @@ export interface TotpResponse {
   user: SessionUser;
 }
 
-export type TelemetryFreshness = "live" | "cached" | "degraded" | "unknown";
+/**
+ * Operating mode (docs/reroute-engine.md "Operating mode"):
+ * - "observe" (default): safe read-only / alert-only — NO reroute executes,
+ *   automatic or manual; alerts carry the actions that WOULD have run. The UI
+ *   must show a persistent observe-mode banner.
+ * - "enforce": execution allowed, still gated by every other safety rule.
+ */
+export type OperatingMode = "observe" | "enforce";
 
-export interface Asset {
-  id: number;
-  name: string;
-  kind: "prefix" | "ip" | "service";
-  value: string;
-  acknowledged: boolean;
-  locked: boolean;
-  telemetry_freshness: TelemetryFreshness;
-  reachability: string;
+export interface SystemSettings {
+  operating_mode: OperatingMode;
+  automatic_actions_enabled: boolean;
+  global_lock: boolean;
+  [key: string]: unknown;
 }
 
-export interface Provider {
-  id: number;
-  name: string;
-  kind: "cloudflare" | "bgp_rtbh" | "flowspec" | "scrubber";
-  reachability: string;
+export interface SystemStatus {
+  operating_mode: OperatingMode;
+  devices_total: number;
+  devices_reachable: number;
+  interfaces_monitored: number;
+  active_rule_matches: number;
+  alerts_24h: number;
+  telemetry_stale_count: number;
 }
 
-export interface DetectionRule {
+// ---------------------------------------------------------------------------
+// SNMP Device types
+// ---------------------------------------------------------------------------
+
+export interface Device {
   id: number;
-  asset_id: number;
   name: string;
+  hostname: string;
+  snmp_version: string;
+  snmp_port: number;
+  enabled: boolean;
+  reachable: boolean;
+  vendor: string | null;
+  model: string | null;
+  os_version: string | null;
+  sys_name: string | null;
+  sys_uptime: string | null;
+  last_poll_at: string | null;
+  last_error: string | null;
+  poll_interval_seconds: number;
+  interface_count: number;
+  // SSH access captured at onboarding (for future CLI reroute actions; unused in
+  // observe mode). Secrets are never returned — only whether one is stored.
+  ssh_username: string | null;
+  ssh_port: number;
+  ssh_auth_method: "password" | "key" | null;
+  ssh_configured: boolean;
+}
+
+/** Payload for enrolling a device. SSH access is optional (password XOR key). */
+export interface DeviceCreate {
+  name: string;
+  hostname: string;
+  snmp_version: string;
+  snmp_port: number;
+  community: string;
+  poll_interval_seconds: number;
+  ssh_username?: string;
+  ssh_port?: number;
+  ssh_auth_method?: "password" | "key";
+  ssh_password?: string;
+  ssh_private_key?: string;
+  ssh_key_passphrase?: string;
+}
+
+export interface InterfaceMetrics {
+  sampled_at: string;
+  valid_sample: boolean;
+  rx_bps: number;
+  tx_bps: number;
+  rx_pps: number;
+  tx_pps: number;
+  rx_util_percent: number;
+  tx_util_percent: number;
+  in_errors: number;
+  out_errors: number;
+}
+
+export interface Interface {
+  id: number;
+  device_id: number;
+  if_index: number;
+  if_name: string;
+  if_descr: string | null;
+  if_alias: string | null;
+  if_speed_bps: number | null;
+  admin_status: string;
+  oper_status: string;
+  enabled_for_monitoring: boolean;
+  metrics: InterfaceMetrics | null;
+}
+
+export interface Sample {
+  sampled_at: string;
+  rx_bps: number;
+  tx_bps: number;
+  rx_pps: number;
+  tx_pps: number;
+  rx_util_percent: number;
+  tx_util_percent: number;
+}
+
+export interface DeviceTestResult {
+  ok: boolean;
+  vendor?: string;
+  model?: string;
+  os_version?: string;
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Rules and Alerts
+// ---------------------------------------------------------------------------
+
+export interface Rule {
+  id: number;
+  name: string;
+  target_kind: "interface" | "asset";
+  interface_id: number | null;
+  device_id: number | null;
+  asset_id: number | null;
+  metric: string;
+  operator: ">" | "<";
+  threshold_value: number;
+  duration_seconds: number;
+  consecutive_samples: number;
+  severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;
   reroute_template_id: number | null;
 }
+
+export interface Alert {
+  id: number;
+  event_type: string;
+  severity: string;
+  device_id: number | null;
+  interface_id: number | null;
+  asset_id: number | null;
+  rule_id: number | null;
+  created_at: string;
+  payload: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy types kept for Reroutes/ManualReroute/Audit pages (placeholders)
+// ---------------------------------------------------------------------------
 
 export type RerouteState =
   | "planned"
@@ -105,21 +229,9 @@ export interface ManualReroutePayload {
   asset_id: number;
   provider_id: number;
   template: string;
-  /** Validated server-side against the template's parameter schema. */
   parameters: Record<string, unknown>;
-  /** Mandatory free-text reason; audited (docs/doctrine.md §9). */
   reason: string;
-  /** Typed confirmation phrase for high-safety templates (docs/doctrine.md §8). */
   confirmation: string;
-}
-
-export interface Alert {
-  id: number;
-  event_type: string;
-  asset_id: number | null;
-  rule_id: number | null;
-  created_at: string;
-  payload: Record<string, unknown>;
 }
 
 export interface AuditEntry {
@@ -130,31 +242,6 @@ export interface AuditEntry {
   ip: string;
   created_at: string;
   details: Record<string, unknown>;
-}
-
-/**
- * Operating mode (docs/reroute-engine.md "Operating mode"):
- * - "observe" (default): safe read-only / alert-only — NO reroute executes,
- *   automatic or manual; alerts carry the actions that WOULD have run. The UI
- *   must show a persistent observe-mode banner.
- * - "enforce": execution allowed, still gated by every other safety rule.
- */
-export type OperatingMode = "observe" | "enforce";
-
-export interface SystemSettings {
-  operating_mode: OperatingMode;
-  automatic_actions_enabled: boolean;
-  global_lock: boolean;
-  [key: string]: unknown;
-}
-
-export interface SystemStatus {
-  healthy: boolean;
-  operating_mode: OperatingMode;
-  telemetry: TelemetryFreshness;
-  global_lock: boolean;
-  active_reroutes: number;
-  unresolved_uncertain: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +310,7 @@ export const api = {
         body: { code },
       }),
     logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+    me: () => request<SessionUser>("/api/auth/me"),
     /** Fresh password+TOTP, required before high-safety reroutes. */
     reauth: (password: string, code: string) =>
       request<void>("/api/auth/reauth", {
@@ -231,50 +319,56 @@ export const api = {
       }),
   },
 
-  health: () => request<{ ok: boolean }>("/api/health"),
   status: () => request<SystemStatus>("/api/status"),
 
-  assets: {
-    list: () => request<Asset[]>("/api/assets"),
-    get: (id: number) => request<Asset>(`/api/assets/${id}`),
-    create: (asset: Partial<Asset>) =>
-      request<Asset>("/api/assets", { method: "POST", body: asset }),
-    update: (id: number, asset: Partial<Asset>) =>
-      request<Asset>(`/api/assets/${id}`, { method: "PUT", body: asset }),
+  devices: {
+    list: () => request<Device[]>("/api/devices"),
+    get: (id: number) => request<Device>(`/api/devices/${id}`),
+    create: (device: DeviceCreate) =>
+      request<Device>("/api/devices", { method: "POST", body: device }),
+    update: (id: number, device: Partial<Device>) =>
+      request<Device>(`/api/devices/${id}`, { method: "PUT", body: device }),
     remove: (id: number) =>
-      request<void>(`/api/assets/${id}`, { method: "DELETE" }),
-    testTelemetry: (id: number) =>
-      request<unknown>(`/api/assets/${id}/test/telemetry`, { method: "POST" }),
-    rediscover: (id: number) =>
-      request<unknown>(`/api/assets/${id}/rediscover`, { method: "POST" }),
-    live: (id: number) => request<unknown>(`/api/assets/${id}/live`),
+      request<void>(`/api/devices/${id}`, { method: "DELETE" }),
+    test: (id: number) =>
+      request<DeviceTestResult>(`/api/devices/${id}/test`, { method: "POST" }),
+    discover: (id: number) =>
+      request<{ discovered: number }>(`/api/devices/${id}/discover`, {
+        method: "POST",
+      }),
+    interfaces: (id: number) =>
+      request<Interface[]>(`/api/devices/${id}/interfaces`),
   },
 
-  providers: {
-    list: () => request<Provider[]>("/api/providers"),
-    get: (id: number) => request<Provider>(`/api/providers/${id}`),
-    create: (provider: Partial<Provider>) =>
-      request<Provider>("/api/providers", { method: "POST", body: provider }),
-    update: (id: number, provider: Partial<Provider>) =>
-      request<Provider>(`/api/providers/${id}`, {
+  interfaces: {
+    get: (id: number) => request<Interface>(`/api/interfaces/${id}`),
+    update: (id: number, data: { enabled_for_monitoring: boolean }) =>
+      request<Interface>(`/api/interfaces/${id}`, {
         method: "PUT",
-        body: provider,
+        body: data,
       }),
-    remove: (id: number) =>
-      request<void>(`/api/providers/${id}`, { method: "DELETE" }),
+    metrics: (id: number, minutes?: number) =>
+      request<Sample[]>(
+        `/api/interfaces/${id}/metrics${minutes !== undefined ? `?minutes=${minutes}` : ""}`,
+      ),
   },
 
   rules: {
-    list: () => request<DetectionRule[]>("/api/rules"),
-    get: (id: number) => request<DetectionRule>(`/api/rules/${id}`),
-    create: (rule: Partial<DetectionRule>) =>
-      request<DetectionRule>("/api/rules", { method: "POST", body: rule }),
-    update: (id: number, rule: Partial<DetectionRule>) =>
-      request<DetectionRule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
+    list: () => request<Rule[]>("/api/rules"),
+    get: (id: number) => request<Rule>(`/api/rules/${id}`),
+    create: (rule: Omit<Rule, "id">) =>
+      request<Rule>("/api/rules", { method: "POST", body: rule }),
+    update: (id: number, rule: Partial<Rule>) =>
+      request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
     remove: (id: number) =>
       request<void>(`/api/rules/${id}`, { method: "DELETE" }),
   },
 
+  alerts: {
+    list: () => request<Alert[]>("/api/alerts"),
+  },
+
+  // Legacy reroute endpoints kept for placeholder pages
   reroutes: {
     list: () => request<Reroute[]>("/api/reroutes"),
     manual: (payload: ManualReroutePayload) =>
@@ -289,10 +383,6 @@ export const api = {
         method: "POST",
         body: { note },
       }),
-  },
-
-  alerts: {
-    list: () => request<Alert[]>("/api/alerts"),
   },
 
   audit: {

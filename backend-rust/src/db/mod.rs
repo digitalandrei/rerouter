@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sqlx::migrate::Migrator;
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::MySqlPool;
+use sqlx::{Executor, MySqlPool};
 
 use crate::config::Config;
 
@@ -26,9 +26,20 @@ pub async fn preflight_connect(cfg: &Config) -> Result<MySqlPool> {
     let url = cfg.database_url()?;
     let target = describe_url(&url);
 
+    // Force every pooled connection's session time zone to UTC. The schema uses
+    // TIMESTAMP columns and the code reads/writes them as UTC (UTC_TIMESTAMP(),
+    // chrono::DateTime<Utc>); sqlx decodes TIMESTAMP -> DateTime<Utc> assuming the
+    // session is +00:00, so we set it explicitly rather than trust the server's
+    // default tz.
     let connect = MySqlPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(PREFLIGHT_TIMEOUT)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET time_zone = '+00:00'").await?;
+                Ok(())
+            })
+        })
         .connect(&url);
 
     let pool = match tokio::time::timeout(PREFLIGHT_TIMEOUT, connect).await {

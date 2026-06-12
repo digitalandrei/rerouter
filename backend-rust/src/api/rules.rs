@@ -1,29 +1,375 @@
-//! Detection-rule CRUD (edit_rules). automatic_reroute_enabled defaults to off
-//! per rule and is additionally gated by the global switch + safety model.
-//! TODO(milestone 2): wire to db + detection engine.
+//! Detection-rule CRUD (edit_rules to write, view_asset to read).
+//!
+//! A rule targets a monitored interface XOR a protected asset (enforced here).
+//! `automatic_reroute_enabled` defaults off per rule and is additionally gated by
+//! the global switch + the reroute safety model — in observe mode it never
+//! executes. Field names are pinned by the frontend contract
+//! (../../frontend/src/lib/api.ts: Rule).
 
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-use super::not_implemented;
+use super::{err, AppState};
+use crate::auth::rbac::{markers, RequirePermission};
 
-pub async fn list() -> (StatusCode, Json<Value>) {
-    not_implemented()
+type JsonResp = (StatusCode, Json<Value>);
+
+/// Metrics valid for an interface-target rule (docs/telemetry-model.md).
+const INTERFACE_METRICS: &[&str] = &[
+    "rx_bps",
+    "tx_bps",
+    "rx_pps",
+    "tx_pps",
+    "rx_util_percent",
+    "tx_util_percent",
+    "oper_status",
+];
+
+#[derive(sqlx::FromRow)]
+struct RuleRow {
+    id: u64,
+    name: String,
+    interface_id: Option<u64>,
+    device_id: Option<u64>,
+    asset_id: Option<u64>,
+    metric: String,
+    operator: String,
+    threshold_value: f64,
+    duration_seconds: u32,
+    consecutive_samples: u32,
+    severity: String,
+    enabled: bool,
+    automatic_reroute_enabled: bool,
+    reroute_template_id: Option<u64>,
 }
 
-pub async fn create() -> (StatusCode, Json<Value>) {
-    not_implemented()
+const RULE_COLS: &str = "id, name, interface_id, device_id, asset_id, metric, operator, \
+     threshold_value, duration_seconds, consecutive_samples, severity, enabled, \
+     automatic_reroute_enabled, reroute_template_id";
+
+fn rule_json(r: &RuleRow) -> Value {
+    let target_kind = if r.interface_id.is_some() { "interface" } else { "asset" };
+    json!({
+        "id": r.id,
+        "name": r.name,
+        "target_kind": target_kind,
+        "interface_id": r.interface_id,
+        "device_id": r.device_id,
+        "asset_id": r.asset_id,
+        "metric": r.metric,
+        "operator": r.operator,
+        "threshold_value": r.threshold_value,
+        "duration_seconds": r.duration_seconds,
+        "consecutive_samples": r.consecutive_samples,
+        "severity": r.severity,
+        "enabled": r.enabled,
+        "automatic_reroute_enabled": r.automatic_reroute_enabled,
+        "reroute_template_id": r.reroute_template_id,
+    })
 }
 
-pub async fn show() -> (StatusCode, Json<Value>) {
-    not_implemented()
+async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
+    let row = sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(rule_json))
 }
 
-pub async fn update() -> (StatusCode, Json<Value>) {
-    not_implemented()
+/// GET /api/rules.
+pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
+    match sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules ORDER BY name"))
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(rule_json).collect();
+            (StatusCode::OK, Json(json!(out)))
+        }
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
 }
 
-pub async fn remove() -> (StatusCode, Json<Value>) {
-    not_implemented()
+#[derive(Debug, Deserialize)]
+pub struct RuleBody {
+    name: String,
+    #[serde(default)]
+    target_kind: Option<String>,
+    interface_id: Option<u64>,
+    asset_id: Option<u64>,
+    metric: String,
+    operator: String,
+    threshold_value: f64,
+    #[serde(default = "default_duration")]
+    duration_seconds: u32,
+    #[serde(default = "default_consecutive")]
+    consecutive_samples: u32,
+    #[serde(default = "default_severity")]
+    severity: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    automatic_reroute_enabled: bool,
+    reroute_template_id: Option<u64>,
+}
+
+fn default_duration() -> u32 {
+    30
+}
+fn default_consecutive() -> u32 {
+    3
+}
+fn default_severity() -> String {
+    "warning".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Validate operator + metric + target. Returns the resolved device_id for an
+/// interface rule (looked up from the interface) on success.
+async fn validate(pool: &sqlx::MySqlPool, body: &RuleBody) -> Result<Option<u64>, (StatusCode, String)> {
+    if body.name.trim().is_empty() {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "name is required".into()));
+    }
+    // Operators: the contract pins > and < for interface rules.
+    if !matches!(body.operator.as_str(), ">" | "<" | ">=" | "<=" | "==" | "!=") {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "unsupported operator".into()));
+    }
+    // Interface XOR asset.
+    match (body.interface_id, body.asset_id) {
+        (Some(_), Some(_)) => {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "a rule targets an interface XOR an asset".into()))
+        }
+        (None, None) => {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id or asset_id is required".into()))
+        }
+        _ => {}
+    }
+    // If the client declared a target_kind, it must agree with the IDs sent.
+    if let Some(kind) = body.target_kind.as_deref() {
+        let consistent = match kind {
+            "interface" => body.interface_id.is_some(),
+            "asset" => body.asset_id.is_some(),
+            _ => return Err((StatusCode::UNPROCESSABLE_ENTITY, "target_kind must be interface or asset".into())),
+        };
+        if !consistent {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "target_kind does not match the target id".into()));
+        }
+    }
+    if let Some(iface_id) = body.interface_id {
+        if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metric must be one of: {}", INTERFACE_METRICS.join(", ")),
+            ));
+        }
+        // Resolve the owning device; also validates the interface exists.
+        let device_id: Option<u64> = sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
+            .bind(iface_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
+        match device_id {
+            Some(d) => Ok(Some(d)),
+            None => Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id does not exist".into())),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// POST /api/rules.
+pub async fn create(
+    g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Json(body): Json<RuleBody>,
+) -> JsonResp {
+    let device_id = match validate(&state.pool, &body).await {
+        Ok(d) => d,
+        Err((code, msg)) => return err(code, &msg),
+    };
+
+    let res = sqlx::query(
+        "INSERT INTO rules (name, asset_id, interface_id, device_id, metric, operator, threshold_value, \
+            duration_seconds, consecutive_samples, severity, enabled, automatic_reroute_enabled, \
+            reroute_template_id, created_by, updated_by) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&body.name)
+    .bind(body.asset_id)
+    .bind(body.interface_id)
+    .bind(device_id)
+    .bind(&body.metric)
+    .bind(&body.operator)
+    .bind(body.threshold_value)
+    .bind(body.duration_seconds)
+    .bind(body.consecutive_samples)
+    .bind(&body.severity)
+    .bind(body.enabled)
+    .bind(body.automatic_reroute_enabled)
+    .bind(body.reroute_template_id)
+    .bind(g.session.user_id)
+    .bind(g.session.user_id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(r) => match fetch_rule(&state.pool, r.last_insert_id()).await {
+            Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
+            _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        },
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+/// GET /api/rules/{id}.
+pub async fn show(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    match fetch_rule(&state.pool, id).await {
+        Ok(Some(v)) => (StatusCode::OK, Json(v)),
+        Ok(None) => err(StatusCode::NOT_FOUND, "rule not found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuleUpdate {
+    name: Option<String>,
+    metric: Option<String>,
+    operator: Option<String>,
+    threshold_value: Option<f64>,
+    duration_seconds: Option<u32>,
+    consecutive_samples: Option<u32>,
+    severity: Option<String>,
+    enabled: Option<bool>,
+    automatic_reroute_enabled: Option<bool>,
+    reroute_template_id: Option<Option<u64>>,
+}
+
+/// PUT /api/rules/{id} — partial update (target is immutable here; recreate to
+/// retarget). Re-validates operator/metric when changed.
+pub async fn update(
+    g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<RuleUpdate>,
+) -> JsonResp {
+    let Ok(Some(existing)) = sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+    else {
+        return err(StatusCode::NOT_FOUND, "rule not found");
+    };
+
+    if let Some(op) = &body.operator {
+        if !matches!(op.as_str(), ">" | "<" | ">=" | "<=" | "==" | "!=") {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported operator");
+        }
+    }
+    if let Some(metric) = &body.metric {
+        if existing.interface_id.is_some() && !INTERFACE_METRICS.contains(&metric.as_str()) {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported interface metric");
+        }
+    }
+
+    let mut sets: Vec<&str> = Vec::new();
+    if body.name.is_some() {
+        sets.push("name = ?");
+    }
+    if body.metric.is_some() {
+        sets.push("metric = ?");
+    }
+    if body.operator.is_some() {
+        sets.push("operator = ?");
+    }
+    if body.threshold_value.is_some() {
+        sets.push("threshold_value = ?");
+    }
+    if body.duration_seconds.is_some() {
+        sets.push("duration_seconds = ?");
+    }
+    if body.consecutive_samples.is_some() {
+        sets.push("consecutive_samples = ?");
+    }
+    if body.severity.is_some() {
+        sets.push("severity = ?");
+    }
+    if body.enabled.is_some() {
+        sets.push("enabled = ?");
+    }
+    if body.automatic_reroute_enabled.is_some() {
+        sets.push("automatic_reroute_enabled = ?");
+    }
+    if body.reroute_template_id.is_some() {
+        sets.push("reroute_template_id = ?");
+    }
+    sets.push("updated_by = ?");
+
+    let sql = format!("UPDATE rules SET {} WHERE id = ?", sets.join(", "));
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = &body.name {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.metric {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.operator {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.threshold_value {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.duration_seconds {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.consecutive_samples {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.severity {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.enabled {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.automatic_reroute_enabled {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.reroute_template_id {
+        q = q.bind(*v);
+    }
+    q = q.bind(g.session.user_id);
+    q = q.bind(id);
+
+    if q.execute(&state.pool).await.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+    match fetch_rule(&state.pool, id).await {
+        Ok(Some(v)) => (StatusCode::OK, Json(v)),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+/// DELETE /api/rules/{id}.
+pub async fn remove(
+    _g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    match sqlx::query("DELETE FROM rules WHERE id = ?")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(_) => err(StatusCode::NOT_FOUND, "rule not found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
 }
