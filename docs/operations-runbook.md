@@ -3,6 +3,19 @@
 Day-2 operations for Rerouter. Assumes the deployment in
 [deployment.md](deployment.md).
 
+## Paths
+
+Everything the controller needs lives in `/srv/rerouter/`:
+
+- `/srv/rerouter/rerouter-controller` — the binary (upgraded by re-running
+  `--install`);
+- `/srv/rerouter/.env` — environment (mode `0600`): `DATABASE_URL`, `SMTP_*`,
+  auto-generated `SESSION_SECRET`/`SECRETS_KEY`, `TWO_FACTOR_ISSUER`;
+- `/srv/rerouter/config.toml` — controller config (missing file = built-in
+  defaults + warning);
+- `/etc/systemd/system/rerouter-controller.service` — the unit (owned by the
+  installer; overwritten on `--install`).
+
 ## Services
 
 ```bash
@@ -17,6 +30,27 @@ Controller health (localhost only):
 curl -s http://127.0.0.1:9277/api/health
 curl -s http://127.0.0.1:9277/api/status | jq .
 ```
+
+## Ops toolbox (CLI)
+
+Run as the service user with the service's config/env:
+
+```bash
+sudo -u rerouter /srv/rerouter/rerouter-controller \
+  --config /srv/rerouter/config.toml --env-file /srv/rerouter/.env <flag>
+```
+
+- `--check` — config check, then exit.
+- `--check-db` — DB connectivity/credential check, then exit (the same
+  preflight the controller runs at startup; clear error, never the password).
+- `--migrate` — apply pending sqlx migrations, then exit (startup also
+  migrates/seeds a fresh database automatically).
+- `--seed-templates` — currently equivalent to `--migrate` (seeds ship as idempotent migrations); deliberate re-seeding of deleted templates is a milestone-3 TODO.
+- `--create-admin` — create an admin user (`ADMIN_EMAIL`/`ADMIN_NAME`/
+  `ADMIN_PASSWORD` via flags or interactive prompt; idempotent on email; 2FA
+  enrollment happens at the user's first login).
+- `--install` — re-run to upgrade the binary and systemd unit; never touches
+  an existing `.env`/`config.toml`.
 
 ## Global safety switches
 
@@ -76,8 +110,8 @@ design). Check the flow exporter, the collector, and `POST
 ### Email alerts not arriving
 
 Check `alert_deliveries` for `failed`/`bounced`, the controller's alert-dispatcher
-log lines (`journalctl -u rerouter-controller`), and the `SMTP_*` environment
-variables on the service. Remember dedup/rate-limit collapses repeats —
+log lines (`journalctl -u rerouter-controller`), and the `SMTP_*` values in
+`/srv/rerouter/.env`. Remember dedup/rate-limit collapses repeats —
 `uncertain`, `failed`, and security events are never collapsed.
 
 ### Origin reachable directly (bypassing Cloudflare)
@@ -88,9 +122,10 @@ in logs (non-Cloudflare source), re-apply the firewall allowlist — see
 
 ## Backups
 
-Back up: the MariaDB database, `/etc/rerouter/` (config + keys), the controller's
-environment file (`DATABASE_URL`, `SESSION_SECRET`, `SECRETS_KEY`, `SMTP_*`),
-and exported reroute templates. Never commit secrets to Git. Test restore into a
+Back up: the MariaDB database, `/srv/rerouter/.env` (`DATABASE_URL`,
+`SESSION_SECRET`, `SECRETS_KEY`, `SMTP_*`), `/srv/rerouter/config.toml`, and
+exported reroute templates. Losing `SECRETS_KEY` makes encrypted provider
+credentials unrecoverable. Never commit secrets to Git. Test restore into a
 staging DB periodically.
 
 ## Routine checks

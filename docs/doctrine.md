@@ -130,6 +130,8 @@ rerouter/
 │   ├── src/
 │   │   ├── main.rs
 │   │   ├── config.rs
+│   │   ├── install.rs        (--install: binary, .env, config.toml, systemd unit)
+│   │   ├── ui.rs             (embed-ui feature: embedded SPA serving, default off)
 │   │   ├── db/
 │   │   ├── auth/             (sessions.rs, password.rs, totp.rs, rbac.rs)
 │   │   ├── alerts/           (dispatcher.rs, mailer.rs)
@@ -203,7 +205,7 @@ API), `argon2` (password hashing), `totp-rs` (TOTP 2FA), `lettre` (SMTP over
 rustls), plus a flow collector and a BGP speaker (ExaBGP via subprocess, or a
 Rust BGP crate evaluated against the lab).
 
-Build: `cargo build --release`. Binary path: `/usr/local/bin/rerouter-controller`.
+Build: `cargo build --release`. Installed path: `/srv/rerouter/rerouter-controller` (laid down by `--install`).
 
 ### 5.2 Rust API & auth layer
 

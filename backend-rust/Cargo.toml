@@ -9,6 +9,13 @@ license = "proprietary"
 name = "rerouter-controller"
 path = "src/main.rs"
 
+[features]
+default = []
+# OPTIONAL single-binary UI: embed ../frontend/dist and serve the SPA from the
+# controller itself (index.html fallback for client routes; /api/* always wins).
+# Build: (cd frontend && npm ci && npm run build) && cargo build --release --features embed-ui
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
@@ -24,6 +31,12 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 thiserror = "1"
+# --env-file loading at startup (process env always wins; missing file = warn).
+dotenvy = "0.15"
+# Single-binary UI (feature "embed-ui" only) — keep the default build free of
+# any frontend/dist requirement.
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
 toml = "0.8"
 # Auth: Argon2id password hashing + RFC 6238 TOTP (30s / 6 digits / issuer "Rerouter").

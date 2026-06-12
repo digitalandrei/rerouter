@@ -69,6 +69,11 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(pool);
 
+    // OPTIONAL single-binary UI (cargo feature "embed-ui"): the SPA is the
+    // router fallback, so every explicit /api route above always wins.
+    #[cfg(feature = "embed-ui")]
+    let app = app.fallback(crate::ui::serve_spa);
+
     let listener = tokio::net::TcpListener::bind(&cfg.server.bind).await?;
     tracing::info!(event_type = "api_listening", bind = %cfg.server.bind, "API up (loopback only; public via Nginx /api proxy)");
     axum::serve(listener, app).await?;

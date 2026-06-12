@@ -1,4 +1,7 @@
-# Rerouter controller configuration — install at /etc/rerouter/config.toml
+# Rerouter controller configuration. `rerouter-controller --install` writes this
+# file verbatim to /srv/rerouter/config.toml (only if it does not already exist);
+# if the file is missing at startup the controller falls back to built-in
+# defaults that mirror this file exactly.
 # Secrets (DB URL, provider tokens) come from the environment / EnvironmentFile,
 # not this file. See deploy/env/rerouter.example.env.
 

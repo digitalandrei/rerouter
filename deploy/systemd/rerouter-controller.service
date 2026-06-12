@@ -7,17 +7,16 @@ Wants=network-online.target
 Type=simple
 User=rerouter
 Group=rerouter
-EnvironmentFile=/etc/rerouter/rerouter.env
-ExecStart=/usr/local/bin/rerouter-controller --config /etc/rerouter/config.toml
+EnvironmentFile=/srv/rerouter/.env
+ExecStart=/srv/rerouter/rerouter-controller --config /srv/rerouter/config.toml --env-file /srv/rerouter/.env
 Restart=always
 RestartSec=5
-WorkingDirectory=/var/lib/rerouter
-
+WorkingDirectory=/srv/rerouter
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/rerouter /var/log/rerouter
+ReadWritePaths=/srv/rerouter
 LockPersonality=true
 
 [Install]

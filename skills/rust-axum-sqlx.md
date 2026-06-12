@@ -18,6 +18,32 @@ description: Patterns for the Rerouter controller — tokio async service, axum 
 - `serde`/`serde_json`, `clap`, `chrono`/`time`, `uuid`, `anyhow`/`thiserror`,
   `reqwest` for the Cloudflare API.
 
+## CLI & bootstrap
+
+Flags (clap, all `--flag` style): `--install [--prefix <dir>]` (installer →
+`src/install.rs`), `--env-file <path>` (default `/srv/rerouter/.env`; missing =
+warn), `--config <path>` (default `/srv/rerouter/config.toml`; missing =
+built-in defaults mirroring `config.example.toml` + warning; `REROUTER_CONFIG`
+respected), `--check`, `--check-db`, `--migrate`, `--seed-templates`,
+`--create-admin`.
+
+Startup order in `main.rs`:
+
+1. load `--env-file` via `dotenvy` if it exists (process env always wins);
+2. load config (missing file → defaults + warning; loopback-bind validation
+   stays);
+3. **DB credential preflight** (~5s timeout) — on failure `exit(1)` with one
+   actionable line (host/db/user and why, never the password) before anything
+   else touches the DB;
+4. migrate/seed: a fresh database (no `_sqlx_migrations` rows) logs
+   `fresh database — creating schema and seeds`; run `db::MIGRATOR`
+   (idempotent — schema + roles/permissions/templates/system_settings);
+5. startup recovery → alert dispatcher → scheduler → API serve.
+
+The optional `embed-ui` cargo feature (default **off**; `src/ui.rs`,
+`#[cfg(feature)]`-isolated) serves `frontend/dist` from the binary —
+`/api/*` always wins; the default build stays green without `frontend/dist`.
+
 ## API conventions
 
 - Bind `127.0.0.1` only; never `0.0.0.0`. Public access is **exclusively** via

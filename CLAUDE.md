@@ -42,6 +42,10 @@ action path as dangerous by default.
 - Frontend: Vite + React + TypeScript + Tailwind + shadcn/ui SPA in `frontend/`,
   served statically by Nginx.
 - DB: MariaDB only. Migrations are sqlx SQL files in `backend-rust/migrations/`.
+- Bootstrap: the installer lives in `src/install.rs`; `.env` is loaded via
+  `dotenvy` (`--env-file`); a missing config falls back to built-in defaults
+  mirroring `config.example.toml`; the `embed-ui` feature is optional and
+  default-off.
 - The Rust API binds to `127.0.0.1` only and is never exposed publicly; public
   access goes through the Nginx `/api/` reverse proxy.
 - The site sits behind Cloudflare (`rerouter.cloudcraft.ro`); Nginx is the origin.

@@ -28,6 +28,29 @@ requirements: the app prefers doing nothing over doing the wrong thing.
   `rerouter.cloudcraft.ro`; Nginx is the origin, serves the SPA, and
   reverse-proxies `/api/` to the controller on `127.0.0.1:9277`.
 
+## Quick start (test deployment)
+
+The released binary contains everything needed — installer, migrations, seeds,
+and (optionally) the UI:
+
+```bash
+# build — add --features embed-ui for a single-binary UI (after building frontend/dist)
+(cd backend-rust && cargo build --release)
+
+scp backend-rust/target/release/rerouter-controller server:/tmp/
+ssh server
+sudo /tmp/rerouter-controller --install   # binary + .env + config.toml + systemd unit
+sudo vi /srv/rerouter/.env                # fill DATABASE_URL + SMTP_* (keys are pre-generated)
+# create the MariaDB database + user, then:
+sudo systemctl start rerouter-controller
+journalctl -fu rerouter-controller        # preflights DB creds, seeds a fresh database itself
+```
+
+Create the first admin with `--create-admin`. With `embed-ui`, browse the UI
+through an SSH tunnel (`ssh -L 9277:127.0.0.1:9277 server`) — the API bind
+stays loopback-only. Full details (including the Nginx + Cloudflare production
+topology): [docs/deployment.md](docs/deployment.md).
+
 ## Quick links
 
 - [docs/doctrine.md](docs/doctrine.md) — the operating doctrine (read this first).

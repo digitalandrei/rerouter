@@ -14,11 +14,16 @@ pub struct Config {
     pub detection: Detection,
     pub safety: Safety,
     pub reroute: Reroute,
+    #[serde(default)]
+    pub providers: Providers,
+    #[serde(default)]
+    pub retention: Retention,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Server {
-    /// MUST be a loopback address. Validated in `load`.
+    /// MUST be a loopback address. Validated in `validate` (both the file and
+    /// the built-in-defaults load paths).
     pub bind: String,
 }
 
@@ -101,17 +106,173 @@ pub struct Reroute {
     pub require_verification: bool,
 }
 
+/// Provider adapter settings ([providers.cloudflare] / [providers.bgp]).
+/// Tokens/keys come from provider credentials, never from this file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Providers {
+    pub cloudflare: CloudflareProvider,
+    pub bgp: BgpProvider,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CloudflareProvider {
+    pub api_base: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BgpProvider {
+    /// Controlled BGP speaker (e.g. "exabgp"); driven over a narrow command
+    /// interface — never arbitrary BGP from free text.
+    pub speaker: String,
+}
+
+/// Retention windows enforced by the controller's cleanup task
+/// (TODO(milestone 2): the task itself).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Retention {
+    pub traffic_samples_days: u32,
+    pub rule_events_days: u32,
+    pub reroute_logs_days: u32,
+}
+
+// Built-in defaults — these MUST mirror config.example.toml exactly. Used when
+// the config file is missing (fresh installs before the operator customizes
+// anything); `Config::load_or_default` logs a warning in that case.
+
+impl Default for Server {
+    fn default() -> Self {
+        Self { bind: "127.0.0.1:9277".into() }
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self { url_env: "DATABASE_URL".into() }
+    }
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self {
+            flow_listen: "0.0.0.0:2055".into(),
+            default_sampling_rate: 1000,
+            metrics_rollup_seconds: 15,
+            reachability_interval_seconds: 15,
+            cloudflare_poll_seconds: 60,
+            stale_after_seconds: 90,
+            jitter_percent: 15,
+        }
+    }
+}
+
+impl Default for Detection {
+    fn default() -> Self {
+        Self {
+            default_consecutive_samples: 3,
+            default_min_duration_seconds: 30,
+            hysteresis_seconds: 30,
+        }
+    }
+}
+
+impl Default for Safety {
+    fn default() -> Self {
+        Self {
+            // SAFETY: observe (read-only / alert-only), automatic actions OFF.
+            operating_mode: OperatingMode::Observe,
+            automatic_actions_enabled: false,
+            global_action_rate_limit_count: 3,
+            global_action_rate_limit_window_seconds: 600,
+            same_rule_cooldown_seconds: 900,
+            same_asset_cooldown_seconds: 300,
+            same_prefix_provider_cooldown_seconds: 1800,
+            mark_running_actions_uncertain_on_startup: true,
+        }
+    }
+}
+
+impl Default for Reroute {
+    fn default() -> Self {
+        Self { default_blackhole_expiry_seconds: 1800, require_verification: true }
+    }
+}
+
+impl Default for Providers {
+    fn default() -> Self {
+        Self { cloudflare: CloudflareProvider::default(), bgp: BgpProvider::default() }
+    }
+}
+
+impl Default for CloudflareProvider {
+    fn default() -> Self {
+        Self { api_base: "https://api.cloudflare.com/client/v4".into() }
+    }
+}
+
+impl Default for BgpProvider {
+    fn default() -> Self {
+        Self { speaker: "exabgp".into() }
+    }
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self { traffic_samples_days: 7, rule_events_days: 90, reroute_logs_days: 365 }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: Server::default(),
+            database: Database::default(),
+            auth: Auth::default(),
+            telemetry: Telemetry::default(),
+            detection: Detection::default(),
+            safety: Safety::default(),
+            reroute: Reroute::default(),
+            providers: Providers::default(),
+            retention: Retention::default(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {path}"))?;
         let cfg: Config = toml::from_str(&raw).context("parsing config.toml")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
 
+    /// Load `path`, or — if the file does not exist — fall back to the built-in
+    /// defaults (an exact mirror of config.example.toml) with a warning. A file
+    /// that exists but fails to parse is still a hard error.
+    pub fn load_or_default(path: &str) -> Result<Self> {
+        if std::path::Path::new(path).exists() {
+            return Self::load(path);
+        }
+        tracing::warn!(
+            event_type = "config_missing",
+            path,
+            "config file not found — using built-in defaults (mirror of config.example.toml)"
+        );
+        let cfg = Self::default();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
         // SAFETY: refuse to start if the API would bind to a non-loopback address.
-        if !cfg.server.bind.starts_with("127.") && !cfg.server.bind.starts_with("[::1]") {
+        if !self.server.bind.starts_with("127.") && !self.server.bind.starts_with("[::1]") {
             anyhow::bail!("server.bind must be loopback; refusing to expose the controller API");
         }
-        Ok(cfg)
+        Ok(())
     }
 
     pub fn database_url(&self) -> Result<String> {
