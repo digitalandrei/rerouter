@@ -29,8 +29,9 @@ import {
   RefreshCw,
   Activity,
   Compass,
+  SlidersHorizontal,
 } from "lucide-react";
-import { api, type Device, type Interface, ApiError } from "@/lib/api";
+import { api, type Device, type Interface, type Rule, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -470,12 +471,14 @@ interface InterfacesTabProps {
   deviceId: number;
   interfaces: Interface[];
   loading: boolean;
+  ruleCountByIfaceId: Map<number, number>;
 }
 
 function InterfacesTab({
   deviceId,
   interfaces,
   loading,
+  ruleCountByIfaceId,
 }: InterfacesTabProps) {
   const navigate = useNavigate();
 
@@ -501,7 +504,8 @@ function InterfacesTab({
           <TableHead>Status</TableHead>
           <TableHead>Rx bps / pps</TableHead>
           <TableHead>Tx bps / pps</TableHead>
-          <TableHead className="pr-6">Util %</TableHead>
+          <TableHead>Util %</TableHead>
+          <TableHead className="pr-6">Rules</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -558,7 +562,7 @@ function InterfacesTab({
                   "—"
                 )}
               </TableCell>
-              <TableCell className="pr-6 text-xs">
+              <TableCell className="text-xs">
                 {valid ? (
                   <>
                     Rx {iface.metrics!.rx_util_percent.toFixed(1)}%
@@ -568,6 +572,26 @@ function InterfacesTab({
                 ) : (
                   "—"
                 )}
+              </TableCell>
+              <TableCell className="pr-6">
+                {(() => {
+                  const count = ruleCountByIfaceId.get(iface.id) ?? 0;
+                  if (count === 0) {
+                    return (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    );
+                  }
+                  return (
+                    <Badge
+                      variant="secondary"
+                      className="inline-flex items-center gap-1"
+                      title={`${count} detection rule${count === 1 ? "" : "s"} target this interface`}
+                    >
+                      <SlidersHorizontal className="size-3" />
+                      {count}
+                    </Badge>
+                  );
+                })()}
               </TableCell>
             </TableRow>
           );
@@ -590,6 +614,7 @@ export default function DeviceDetail() {
 
   const [device, setDevice] = useState<Device | null>(null);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
+  const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(true);
   const [ifLoading, setIfLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -620,6 +645,7 @@ export default function DeviceDetail() {
   useEffect(() => {
     loadDevice();
     loadInterfaces();
+    api.rules.list().then(setRules).catch(() => setRules([]));
     ifaceTimerRef.current = setInterval(() => {
       loadDevice();
       loadInterfaces();
@@ -784,6 +810,15 @@ export default function DeviceDetail() {
                 deviceId={deviceId}
                 interfaces={interfaces}
                 loading={ifLoading}
+                ruleCountByIfaceId={(() => {
+                  const m = new Map<number, number>();
+                  for (const r of rules) {
+                    if (r.interface_id !== null) {
+                      m.set(r.interface_id, (m.get(r.interface_id) ?? 0) + 1);
+                    }
+                  }
+                  return m;
+                })()}
               />
             </CardContent>
           </Card>

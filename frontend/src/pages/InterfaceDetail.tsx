@@ -14,11 +14,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ArrowLeft, RefreshCw } from "lucide-react";
+import { ArrowLeft, RefreshCw, SlidersHorizontal } from "lucide-react";
 import {
   api,
   type Device,
   type Interface,
+  type Rule,
   type Sample,
   ApiError,
 } from "@/lib/api";
@@ -101,6 +102,37 @@ function SmoothingControl({
 }
 
 // ---------------------------------------------------------------------------
+// Detection rules helpers (mirrors Rules.tsx)
+// ---------------------------------------------------------------------------
+
+const METRIC_LABELS: Record<string, string> = {
+  rx_bps: "Rx bps",
+  tx_bps: "Tx bps",
+  rx_pps: "Rx pps",
+  tx_pps: "Tx pps",
+  rx_util_percent: "Rx utilization %",
+  tx_util_percent: "Tx utilization %",
+};
+
+function conditionLabel(rule: Rule): string {
+  const metricLabel = METRIC_LABELS[rule.metric] ?? rule.metric;
+  return `${metricLabel} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
+}
+
+function severityVariant(
+  severity: string,
+): "default" | "secondary" | "destructive" | "outline" {
+  switch (severity) {
+    case "critical":
+      return "destructive";
+    case "warning":
+      return "secondary";
+    default:
+      return "outline";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -115,6 +147,7 @@ export default function InterfaceDetail() {
   const [device, setDevice] = useState<Device | null>(null);
   const [iface, setIface] = useState<Interface | null>(null);
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(true);
   const [metricsReady, setMetricsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -151,13 +184,14 @@ export default function InterfaceDetail() {
       .catch(() => setDevice(null));
   }, [deviceId]);
 
-  // Interface + metrics, then a shared 30 s auto-refresh.
+  // Interface + metrics + rules, then a shared 30 s auto-refresh.
   useEffect(() => {
     setLoading(true);
     setMetricsReady(false);
     setSamples([]);
     loadInterface();
     loadMetrics();
+    api.rules.list().then(setRules).catch(() => setRules([]));
 
     const refresh = () => {
       loadInterface();
@@ -331,6 +365,62 @@ export default function InterfaceDetail() {
           </CardContent>
         </Card>
       </div>
+
+      {/* ---- Detection rules card ---- */}
+      {(() => {
+        const ifaceRules = rules.filter((r) => r.interface_id === ifaceId);
+        return (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <SlidersHorizontal className="size-4 text-muted-foreground" />
+                Detection rules
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {ifaceRules.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No detection rules target this interface yet.{" "}
+                  <Link
+                    to="/rules"
+                    className="text-primary underline-offset-4 hover:underline"
+                  >
+                    Go to Rules
+                  </Link>
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {ifaceRules.map((rule) => (
+                    <div
+                      key={rule.id}
+                      className="flex flex-wrap items-center gap-3 rounded-md border border-border px-3 py-2 text-sm"
+                    >
+                      <span className="font-medium">{rule.name}</span>
+                      <code className="text-xs text-muted-foreground">
+                        {conditionLabel(rule)}
+                      </code>
+                      <Badge variant={severityVariant(rule.severity)}>
+                        {rule.severity}
+                      </Badge>
+                      <Badge variant={rule.enabled ? "default" : "outline"}>
+                        {rule.enabled ? "enabled" : "disabled"}
+                      </Badge>
+                    </div>
+                  ))}
+                  <p className="pt-1 text-xs text-muted-foreground">
+                    <Link
+                      to="/rules"
+                      className="text-primary underline-offset-4 hover:underline"
+                    >
+                      Manage in Rules
+                    </Link>
+                  </p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })()}
 
       {/* ---- Telemetry charts ---- */}
       <div className="flex flex-wrap items-center justify-between gap-2">
