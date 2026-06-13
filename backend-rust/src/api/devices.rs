@@ -579,6 +579,29 @@ pub async fn ssh_test(
     }
 }
 
+/// POST /api/devices/{id}/ssh-capabilities — probe whether the SSH account can run
+/// the commands Rerouter needs (reads + config-mode entry), changing nothing.
+/// Returns per-command ok/denied so an under-privileged account is obvious in the
+/// device Settings tab. `manage_devices` (superadmin) only.
+pub async fn ssh_capabilities(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    }
+    match crate::ssh::probe_capabilities(&state.pool, id).await {
+        Ok(checks) => (StatusCode::OK, Json(json!({ "ok": true, "checks": checks }))),
+        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+    }
+}
+
 /// POST /api/devices/{id}/ssh-generate-key — generate a fresh 2048-bit RSA client
 /// keypair (no passphrase), store the private key encrypted, switch the device to
 /// key auth, persist + return the public key for enrollment on the router.

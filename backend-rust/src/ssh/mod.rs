@@ -276,15 +276,17 @@ pub async fn run_commands(pool: &MySqlPool, device_id: u64, commands: &[String])
     Ok(outcome)
 }
 
-/// Discover the device's announced BGP prefixes (`network` statements) over SSH
-/// and reconcile `device_bgp_networks`. Returns the prefix count. Requires
-/// working SSH; a failure is a structured error (caller logs it).
+/// Discover routing context from the `router bgp` config section over SSH:
+/// reconcile announced prefixes (`network` statements) into `device_bgp_networks`
+/// AND auto-label discovered BGP peers from their `neighbor <ip> description`
+/// lines. Returns the prefix count. Requires working SSH; a failure is a
+/// structured error (caller logs it).
 pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let cmd = "show running-config | section ^router bgp".to_string();
     let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
     let output = outcome.results.first().map(|r| r.output.as_str()).unwrap_or("");
-    let prefixes = parse_network_statements(output);
 
+    let prefixes = parse_network_statements(output);
     for prefix in &prefixes {
         let _ = sqlx::query(
             "INSERT INTO device_bgp_networks (device_id, prefix, first_seen_at, last_seen_at, last_discovered_at) \
@@ -296,7 +298,108 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         .execute(pool)
         .await;
     }
+
+    // Auto-label sessions from `neighbor <ip> description <text>`. The router's own
+    // description is authoritative for the friendly name; only fill peers that have
+    // no label yet so a manually-set label is never clobbered.
+    for (addr, description) in parse_neighbor_descriptions(output) {
+        let _ = sqlx::query(
+            "UPDATE device_bgp_peers SET label = ? \
+             WHERE device_id = ? AND peer_remote_addr = ? AND (label IS NULL OR label = '')",
+        )
+        .bind(&description)
+        .bind(device_id)
+        .bind(addr.to_string())
+        .execute(pool)
+        .await;
+    }
+
     Ok(prefixes.len())
+}
+
+/// Parse `neighbor A.B.C.D description <free text>` lines from a `router bgp`
+/// config section into (addr, description) pairs. Peer-group / IPv6 neighbours
+/// whose first token isn't an IPv4 literal are skipped (v1 is IPv4).
+fn parse_neighbor_descriptions(config: &str) -> Vec<(Ipv4Addr, String)> {
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("neighbor ") else { continue };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let Some(addr_tok) = parts.next() else { continue };
+        let Ok(addr) = addr_tok.parse::<Ipv4Addr>() else { continue };
+        let Some(tail) = parts.next() else { continue };
+        if let Some(desc) = tail.trim().strip_prefix("description ") {
+            let desc = desc.trim();
+            if !desc.is_empty() {
+                out.push((addr, desc.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// One command-access check result for the device Settings "command access" panel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CapabilityCheck {
+    pub name: String,
+    pub command: String,
+    pub ok: bool,
+    /// The router's message when access is denied (empty when ok).
+    pub detail: String,
+}
+
+/// Cisco rejection markers present in cleaned output when a command is not
+/// permitted (parser view / privilege level) or not recognised.
+fn cisco_denied(output: &str) -> Option<String> {
+    const MARKERS: [&str; 6] = [
+        "% Invalid input",
+        "ommand authorization failed", // "Command authorization failed"
+        "not authorized",
+        "% Incomplete command",
+        "% Ambiguous command",
+        "% Permission denied",
+    ];
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| MARKERS.iter().any(|m| l.contains(m)))
+        .map(str::to_string)
+}
+
+/// Probe whether the device's SSH account can run the commands Rerouter needs —
+/// WITHOUT changing any configuration (reads + a no-op config-mode entry/exit).
+/// Each check reports ok + the router's message on denial. Used by the Settings
+/// "command access" panel so an under-privileged account is obvious.
+pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<CapabilityCheck>> {
+    // Reads first, then enter+leave config mode (nothing is applied).
+    let probes: [(&str, &str); 4] = [
+        ("Read running-config", "show running-config | section ^router bgp"),
+        ("Read routing table", "show ip route summary"),
+        ("Read BGP table", "show ip bgp summary"),
+        ("Enter configuration mode", "configure terminal"),
+    ];
+    let commands: Vec<String> = probes
+        .iter()
+        .map(|(_, c)| c.to_string())
+        .chain(std::iter::once("end".to_string())) // leave config mode if we entered it
+        .collect();
+
+    let outcome = run_commands(pool, device_id, &commands).await?;
+
+    Ok(probes
+        .iter()
+        .enumerate()
+        .map(|(i, (name, command))| {
+            let output = outcome.results.get(i).map(|r| r.output.as_str()).unwrap_or("");
+            let denied = cisco_denied(output);
+            CapabilityCheck {
+                name: name.to_string(),
+                command: command.to_string(),
+                ok: denied.is_none(),
+                detail: denied.unwrap_or_default(),
+            }
+        })
+        .collect())
 }
 
 /// Parse `network A.B.C.D mask M.M.M.M` (and `network A.B.C.D/len`) lines from a

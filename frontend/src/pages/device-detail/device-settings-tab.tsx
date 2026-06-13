@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Activity, Copy, KeyRound, TerminalSquare } from "lucide-react";
+import { Activity, Copy, KeyRound, ShieldCheck, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
-import { api, type Device, ApiError } from "@/lib/api";
+import { api, type Device, type CapabilityCheck, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ToneBadge } from "@/components/status-badge";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -74,6 +75,9 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   const [testing, setTesting] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [regenOpen, setRegenOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [caps, setCaps] = useState<CapabilityCheck[] | null>(null);
+  const [capsErr, setCapsErr] = useState<string | null>(null);
 
   // Reset only when navigating to a different device (not on the 30s refresh of
   // the same device, which would wipe in-progress edits).
@@ -133,6 +137,21 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       toast.error(err instanceof ApiError ? err.message : "Key generation failed");
     } finally {
       setGenerating(false);
+    }
+  }
+
+  async function checkAccess() {
+    setChecking(true);
+    setCaps(null);
+    setCapsErr(null);
+    try {
+      const r = await api.devices.sshCapabilities(device.id);
+      if (r.ok && r.checks) setCaps(r.checks);
+      else setCapsErr(r.error ?? "probe failed");
+    } catch {
+      setCapsErr("probe request failed");
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -326,6 +345,47 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                     </details>
                   </div>
                 )}
+
+                {/* Command-access check — does this account have permission to run
+                    what Rerouter needs? Read-only probe (changes nothing). */}
+                <div className="space-y-2 rounded-md border border-border p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Command access</span>
+                    <Button type="button" variant="outline" size="sm" disabled={checking} onClick={() => void checkAccess()}>
+                      <ShieldCheck className="size-4" />
+                      {checking ? "Checking…" : "Check access"}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Verifies the SSH account can run the commands Rerouter needs (config reads + entering config mode). Changes nothing on the router.
+                  </p>
+                  {capsErr && (
+                    <p className="text-sm text-destructive" role="alert">
+                      {capsErr}
+                    </p>
+                  )}
+                  {caps && (
+                    <ul className="space-y-1.5">
+                      {caps.map((c) => (
+                        <li key={c.command} className="flex items-start gap-2 text-sm">
+                          <ToneBadge tone={c.ok ? "good" : "bad"}>{c.ok ? "OK" : "denied"}</ToneBadge>
+                          <div className="min-w-0 flex-1">
+                            <div>{c.name}</div>
+                            <code className="text-xs break-all text-muted-foreground">{c.command}</code>
+                            {!c.ok && c.detail && (
+                              <div className="break-all text-xs text-destructive">{c.detail}</div>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {caps && caps.some((c) => !c.ok) && (
+                    <p className="text-xs text-muted-foreground">
+                      Denied commands usually mean the account's privilege level or parser view is too restrictive. See <code>deploy/cisco/rerouter-bgp-view.ios</code>.
+                    </p>
+                  )}
+                </div>
               </>
             )}
           </div>

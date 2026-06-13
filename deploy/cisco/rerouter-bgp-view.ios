@@ -1,0 +1,101 @@
+! ============================================================================
+!  Rerouter — Cisco IOS / IOS-XE (classic CLI) restricted parser view
+! ============================================================================
+!  Role-Based CLI Access "view" that limits the controller's SSH account to ONLY
+!  the commands Rerouter actually issues:
+!
+!     reads     : show running-config, show ip route, show ip bgp, show version,
+!                 show clock, terminal length
+!     null-route: [no] ip route <net> <mask> Null0        (RTBH to Null0)
+!     bgp session: router bgp <asn> ; [no] neighbor <ip> shutdown
+!
+!  Everything else is denied by the view (fail-closed). This is defense-in-depth:
+!  the controller ALSO only ever renders these commands from validated templates
+!  with typed parameters (no free-text command path).
+!
+!  Replace <ENABLE_SECRET> and <VIEW_SECRET> before pasting. Tested shape for
+!  IOS 15.x; verify command tokens on your image (`?` is your friend inside the
+!  view: `parser view RRT-BGP` then `commands exec include ?`).
+! ----------------------------------------------------------------------------
+
+! ---- 1. one-time prerequisites (AAA + an enable secret to reach root view) ----
+configure terminal
+ aaa new-model
+ aaa authentication login default local
+ aaa authorization exec default local
+ enable secret <ENABLE_SECRET>
+end
+
+! ---- 2. enter the root view (required to create/edit any view) ----
+!  (interactive: run `enable view`, then supply <ENABLE_SECRET>)
+enable view
+
+! ---- 3. define the restricted view ----
+configure terminal
+parser view RRT-BGP
+ secret <VIEW_SECRET>
+ !
+ ! -- reads the controller needs (Test SSH, verify, discovery, label parsing) --
+ commands exec include terminal length 0
+ commands exec include show clock
+ commands exec include show version
+ commands exec include show ip route
+ commands exec include show ip bgp
+ commands exec include show running-config
+ !
+ ! -- enter global configuration mode --
+ commands exec include configure terminal
+ !
+ ! -- null-route (RTBH to Null0) in global config --
+ commands configure include ip route
+ commands configure include no ip route
+ !
+ ! -- BGP session shut / no-shut --
+ commands configure include router bgp
+ commands router include neighbor
+ commands router include no neighbor
+ !
+ ! -- OPTIONAL: uncomment so `show running-config` also reveals `network`
+ !    statements, which announced-prefix discovery needs. NOTE: including it
+ !    also lets the account edit network statements (slightly wider than
+ !    shut/no-shut + Null0). Leave commented to keep the view minimal.
+ ! commands router include network
+end
+
+! ============================================================================
+!  Assigning the view to the controller's SSH account
+! ============================================================================
+!  IMPORTANT: IOS does NOT auto-assign a CLI view to a *locally*-authenticated
+!  user — local login lands in the root/privilege context, and a non-interactive
+!  SSH (publickey) session cannot run `enable view RRT-BGP` interactively.
+!
+!  Use ONE of:
+!
+!   (A) TACACS+ (recommended for an automated account): return the view on login
+!       so it is applied with no interaction. Free-radius/ISE/ACS av-pair:
+!           shell:cli-view-name=RRT-BGP
+!       (with priv-lvl 15). This is the clean "priv 15 + view" setup.
+!
+!   (B) Local testing only: log in interactively and run
+!           enable view RRT-BGP
+!       then supply <VIEW_SECRET>. Good for verifying the command set, but not
+!       usable by the controller's non-interactive session.
+!
+!  If you are local-only with no TACACS+, the controller-side allowlist (it only
+!  ever sends the commands above) remains the enforcing control; tell us and we
+!  can instead lower exactly these commands to a custom privilege level.
+! ----------------------------------------------------------------------------
+
+! ============================================================================
+!  Granularity caveats (why the controller-side allowlist still matters)
+! ============================================================================
+!  * `commands configure include ip route` permits ANY static route, not only
+!    routes to Null0 — the Null0 keyword sits after the variable net/mask, which
+!    a parser view cannot pin. The controller only ever emits `... Null0`.
+!  * `commands router include neighbor` permits ALL `neighbor` subcommands, not
+!    only `shutdown` — the neighbor IP is a variable, so the view cannot pin the
+!    trailing `shutdown` keyword. The controller only ever emits
+!    `[no] neighbor <ip> shutdown`.
+!  Pinning to the exact full command line requires TACACS+ command authorization
+!  (regex per line) or the in-app allowlist — not local parser views.
+! ----------------------------------------------------------------------------

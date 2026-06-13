@@ -117,6 +117,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/discover", post(devices::discover))
         .route("/api/devices/{id}/ssh-test", post(devices::ssh_test))
         .route("/api/devices/{id}/ssh-generate-key", post(devices::generate_key))
+        .route("/api/devices/{id}/ssh-capabilities", post(devices::ssh_capabilities))
         .route("/api/devices/{id}/discover-bgp", post(devices::discover_bgp))
         .route("/api/devices/{id}/bgp-peers", get(devices::bgp_peers))
         .route("/api/devices/{device_id}/bgp-peers/{peer_id}", patch(devices::update_bgp_peer))

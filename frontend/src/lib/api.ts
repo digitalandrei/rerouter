@@ -198,6 +198,14 @@ export interface SshTestResult {
   error?: string;
 }
 
+/** One command-access probe result (Settings → command access). */
+export interface CapabilityCheck {
+  name: string;
+  command: string;
+  ok: boolean;
+  detail: string;
+}
+
 export interface BgpPeer {
   id: number;
   device_id: number;
@@ -528,6 +536,11 @@ export const api = {
     generateKey: (id: number) =>
       request<{ ok: boolean; public_key: string; fingerprint: string }>(
         `/api/devices/${id}/ssh-generate-key`,
+        { method: "POST" },
+      ),
+    sshCapabilities: (id: number) =>
+      request<{ ok: boolean; checks?: CapabilityCheck[]; error?: string }>(
+        `/api/devices/${id}/ssh-capabilities`,
         { method: "POST" },
       ),
     interfaces: (id: number) =>
