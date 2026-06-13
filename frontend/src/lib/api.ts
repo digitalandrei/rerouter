@@ -248,7 +248,17 @@ export interface AuditEntry {
 // Core request helper
 // ---------------------------------------------------------------------------
 
-const AUTH_PATHS = ["/api/auth/login", "/api/auth/totp", "/api/auth/reauth"];
+// Paths whose 401 is handled by the caller (the auth forms / the session probe)
+// rather than by the global "session gone -> /login" redirect. `/api/auth/me` is
+// the mount-time session probe: a 401 there just means "anonymous", so it must
+// NOT trigger a redirect — otherwise the /login page probes, 401s, redirects to
+// /login, and loops.
+const NO_REDIRECT_PATHS = [
+  "/api/auth/login",
+  "/api/auth/totp",
+  "/api/auth/reauth",
+  "/api/auth/me",
+];
 
 async function request<T>(
   path: string,
@@ -266,8 +276,13 @@ async function request<T>(
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 
-  if (res.status === 401 && !AUTH_PATHS.includes(path)) {
-    // Session expired or revoked: leave the app entirely.
+  if (
+    res.status === 401 &&
+    !NO_REDIRECT_PATHS.includes(path) &&
+    window.location.pathname !== "/login"
+  ) {
+    // Session expired or revoked: leave the app entirely. (Never redirect when
+    // already on /login — that would loop.)
     window.location.assign("/login");
     throw new ApiError(401, "Session expired");
   }
