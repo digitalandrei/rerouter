@@ -9,6 +9,10 @@
  *
  * Throttling/lockout happen server-side (per email + real client IP via
  * CF-Connecting-IP); this page only surfaces the resulting errors verbatim.
+ *
+ * Visual layer only here: centered light card matching the nosignal shell.
+ * The auth logic, the stage machine, and the QR/secret enrollment block are
+ * unchanged.
  */
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
@@ -16,6 +20,8 @@ import { QRCodeSVG } from "qrcode.react";
 import { useAuth } from "@/lib/auth";
 import { ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -66,43 +72,40 @@ export default function Login() {
     }
   }
 
-  const inputClass =
-    "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
-
   return (
-    <div className="flex min-h-screen items-center justify-center p-4">
+    <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4">
       <Card className="w-full max-w-md">
         {stage !== "totp" ? (
           <>
-            <CardHeader>
-              <CardTitle>Rerouter</CardTitle>
+            <CardHeader className="text-center">
+              <CardTitle className="text-2xl">Rerouter</CardTitle>
               <CardDescription>Sign in to the control plane.</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={handlePassword} className="space-y-4">
-                <label className="block space-y-1 text-sm font-medium">
-                  Email
-                  <input
+                <div className="space-y-2">
+                  <Label htmlFor="email">Email</Label>
+                  <Input
+                    id="email"
                     type="email"
                     required
+                    autoFocus
                     autoComplete="username"
-                    className={inputClass}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                   />
-                </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  Password
-                  <input
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="password">Password</Label>
+                  <Input
+                    id="password"
                     type="password"
                     required
                     autoComplete="current-password"
-                    className={inputClass}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                   />
-                </label>
+                </div>
                 {error && (
                   <p className="text-sm text-destructive" role="alert">
                     {error}
@@ -116,8 +119,10 @@ export default function Login() {
           </>
         ) : (
           <>
-            <CardHeader>
-              <CardTitle>Two-factor authentication</CardTitle>
+            <CardHeader className="text-center">
+              <CardTitle className="text-2xl">
+                Two-factor authentication
+              </CardTitle>
               <CardDescription>
                 Enter the 6-digit code from your authenticator app, or a
                 single-use recovery code.
@@ -169,17 +174,17 @@ export default function Login() {
                 </div>
               )}
               <form onSubmit={handleTotp} className="space-y-4">
-                <label className="block space-y-1 text-sm font-medium">
-                  Code
-                  <input
+                <div className="space-y-2">
+                  <Label htmlFor="totp">Code</Label>
+                  <Input
+                    id="totp"
                     inputMode="numeric"
                     autoComplete="one-time-code"
                     required
-                    className={inputClass}
                     value={code}
                     onChange={(e) => setCode(e.target.value)}
                   />
-                </label>
+                </div>
                 {error && (
                   <p className="text-sm text-destructive" role="alert">
                     {error}
