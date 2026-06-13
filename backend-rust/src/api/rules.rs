@@ -50,7 +50,7 @@ const RULE_COLS: &str = "id, name, interface_id, device_id, asset_id, metric, op
      threshold_value, duration_seconds, consecutive_samples, severity, enabled, \
      automatic_reroute_enabled, reroute_template_id";
 
-fn rule_json(r: &RuleRow) -> Value {
+fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
     let target_kind = if r.interface_id.is_some() { "interface" } else { "asset" };
     json!({
         "id": r.id,
@@ -68,7 +68,45 @@ fn rule_json(r: &RuleRow) -> Value {
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
         "reroute_template_id": r.reroute_template_id,
+        "action_count": actions.len(),
+        "actions": actions,
     })
+}
+
+/// Load a rule's attached actions (template + target router + params) for the
+/// rule JSON. Joins display names so the SPA needn't re-resolve them.
+async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
+    let rows = sqlx::query_as::<_, (u64, u64, String, u64, String, Option<sqlx::types::Json<Value>>, bool, u32)>(
+        "SELECT ra.id, ra.reroute_template_id, t.name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position \
+         FROM rule_actions ra \
+         JOIN reroute_templates t ON t.id = ra.reroute_template_id \
+         JOIN devices d ON d.id = ra.device_id \
+         WHERE ra.rule_id = ? ORDER BY ra.position, ra.id",
+    )
+    .bind(rule_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|(id, template_id, template_name, device_id, device_name, params, enabled, position)| {
+            json!({
+                "id": id,
+                "reroute_template_id": template_id,
+                "template_name": template_name,
+                "device_id": device_id,
+                "device_name": device_name,
+                "params": params.map(|j| j.0).unwrap_or(Value::Null),
+                "enabled": enabled,
+                "position": position,
+            })
+        })
+        .collect()
+}
+
+/// Build the full rule JSON (row + its actions).
+async fn rule_value(pool: &sqlx::MySqlPool, r: &RuleRow) -> Value {
+    let actions = load_actions(pool, r.id).await;
+    rule_json(r, actions)
 }
 
 async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
@@ -76,7 +114,10 @@ async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Va
         .bind(id)
         .fetch_optional(pool)
         .await?;
-    Ok(row.as_ref().map(rule_json))
+    match row {
+        Some(r) => Ok(Some(rule_value(pool, &r).await)),
+        None => Ok(None),
+    }
 }
 
 /// GET /api/rules.
@@ -86,7 +127,10 @@ pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State
         .await
     {
         Ok(rows) => {
-            let out: Vec<Value> = rows.iter().map(rule_json).collect();
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                out.push(rule_value(&state.pool, r).await);
+            }
             (StatusCode::OK, Json(json!(out)))
         }
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
@@ -370,6 +414,99 @@ pub async fn remove(
     {
         Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
         Ok(_) => err(StatusCode::NOT_FOUND, "rule not found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+// ---- Rule action targets (template + router + params) --------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RuleActionBody {
+    reroute_template_id: u64,
+    device_id: u64,
+    #[serde(default)]
+    params: Value,
+    #[serde(default)]
+    position: Option<u32>,
+}
+
+/// POST /api/rules/{id}/actions — attach a device-CLI action to a rule. Validates
+/// the template (must be device_cli), the device, and the params against the
+/// template schema, so a malformed action can't be saved. Returns the updated rule.
+pub async fn add_action(
+    _g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path(rule_id): Path<u64>,
+    Json(body): Json<RuleActionBody>,
+) -> JsonResp {
+    let rule_exists: Option<u64> = sqlx::query_scalar("SELECT id FROM rules WHERE id = ?")
+        .bind(rule_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if rule_exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "rule not found");
+    }
+
+    let template = match crate::reroute::templates::load(&state.pool, body.reroute_template_id).await {
+        Ok(t) => t,
+        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template not found"),
+    };
+    if template.provider_type != "device_cli" {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "only device_cli templates can be attached as rule actions");
+    }
+    if let Err(e) = crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params) {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+    }
+
+    let device_exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(body.device_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if device_exists.is_none() {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "device not found");
+    }
+
+    let res = sqlx::query(
+        "INSERT INTO rule_actions (rule_id, reroute_template_id, device_id, params_json, position) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(rule_id)
+    .bind(body.reroute_template_id)
+    .bind(body.device_id)
+    .bind(sqlx::types::Json(&body.params))
+    .bind(body.position.unwrap_or(0))
+    .execute(&state.pool)
+    .await;
+
+    if res.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+    match fetch_rule(&state.pool, rule_id).await {
+        Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+/// DELETE /api/rules/{rule_id}/actions/{action_id} — detach an action. Returns
+/// the updated rule.
+pub async fn remove_action(
+    _g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path((rule_id, action_id)): Path<(u64, u64)>,
+) -> JsonResp {
+    let res = sqlx::query("DELETE FROM rule_actions WHERE id = ? AND rule_id = ?")
+        .bind(action_id)
+        .bind(rule_id)
+        .execute(&state.pool)
+        .await;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => match fetch_rule(&state.pool, rule_id).await {
+            Ok(Some(v)) => (StatusCode::OK, Json(v)),
+            _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        },
+        Ok(_) => err(StatusCode::NOT_FOUND, "action not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }

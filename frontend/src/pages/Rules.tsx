@@ -17,8 +17,19 @@ import {
   ArrowUp,
   ArrowDown,
   ChevronsUpDown,
+  Workflow,
+  Plus,
+  X,
 } from "lucide-react";
-import { api, type Rule, type Device, type Interface, ApiError } from "@/lib/api";
+import {
+  api,
+  type Rule,
+  type Device,
+  type Interface,
+  type Template,
+  type BgpPeer,
+  ApiError,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,6 +41,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Table,
   TableBody,
   TableCell,
@@ -37,6 +55,253 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+
+/**
+ * Manage a rule's reroute actions (template + target router + params). The
+ * params form is schema-driven: a BGP-neighbor param renders a dropdown of the
+ * device's discovered sessions and auto-fills the local AS.
+ */
+function RuleActionsDialog({
+  rule,
+  onClose,
+  onChanged,
+}: {
+  rule: Rule;
+  onClose: () => void;
+  onChanged: (updated: Rule) => void;
+}) {
+  const [current, setCurrent] = useState<Rule>(rule);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [templateId, setTemplateId] = useState<string>("");
+  const [deviceId, setDeviceId] = useState<string>("");
+  const [peers, setPeers] = useState<BgpPeer[]>([]);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.templates
+      .list()
+      .then((ts) => setTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
+      .catch(() => setTemplates([]));
+    api.devices
+      .list()
+      .then(setDevices)
+      .catch(() => setDevices([]));
+  }, []);
+
+  useEffect(() => {
+    if (!deviceId) {
+      setPeers([]);
+      return;
+    }
+    api.devices
+      .bgpPeers(parseInt(deviceId, 10))
+      .then(setPeers)
+      .catch(() => setPeers([]));
+  }, [deviceId]);
+
+  const template = templates.find((t) => String(t.id) === templateId) ?? null;
+  const schema = template?.parameter_schema ?? {};
+
+  function selectNeighbor(name: string, addr: string) {
+    setValues((v) => {
+      const next = { ...v, [name]: addr };
+      // Auto-fill a local-AS param from the chosen peer.
+      const peer = peers.find((p) => p.peer_remote_addr === addr);
+      if (peer?.local_as != null) {
+        for (const [pname, spec] of Object.entries(schema)) {
+          if (spec.source === "bgp_local_as") next[pname] = String(peer.local_as);
+        }
+      }
+      return next;
+    });
+  }
+
+  async function add() {
+    if (!template || !deviceId) {
+      setError("Pick a template and a target router.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const params: Record<string, unknown> = {};
+      for (const name of Object.keys(schema)) {
+        if (values[name]) params[name] = values[name];
+      }
+      const updated = await api.rules.addAction(current.id, {
+        reroute_template_id: template.id,
+        device_id: parseInt(deviceId, 10),
+        params,
+      });
+      setCurrent(updated);
+      onChanged(updated);
+      setTemplateId("");
+      setDeviceId("");
+      setValues({});
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Failed to add action");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(actionId: number) {
+    try {
+      const updated = await api.rules.removeAction(current.id, actionId);
+      setCurrent(updated);
+      onChanged(updated);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const actions = current.actions ?? [];
+
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Reroute actions — {current.name}</DialogTitle>
+          <DialogDescription>
+            When this rule fires, these mitigations would run on the selected
+            routers. In observe mode they are rendered as a plan only; execution
+            is manual and gated.
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Existing actions */}
+        <div className="space-y-2">
+          {actions.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No actions attached yet.</p>
+          ) : (
+            actions.map((a) => (
+              <div
+                key={a.id}
+                className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
+              >
+                <code className="text-xs">{a.template_name}</code>
+                <span className="text-muted-foreground">on</span>
+                <span className="font-medium">{a.device_name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {Object.entries(a.params ?? {})
+                    .map(([k, v]) => `${k}=${String(v)}`)
+                    .join(", ")}
+                </span>
+                <span className="flex-1" />
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => void remove(a.id)}
+                  title="Remove action"
+                >
+                  <X className="size-4" />
+                </Button>
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Add an action */}
+        <div className="space-y-3 rounded-md border border-dashed border-border p-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="block space-y-1 text-sm font-medium">
+              Template
+              <select
+                className={inputClass}
+                value={templateId}
+                onChange={(e) => {
+                  setTemplateId(e.target.value);
+                  setValues({});
+                }}
+              >
+                <option value="">Select template…</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} ({t.safety_level})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block space-y-1 text-sm font-medium">
+              Target router
+              <select
+                className={inputClass}
+                value={deviceId}
+                onChange={(e) => setDeviceId(e.target.value)}
+              >
+                <option value="">Select router…</option>
+                {devices.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          {template && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              {Object.entries(schema).map(([name, spec]) => (
+                <label key={name} className="block space-y-1 text-sm font-medium">
+                  {spec.label ?? name}{" "}
+                  <span className="text-muted-foreground">({spec.type})</span>
+                  {spec.source === "bgp_peer" ? (
+                    <select
+                      className={inputClass}
+                      value={values[name] ?? ""}
+                      onChange={(e) => selectNeighbor(name, e.target.value)}
+                      disabled={!deviceId}
+                    >
+                      <option value="">
+                        {deviceId ? "Select neighbor…" : "Pick a router first"}
+                      </option>
+                      {peers.map((p) => (
+                        <option key={p.id} value={p.peer_remote_addr}>
+                          {p.peer_remote_addr}
+                          {p.peer_remote_as ? ` · AS${p.peer_remote_as}` : ""}
+                          {p.label ? ` · ${p.label}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className={inputClass}
+                      value={values[name] ?? ""}
+                      placeholder={
+                        spec.type === "cidr"
+                          ? "e.g. 192.0.2.0/24"
+                          : spec.type === "asn"
+                            ? "e.g. 65001"
+                            : ""
+                      }
+                      onChange={(e) =>
+                        setValues((v) => ({ ...v, [name]: e.target.value }))
+                      }
+                    />
+                  )}
+                </label>
+              ))}
+            </div>
+          )}
+
+          {error && (
+            <p className="text-sm text-destructive" role="alert">
+              {error}
+            </p>
+          )}
+          <Button size="sm" onClick={() => void add()} disabled={busy}>
+            <Plus className="size-4" />
+            {busy ? "Adding…" : "Add action"}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -109,6 +374,7 @@ export default function Rules() {
   const [form, setForm] = useState<RuleForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
   const [addBusy, setAddBusy] = useState(false);
+  const [manageRule, setManageRule] = useState<Rule | null>(null);
 
   const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
@@ -415,6 +681,7 @@ export default function Rules() {
                   <TableHead>Duration</TableHead>
                   <TableHead>Severity</TableHead>
                   <TableHead>Enabled</TableHead>
+                  <TableHead>Mitigation</TableHead>
                   <TableHead className="pr-6 text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -463,6 +730,21 @@ export default function Rules() {
                       </Badge>
                     </TableCell>
 
+                    {/* Mitigation — attached reroute actions */}
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 gap-1.5"
+                        onClick={() => setManageRule(rule)}
+                        disabled={!canEdit}
+                        title={canEdit ? "Manage reroute actions" : "Requires edit_rules"}
+                      >
+                        <Workflow className="size-3.5 text-muted-foreground" />
+                        {rule.action_count ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}` : "none"}
+                      </Button>
+                    </TableCell>
+
                     {/* Actions */}
                     <TableCell
                       className="pr-6 text-right"
@@ -507,6 +789,17 @@ export default function Rules() {
           )}
         </CardContent>
       </Card>
+
+      {manageRule && (
+        <RuleActionsDialog
+          rule={manageRule}
+          onClose={() => setManageRule(null)}
+          onChanged={(updated) => {
+            setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r)));
+            setManageRule(updated);
+          }}
+        />
+      )}
     </div>
   );
 }

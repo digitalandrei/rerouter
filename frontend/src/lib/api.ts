@@ -211,6 +211,17 @@ export interface BgpPeer {
 // Rules and Alerts
 // ---------------------------------------------------------------------------
 
+export interface RuleAction {
+  id: number;
+  reroute_template_id: number;
+  template_name: string;
+  device_id: number;
+  device_name: string;
+  params: Record<string, unknown>;
+  enabled: boolean;
+  position: number;
+}
+
 export interface Rule {
   id: number;
   name: string;
@@ -227,6 +238,8 @@ export interface Rule {
   enabled: boolean;
   automatic_reroute_enabled: boolean;
   reroute_template_id: number | null;
+  action_count?: number;
+  actions?: RuleAction[];
 }
 
 export interface Alert {
@@ -471,6 +484,18 @@ export const api = {
       request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
     remove: (id: number) =>
       request<void>(`/api/rules/${id}`, { method: "DELETE" }),
+    addAction: (
+      ruleId: number,
+      body: {
+        reroute_template_id: number;
+        device_id: number;
+        params: Record<string, unknown>;
+      },
+    ) => request<Rule>(`/api/rules/${ruleId}/actions`, { method: "POST", body }),
+    removeAction: (ruleId: number, actionId: number) =>
+      request<Rule>(`/api/rules/${ruleId}/actions/${actionId}`, {
+        method: "DELETE",
+      }),
   },
 
   templates: {

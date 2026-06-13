@@ -264,6 +264,12 @@ async fn on_fire(
     if let Some(plan) = would_run {
         payload["would_run"] = plan;
     }
+    // Multi-target action plan (the rule's attached actions, one per router),
+    // each rendered to its exact commands. Render-only — nothing executes.
+    let would_run_actions = render_would_run_actions(pool, rule.id).await;
+    if !would_run_actions.is_empty() {
+        payload["would_run_actions"] = json!(would_run_actions);
+    }
 
     let dedup_key = format!("rule_fired:rule:{}:iface:{}", rule.id, rule.interface_id);
     sqlx::query(
@@ -319,6 +325,50 @@ async fn render_would_run_plan(pool: &MySqlPool, rule: &InterfaceRule) -> Option
             "would have executed template '{name}' ({provider_type}/{mode}, safety={safety_level})"
         ),
     }))
+}
+
+/// Render every attached action of a rule (template + target router + params)
+/// to its exact would-run commands, for the alert payload. Best-effort and
+/// observe-safe: it loads templates and renders strings; it executes nothing.
+async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> {
+    let rows = sqlx::query_as::<_, (u64, u64, String, u64, String, Option<sqlx::types::Json<Value>>)>(
+        "SELECT ra.id, ra.reroute_template_id, t.name, ra.device_id, d.name, ra.params_json \
+         FROM rule_actions ra \
+         JOIN reroute_templates t ON t.id = ra.reroute_template_id \
+         JOIN devices d ON d.id = ra.device_id \
+         WHERE ra.rule_id = ? AND ra.enabled = 1 \
+         ORDER BY ra.position, ra.id",
+    )
+    .bind(rule_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (action_id, template_id, template_name, device_id, device_name, params_json) in rows {
+        let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
+        let rendered = match crate::reroute::templates::load(pool, template_id).await {
+            Ok(t) => match crate::reroute::templates::render(&t, &params) {
+                Ok(plan) => json!({
+                    "commands": plan.commands,
+                    "verify": plan.verify,
+                    "safety_level": plan.safety_level,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(_) => json!({ "error": "template not found" }),
+        };
+        out.push(json!({
+            "action_id": action_id,
+            "template_id": template_id,
+            "template_name": template_name,
+            "device_id": device_id,
+            "device_name": device_name,
+            "params": params,
+            "rendered": rendered,
+        }));
+    }
+    out
 }
 
 /// A short human label for an interface ("ifName on device").
