@@ -20,11 +20,12 @@ pub mod locks;
 pub mod settings;
 pub mod devices;
 pub mod interfaces;
+pub mod users;
 
 use anyhow::{Context, Result};
 use axum::extract::FromRef;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use serde_json::{json, Value};
@@ -139,6 +140,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // safety locks + global settings
         .route("/api/locks/global", post(locks::create_global).delete(locks::clear_global))
         .route("/api/settings", get(settings::show).put(settings::update))
+        // user management (manage_users / superadmin only)
+        .route("/api/users", get(users::list).post(users::create))
+        .route("/api/users/{id}", put(users::update).delete(users::remove))
+        .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

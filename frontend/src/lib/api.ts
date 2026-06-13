@@ -26,6 +26,15 @@ export class ApiError extends Error {
 // Domain types — exact field names from the API contract
 // ---------------------------------------------------------------------------
 
+export interface User {
+  id: number;
+  email: string;
+  name: string;
+  role: string;
+  twofa_enrolled: boolean;
+  created_at: string;
+}
+
 export interface SessionUser {
   id: number;
   email: string;
@@ -398,6 +407,22 @@ export const api = {
         method: "POST",
         body: { note },
       }),
+  },
+
+  users: {
+    list: () => request<User[]>("/api/users"),
+    create: (payload: {
+      email: string;
+      name: string;
+      role: string;
+      password: string;
+    }) => request<User>("/api/users", { method: "POST", body: payload }),
+    update: (id: number, payload: { name?: string; role?: string }) =>
+      request<User>(`/api/users/${id}`, { method: "PUT", body: payload }),
+    remove: (id: number) =>
+      request<{ ok: true }>(`/api/users/${id}`, { method: "DELETE" }),
+    reset2fa: (id: number) =>
+      request<{ ok: true }>(`/api/users/${id}/reset-2fa`, { method: "POST" }),
   },
 
   audit: {

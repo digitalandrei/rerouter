@@ -8,6 +8,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api, type Device, type Interface, ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,6 +45,8 @@ function operStatusVariant(
 }
 
 export default function DeviceDetail() {
+  const { hasPermission } = useAuth();
+  const canManage = hasPermission("manage_devices");
   const { id } = useParams<{ id: string }>();
   const deviceId = Number(id);
 
@@ -190,36 +193,38 @@ export default function DeviceDetail() {
             )}
           </dl>
 
-          <div className="mt-4 flex gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() =>
-                api.devices.test(device.id).then((r) => {
-                  const msg = r.ok
-                    ? `OK: ${[r.vendor, r.model].filter(Boolean).join(" / ") || "reachable"}`
-                    : `Failed: ${r.error ?? "unknown"}`;
-                  alert(msg);
-                })
-              }
-            >
-              Test SNMP
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() =>
-                api.devices
-                  .discover(device.id)
-                  .then((r) => {
-                    alert(`Discovered ${r.discovered} interfaces`);
-                    loadInterfaces();
+          {canManage && (
+            <div className="mt-4 flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  api.devices.test(device.id).then((r) => {
+                    const msg = r.ok
+                      ? `OK: ${[r.vendor, r.model].filter(Boolean).join(" / ") || "reachable"}`
+                      : `Failed: ${r.error ?? "unknown"}`;
+                    alert(msg);
                   })
-              }
-            >
-              Discover interfaces
-            </Button>
-          </div>
+                }
+              >
+                Test SNMP
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  api.devices
+                    .discover(device.id)
+                    .then((r) => {
+                      alert(`Discovered ${r.discovered} interfaces`);
+                      loadInterfaces();
+                    })
+                }
+              >
+                Discover interfaces
+              </Button>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -316,18 +321,24 @@ export default function DeviceDetail() {
                         )}
                       </td>
                       <td className="py-2">
-                        <Button
-                          size="sm"
-                          variant={
-                            iface.enabled_for_monitoring
-                              ? "default"
-                              : "outline"
-                          }
-                          disabled={toggleBusy[iface.id]}
-                          onClick={() => void toggleMonitoring(iface)}
-                        >
-                          {iface.enabled_for_monitoring ? "On" : "Off"}
-                        </Button>
+                        {canManage ? (
+                          <Button
+                            size="sm"
+                            variant={
+                              iface.enabled_for_monitoring
+                                ? "default"
+                                : "outline"
+                            }
+                            disabled={toggleBusy[iface.id]}
+                            onClick={() => void toggleMonitoring(iface)}
+                          >
+                            {iface.enabled_for_monitoring ? "On" : "Off"}
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">
+                            {iface.enabled_for_monitoring ? "On" : "Off"}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}

@@ -258,7 +258,7 @@ pub async fn create_admin(
 
     // Attach the admin role (idempotent; the role itself is seeded by migrations).
     let role_rows = sqlx::query(
-        "INSERT IGNORE INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = 'admin'",
+        "INSERT IGNORE INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = 'superadmin'",
     )
     .bind(user_id)
     .execute(pool)
@@ -279,9 +279,9 @@ pub async fn create_admin(
         println!("user '{email}' already exists (id {user_id}); password left unchanged");
     }
     if role_rows > 0 {
-        println!("attached role 'admin' to user id {user_id}");
+        println!("attached role 'superadmin' to user id {user_id}");
     } else {
-        println!("role 'admin' was already attached to user id {user_id}");
+        println!("role 'superadmin' was already attached to user id {user_id}");
     }
     Ok(())
 }

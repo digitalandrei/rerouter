@@ -18,6 +18,7 @@ pub enum Permission {
     ViewDashboard,
     ViewAsset,
     EditAsset,
+    ManageDevices,
     EditProvider,
     EditCredentials,
     ViewCredentialsMetadata,
@@ -37,6 +38,7 @@ impl Permission {
             Permission::ViewDashboard => "view_dashboard",
             Permission::ViewAsset => "view_asset",
             Permission::EditAsset => "edit_asset",
+            Permission::ManageDevices => "manage_devices",
             Permission::EditProvider => "edit_provider",
             Permission::EditCredentials => "edit_credentials",
             Permission::ViewCredentialsMetadata => "view_credentials_metadata",
@@ -69,11 +71,13 @@ pub async fn has_permission(pool: &MySqlPool, session: &Session, permission: Per
     Ok(count > 0)
 }
 
-/// True if the user holds the admin role (critical-event fan-out, mode flips).
+/// True if the user holds an admin-tier role (critical-event fan-out, mode
+/// flips). Both `admin` and `superadmin` qualify — superadmin is a strict
+/// superset of admin.
 pub async fn is_admin(pool: &MySqlPool, user_id: u64) -> Result<bool> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM role_user ru JOIN roles r ON r.id = ru.role_id \
-         WHERE ru.user_id = ? AND r.name = 'admin'",
+         WHERE ru.user_id = ? AND r.name IN ('admin', 'superadmin')",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -170,6 +174,7 @@ pub mod markers {
         };
     }
     marker!(EditAsset => Permission::EditAsset);
+    marker!(ManageDevices => Permission::ManageDevices);
     marker!(ViewAsset => Permission::ViewAsset);
     marker!(EditRules => Permission::EditRules);
     marker!(ManageAlerts => Permission::ManageAlerts);

@@ -3,7 +3,7 @@
 //! it is encrypted at rest via `crypto` on create/update and NEVER returned.
 //!
 //! Reads require `view_asset`; writes (create/update/delete/test/discover and
-//! the per-device community) require `edit_asset` — the operator role manages
+//! the per-device community) require `manage_devices` — superadmin-only — manages
 //! telemetry sources. Field names are pinned by the frontend contract
 //! (../../frontend/src/lib/api.ts: Device / Interface / DeviceTestResult).
 
@@ -206,7 +206,7 @@ fn validate_ssh<'a>(
 
 /// POST /api/devices — create a device. Encrypts the community before insert.
 pub async fn create(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Json(body): Json<CreateDevice>,
 ) -> JsonResp {
@@ -306,7 +306,7 @@ pub struct UpdateDevice {
 /// PUT /api/devices/{id} — partial update. A present, non-empty `community` is
 /// re-encrypted; an absent one leaves the stored ciphertext untouched.
 pub async fn update(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
     Json(body): Json<UpdateDevice>,
@@ -451,7 +451,7 @@ pub async fn update(
 
 /// DELETE /api/devices/{id}. Cascades to interfaces/metrics/samples via FKs.
 pub async fn remove(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
@@ -470,7 +470,7 @@ pub async fn remove(
 /// Persists the identity/reachability; returns DeviceTestResult. A failure is a
 /// clean structured 200 `{ok:false, error}` (the device row carries last_error).
 pub async fn test(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
@@ -500,7 +500,7 @@ pub async fn test(
 /// `device_interfaces`. Returns {discovered:N}. A failure surfaces as a 502 with
 /// the structured error (the device is marked unreachable, no panic).
 pub async fn discover(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {

@@ -9,7 +9,9 @@
  * defaults that loosen safety.
  */
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api, type SystemSettings } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,6 +23,8 @@ import {
 } from "@/components/ui/card";
 
 export default function Settings() {
+  const { hasPermission } = useAuth();
+  const navigate = useNavigate();
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -158,12 +162,24 @@ export default function Settings() {
         <CardHeader>
           <CardTitle className="text-lg">Users &amp; roles</CardTitle>
           <CardDescription>
-            Admin/operator/viewer/auditor role assignment and TOTP/recovery-code
-            resets (manage_users).
+            User account management, role assignment, and TOTP resets
+            (manage_users — super admin only).
           </CardDescription>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
-          User management not implemented yet.
+        <CardContent>
+          {hasPermission("manage_users") ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => navigate("/users")}
+            >
+              Manage users
+            </Button>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Restricted to super admins.
+            </p>
+          )}
         </CardContent>
       </Card>
     </div>

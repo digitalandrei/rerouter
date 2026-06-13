@@ -146,7 +146,7 @@ pub struct UpdateInterface {
 /// PUT /api/interfaces/{id} — toggle monitoring. Only monitored interfaces are
 /// polled and rule-evaluated.
 pub async fn update(
-    _g: RequirePermission<markers::EditAsset>,
+    _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
     Json(body): Json<UpdateInterface>,

@@ -168,7 +168,7 @@ async fn resolve_recipients(pool: &MySqlPool, alert: &PendingAlert, is_critical:
             "SELECT r.id, r.email FROM alert_recipients r \
              JOIN role_user ru ON ru.user_id = r.user_id \
              JOIN roles ro ON ro.id = ru.role_id \
-             WHERE ro.name = 'admin' AND r.verified_at IS NOT NULL",
+             WHERE ro.name IN ('admin', 'superadmin') AND r.verified_at IS NOT NULL",
         )
         .fetch_all(pool)
         .await?;

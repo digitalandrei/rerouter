@@ -20,6 +20,7 @@ import {
   Routes,
 } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
+import Users from "@/pages/Users";
 import { api, type SystemStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -34,7 +35,7 @@ import Alerts from "@/pages/Alerts";
 import Audit from "@/pages/Audit";
 import Settings from "@/pages/Settings";
 
-const NAV_ITEMS: Array<{ to: string; label: string }> = [
+const BASE_NAV_ITEMS: Array<{ to: string; label: string }> = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/devices", label: "Devices" },
   { to: "/rules", label: "Rules" },
@@ -64,6 +65,14 @@ function ObserveBanner() {
   );
 }
 
+function RequirePermission({ permission }: { permission: string }) {
+  const { hasPermission } = useAuth();
+  if (!hasPermission(permission)) {
+    return <Navigate to="/dashboard" replace />;
+  }
+  return <Outlet />;
+}
+
 function RequireAuth() {
   const { stage } = useAuth();
 
@@ -83,7 +92,10 @@ function RequireAuth() {
 }
 
 function AppLayout() {
-  const { user, logout } = useAuth();
+  const { user, logout, hasPermission } = useAuth();
+  const navItems = hasPermission("manage_users")
+    ? [...BASE_NAV_ITEMS, { to: "/users", label: "Users" }]
+    : BASE_NAV_ITEMS;
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -94,7 +106,7 @@ function AppLayout() {
             Rerouter
           </Link>
           <nav className="flex flex-1 items-center gap-1 overflow-x-auto">
-            {NAV_ITEMS.map((item) => (
+            {navItems.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
@@ -140,6 +152,9 @@ export default function App() {
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/settings" element={<Settings />} />
+            <Route element={<RequirePermission permission="manage_users" />}>
+              <Route path="/users" element={<Users />} />
+            </Route>
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

@@ -9,6 +9,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api, type Device, ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -62,6 +63,8 @@ function reachabilityVariant(
 }
 
 export default function Devices() {
+  const { hasPermission } = useAuth();
+  const canEnroll = hasPermission("manage_devices");
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -170,16 +173,22 @@ export default function Devices() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Devices</h1>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setShowAdd((v) => !v)}
-        >
-          {showAdd ? "Cancel" : "Add device"}
-        </Button>
+        {canEnroll ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowAdd((v) => !v)}
+          >
+            {showAdd ? "Cancel" : "Add device"}
+          </Button>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            Device enrollment is restricted to super admins.
+          </p>
+        )}
       </div>
 
-      {showAdd && (
+      {showAdd && canEnroll && (
         <Card>
           <CardHeader>
             <CardTitle className="text-lg">Add SNMP device</CardTitle>
@@ -406,20 +415,24 @@ export default function Devices() {
                       {device.interface_count} interfaces
                     </span>
                     <span className="flex-1" />
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void handleTest(device)}
-                    >
-                      Test
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void handleDiscover(device)}
-                    >
-                      Discover
-                    </Button>
+                    {canEnroll && (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleTest(device)}
+                        >
+                          Test
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleDiscover(device)}
+                        >
+                          Discover
+                        </Button>
+                      </>
+                    )}
                   </div>
                   {feedback[device.id] && (
                     <p className="mt-1 text-xs text-muted-foreground">
