@@ -4,16 +4,8 @@
 //! device (router) + interface: poll 64-bit ifXTable counters, derive per-
 //! interface rates, store current + history, and feed the detection engine.
 //! SNMP is read-only — ideal for observe mode.
-//!
-//! The flow-based modules ([`netflow`], [`sflow`], [`bgp`], [`cloudflare`]) are
-//! kept as future/NetFlow scaffolding; they are NOT the v1 source.
 
 pub mod snmp;
-// Future / NetFlow-centric sources — not wired in v1 (SNMP polling is the source).
-pub mod netflow;
-pub mod sflow;
-pub mod bgp;
-pub mod cloudflare;
 
 use chrono::{DateTime, Utc};
 

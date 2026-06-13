@@ -25,13 +25,11 @@ fn template_json(t: &templates::Template) -> Value {
         "description": t.description,
         "provider_type": t.provider_type,
         "mode": t.mode,
-        "manual_confirmation_required": t.manual_confirmation_required,
         "automatic_allowed": t.automatic_allowed,
         "parameter_schema": t.parameter_schema,
         "plan": t.plan,
         "verification": t.verification,
         "rollback_template_id": t.rollback_template_id,
-        "auto_expiry_seconds": t.auto_expiry_seconds,
         "enabled": t.enabled,
     })
 }

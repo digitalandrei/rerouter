@@ -24,9 +24,6 @@ pub struct Session {
     /// false until the TOTP challenge succeeds — a password-only session may
     /// ONLY call /api/auth/totp.
     pub totp_verified: bool,
-    /// last fresh password+TOTP confirmation; high-safety reroutes require this
-    /// to be recent (see rbac.rs and api/reroutes.rs).
-    pub reauth_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -89,16 +86,6 @@ pub async fn mark_totp_verified_and_rotate(pool: &MySqlPool, session_id: u64) ->
     Ok(token)
 }
 
-/// Stamp `reauth_at = now` (fresh password+TOTP for a high-safety reroute).
-pub async fn stamp_reauth(pool: &MySqlPool, session_id: u64) -> Result<()> {
-    sqlx::query("UPDATE sessions SET reauth_at = UTC_TIMESTAMP() WHERE id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .context("stamping reauth_at")?;
-    Ok(())
-}
-
 /// Look up + validate a session by its plaintext token: exists and not expired.
 /// `totp_verified` is returned for the caller/extractor to gate on. Bumps
 /// last_activity_at.
@@ -106,8 +93,8 @@ pub async fn validate(pool: &MySqlPool, token: &str) -> Result<Option<Session>> 
     let token_hash = hash_token(token);
     // TIMESTAMP columns decode as DateTime<Utc> (NaiveDateTime maps only to
     // DATETIME in sqlx-mysql); the pool pins the session tz to UTC.
-    let row = sqlx::query_as::<_, (u64, u64, bool, Option<DateTime<Utc>>, DateTime<Utc>)>(
-        "SELECT id, user_id, totp_verified, reauth_at, expires_at FROM sessions \
+    let row = sqlx::query_as::<_, (u64, u64, bool, DateTime<Utc>)>(
+        "SELECT id, user_id, totp_verified, expires_at FROM sessions \
          WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP()",
     )
     .bind(&token_hash)
@@ -115,7 +102,7 @@ pub async fn validate(pool: &MySqlPool, token: &str) -> Result<Option<Session>> 
     .await
     .context("looking up session")?;
 
-    let Some((id, user_id, totp_verified, reauth_at, expires_at)) = row else {
+    let Some((id, user_id, totp_verified, expires_at)) = row else {
         return Ok(None);
     };
 
@@ -129,7 +116,6 @@ pub async fn validate(pool: &MySqlPool, token: &str) -> Result<Option<Session>> 
         id,
         user_id,
         totp_verified,
-        reauth_at,
         expires_at,
     }))
 }

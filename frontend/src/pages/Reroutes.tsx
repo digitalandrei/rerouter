@@ -80,7 +80,7 @@ function RerouteDrawer({
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            Reroute #{id}
+            Mitigation #{id}
             {detail && <StateBadge state={detail.state} />}
           </DialogTitle>
         </DialogHeader>
@@ -201,7 +201,7 @@ function RerouteDrawer({
       <PromptDialog
         open={ackOpen}
         onOpenChange={setAckOpen}
-        title="Acknowledge uncertain reroute"
+        title="Acknowledge uncertain mitigation"
         description="This resolves the action and clears the device lock so reroutes can resume."
         label="Acknowledgement note (what did you verify on the router?)"
         multiline
@@ -277,7 +277,7 @@ export default function Reroutes() {
               </div>
             ))}
             <p className="pt-1 text-xs text-muted-foreground">
-              A locked device blocks reroutes until the related uncertain action is acknowledged.
+              A locked device blocks mitigations until the related uncertain action is acknowledged.
             </p>
           </CardContent>
         </Card>
@@ -287,7 +287,7 @@ export default function Reroutes() {
         <CardContent className="px-0 py-2">
           {reroutes.length === 0 ? (
             <p className="px-6 py-4 text-sm text-muted-foreground">
-              No reroute actions yet.
+              No mitigation actions yet.
             </p>
           ) : (
             <Table>

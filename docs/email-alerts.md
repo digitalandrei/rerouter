@@ -9,7 +9,7 @@ task so alerting never blocks API requests, detection, or reroutes.
 
 An alert is generated on:
 
-- `attack_detected` — a detection rule fired (threshold crossed above/below for
+- `rule_fired` — a detection rule fired (threshold crossed above/below for
   the configured duration); in observe mode the payload carries the would-run
   action plan;
 - `operating_mode_changed` — observe/enforce flipped (admin-only, audited);
@@ -17,7 +17,7 @@ An alert is generated on:
 - `reroute_uncertain` — action left ambiguous (see [state-recovery.md](state-recovery.md));
 - `asset_unreachable` / `telemetry_stale`;
 - `lock_created` / `lock_cleared`;
-- security events: `2fa_recovery_used`, `account_locked`, `reauth_for_action`.
+- security events: `2fa_recovery_used`, `account_locked`.
 
 Each alert type has a default severity and can be enabled/disabled per recipient
 and per asset.
@@ -82,7 +82,7 @@ Every alert email includes: event type + severity, asset and prefix, the rule an
 metric value that fired (and whether it crossed above or below the threshold),
 the reroute (if any) and its state, a timestamp, and a deep link to the relevant
 UI page. In **observe** mode (read-only / alert-only — see
-[reroute-engine.md](reroute-engine.md) "Operating mode"), `attack_detected`
+[reroute-engine.md](reroute-engine.md) "Operating mode"), `rule_fired`
 alerts additionally include the rendered **would-run action plan**: the exact
-template, provider, prefix, and parameters that `enforce` mode would have
+template, target device(s), prefix, and parameters that `enforce` mode would have
 executed. Never include secrets or raw credentials.

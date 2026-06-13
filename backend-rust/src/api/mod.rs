@@ -10,8 +10,6 @@
 //! reach Nginx and only Nginx can reach us.
 
 pub mod health;
-pub mod assets;
-pub mod providers;
 pub mod rules;
 pub mod templates;
 pub mod rtbh;
@@ -88,11 +86,6 @@ pub fn cookie_key_from_env() -> Result<Key> {
     }
 }
 
-/// Shared stub response while handlers are filled in milestone by milestone.
-pub(crate) fn not_implemented() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({ "error": "not_implemented" })))
-}
-
 /// JSON error helper with an explicit status.
 pub(crate) fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": msg })))
@@ -107,8 +100,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // unauthenticated liveness probe — everything else requires a session
         .route("/api/health", get(health::health))
         .route("/api/status", get(health::status))
-        // auth: login (password) -> totp (2FA, issues session) -> logout;
-        // reauth = fresh password+TOTP before high-safety reroutes
+        // auth: login (password) -> totp (2FA, issues session) -> logout
         .nest("/api/auth", auth::router())
         // devices (SNMP) — telemetry source of record in v1
         .route("/api/devices", get(devices::list).post(devices::create))
@@ -127,15 +119,6 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))
         .route("/api/interfaces/{id}/metrics", get(interfaces::metrics))
-        // assets
-        .route("/api/assets", get(assets::list).post(assets::create))
-        .route("/api/assets/{id}", get(assets::show).put(assets::update).delete(assets::remove))
-        .route("/api/assets/{id}/test/telemetry", post(assets::test_telemetry))
-        .route("/api/assets/{id}/rediscover", post(assets::rediscover))
-        .route("/api/assets/{id}/live", get(assets::live))
-        // providers
-        .route("/api/providers", get(providers::list).post(providers::create))
-        .route("/api/providers/{id}", get(providers::show).put(providers::update).delete(providers::remove))
         // rules
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", get(rules::show).put(rules::update).delete(rules::remove))
@@ -148,7 +131,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // global RTBH community catalog (blackhole tag picker)
         .route("/api/rtbh-communities", get(rtbh::list).post(rtbh::create))
         .route("/api/rtbh-communities/{id}", delete(rtbh::remove))
-        // reroutes (authz: session + RBAC + re-auth — see reroutes.rs)
+        // reroutes (authz: session + RBAC — see reroutes.rs)
         .route("/api/reroutes", get(reroutes::list))
         .route("/api/reroutes/manual", post(reroutes::manual))
         .route("/api/reroutes/{id}", get(reroutes::show))

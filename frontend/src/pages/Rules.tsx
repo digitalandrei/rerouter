@@ -157,7 +157,7 @@ function RuleActionsDialog({
     <Dialog open onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Reroute actions — {current.name}</DialogTitle>
+          <DialogTitle>Mitigation actions — {current.name}</DialogTitle>
           <DialogDescription>
             When this rule fires (its sliding window holds), these mitigations run
             on the selected routers. Observe mode always renders a plan only.
@@ -798,7 +798,7 @@ export default function Rules() {
                           className="h-7 gap-1.5"
                           onClick={() => setManageRule(rule)}
                           disabled={!canEdit}
-                          title={canEdit ? "Manage reroute actions" : "Requires edit_rules"}
+                          title={canEdit ? "Manage mitigation actions" : "Requires edit_rules"}
                         >
                           <Workflow className="size-3.5 text-muted-foreground" />
                           {rule.action_count

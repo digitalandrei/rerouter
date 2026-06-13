@@ -390,13 +390,11 @@ export interface Template {
   description: string | null;
   provider_type: string;
   mode: string;
-  manual_confirmation_required: boolean;
   automatic_allowed: boolean;
   parameter_schema: Record<string, TemplateParamSpec>;
   plan: unknown;
   verification: unknown;
   rollback_template_id: number | null;
-  auto_expiry_seconds: number | null;
   enabled: boolean;
 }
 
@@ -436,7 +434,6 @@ export interface AuditEntry {
 const NO_REDIRECT_PATHS = [
   "/api/auth/login",
   "/api/auth/totp",
-  "/api/auth/reauth",
   "/api/auth/me",
 ];
 
@@ -506,12 +503,6 @@ export const api = {
       }),
     logout: () => request<void>("/api/auth/logout", { method: "POST" }),
     me: () => request<SessionUser>("/api/auth/me"),
-    /** Fresh password+TOTP, required before high-safety reroutes. */
-    reauth: (password: string, code: string) =>
-      request<void>("/api/auth/reauth", {
-        method: "POST",
-        body: { password, code },
-      }),
   },
 
   status: () => request<SystemStatus>("/api/status"),

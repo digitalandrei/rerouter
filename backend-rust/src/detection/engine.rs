@@ -7,10 +7,11 @@
 //! firing we do not re-alert each tick. The condition clearing drops the rule
 //! back toward `clear` after a `hysteresis_seconds` settle window.
 //!
-//! SAFETY (GATE 0): this engine NEVER executes a reroute. In observe mode — and
-//! regardless of mode here, since execution lives behind the reroute engine — a
-//! firing rule with an attached reroute_template_id renders the would-run plan
-//! into the alert payload ("would have executed: ...") instead of acting.
+//! SAFETY (GATE 0): this engine NEVER executes a reroute directly. In observe
+//! mode — or for a manual-only rule — a firing rule renders its attached actions
+//! (`rule_actions`) as the would-run plan in the alert payload instead of acting.
+//! Only in enforce mode, and only when the rule's auto switch is on, does it hand
+//! the actions to the reroute executor (which re-checks its own safety gates).
 //!
 //! Stale/invalid samples are ignored: only `interface_metrics_current` rows with
 //! `valid_sample = 1` and a recent `sampled_at` advance a rule's state.
@@ -40,7 +41,6 @@ struct InterfaceRule {
     duration_seconds: u32,
     consecutive_samples: u32,
     severity: String,
-    reroute_template_id: Option<u64>,
     /// Per-rule switch: in enforce mode, run the rule's actions automatically on
     /// the firing edge. "The rule decides" — this is the only auto gate besides
     /// enforce mode + the executor's locks/cooldowns.
@@ -99,7 +99,7 @@ struct RuleStateRow {
 pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<usize> {
     let rules = sqlx::query_as::<_, InterfaceRule>(
         "SELECT id, name, interface_id, device_id, metric, operator, threshold_value, \
-                duration_seconds, consecutive_samples, severity, reroute_template_id, \
+                duration_seconds, consecutive_samples, severity, \
                 automatic_reroute_enabled \
          FROM rules \
          WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ?",
@@ -242,7 +242,6 @@ async fn on_fire(
     record_event(pool, rule, "fired", value, sampled_at).await?;
 
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
-    let would_run = render_would_run_plan(pool, rule).await;
 
     // Direction phrasing for the alert body.
     let direction = match Op::parse(&rule.operator) {
@@ -266,9 +265,6 @@ async fn on_fire(
         "operating_mode": mode,
         "severity": rule.severity,
     });
-    if let Some(plan) = would_run {
-        payload["would_run"] = plan;
-    }
 
     // "The rule decides": in enforce mode, a rule with auto enabled runs its
     // actions now (gated further by the executor's locks/cooldowns). Otherwise —
@@ -311,35 +307,6 @@ async fn on_fire(
         "detection rule fired (observe-safe: no reroute executed)"
     );
     Ok(())
-}
-
-/// Render the "would have executed" plan from the rule's reroute template (if
-/// any), for the alert payload. Never executes anything.
-async fn render_would_run_plan(pool: &MySqlPool, rule: &InterfaceRule) -> Option<Value> {
-    let template_id = rule.reroute_template_id?;
-    let row = sqlx::query_as::<_, (String, String, String, String, Option<sqlx::types::Json<Value>>)>(
-        "SELECT name, provider_type, mode, safety_level, plan_json FROM reroute_templates WHERE id = ?",
-    )
-    .bind(template_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
-    let (name, provider_type, mode, safety_level, plan_json) = row;
-
-    Some(json!({
-        "would_execute": true,
-        "note": "observe mode: this reroute was NOT executed",
-        "template_id": template_id,
-        "template_name": name,
-        "provider_type": provider_type,
-        "mode": mode,
-        "safety_level": safety_level,
-        "plan": plan_json.map(|j| j.0),
-        "summary": format!(
-            "would have executed template '{name}' ({provider_type}/{mode}, safety={safety_level})"
-        ),
-    }))
 }
 
 /// Render every attached action of a rule (template + target router + params)

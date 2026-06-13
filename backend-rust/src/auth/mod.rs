@@ -7,8 +7,6 @@
 //!   * throttle/lockout by email + real client IP (CF-Connecting-IP, trusted
 //!     because only Cloudflare reaches Nginx and only Nginx reaches us);
 //!   * recovery codes are single-use and stored hashed;
-//!   * high-safety reroutes require a FRESH password + TOTP re-auth (POST
-//!     /api/auth/reauth) regardless of an active session;
 //!   * every auth event is audited with actor, real IP, and user-agent.
 
 pub mod password;
@@ -34,7 +32,6 @@ pub fn router() -> Router<AppState> {
         .route("/login", post(login))
         .route("/totp", post(totp_challenge))
         .route("/logout", post(logout))
-        .route("/reauth", post(reauth))
         .route("/me", get(me))
 }
 
@@ -294,57 +291,6 @@ async fn me(State(state): State<AppState>, session: Session) -> JsonResp {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ReauthBody {
-    password: String,
-    code: String,
-}
-
-/// POST /api/auth/reauth — fresh password + current TOTP immediately before a
-/// high-safety reroute. Stamps sessions.reauth_at; the reroute endpoints check
-/// its freshness. Produces a reauth_for_action audit record.
-async fn reauth(
-    State(state): State<AppState>,
-    session: Session,
-    headers: HeaderMap,
-    ConnectInfo(socket): ConnectInfo<SocketAddr>,
-    Json(body): Json<ReauthBody>,
-) -> JsonResp {
-    let pool = &state.pool;
-    let ip = client_ip(&headers, Some(&socket));
-    let ua = user_agent(&headers);
-
-    let Some((email, phc, secret_hex)) =
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT email, password, two_factor_secret FROM users WHERE id = ?",
-        )
-        .bind(session.user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_session" })));
-    };
-
-    let pw_ok = password::verify(&body.password, &phc).unwrap_or(false);
-    let totp_ok = secret_hex
-        .as_deref()
-        .and_then(decrypt_secret)
-        .map(|s| totp::verify(&s, &body.code, &email).unwrap_or(false))
-        .unwrap_or(false);
-
-    if !(pw_ok && totp_ok) {
-        audit(pool, Some(session.user_id), "2fa_failed", &ip, &ua, "reauth failed").await;
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "reauth_failed" })));
-    }
-
-    if sessions::stamp_reauth(pool, session.id).await.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "reauth_stamp_failed" })));
-    }
-    audit(pool, Some(session.user_id), "reauth_for_action", &ip, &ua, "fresh password+totp confirmed").await;
-    (StatusCode::OK, Json(json!({ "ok": true, "reauth_at": chrono::Utc::now().to_rfc3339() })))
-}
 
 // ---- helpers -------------------------------------------------------------------
 

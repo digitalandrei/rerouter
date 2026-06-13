@@ -1,12 +1,11 @@
 //! Reroute endpoints: list / detail / manual / cancel / acknowledge-uncertain /
 //! rollback.
 //!
-//! Authorization is enforced HERE (session + RBAC + re-auth) — this process is
-//! the security boundary. Manual triggers require `trigger_manual_reroute`;
-//! high-safety templates additionally require a FRESH password+TOTP re-auth
-//! (rbac::reauth_is_fresh), a typed confirmation, and a reason. The executor
-//! then re-checks every safety gate regardless of what the UI showed, and in
-//! observe mode returns the would-run plan instead of executing.
+//! Authorization is enforced HERE (session + RBAC) — this process is the security
+//! boundary. Manual triggers require `trigger_manual_reroute` and accept an
+//! optional reason for the audit log. The executor then re-checks every safety
+//! gate regardless of what the UI showed, and in observe mode returns the
+//! would-run plan instead of executing.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

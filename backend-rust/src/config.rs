@@ -15,8 +15,6 @@ pub struct Config {
     pub safety: Safety,
     pub reroute: Reroute,
     #[serde(default)]
-    pub providers: Providers,
-    #[serde(default)]
     pub retention: Retention,
 }
 
@@ -55,11 +53,8 @@ impl Default for Auth {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Telemetry {
-    pub flow_listen: String,
-    pub default_sampling_rate: u32,
     pub metrics_rollup_seconds: u64,
     pub reachability_interval_seconds: u64,
-    pub cloudflare_poll_seconds: u64,
     pub stale_after_seconds: u64,
     pub jitter_percent: u8,
 }
@@ -102,32 +97,9 @@ pub struct Safety {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reroute {
-    pub default_blackhole_expiry_seconds: u64,
     pub require_verification: bool,
 }
 
-/// Provider adapter settings ([providers.cloudflare] / [providers.bgp]).
-/// Tokens/keys come from provider credentials, never from this file.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct Providers {
-    pub cloudflare: CloudflareProvider,
-    pub bgp: BgpProvider,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct CloudflareProvider {
-    pub api_base: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct BgpProvider {
-    /// Controlled BGP speaker (e.g. "exabgp"); driven over a narrow command
-    /// interface — never arbitrary BGP from free text.
-    pub speaker: String,
-}
 
 /// Retention windows enforced by the controller's cleanup task
 /// (TODO(milestone 2): the task itself).
@@ -158,11 +130,8 @@ impl Default for Database {
 impl Default for Telemetry {
     fn default() -> Self {
         Self {
-            flow_listen: "0.0.0.0:2055".into(),
-            default_sampling_rate: 1000,
             metrics_rollup_seconds: 15,
             reachability_interval_seconds: 15,
-            cloudflare_poll_seconds: 60,
             stale_after_seconds: 90,
             jitter_percent: 15,
         }
@@ -197,25 +166,7 @@ impl Default for Safety {
 
 impl Default for Reroute {
     fn default() -> Self {
-        Self { default_blackhole_expiry_seconds: 1800, require_verification: true }
-    }
-}
-
-impl Default for Providers {
-    fn default() -> Self {
-        Self { cloudflare: CloudflareProvider::default(), bgp: BgpProvider::default() }
-    }
-}
-
-impl Default for CloudflareProvider {
-    fn default() -> Self {
-        Self { api_base: "https://api.cloudflare.com/client/v4".into() }
-    }
-}
-
-impl Default for BgpProvider {
-    fn default() -> Self {
-        Self { speaker: "exabgp".into() }
+        Self { require_verification: true }
     }
 }
 
@@ -235,7 +186,6 @@ impl Default for Config {
             detection: Detection::default(),
             safety: Safety::default(),
             reroute: Reroute::default(),
-            providers: Providers::default(),
             retention: Retention::default(),
         }
     }

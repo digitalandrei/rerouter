@@ -26,12 +26,11 @@ lockout_minutes = 15
 # SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM
 # (see deploy/env/rerouter.example.env). No [smtp] section here.
 
+# v1 telemetry is SNMP v2c interface polling (per-device poll interval lives on
+# the device row). These are the rollup/staleness knobs for the poll loop.
 [telemetry]
-flow_listen = "0.0.0.0:2055"        # NetFlow/IPFIX collector (sFlow: 6343)
-default_sampling_rate = 1000        # override per-exporter once known
 metrics_rollup_seconds = 15
 reachability_interval_seconds = 15
-cloudflare_poll_seconds = 60
 stale_after_seconds = 90
 jitter_percent = 15
 
@@ -57,19 +56,8 @@ same_prefix_provider_cooldown_seconds = 1800
 mark_running_actions_uncertain_on_startup = true
 
 [reroute]
-# Default auto-expiry for disruptive mitigations (blackhole/divert) unless the
-# template overrides it. 0 = no expiry (not recommended).
-default_blackhole_expiry_seconds = 1800
+# Verify the resulting routing state after every action ("never trust 'sent'").
 require_verification = true
-
-[providers.cloudflare]
-api_base = "https://api.cloudflare.com/client/v4"
-# token comes from the environment per provider credential reference
-
-[providers.bgp]
-# Controlled BGP speaker (e.g. ExaBGP). The controller drives it over a narrow
-# command interface; it never crafts arbitrary BGP from free text.
-speaker = "exabgp"
 
 [retention]
 traffic_samples_days = 7

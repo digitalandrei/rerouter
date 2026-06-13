@@ -16,7 +16,6 @@ pub mod telemetry;
 pub mod ssh;
 pub mod detection;
 pub mod reroute;
-pub mod providers;
 pub mod api;
 pub mod scheduler;
 pub mod install;

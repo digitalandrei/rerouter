@@ -17,6 +17,7 @@ import {
 import { api, type Device, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
+import { ToneBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -471,13 +472,9 @@ export default function Devices() {
 
                     {/* Reachability status */}
                     <TableCell>
-                      {device.reachable ? (
-                        <Badge className="bg-green-500/15 text-green-700 dark:text-green-400 border-transparent">
-                          reachable
-                        </Badge>
-                      ) : (
-                        <Badge variant="destructive">unreachable</Badge>
-                      )}
+                      <ToneBadge tone={device.reachable ? "good" : "bad"}>
+                        {device.reachable ? "reachable" : "unreachable"}
+                      </ToneBadge>
                     </TableCell>
 
                     {/* Actions */}

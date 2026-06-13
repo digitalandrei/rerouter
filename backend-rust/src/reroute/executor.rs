@@ -7,8 +7,8 @@
 //!   `execute` returns the would-run plan instead. Then: not dry-run | no global
 //!   maintenance lock | device not locked | no action already running on the
 //!   device | no unresolved `uncertain` on the device | not in cooldown. The
-//!   caller (api/reroutes.rs) additionally enforces permission + (high safety)
-//!   re-auth + typed confirmation + reason BEFORE calling execute.
+//!   caller (api/reroutes.rs) additionally enforces the `trigger_manual_reroute`
+//!   permission and records the operator's reason BEFORE calling execute.
 //!
 //! Verify, don't assume: after pushing config we open a separate read-only
 //! session and run the template's `show` check. The FINAL state is decided from

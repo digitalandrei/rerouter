@@ -26,12 +26,11 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { SeverityBadge } from "@/components/status-badge";
+import { SeverityBadge, StatusBadge } from "@/components/status-badge";
 import {
   TelemetryChart,
   buildChartData,
   classifyInterface,
-  statusVariant,
   fmtBps,
   fmtPps,
   fmtSpeed,
@@ -253,9 +252,7 @@ export default function InterfaceDetail() {
         </Link>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-bold tracking-tight">{iface.if_name}</h1>
-          <Badge variant={statusVariant(iface.oper_status)}>
-            {iface.oper_status.toUpperCase()}
-          </Badge>
+          <StatusBadge value={iface.oper_status} label={iface.oper_status.toUpperCase()} />
           <Badge variant="outline">adm:{iface.admin_status}</Badge>
 
           <div className="ml-auto flex items-center gap-2">
@@ -297,14 +294,10 @@ export default function InterfaceDetail() {
           <CardContent>
             <dl className="grid grid-cols-2 gap-4 sm:grid-cols-3">
               <Fact label="Admin State">
-                <Badge variant={statusVariant(iface.admin_status)}>
-                  {iface.admin_status.toUpperCase()}
-                </Badge>
+                <StatusBadge value={iface.admin_status} label={iface.admin_status.toUpperCase()} />
               </Fact>
               <Fact label="Oper State">
-                <Badge variant={statusVariant(iface.oper_status)}>
-                  {iface.oper_status.toUpperCase()}
-                </Badge>
+                <StatusBadge value={iface.oper_status} label={iface.oper_status.toUpperCase()} />
               </Fact>
               <Fact label="Utilization">
                 {validMetrics

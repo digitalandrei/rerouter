@@ -2,7 +2,7 @@
  * /templates — the reroute action-template catalog (docs/reroute-engine.md).
  *
  * Templates are the ONLY way a reroute runs: parameterized, allowlisted
- * mitigations with a safety level, verification, and rollback. This page lists
+ * mitigations with verification and rollback. This page lists
  * them and — for device_cli (IOS-over-SSH) templates — renders the EXACT
  * commands for a given parameter set via the read-only /render endpoint. No
  * execution happens here; it is a preview sandbox.

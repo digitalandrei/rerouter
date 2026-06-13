@@ -6,10 +6,7 @@
  *   (the cookie is HttpOnly and owned by the controller; the SPA never sees a
  *   token, it only tracks "who am I" state);
  * - first login returns TOTP enrollment material (otpauth URL + secret) which
- *   the Login page must display before the first code is accepted;
- * - high-safety reroutes require a FRESH re-auth (password + TOTP) shortly
- *   before submission — `reauth()` exists solely for that flow and never
- *   changes the session state on the client.
+ *   the Login page must display before the first code is accepted.
  */
 import {
   createContext,
@@ -37,7 +34,6 @@ export interface AuthState {
   submitTotp: (code: string) => Promise<void>;
   logout: () => Promise<void>;
   /** Fresh password+TOTP check before high-safety reroutes. */
-  reauth: (password: string, code: string) => Promise<void>;
   hasPermission: (permission: string) => boolean;
 }
 
@@ -97,10 +93,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const reauth = useCallback(async (password: string, code: string) => {
-    await api.auth.reauth(password, code);
-  }, []);
-
   const hasPermission = useCallback(
     (permission: string) => user?.permissions.includes(permission) ?? false,
     [user],
@@ -114,10 +106,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       submitTotp,
       logout,
-      reauth,
       hasPermission,
     }),
-    [stage, user, enrollment, login, submitTotp, logout, reauth, hasPermission],
+    [stage, user, enrollment, login, submitTotp, logout, hasPermission],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -13,17 +13,25 @@ of schema truth.
 
 ```text
 auth        users, roles, permissions, role_user, permission_role, sessions
-assets      protected_assets, asset_statuses, asset_provider
-providers   reroute_providers, provider_credentials
-devices     devices, device_interfaces, interface_metrics_current, interface_samples
-telemetry   asset_metrics_current, traffic_samples
-detection   rules, rule_states, rule_events
+assets      protected_assets, asset_statuses, asset_provider           (vestigial)
+providers   reroute_providers, provider_credentials                    (vestigial)
+devices     devices, device_interfaces, interface_metrics_current, interface_samples,
+            device_bgp_peers, device_bgp_networks
+routing     rtbh_communities
+telemetry   asset_metrics_current, traffic_samples                     (vestigial)
+detection   rules, rule_states, rule_events, rule_actions
 reroute     reroute_templates, reroutes, reroute_steps, reroute_outputs,
             reroute_verifications
 safety      locks, cooldowns
 alerts      alerts, alert_recipients, alert_subscriptions, alert_deliveries
 core        audit_logs, system_settings
 ```
+
+> **Live vs. vestigial.** The shipped telemetry + mitigation model is
+> **devices / interfaces** (SNMP polling) with `device_cli` reroutes over SSH.
+> The `protected_assets` / `reroute_providers` / `asset_*` / `*_metrics`(asset)
+> tables predate that pivot and still exist, but no live code path drives them —
+> treat them as vestigial.
 
 ## auth / users
 
@@ -43,12 +51,13 @@ Server-side store backing the session cookie (see
 [authentication.md](authentication.md)):
 
 ```text
-id, user_id, token_hash, totp_verified, reauth_at, ip_address, user_agent,
+id, user_id, token_hash, totp_verified, ip_address, user_agent,
 created_at, last_activity_at, expires_at
 ```
 
-`totp_verified` gates the 2FA-complete state of a session; `reauth_at` records
-the last fresh password+TOTP re-auth backing a high-safety reroute.
+`totp_verified` gates the 2FA-complete state of a session. (The `reauth_at`
+column was dropped: the re-auth gate it backed — for "high safety" reroutes —
+was removed along with the `safety_level` classification.)
 
 ## roles / permissions
 
@@ -63,6 +72,11 @@ permission_role:  permission_id, role_id
 ```
 
 ## protected_assets
+
+> **Vestigial.** Superseded by the `devices` / `device_interfaces` model. The
+> table (and `asset_provider`, `asset_statuses`, `reroute_providers`,
+> `provider_credentials`, `asset_metrics_current`) still exists but is not on any
+> live path; documented here for completeness.
 
 ```text
 id, name, kind(prefix|ip|service), cidr, address_family(v4|v6),
@@ -110,6 +124,9 @@ encrypted_value, key_path, created_at, updated_at
 
 ## asset_metrics_current
 
+> **Vestigial** (asset-era). The live per-interface equivalent is
+> `interface_metrics_current`.
+
 Latest normalized metrics per asset (one row per asset).
 
 ```text
@@ -132,23 +149,26 @@ community_encrypted (VARBINARY, nullable), v3_* (reserved, nullable),
 poll_interval_seconds, enabled,
 vendor, model, os_version, sys_name, sys_uptime,   -- learned from sysDescr
 reachable (default 0), last_poll_at, last_error,
--- SSH access (captured at onboarding for future CLI reroute actions; unused in
--- observe mode). Password XOR key; all secrets AES-256-GCM, never returned.
+-- SSH access — actively used by the device_cli reroute engine (backend-rust/src/ssh/)
+-- to push config and run verification `show`s. Password XOR key; all secrets
+-- AES-256-GCM, never returned. ssh_public_key is NOT secret (plaintext, returned
+-- by the API) so the UI can show it for `ip ssh pubkey-chain` enrollment.
 ssh_username, ssh_port (default 22), ssh_auth_method(password|key, nullable),
 ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted,
-ssh_host_fingerprint (reserved),
+ssh_host_fingerprint (reserved), ssh_public_key (TEXT, nullable, plaintext),
 created_at, updated_at
 ```
 
 ## device_interfaces
 
 Interfaces discovered on a device (ifXTable + ifTable), reconciled by
-`(device_id, if_index)`. Only `enabled_for_monitoring = 1` rows are polled and
-rule-evaluated.
+`(device_id, if_index)`. **Every** discovered interface is polled, chartable, and
+rule-evaluable (the old `enabled_for_monitoring` toggle was dropped — it no longer
+gated anything).
 
 ```text
 id, device_id, if_index, if_name, if_descr, if_alias, if_speed_bps,
-admin_status, oper_status, is_physical, enabled_for_monitoring (default 0),
+admin_status, oper_status, is_physical,
 display_order, first_seen_at, last_seen_at
 UNIQUE (device_id, if_index)
 ```
@@ -179,7 +199,48 @@ id, interface_id, device_id, sampled_at, valid_sample,
 rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, created_at
 ```
 
+## device_bgp_peers
+
+BGP neighbors discovered over SNMP (BGP4-MIB `bgpPeerTable`), reconciled by
+`(device_id, peer_remote_addr)` and refreshed every poll. Read-only telemetry that
+backs the neighbor picker for the `bgp_session_*` templates (operators pick a real
+neighbor — e.g. a GRE scrubber session). IPv4 only in v1.
+
+```text
+id, device_id, peer_remote_addr, peer_remote_as, local_as,
+peer_state, peer_admin_status, label,
+first_seen_at, last_seen_at, last_polled_at, created_at, updated_at
+UNIQUE (device_id, peer_remote_addr)
+```
+
+## device_bgp_networks
+
+Per-device announced prefixes (BGP `network` statements), discovered from config
+over SSH and revalidated daily/manually. Backs the "announced prefix" picker for
+the `blackhole_*` / `null_route_*` templates.
+
+```text
+id, device_id, prefix (CIDR), first_seen_at, last_seen_at,
+last_discovered_at, created_at, updated_at
+UNIQUE (device_id, prefix)
+```
+
+## rtbh_communities
+
+Global list of blackhole communities (standard `X:Y` or large `X:Y:Z`) plus the
+route **tag** the routers' RTBH redistribute route-map matches to set that
+community. Backs the "RTBH community" picker for `blackhole_*` (the chosen row's
+`tag` flows into `ip route … Null0 tag {tag}`).
+
+```text
+id, label, kind(standard|large), community, tag (unique),
+created_by, created_at, updated_at
+```
+
 ## traffic_samples
+
+> **Vestigial** (asset-era). The live per-interface history lives in
+> `interface_samples`.
 
 High volume; retention-controlled (default 7 days).
 
@@ -191,16 +252,17 @@ unique_src_count, raw_ref, created_at
 
 ## rules
 
-A rule targets a protected **asset** XOR a monitored **interface** (the
-interface path was added with the SNMP device tables; `asset_id` is now
-nullable, and `interface_id`/`device_id` are the alternative target — enforced in
-application code).
+The live rule targets a monitored **interface** (`interface_id` + `device_id`);
+the evaluator only selects `interface_id IS NOT NULL` rows. `asset_id` is nullable
+and belongs to the vestigial asset path. A rule's mitigation is **not** the
+`reroute_template_id` column (now legacy / unused) — its actions live in
+`rule_actions` (below).
 
 ```text
 id, asset_id (nullable), interface_id (nullable), device_id (nullable),
 name, metric, operator, threshold_value, threshold_unit,
 duration_seconds, consecutive_samples, severity, schedule_json,
-enabled, automatic_reroute_enabled (default 0), reroute_template_id,
+enabled, automatic_reroute_enabled (default 0), reroute_template_id (legacy/unused),
 alert_enabled (default 1), cooldown_seconds,
 created_by, updated_by, created_at, updated_at
 ```
@@ -220,24 +282,51 @@ id, rule_id, asset_id, event(matched|fired|cleared), metric_value,
 sampled_at, created_at
 ```
 
-## reroute_templates
+## rule_actions
+
+A fired rule's mitigation: one or more actions, each `(template, target device,
+params)`. Lets a rule fan the same mitigation out to several routers, each with
+its own params (e.g. a different scrubber neighbor IP per router). The detection
+engine renders these as the would-run plan (observe / manual-only) or hands them
+to the executor (enforce + the rule's auto switch on).
 
 ```text
-id, name, description, provider_type, mode, safety_level,
-automatic_allowed, manual_confirmation_required,
+id, rule_id, reroute_template_id, device_id, params_json,
+position (default 0), enabled (default 1), created_at, updated_at
+KEY (rule_id)
+```
+
+## reroute_templates
+
+`provider_type` enum is `cloudflare|bgp_rtbh|flowspec|scrubber|device_cli`, but
+only **`device_cli`** (mode `ios_ssh`) has a backing executor — the others were
+de-scoped. The `safety_level`, `manual_confirmation_required`, and
+`auto_expiry_seconds` columns were **dropped** (the safety-level classification,
+its re-auth/typed-confirmation gate, and template auto-expiry were all removed).
+
+```text
+id, name, description, provider_type, mode,
+automatic_allowed,
 parameter_schema_json, plan_json, verification_json,
-rollback_template_id, auto_expiry_seconds, enabled, created_at, updated_at
+rollback_template_id, enabled, created_at, updated_at
 ```
 
 ## reroutes (actions)
 
+The real target is now `device_id` (the router the action ran against); `asset_id`
+is nullable and `provider_id` is vestigial (the `device_cli` executor never sets
+either). The `safety_level`, `expires_at`, and `cooldown_until` columns were
+**dropped** (safety levels and auto-expiry removed; cooldowns live in the
+`cooldowns` table keyed on the `device` scope).
+
 ```text
-id, asset_id, provider_id, rule_id, reroute_template_id,
+id, asset_id (nullable), device_id (nullable), provider_id (vestigial),
+rule_id, reroute_template_id,
 trigger_type(automatic|manual|rollback), triggered_by_user_id,
 state(planned|pending|running|verifying|succeeded|failed|uncertain),
-safety_level, reason, parameters_json, planned_steps_json,
+reason, parameters_json, planned_steps_json,
 started_at, finished_at, success, failure_reason, verification_status,
-expires_at, cooldown_until, created_at, updated_at
+created_at, updated_at
 ```
 
 ## reroute_steps / reroute_outputs
@@ -257,11 +346,16 @@ checked_at, created_at
 
 ## locks / cooldowns
 
+The device-CLI engine uses the `device` scope on both (the others are vestigial
+asset/provider scopes). A `device` lock is what an `uncertain`/failed action or
+crash recovery sets; the per-device cooldown row is what the 5-min post-action
+window writes.
+
 ```text
-locks:     id, scope(global|asset|provider|prefix|template), scope_ref,
+locks:     id, scope(global|asset|provider|prefix|template|device), scope_ref,
            reason, kind(manual|auto_failed|auto_crash|auto_uncertain),
            created_by, created_at, cleared_by, cleared_at
-cooldowns: id, scope(rule|asset|prefix_provider|global), scope_ref,
+cooldowns: id, scope(rule|asset|prefix_provider|global|device), scope_ref,
            until, reason, created_at
 ```
 

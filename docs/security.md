@@ -7,7 +7,7 @@ authorization are first-class. See also [authentication.md](authentication.md)
 ## Roles
 
 ```text
-admin     full control, user management, dangerous-action approval
+admin     full control, user management, mode flips, lock management
 operator  trigger manual reroutes, manage rules, acknowledge uncertain
 viewer    read-only dashboards and data
 auditor   read audit logs and configuration, no changes
@@ -24,7 +24,6 @@ edit_credentials
 view_credentials_metadata
 edit_rules
 trigger_manual_reroute
-approve_dangerous_reroute
 acknowledge_uncertain_reroute
 manage_locks
 manage_alerts
@@ -40,14 +39,28 @@ authorized identity (session + permission check) and a reason.
 
 ## Dangerous actions
 
-For high-safety-level reroutes (blackhole, withdraw announcement, scrub-divert):
+Reroutes are device-CLI actions over SSH to Cisco IOS — null-route a prefix to
+`Null0` (RTBH), tagged-`Null0` upstream RTBH (blackhole), and BGP-neighbor
+shut / no-shut. This is an in-house operator tool, so there is **no** typed
+confirmation or per-action re-authentication gate; the safety comes from
+layered, fail-closed controls rather than per-click friction:
 
-- require **re-authentication** (password + current TOTP);
-- require **typed confirmation** of the target (e.g. type the prefix);
-- require a **reason** field;
-- show the exact reroute preview (prefix, provider, method, communities);
-- log user / real client IP (`CF-Connecting-IP`) / time;
-- support optional second-approver later.
+- **observe by default** — the shipped operating mode is `observe`
+  (read-only / alert-only); nothing executes, automatic or manual, until an
+  admin flips to `enforce`;
+- **template-only, allowlisted commands** — actions are rendered from validated
+  templates, and the device-CLI layer enforces a fail-closed command allowlist
+  (only the exact `Null0` route and `neighbor … shutdown` forms pass);
+- **authorized identity** — a manual reroute must carry an authenticated session
+  with the `trigger_manual_reroute` permission and an optional free-text reason
+  for the audit log;
+- **device locks and cooldowns** — a locked or cooling-down device refuses new
+  actions;
+- **verify, don't assume** — every action confirms the resulting routing state
+  with a `show` read-back before it is called succeeded (see
+  [state-recovery.md](state-recovery.md) and [reroute-engine.md](reroute-engine.md));
+- **full audit** — user / real client IP (`CF-Connecting-IP`) / time on every
+  action and lifecycle transition.
 
 Flipping the global operating mode (`observe` → `enforce`, see
 [reroute-engine.md](reroute-engine.md) "Operating mode") is itself a dangerous
@@ -56,9 +69,11 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
 
 ## Credentials & secrets
 
-- Provider API tokens (Cloudflare), BGP TSIG/keys, scrubber creds: encrypted at
-  rest by the controller — AES-256-GCM with the key from the `SECRETS_KEY` env
-  var; the UI exposes only references/metadata.
+- Device secrets — SNMP community strings and SSH credentials (password XOR
+  private key + passphrase) — are encrypted at rest by the controller: AES-256-GCM
+  with the key from the `SECRETS_KEY` env var; the UI never returns them (only
+  presence flags + the non-secret SSH public key). In-app-generated SSH keys are
+  stored encrypted the same way.
 - File-based keys live under `/etc/rerouter/keys/`, owner `rerouter`, mode `0600`.
 - The controller runs as a dedicated `rerouter` system user.
 - Better later: HashiCorp Vault, per-provider rotation, never re-expose secrets in
@@ -71,9 +86,10 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   `/api/` is the public app API, but **only** through the Nginx reverse proxy
   (`location /api/` -> `http://127.0.0.1:9277`); the SPA is served as static
   files by Nginx.
-- The controller must reach: flow collector ports, the BGP speaker, the Cloudflare
-  API (HTTPS egress), the scrubbing center as contracted, and the configured
-  SMTP server for alerts.
+- The controller must reach the managed devices over **SNMP (UDP 161)** for
+  telemetry and **SSH (TCP 22)** for reroute actions/discovery, plus the configured
+  SMTP server for alerts. There are no flow-collector / BGP-speaker / Cloudflare /
+  scrubber egress paths in v1.
 
 ## Authentication hardening
 

@@ -33,27 +33,41 @@ back to a client.
 
 ## SSH access
 
-A device is also onboarded with **SSH access**, captured now so the future
-CLI-based reroute/remediation actions (Cisco IOS-XE commands over SSH) have
-credentials ready. **SSH is not used in observe mode** — these fields are stored,
-encrypted, and idle until enforce mode and the SSH action engine land.
+A device is onboarded with **SSH access**, and SSH is **actively used** by the
+controller — it is no longer an idle, enforce-only field. Even in observe mode the
+controller uses SSH (through a restricted Cisco read-only view) to discover
+routing context: announced prefixes and BGP neighbor labels
+(`POST /api/devices/{id}/discover-prefixes`) and a command-access probe
+(`POST /api/devices/{id}/ssh-capabilities`). In enforce mode the same SSH path
+drives the device-CLI reroute templates. Every SSH command is checked against a
+**fail-closed in-app allowlist**; the restricted view ships at
+[../deploy/cisco/rerouter-bgp-view.ios](../deploy/cisco/rerouter-bgp-view.ios).
 
-SSH auth is **password XOR key** (the operator picks one per device, "for now"):
+SSH auth is **password XOR key** (the operator picks one per device):
 
 - `ssh_username`, `ssh_port` (default 22);
 - `ssh_auth_method` — `password` or `key`;
 - `password` method: `ssh_password` (encrypted at rest);
 - `key` method: `ssh_private_key` + optional `ssh_key_passphrase` (both
   encrypted at rest);
-- `ssh_host_fingerprint` — reserved; pinned at enrollment so a later host-key
-  change can fail closed (doctrine §8 SSH host verification).
+- `ssh_host_fingerprint` — pinned at enrollment so a later host-key change can
+  fail closed (doctrine §8 SSH host verification).
+
+**In-app key generation.** Rather than pasting a private key, the operator can
+have the controller mint a device keypair: `POST /api/devices/{id}/ssh-generate-key`
+generates an **RSA** keypair (RSA, not ed25519, because Cisco IOS
+`ip ssh pubkey-chain` only accepts RSA), stores the encrypted private key, and
+saves the **public key** in `ssh_public_key`. That public key is **returned and
+shown in the UI** so the operator can enroll it on the router via
+`ip ssh pubkey-chain`.
 
 All SSH secret material is AES-256-GCM ciphertext (key from `SECRETS_KEY`), the
 same scheme as the community: only ciphertext is stored, nothing is logged, and
-the API never returns it. `GET /api/devices` exposes only `ssh_username`,
-`ssh_port`, `ssh_auth_method`, and `ssh_configured` (a boolean — whether a secret
-is stored). On `PUT`, an omitted/empty secret leaves the stored value untouched;
-a present one re-encrypts it.
+the API never returns the private material. `GET /api/devices` exposes only
+`ssh_username`, `ssh_port`, `ssh_auth_method`, `ssh_configured` (a boolean —
+whether a secret is stored), and the non-secret `ssh_public_key`. On `PUT`, an
+omitted/empty secret leaves the stored value untouched; a present one
+re-encrypts it.
 
 > SSH is **optional** at enrollment: `ssh_auth_method` may be absent for an
 > SNMP-only device, and added later via `PUT /api/devices/{id}`.

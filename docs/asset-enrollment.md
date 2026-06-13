@@ -1,5 +1,14 @@
 # Asset & Provider Enrollment
 
+> **Not implemented in v1.** This asset/provider enrollment model was superseded
+> by **device enrollment** — see [device-enrollment.md](device-enrollment.md).
+> v1 enrolls **devices** (routers) and polls their **interfaces** over SNMP;
+> reroutes run as device-CLI templates over SSH. There are no provider adapters
+> (Cloudflare / BGP-RTBH / FlowSpec / scrubber) and no `/api/assets` or
+> `/api/providers` endpoints. This document is retained for design context only;
+> the `protected_assets` / `reroute_providers` tables survive merely as legacy
+> foreign keys.
+
 Rerouter protects **assets** (prefixes / IPs / services) by rerouting through
 **providers** (Cloudflare, BGP upstreams, scrubbing centers). Both are enrolled
 explicitly.
@@ -12,7 +21,7 @@ Fields:
 - prefix or IP (CIDR, IPv4/IPv6);
 - service description / owner;
 - site / region;
-- criticality (so safety levels can scale with blast radius);
+- criticality (operator-facing blast-radius label);
 - enabled / disabled;
 - telemetry sources enabled (flow, BGP, Cloudflare zone);
 - baseline traffic profile (learned bps/pps, optional);

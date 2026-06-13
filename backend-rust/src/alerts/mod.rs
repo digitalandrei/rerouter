@@ -20,7 +20,6 @@ pub const ALWAYS_IMMEDIATE: &[&str] = &[
     "reroute_failed",
     "2fa_recovery_used",
     "account_locked",
-    "reauth_for_action",
 ];
 
 /// Spawn the alert dispatcher as a long-lived background task.

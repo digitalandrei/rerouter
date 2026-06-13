@@ -10,11 +10,11 @@ The engine sits behind a global operating mode
 (`system_settings.operating_mode`):
 
 - **`observe`** — the shipped default. Safe read-only / alert-only: **nothing
-  executes, automatic or manual**. When a rule fires (threshold above/below for
-  the configured duration), the engine renders the attached template in
-  **dry-run** — exact provider, method, prefix, parameters — and attaches that
-  would-run plan to the rule event and the email alert. This lets operators
-  validate thresholds and templates against live traffic with zero risk.
+  executes, automatic or manual**. When a rule fires, the engine renders the
+  rule's attached actions (its `rule_actions` rows — each a template + target
+  router + parameters) to their exact would-run commands and attaches that plan to
+  the rule event and the email alert. This lets operators validate thresholds and
+  templates against live traffic with zero risk.
 - **`enforce`** — execution allowed, still subject to every gate below.
 
 Flipping the mode is admin-only, audited, and itself alerted. The mode is
@@ -31,53 +31,70 @@ not a feature.
 Each template defines:
 
 - `name`, `description`;
-- provider type compatibility (`cloudflare` / `bgp_rtbh` / `flowspec` / `scrubber`);
-- `mode` (e.g. `cloudflare_api`, `bgp_announce`, `bgp_withdraw`, `flowspec`);
-- parameter schema (typed, validated);
-- `safety_level` (`low` / `medium` / `high`);
-- `manual_confirmation_required` (bool);
+- `provider_type` — only `device_cli` executes in v1 (the Cisco-IOS-over-SSH
+  engine in `backend-rust/src/ssh/`). The legacy `cloudflare` / `bgp_rtbh` /
+  `flowspec` / `scrubber` provider adapters were de-scoped; the enum value still
+  exists but no executor backs it;
+- `mode` — `ios_ssh` for the device-CLI templates;
+- parameter schema (typed, validated: `ip` / `cidr` / `asn` / `int`);
 - `automatic_allowed` (bool);
-- expected success markers / verification method;
+- `plan_json` — the exact commands to push (see shape below);
+- `verification_json` — the read-back `show` check (see shape below);
 - optional `rollback_template` (how to undo).
 
-### Example templates (simple first)
+### Plan / verification shape (device_cli)
 
-```yaml
-name: cloudflare_under_attack
-provider: cloudflare
-mode: cloudflare_api
-safety_level: low
-automatic_allowed: true
-params: { zone_id }
-verify: zone security_level == "under_attack"
-rollback: cloudflare_restore_security_level
+Every `device_cli` template stores its commands as JSON, not free text:
 
-name: blackhole_prefix          # RTBH
-provider: bgp_rtbh
-mode: bgp_announce
-safety_level: high
-manual_confirmation_required: true
-params: { prefix, blackhole_community }
-verify: bgp announcement present with community
-rollback: withdraw_blackhole_prefix
-
-name: flowspec_drop
-provider: flowspec
-mode: flowspec
-safety_level: high
-params: { src, dst, proto, port }
-verify: flowspec rule installed upstream
-rollback: flowspec_remove_rule
-
-name: divert_to_scrubber
-provider: scrubber
-mode: bgp_announce
-safety_level: high
-manual_confirmation_required: true
-params: { prefix, scrubber_target }
-verify: prefix announced to scrubber; return path healthy
-rollback: stop_diversion
+```text
+plan_json:         {"transport":"ios_ssh","config_mode":true,"apply":["<cmd with {param}>"]}
+verification_json: {"method":"ios_show","command":"<show {param}>","expect":<substr present>,"reject":<substr absent>}
 ```
+
+The renderer substitutes only type-checked parameter values. A `cidr` param `X`
+also exposes `{X_net}` and `{X_mask}` (validated values contain no whitespace or
+newlines, so extra commands cannot be smuggled in). Verification opens a
+*separate* read-only session, runs the `show`, and passes iff `expect` is present
+**and** `reject` is absent (case-insensitive substring).
+
+### Shipped catalog (all `device_cli` / `ios_ssh`)
+
+```text
+null_route_prefix     ip route {target_net} {target_mask} Null0
+                      Local Null0 black hole of a destination subprefix. Drops
+                      ALL traffic to it on this router.
+                      verify: show ip route {target_net} -> expect "Null0"
+                      rollback: null_route_withdraw
+
+null_route_withdraw   no ip route {target_net} {target_mask} Null0
+                      verify: show ip route {target_net} -> reject "Null0"
+
+blackhole_prefix      ip route {prefix_net} {prefix_mask} Null0 tag {tag}
+                      Tagged Null0 static the router's RTBH route-map
+                      redistributes into BGP with the blackhole community, so the
+                      prefix is dropped UPSTREAM (true RTBH). Needs a route-map
+                      matching the tag.
+                      verify: show ip route {prefix_net} -> expect "Null0"
+                      rollback: blackhole_withdraw
+
+blackhole_withdraw    no ip route {prefix_net} {prefix_mask} Null0 tag {tag}
+                      verify: show ip route {prefix_net} -> reject "Null0"
+
+bgp_session_enable    router bgp {local_asn} ; no neighbor {neighbor_ip} shutdown
+                      Bring a BGP neighbor up — e.g. start the GRE scrubber
+                      session so routes announce and traffic diverts.
+                      verify: show ip bgp neighbors {neighbor_ip}
+                              -> expect "BGP state", reject "Administratively shut"
+                      rollback: bgp_session_disable
+
+bgp_session_disable   router bgp {local_asn} ; neighbor {neighbor_ip} shutdown
+                      verify: show ip bgp neighbors {neighbor_ip}
+                              -> expect "Administratively shut"
+```
+
+Disruptive templates are paired with their inverse via `rollback_template_id`.
+The old `cloudflare_under_attack` / `flowspec_drop` / `divert_to_scrubber`
+templates were removed when their providers were de-scoped.
 
 ## Two-phase state machine
 
@@ -94,74 +111,91 @@ success — move to `verifying` and confirm the routing/zone state actually chan
 ## Safety gates (checked again at execution time)
 
 Even if a rule fired, the reroute engine re-validates *all* of these before doing
-anything. Any failure aborts and logs:
+anything. The gates are **device-scoped** (the target of a `device_cli` action is
+a router, not an asset/prefix). Any failure aborts and logs:
 
 - **gate 0:** `operating_mode == enforce` — in `observe` mode the engine stops
-  here and emits the would-run plan instead (see "Operating mode" above);
-- automatic reroutes globally enabled **and** this rule's
-  `automatic_reroute_enabled` is true (for automatic triggers);
-- a valid action template is attached;
-- telemetry for the asset is fresh and valid;
-- detection confidence is high (no parser/collector errors);
-- the provider is reachable and `actions_enabled`;
-- the target prefix is within the provider's permitted ranges;
-- no other action is running on this asset;
-- not inside any applicable cooldown window;
-- no global maintenance lock; asset not in manual lock;
-- no unresolved (`uncertain`) prior action on this asset;
-- for manual: caller has `trigger_manual_reroute`; for high safety level,
-  re-auth + typed confirmation + reason present.
+  here and returns the would-run plan instead (see "Operating mode" above);
+- not a dry-run request (dry-run renders the plan only, even in enforce mode);
+- no global maintenance lock;
+- the target **device** is not locked (a prior uncertain/failed action that needs
+  admin acknowledgement locks it);
+- no other action is already running on this device;
+- no unresolved (`uncertain`) prior action on this device;
+- the device is not inside its post-action cooldown window;
+- for manual: the caller has `trigger_manual_reroute` (enforced by the API before
+  it calls the executor), with an optional reason recorded for the audit log.
 
-## Cooldowns & rate limits
+For automatic triggers, the *rule* decides: the firing edge only auto-executes in
+enforce mode when the rule's `automatic_reroute_enabled` is on. There is **no**
+provider-reachability gate, no permitted-prefix-range gate, and no re-auth / typed
+confirmation step (those were de-scoped along with the multi-provider model and
+the `safety_level` classification).
+
+## Cooldowns
+
+Only a **per-device** cooldown is enforced: after any action finishes on a device,
+that device is in cooldown for 5 minutes before another action can run on it.
 
 ```text
-same rule cooldown:          15 min
-same asset action cooldown:   5 min
-same prefix/provider:        30 min
-global automatic rate limit:  3 actions / 10 min
+same device action cooldown:  5 min (300s)
 ```
+
+The `cooldowns` table can also record other scopes, but the executor enforces the
+device scope only. The per-rule / per-prefix cooldowns and the global automatic
+rate-limit from the original router-CLI design are **not** implemented.
 
 ## Locks
 
-Lock scopes: `global`, `asset`, `provider`, `prefix`, `template`. Locks can be
-manual, automatic after a failed action, automatic after crash recovery, or
-automatic after action uncertainty. A locked scope blocks all reroutes touching it
-until cleared (admin ack for safety-induced locks).
+Lock scopes: `global`, `asset`, `provider`, `prefix`, `template`, `device`. The
+device-CLI engine uses the `device` scope (and `global`); the others remain for
+the vestigial asset/provider model. Locks can be manual, automatic after a failed
+action, automatic after crash recovery, or automatic after action uncertainty. A
+locked scope blocks all reroutes touching it until cleared (admin ack for
+safety-induced locks).
 
 ## Manual reroutes
 
 Manual reroutes are first-class:
 
 ```text
-1. User selects asset + reroute template.
-2. User fills parameters.
-3. SPA renders the exact reroute preview (prefix, provider, method, communities).
-4. For high safety level: the Rust API enforces fresh re-auth (password + TOTP),
-   typed confirmation, and a reason.
-5. Controller receives the request, re-checks all safety gates, locks the asset.
-6. Controller executes via the provider, capturing every step.
-7. Controller verifies the resulting state.
+1. User selects a reroute template and one or more target routers (devices).
+2. User fills parameters per target (guided by ASN / neighbor / prefix / RTBH
+   pickers; the scrubber neighbor IP, say, can differ per router).
+3. SPA renders the exact would-run commands + verification per target.
+4. The Rust API checks the caller has `trigger_manual_reroute` and records the
+   optional reason. (No re-auth / TOTP / typed-confirmation step — de-scoped.)
+5. For each target the controller re-checks all device-scoped safety gates and
+   runs the executor independently (multi-router fan-out; one device locked or in
+   cooldown is skipped without blocking the others).
+6. Controller pushes the config over SSH, capturing every step's output.
+7. Controller verifies the resulting state with a read-only `show`.
 8. UI shows result + raw output; audit log records everything; email alert sent.
 ```
 
-Manual reroutes support **dry-run**: render the plan, test provider auth, and run
-the verification read only — without changing any routing.
+Manual reroutes support **dry-run**: render the exact plan without changing any
+routing (in observe mode every trigger behaves this way regardless).
 
-## Rollback & expiry
+## Rollback
 
-Every disruptive template should define a rollback and, where it makes sense, an
-**auto-expiry** (e.g. a blackhole that lifts after N minutes unless renewed) so a
-forgotten mitigation does not persist indefinitely. Rollback is itself an audited
-action with verification.
+Every disruptive template defines a rollback (its paired inverse, via
+`rollback_template_id`). A mitigation lifts only via an explicit rollback — there
+is **no** auto-expiry / self-clearing after N minutes (de-scoped: a template
+describes *what* it does, not how long it lasts). Rollback runs against the same
+device + parameters as a fresh audited action, with its own verification, exposed
+as `POST /api/reroutes/{id}/rollback`.
 
 ## Verification examples
 
-- **blackhole**: confirm the `/32` announcement with the blackhole community is
-  present in the BGP feed; confirm asset bps drops at the edge.
-- **cloudflare_under_attack**: read zone security level back as `under_attack`.
-- **flowspec_drop**: confirm the rule is installed upstream.
-- **scrub divert**: confirm announcement to the scrubber and a healthy return path.
+Verification is always an IOS `show` read parsed for an expected/rejected
+substring (case-insensitive):
 
-If verification cannot prove success or failure, the action is `uncertain`: lock
-the asset, disable automatic actions for it, alert, and require admin
+- **null_route / blackhole**: `show ip route <net>` must contain `Null0` after a
+  black hole (and must *not* contain it after a withdraw).
+- **bgp_session_enable**: `show ip bgp neighbors <ip>` must contain `BGP state`
+  and must *not* contain `Administratively shut`.
+- **bgp_session_disable**: the same `show` must contain `Administratively shut`.
+
+If the verification read fails or cannot prove success or failure, the action is
+`uncertain`: lock the **device**, alert (critical), and require admin
 acknowledgement. See [state-recovery.md](state-recovery.md).

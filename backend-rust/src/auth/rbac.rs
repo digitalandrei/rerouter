@@ -24,7 +24,6 @@ pub enum Permission {
     ViewCredentialsMetadata,
     EditRules,
     TriggerManualReroute,
-    ApproveDangerousReroute,
     AcknowledgeUncertainReroute,
     ManageLocks,
     ManageAlerts,
@@ -44,7 +43,6 @@ impl Permission {
             Permission::ViewCredentialsMetadata => "view_credentials_metadata",
             Permission::EditRules => "edit_rules",
             Permission::TriggerManualReroute => "trigger_manual_reroute",
-            Permission::ApproveDangerousReroute => "approve_dangerous_reroute",
             Permission::AcknowledgeUncertainReroute => "acknowledge_uncertain_reroute",
             Permission::ManageLocks => "manage_locks",
             Permission::ManageAlerts => "manage_alerts",
@@ -124,16 +122,6 @@ pub async fn load_session_user(pool: &MySqlPool, user_id: u64) -> Result<Value> 
     Ok(json!({ "id": id, "email": email, "name": name, "roles": roles, "permissions": permissions }))
 }
 
-/// Re-auth freshness gate for high-safety reroutes: a recent password+TOTP
-/// confirmation (sessions.reauth_at) is required IN ADDITION to the permission
-/// check and the typed confirmation + reason. See ../docs/security.md.
-pub fn reauth_is_fresh(session: &Session, max_age_secs: i64) -> bool {
-    session
-        .reauth_at
-        .map(|t| (chrono::Utc::now() - t).num_seconds() <= max_age_secs)
-        .unwrap_or(false)
-}
-
 /// Generic permission-gated extractor: `RequirePermission::<EditRules>` in a
 /// handler signature both authenticates (valid session) and authorizes (holds
 /// the permission), rejecting with 401/403 before the body runs. The marker type
@@ -183,6 +171,5 @@ pub mod markers {
     marker!(ViewDashboard => Permission::ViewDashboard);
     marker!(ViewAudit => Permission::ViewAudit);
     marker!(TriggerManualReroute => Permission::TriggerManualReroute);
-    marker!(ApproveDangerousReroute => Permission::ApproveDangerousReroute);
     marker!(AcknowledgeUncertainReroute => Permission::AcknowledgeUncertainReroute);
 }

@@ -166,10 +166,9 @@ Internet
   Nginx and only Nginx can reach the controller.
 - Caching: cache only the static SPA assets. Bypass cache for `/api/`
   (authenticated, dynamic).
-- Note: Cloudflare is also a **reroute provider** in this app (Under-Attack mode,
-  firewall/rate-limit rules). The Cloudflare account used to *front* the site and
-  the one used to *mitigate* may differ — keep their API tokens separate. See
-  [../skills/cloudflare-api.md](../skills/cloudflare-api.md).
+- Note: in v1 Cloudflare is **only** the CDN/front for this site — it is **not** a
+  reroute provider. Reroutes run as device-CLI templates over SSH to the routers;
+  there is no Cloudflare (Under-Attack / firewall / rate-limit) mitigation path.
 
 See [../deploy/cloudflare/README.md](../deploy/cloudflare/README.md).
 
@@ -206,8 +205,8 @@ Everything lives in `/srv/rerouter/`, owned by `rerouter`:
   - `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` /
     `SMTP_FROM` — email alert delivery (**operator must fill**);
   - `SESSION_SECRET` — session cookie signing key (auto-generated);
-  - `SECRETS_KEY` — AES-256-GCM key for provider credentials at rest
-    (auto-generated);
+  - `SECRETS_KEY` — AES-256-GCM key for device secrets at rest (SNMP
+    communities, SSH passwords/keys) (auto-generated);
   - `TWO_FACTOR_ISSUER=Rerouter` — TOTP issuer string.
 - `/srv/rerouter/config.toml` — controller config (see
   [../backend-rust/config.example.toml](../backend-rust/config.example.toml)).

@@ -25,10 +25,9 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
       : null;
   const operator =
     typeof payload.operator === "string" ? payload.operator : null;
-  const wouldRun =
-    typeof payload.would_run_action === "string"
-      ? payload.would_run_action
-      : null;
+  const wouldRunActions = Array.isArray(payload.would_run_actions)
+    ? (payload.would_run_actions as Array<Record<string, unknown>>)
+    : [];
 
   const hasMeasurement = metric !== null && value !== null;
 
@@ -46,10 +45,18 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
           )}
         </div>
       )}
-      {wouldRun && (
-        <div>
-          <span className="font-medium text-yellow-700">Would run: </span>
-          <code>{wouldRun}</code>
+      {wouldRunActions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="font-medium text-amber-700 dark:text-amber-400">Would run: </span>
+          {wouldRunActions.map((a, i) => {
+            const t = typeof a.template_name === "string" ? a.template_name : "action";
+            const d = typeof a.device_name === "string" ? a.device_name : "device";
+            return (
+              <code key={i}>
+                {t} on {d}
+              </code>
+            );
+          })}
         </div>
       )}
     </div>

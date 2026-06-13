@@ -12,23 +12,6 @@ use sqlx::MySqlPool;
 
 use crate::config::Config;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionState {
-    Planned,
-    Pending,
-    Running,
-    Verifying,
-    Succeeded,
-    Failed,
-    Uncertain,
-}
-
-impl ActionState {
-    pub fn is_non_terminal(self) -> bool {
-        matches!(self, ActionState::Pending | ActionState::Running | ActionState::Verifying)
-    }
-}
-
 /// On startup, any reroute in pending/running/verifying becomes `uncertain` and
 /// locks the affected device until an admin acknowledges it. Do NOT assume
 /// nothing happened after a crash — a config push made milliseconds before the

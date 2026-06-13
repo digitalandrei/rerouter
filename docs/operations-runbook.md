@@ -79,14 +79,14 @@ shows what *would* have run), automatic reroutes are off, the rule's
 `automatic_reroute_enabled` is false, a cooldown is active, or a safety gate
 failed. Check the rule event, the asset's locks/cooldowns, and the controller log
 line for the abort reason. In enforce mode, trigger a **manual** reroute from
-`/reroutes/manual` if appropriate.
+`/mitigations/manual` if appropriate.
 
 ### A reroute is stuck `uncertain`
 
 The controller could not prove the outcome (often after a crash). The asset is
-locked and automatic reroutes are disabled for it. Verify the real state
-(BGP feed / Cloudflare zone / upstream FlowSpec), then **acknowledge** from the UI
-or:
+locked and automatic reroutes are disabled for it. Verify the real routing state
+on the router (e.g. `show ip route <prefix>` for a Null0, or the neighbor's
+session state), then **acknowledge** from the UI or:
 
 ```bash
 curl -X POST http://127.0.0.1:9277/api/reroutes/<id>/acknowledge-uncertain
@@ -96,16 +96,16 @@ Only acknowledge after you have confirmed the real routing state.
 
 ### A mitigation needs to be lifted
 
-Run the template's **rollback** (e.g. `withdraw_blackhole_prefix`,
-`cloudflare_restore_security_level`) from `/reroutes`. Rollbacks are themselves
-audited and verified. Blackholes with `auto_expiry_seconds` lift automatically
-unless renewed.
+Run the template's **rollback** (`null_route_withdraw`, `blackhole_withdraw`, or
+`bgp_session_disable`) from `/mitigations`. Rollbacks are themselves audited and
+verified. There is no auto-expiry: a mitigation stays in effect until you
+explicitly run its rollback.
 
 ### Telemetry went stale
 
-The asset shows `telemetry_stale`. Traffic-threshold rules are suppressed (by
-design). Check the flow exporter, the collector, and `POST
-/api/assets/{id}/test/telemetry`. Do not force reroutes off stale data.
+The device shows `telemetry_stale`. Traffic-threshold rules are suppressed (by
+design). Check device reachability and the SNMP community with `POST
+/api/devices/{id}/test`. Do not force reroutes off stale data.
 
 ### Email alerts not arriving
 
@@ -124,9 +124,9 @@ in logs (non-Cloudflare source), re-apply the firewall allowlist — see
 
 Back up: the MariaDB database, `/srv/rerouter/.env` (`DATABASE_URL`,
 `SESSION_SECRET`, `SECRETS_KEY`, `SMTP_*`), `/srv/rerouter/config.toml`, and
-exported reroute templates. Losing `SECRETS_KEY` makes encrypted provider
-credentials unrecoverable. Never commit secrets to Git. Test restore into a
-staging DB periodically.
+exported reroute templates. Losing `SECRETS_KEY` makes encrypted device secrets
+(SNMP communities, SSH passwords/keys) unrecoverable. Never commit secrets to
+Git. Test restore into a staging DB periodically.
 
 ## Routine checks
 
@@ -134,5 +134,5 @@ staging DB periodically.
   match the intended posture.
 - Review open locks and stale cooldowns weekly.
 - Review `uncertain`/`failed` reroutes and audit logs after any incident.
-- Verify retention jobs are pruning `traffic_samples` (7d) and keeping audit logs.
-- Rotate provider API tokens and BGP keys on schedule.
+- Verify retention jobs are pruning `interface_samples` and keeping audit logs.
+- Rotate device SNMP communities and SSH credentials on schedule.

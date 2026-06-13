@@ -13,25 +13,25 @@ and safely trigger automated or manual **reroute** actions to mitigate them.
 
 ## 1. Purpose
 
-Rerouter is a small but safety-critical web application for monitoring traffic to
-one or more protected network assets (prefixes / IPs / services) and executing
-controlled **reroute** actions when traffic conditions cross configured
+Rerouter is a small but safety-critical web application for monitoring traffic on
+the interfaces of one or more network devices (Cisco IOS edge routers) and
+executing controlled **reroute** actions when traffic conditions cross configured
 thresholds — for example during a volumetric flood, SYN flood, or amplification
 attack.
 
 The application must:
 
 - let operators log in (with TOTP 2FA) to view live data;
-- enroll protected assets (prefixes/IPs/services) and reroute providers
-  (Cloudflare account, BGP upstreams, scrubbing centers);
-- collect traffic telemetry (NetFlow/sFlow/IPFIX, BGP, and Cloudflare analytics);
-- evaluate editable detection conditions and thresholds;
+- enroll network **devices** (Cisco IOS edge routers) and their monitored
+  **interfaces**;
+- collect traffic telemetry by **SNMP interface polling** (v1);
+- evaluate editable detection conditions and thresholds on interface metrics;
 - execute approved reroute actions when conditions match;
 - allow manual reroute triggering from the web GUI;
 - send email alerts on detection, reroute, failure, and uncertain state;
 - recover state after crash/restart;
-- show asset/provider reachability and collection/action status;
-- provide a drag-and-drop GUI for selecting monitored assets and assigning rules.
+- show device reachability and collection/action status;
+- provide a GUI for selecting monitored interfaces and assigning rules.
 
 The project is not only a dashboard. It is an operations control-plane. Safety,
 auditability, and predictable state recovery are core requirements.
@@ -77,11 +77,12 @@ One service, one static SPA:
 | alerts, audit               |
 +-------------+---------------+
               |
-        +-----+-----+----------------+
-        |           |                |
-        v           v                v
-   NetFlow/     BGP (ExaBGP/      Cloudflare API /
-   sFlow taps   GoBGP/RTBH)       Scrubbing center
+        +-----+----------------+
+        |                       |
+        v                       v
+   SNMP polling          Device CLI over SSH
+   (devices /            (Cisco IOS edge routers:
+    interfaces)           Null0 RTBH + BGP shut/no-shut)
 ```
 
 Deployment model:
@@ -116,7 +117,7 @@ rerouter/
 │   ├── security.md
 │   ├── authentication.md
 │   ├── database.md
-│   ├── asset-enrollment.md
+│   ├── device-enrollment.md
 │   ├── telemetry-model.md
 │   ├── detection-engine.md
 │   ├── reroute-engine.md
@@ -135,13 +136,19 @@ rerouter/
 │   │   ├── db/
 │   │   ├── auth/             (sessions.rs, password.rs, totp.rs, rbac.rs)
 │   │   ├── alerts/           (dispatcher.rs, mailer.rs)
-│   │   ├── telemetry/        (netflow.rs, sflow.rs, bgp.rs, cloudflare.rs)
-│   │   ├── detection/        (condition.rs, cooldown.rs)
-│   │   ├── reroute/          (executor.rs, state_machine.rs, templates.rs, rollback.rs)
-│   │   ├── providers/        (cloudflare.rs, bgp_rtbh.rs, flowspec.rs, scrubber.rs)
-│   │   ├── api/              (health.rs, assets.rs, providers.rs, rules.rs,
-│   │   │                      reroutes.rs, alerts.rs, audit.rs, locks.rs,
-│   │   │                      settings.rs — the auth router lives in src/auth/)
+│   │   ├── telemetry/        (snmp.rs — v1 interface polling; netflow.rs/
+│   │   │                      sflow.rs/bgp.rs/cloudflare.rs are inert stubs)
+│   │   ├── detection/        (condition.rs, cooldown.rs, engine.rs)
+│   │   ├── reroute/          (executor.rs, state_machine.rs, templates.rs,
+│   │   │                      locks.rs, rollback.rs)
+│   │   ├── ssh/              (mod.rs — device-CLI execution over SSH, RSA
+│   │   │                      keygen, command-access probe, fail-closed
+│   │   │                      command allowlist, BGP/prefix discovery)
+│   │   │                      (the old providers/ adapter layer was removed)
+│   │   ├── api/              (health.rs, devices.rs, interfaces.rs, rules.rs,
+│   │   │                      templates.rs, reroutes.rs, rtbh.rs, alerts.rs,
+│   │   │                      audit.rs, locks.rs, users.rs, settings.rs —
+│   │   │                      the auth router lives in src/auth/)
 │   │   └── scheduler.rs
 │   └── tests/                (fixtures + integration skeletons)
 ├── frontend/
@@ -153,8 +160,9 @@ rerouter/
 │   ├── index.html
 │   └── src/
 │       ├── main.tsx
-│       ├── pages/            (login, dashboard, assets, providers, rules,
-│       │                      reroutes, alerts, audit, settings)
+│       ├── pages/            (login, dashboard, devices, device-detail,
+│       │                      interface-detail, rules, templates, mitigations,
+│       │                      manual-reroute, alerts, audit, settings, users)
 │       ├── lib/              (api client, session helpers, types)
 │       └── components/ui/    (shadcn/ui components)
 ├── deploy/
@@ -186,13 +194,14 @@ rerouter/
 
 The operational heart of the system — and the only service. Responsibilities:
 
-- load asset & provider inventory from DB;
-- maintain telemetry ingestion (flow collectors, BGP feed, Cloudflare poll);
-- normalize per-asset traffic counters and rates;
-- calculate bps, pps, new-connections/s, SYN rate, unique-source counts;
+- load device & interface inventory from DB;
+- maintain telemetry ingestion (SNMP interface polling);
+- normalize per-interface traffic counters and rates;
+- calculate per-interface rx/tx bps, rx/tx pps, link utilization %, and
+  operational status from SNMP counters;
 - evaluate configured detection rules;
 - enforce cooldowns, locks, and safety limits;
-- execute approved reroutes via providers (Cloudflare/BGP/FlowSpec/scrubber);
+- execute approved reroutes via device CLI over SSH (Cisco IOS);
 - persist every decision and action;
 - serve the authenticated REST API under `/api/` (loopback-only bind);
 - run sqlx database migrations (single source of schema truth);
@@ -200,10 +209,10 @@ The operational heart of the system — and the only service. Responsibilities:
 - recover incomplete reroutes after restart.
 
 Suggested crates: `tokio`, `axum`, `sqlx` (mysql/mariadb), `serde`, `tracing`,
-`clap`, `chrono`/`time`, `uuid`, `anyhow`/`thiserror`, `reqwest` (Cloudflare
-API), `argon2` (password hashing), `totp-rs` (TOTP 2FA), `lettre` (SMTP over
-rustls), plus a flow collector and a BGP speaker (ExaBGP via subprocess, or a
-Rust BGP crate evaluated against the lab).
+`clap`, `chrono`/`time`, `uuid`, `anyhow`/`thiserror`, an SNMP client for
+interface polling, `russh` (device-CLI execution + RSA keygen over SSH),
+`argon2` (password hashing), `totp-rs` (TOTP 2FA), and `lettre` (SMTP over
+rustls).
 
 Build: `cargo build --release`. Installed path: `/srv/rerouter/rerouter-controller` (laid down by `--install`).
 
@@ -218,15 +227,18 @@ Part of the same binary; owns everything user-facing on the server side:
 - **RBAC**: explicit `roles`/`permissions`/`role_user`/`permission_role` tables,
   enforced via axum middleware/extractors. Roles: `admin`, `operator`,
   `viewer`, `auditor`.
-- **REST API** under `/api/`: auth, status, asset/provider/rule CRUD, manual
-  reroute triggering, alerts, audit, locks, settings. High-safety reroutes
-  require fresh re-auth (`POST /api/auth/reauth`), typed confirmation, and a
-  reason — enforced server-side.
+- **REST API** under `/api/`: auth, status, device/interface/rule/template
+  CRUD, manual reroute triggering, RTBH-community catalog, alerts, audit, locks,
+  settings, users. Manual reroutes require the `trigger_manual_reroute`
+  permission and accept an optional free-text reason for the audit log; there is
+  no typed-confirmation or re-auth gate (de-scoped — see §9).
 - **Email alerts**: an internal async alert dispatcher task reads new `alerts`
   rows, resolves recipients/subscriptions, de-duplicates, rate-limits, sends
   via SMTP, and records deliveries (see §10).
-- **Credential encryption**: provider secrets encrypted at rest with
-  AES-256-GCM (key from the `SECRETS_KEY` environment variable).
+- **Credential encryption**: device secrets — SNMP community strings and SSH
+  credentials (password / private key / passphrase) — and TOTP secrets are
+  encrypted at rest with AES-256-GCM (key from the `SECRETS_KEY` environment
+  variable).
 - **Audit**: every authentication event, CRUD change, and reroute decision is
   written to the audit log with the real client IP.
 
@@ -240,18 +252,20 @@ Clean, operational, explicit. Principles:
 - never hide dangerous reroute details;
 - show the operating mode prominently — a persistent banner while in `observe`
   (read-only / alert-only) mode;
-- show current asset/provider reachability prominently;
+- show current device reachability prominently;
 - show stale telemetry clearly (live / cached / degraded / unknown);
-- require confirmation for manual disruptive reroutes;
-- display exactly which reroute will be performed (prefix, provider, method) —
-  the SPA renders the exact reroute preview returned by the API;
-- show action history near every rule and asset;
-- support drag-and-drop monitored-asset configuration;
+- display exactly which reroute will be performed (template, target device, the
+  exact CLI commands) — the SPA renders the exact reroute preview returned by
+  the API;
+- show action history near every rule and device;
+- support GUI selection of monitored interfaces and rule assignment;
 - show a clear degraded state when the API is unreachable.
 
 Core pages: `/login` (password → TOTP challenge; first-login TOTP enrollment),
-`/dashboard`, `/assets`, `/assets/:id`, `/providers`, `/rules`, `/reroutes`,
-`/reroutes/manual`, `/alerts`, `/audit`, `/settings`.
+`/dashboard`, `/devices`, `/devices/:id`,
+`/devices/:deviceId/interfaces/:ifaceId`, `/rules`, `/templates`,
+`/mitigations` (reroute history), `/mitigations/manual`, `/alerts`, `/audit`,
+`/settings`, `/users`.
 
 ---
 
@@ -259,37 +273,47 @@ Core pages: `/login` (password → TOTP challenge; first-login TOTP enrollment),
 
 | Concept | Meaning |
 | --- | --- |
-| **Protected asset** | A prefix / IP / service we monitor and protect. |
-| **Reroute provider** | A channel we reroute *through*: Cloudflare account, BGP upstream (RTBH/FlowSpec), or scrubbing center. |
-| **Telemetry sample** | A normalized traffic measurement for an asset over an interval. |
-| **Detection rule** | A stateful threshold/condition that fires when an asset's traffic matches for a duration. |
-| **Reroute template** | An allowlisted, parameterized mitigation (blackhole, FlowSpec drop, Cloudflare under-attack, scrub-divert). |
-| **Reroute (action)** | A single, audited execution of a template against an asset/provider, driven by a state machine. |
-| **Lock / cooldown** | Safety controls that block actions when state is unsafe or recently changed. |
+| **Device** | A network device we manage — a Cisco IOS edge router reached by SNMP (telemetry) and SSH (execution). |
+| **Interface** | A monitored interface on a device; telemetry and detection rules target interfaces. |
+| **Telemetry sample** | A normalized traffic measurement for an interface over an interval (SNMP poll). |
+| **Detection rule** | A stateful threshold/condition that fires when an interface's metric matches for a duration / sample count. |
+| **Reroute template** | An allowlisted, parameterized device-CLI mitigation (Null0 RTBH announce/withdraw, upstream-tagged blackhole, BGP session enable/disable). |
+| **Reroute (action)** | A single, audited execution of a template against a target device, driven by a state machine. A rule's actions live in `rule_actions` (template + device + params; one rule may drive several routers). |
+| **Lock / cooldown** | Device-scoped safety controls that block actions when state is unsafe or recently changed. |
 
-Detail: [asset-enrollment.md](asset-enrollment.md),
+Detail: [device-enrollment.md](device-enrollment.md),
 [telemetry-model.md](telemetry-model.md),
 [detection-engine.md](detection-engine.md),
 [reroute-engine.md](reroute-engine.md).
 
 ---
 
-## 7. Reroute methods (simple first)
+## 7. Reroute methods
 
-Start simple. The v1 reroute templates, in increasing blast radius:
+All v1 reroutes execute as **device CLI over SSH** to Cisco IOS edge routers
+(`provider_type = device_cli`); it is the only execution path. The template
+catalog (the only way a reroute runs) is:
 
-1. **Enable Cloudflare "Under Attack" mode** for a zone (exec, easily reversible).
-2. **Add a Cloudflare firewall / rate-limit rule** for an attacked path/IP.
-3. **RTBH blackhole** a `/32` or `/128` — announce the host route to an upstream
-   blackhole community so the edge drops it.
-4. **FlowSpec drop / rate-limit** rule for a `{src,dst,proto,port}` tuple.
-5. **Divert to scrubbing center** — announce the prefix to the scrubber and accept
-   the cleaned return path.
-6. **Withdraw / restore** a BGP announcement.
+1. **`null_route_prefix`** — install a local `Null0` static route for a prefix
+   on the device (local RTBH; drop at this router).
+2. **`null_route_withdraw`** — remove that `Null0` static route (rollback of #1).
+3. **`blackhole_prefix`** — announce a prefix into BGP tagged for upstream RTBH
+   (a route to `Null0` with the blackhole community), so the upstream drops it.
+4. **`blackhole_withdraw`** — withdraw that tagged announcement (rollback of #3).
+5. **`bgp_session_disable`** — administratively shut a BGP neighbor
+   (`neighbor … shutdown`).
+6. **`bgp_session_enable`** — bring the neighbor back up (`no … shutdown`;
+   rollback of #5).
 
 Every method is an action template (see [reroute-engine.md](reroute-engine.md))
-with a parameter schema, a safety level, verification, and a rollback template.
-Never expose a free-text "run this route command" box in v1.
+with a parameter schema, verification, and a rollback template. The earlier
+provider-adapter methods (Cloudflare "Under Attack", FlowSpec drop, scrubbing-
+center diversion) were **de-scoped** when the project pivoted to device-CLI/SSH;
+the per-template "safety level" attribute was removed with them. A free-text
+"run this route command" box is never exposed: commands come only from these
+templates with typed params, gated by a fail-closed in-app command allowlist
+(`ssh::command_allowed`), and the router account is further scoped by a
+restricted Cisco parser view (`deploy/cisco/rerouter-bgp-view.ios`).
 
 ---
 
@@ -310,22 +334,31 @@ Safety is the most important part of this project. Full detail in
 Only an admin can flip the mode (from `/settings`); the change is audited and
 alerted. Gate 0 of every execution path checks the mode.
 
-Global safety rules — the app must enforce (in `enforce` mode):
+Global safety rules — the executor re-checks every gate at execution time, in
+order. The live gates are **device-scoped** (in `enforce` mode):
 
+- **GATE 0** — `operating_mode == enforce`. In `observe`, `execute` returns the
+  would-run plan and runs nothing;
+- not a dry-run;
 - no automatic reroute unless explicitly enabled (global **and** per-rule);
 - no automatic reroute without an action template;
-- no automatic reroute if telemetry is stale;
-- no automatic reroute if the provider/asset reachability is degraded;
-- no automatic reroute if detection confidence is low;
-- no action if another action is already running on the same asset;
-- no repeated action inside a cooldown window;
 - no action under a global maintenance lock;
-- no action if the asset is in manual lock mode;
-- no action if a previous action is unresolved (`uncertain`);
-- no action on newly-discovered/unacknowledged assets.
+- no action if the device is in manual lock mode;
+- no action if another action is already running on the same device;
+- no action if a previous action on the device is unresolved (`uncertain`);
+- no repeated action inside the per-device cooldown window;
+- (manual triggers additionally require the `trigger_manual_reroute`
+  permission, enforced by the API before `execute` is called).
 
-Cooldown defaults: same rule 15 min; same asset 5 min; same prefix/provider
-30 min; global automatic-action rate limit 3 actions / 10 min.
+The per-template "safety level", the provider/asset-reachability gate, the
+detection-confidence gate, the telemetry-stale gate, and the
+newly-discovered-asset gate were **de-scoped** with the provider abstraction;
+the live gates above are the complete set.
+
+Cooldown default: a single **per-device** post-action cooldown of 5 min
+(`DEVICE_COOLDOWN_SECS = 300`). The earlier per-rule / per-prefix cooldowns and
+the global automatic-action rate limit are **not** wired in v1 — some of those
+config fields still exist but are not enforced; do not rely on them.
 
 Two-phase action state machine:
 
@@ -335,9 +368,10 @@ planned -> pending -> running -> verifying -> succeeded
                              \-> uncertain
 ```
 
-If the process crashes mid-action, the restarted service marks the action
-`uncertain` and locks the asset until verification proves success/failure or an
-admin acknowledges. The app prefers doing nothing over doing the wrong thing.
+If the process crashes mid-action (any reroute left `pending`/`running`/
+`verifying`), the restarted service marks the action `uncertain` and locks the
+**device** until an admin acknowledges. The app prefers doing nothing over doing
+the wrong thing.
 
 ---
 
@@ -348,22 +382,27 @@ backed by a DB `sessions` table, Argon2id password hashing, and **TOTP 2FA**
 (RFC 6238, enrolled on first login) with 8 single-use hashed recovery codes.
 Login throttling and account lockout apply per email + real client IP
 (`CF-Connecting-IP`, forwarded by Nginx). Roles: `admin`, `operator`, `viewer`,
-`auditor`, enforced via explicit RBAC tables and axum middleware. Dangerous
-reroutes require re-authentication (`POST /api/auth/reauth`), typed
-confirmation, and a reason. See [authentication.md](authentication.md) and
-[security.md](security.md).
+`auditor`, enforced via explicit RBAC tables and axum middleware. Manual
+reroutes require only the `trigger_manual_reroute` permission and accept an
+optional free-text reason for the audit log. The earlier re-authentication
+gate (`POST /api/auth/reauth`, `sessions.reauth_at`, the
+`approve_dangerous_reroute` permission) and typed confirmation were **de-scoped**
+and removed; safety now rests on the operating mode, the template/allowlist
+controls, and the device-scoped execution gates (§7, §8). See
+[authentication.md](authentication.md) and [security.md](security.md).
 
 ---
 
 ## 10. Email alerts
 
 Rerouter sends email alerts from the controller itself via SMTP (lettre,
-rustls) on: attack detected, reroute planned/started/succeeded/failed, action
-`uncertain`, asset unreachable, telemetry stale, and lock created/cleared. An
-internal async alert dispatcher task reads new `alerts` rows, resolves
-recipients/subscriptions, de-duplicates (10-minute window per
-`(event_type, asset, rule)`), rate-limits (20/hr per recipient with digest
-fallback), sends, and records `alert_deliveries`. `reroute_uncertain`,
+rustls) on: rule fired (`rule_fired` — carrying the would-run action plan in
+observe mode), reroute started/succeeded/failed, action `uncertain`, device
+unreachable, telemetry stale, and lock created/cleared. An internal async alert
+dispatcher task reads new `alerts` rows, resolves recipients/subscriptions,
+de-duplicates (10-minute window, keyed on the `alerts.dedup_key` — for firing
+alerts `rule_fired:rule:<id>:iface:<id>`), rate-limits (20/hr per recipient with
+digest fallback), sends, and records `alert_deliveries`. `reroute_uncertain`,
 `reroute_failed`, and security events are always sent immediately and never
 collapsed. See [email-alerts.md](email-alerts.md).
 
@@ -374,10 +413,14 @@ collapsed. See [email-alerts.md](email-alerts.md).
 MariaDB only. The controller (sqlx) is the single owner: it runs the sqlx
 migrations in `backend-rust/migrations/` and is the single source of schema
 truth. Full schema in [database.md](database.md). Core groups:
-users/roles/permissions (+ 2FA, sessions, recovery codes), assets/providers/
-credentials/statuses, telemetry samples/current, detection rules/states/events,
-reroute templates/actions/steps/outputs/verifications, locks/cooldowns, alerts/
-alert_deliveries, audit logs, system settings.
+users/roles/permissions (+ 2FA, sessions, recovery codes), devices/
+device_interfaces (+ encrypted SNMP/SSH credentials, device_bgp_networks,
+device BGP peers), telemetry samples/current, detection rules/states/events
+(+ `rule_actions`), reroute templates/actions/steps/outputs/verifications,
+the global `rtbh_communities` catalog, locks/cooldowns, alerts/alert_deliveries,
+audit logs, system settings. The legacy `protected_assets` and
+`reroute_providers` tables remain for historical FKs but are not on the live
+device-CLI path.
 
 ---
 
@@ -393,26 +436,34 @@ See [deployment.md](deployment.md).
 
 ## 13. Implementation milestones
 
-The first production deployment target is a server with access to **Cisco ASR
-edge routers** — the ASRs are the NetFlow/IPFIX exporters feeding telemetry,
-and are candidates to become RTBH/FlowSpec providers later. Milestones 1–2 run
-entirely in `observe` mode (read-only / alert-only — see §8).
+The first production deployment target is a server with access to **Cisco IOS
+edge routers**, reached by SNMP for telemetry and by SSH for device-CLI
+execution. The shipped default is `observe` mode (read-only / alert-only — see
+§8); execution paths run only after an admin flips to `enforce`.
 
-1. **Inventory & telemetry (observe mode).** API + SPA login with 2FA,
-   asset/provider CRUD, encrypted credentials, flow/BGP/Cloudflare telemetry
-   ingestion, per-asset current metrics, dashboard, asset detail,
-   monitored-asset selection. **No reroutes executed.**
-2. **Detection engine (observe mode).** Rule CRUD, threshold above/below +
-   duration/consecutive-sample logic, rule state + events, dashboard active
-   matches, email alerts that include the **would-run action plan**.
-   **No reroutes.**
-3. **Manual reroute engine** (the first milestone that may run in `enforce`
-   mode). Reroute templates, command/route preview, manual trigger, provider
-   execution, output capture, verification, audit log, locks & cooldowns.
-4. **Automatic reroutes.** Explicit global enable, per-rule enable, safety locks,
-   cooldown enforcement, state recovery, uncertain-action handling, admin ack.
-5. **Hardening.** More providers, FlowSpec, scrubbing-center diversion, richer
-   verification.
+1. **Inventory & telemetry (observe mode). [BUILT]** API + SPA login with 2FA,
+   device/interface CRUD, encrypted SNMP/SSH credentials, SNMP interface
+   polling, per-interface current metrics, dashboard, device & interface detail,
+   monitored-interface selection. **No reroutes executed.**
+2. **Detection engine (observe mode). [BUILT]** Rule CRUD, threshold above/below
+   + duration / consecutive-sample firing logic, hysteresis settle on clear,
+   rule state + `rule_fired` events, dashboard active matches, email alerts that
+   include the **would-run action plan**. **No reroutes.**
+3. **Reroute engine — manual + per-rule automatic. [BUILT]** Device-CLI
+   templates over SSH, command preview, manual trigger (`trigger_manual_reroute`
+   + optional reason), per-rule automatic execution on the firing edge when
+   `automatic_reroute_enabled` is on (enforce mode only), output capture,
+   verification, audit log, device-scoped locks & cooldowns, crash recovery
+   (`uncertain` + device lock + admin ack). The full automatic-execution
+   machinery — global + per-rule enable, safety locks, cooldown, state recovery,
+   uncertain handling, admin ack — is built and active in `enforce` mode; the
+   shipped default `observe` mode renders `would_run_actions` and executes
+   nothing.
+4. **De-scoped.** The original "more providers" milestone (Cloudflare,
+   FlowSpec, scrubbing-center diversion, the provider-adapter abstraction) was
+   **de-scoped** when the project pivoted to device-CLI/SSH — it is not pending
+   work. Future hardening stays within the device-CLI model (richer verification,
+   more IOS templates).
 
 ---
 
@@ -420,14 +471,16 @@ entirely in `observe` mode (read-only / alert-only — see §8).
 
 Answer later; do not block bootstrap.
 
-1. Which upstreams support RTBH communities / FlowSpec, and what community values?
-2. Cloudflare plan & which features are available (Magic Transit? rate-limiting?).
-3. Is there a scrubbing-center contract, and what is the diversion mechanism?
-4. Which prefixes are in scope, and which are never to be auto-rerouted?
-5. Flow telemetry source: NetFlow v9, IPFIX, or sFlow? Sampling rate?
-6. Are there maintenance windows where automatic reroutes are allowed/forbidden?
-7. SMTP relay details for email alerts.
-8. Retention: long-term traffic graphs, or current state + short retention only?
+1. Which upstreams support RTBH communities, and what community values?
+   (Rerouter now ships a global `rtbh_communities` catalog — see
+   `/api/rtbh-communities`; this question is now about populating it per
+   upstream.)
+2. *(Resolved by de-scoping.)* Cloudflare / FlowSpec / scrubbing-center
+   diversion were dropped when the project pivoted to device-CLI/SSH.
+3. Which prefixes are in scope, and which are never to be auto-rerouted?
+4. Are there maintenance windows where automatic reroutes are allowed/forbidden?
+5. SMTP relay details for email alerts.
+6. Retention: long-term traffic graphs, or current state + short retention only?
 
 ---
 
@@ -437,10 +490,12 @@ Rerouter must be conservative. Monitoring may be fast. Reroutes must be slow,
 explicit, audited, reversible where possible, and blocked whenever state is
 uncertain. The app must prefer doing nothing over doing the wrong thing.
 
-Automatic remediation is allowed only when: telemetry is fresh; detection
-confidence is high; the rule matched for the configured duration; the reroute
-template is approved; the asset/provider is not locked; cooldown allows it; the
-exact target is known; verification is possible; and the previous state is
-understood.
+Automatic remediation is allowed only when: the controller is in `enforce`
+mode and the rule's automatic switch is on; the rule matched for its configured
+duration / sample count; the action comes from an approved device-CLI template;
+the target device is not locked and has no action running or unresolved
+(`uncertain`); the per-device cooldown allows it; the exact target is known; and
+verification is possible. (Telemetry-freshness and detection-confidence gating
+were de-scoped — see §8.)
 
 That is the operating doctrine.

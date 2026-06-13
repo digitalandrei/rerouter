@@ -28,13 +28,11 @@ pub struct Template {
     pub description: Option<String>,
     pub provider_type: String,
     pub mode: String,
-    pub manual_confirmation_required: bool,
     pub automatic_allowed: bool,
     pub parameter_schema: Value,
     pub plan: Value,
     pub verification: Value,
     pub rollback_template_id: Option<u64>,
-    pub auto_expiry_seconds: Option<u32>,
     pub enabled: bool,
 }
 
@@ -45,19 +43,17 @@ struct TemplateRow {
     description: Option<String>,
     provider_type: String,
     mode: String,
-    manual_confirmation_required: bool,
     automatic_allowed: bool,
     parameter_schema_json: Option<SqlxJson<Value>>,
     plan_json: Option<SqlxJson<Value>>,
     verification_json: Option<SqlxJson<Value>>,
     rollback_template_id: Option<u64>,
-    auto_expiry_seconds: Option<u32>,
     enabled: bool,
 }
 
 const COLS: &str = "id, name, description, provider_type, mode, \
-     manual_confirmation_required, automatic_allowed, parameter_schema_json, plan_json, \
-     verification_json, rollback_template_id, auto_expiry_seconds, enabled";
+     automatic_allowed, parameter_schema_json, plan_json, \
+     verification_json, rollback_template_id, enabled";
 
 impl From<TemplateRow> for Template {
     fn from(r: TemplateRow) -> Self {
@@ -67,13 +63,11 @@ impl From<TemplateRow> for Template {
             description: r.description,
             provider_type: r.provider_type,
             mode: r.mode,
-            manual_confirmation_required: r.manual_confirmation_required,
             automatic_allowed: r.automatic_allowed,
             parameter_schema: r.parameter_schema_json.map(|j| j.0).unwrap_or(Value::Null),
             plan: r.plan_json.map(|j| j.0).unwrap_or(Value::Null),
             verification: r.verification_json.map(|j| j.0).unwrap_or(Value::Null),
             rollback_template_id: r.rollback_template_id,
-            auto_expiry_seconds: r.auto_expiry_seconds,
             enabled: r.enabled,
         }
     }

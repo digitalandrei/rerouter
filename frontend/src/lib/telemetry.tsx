@@ -146,23 +146,6 @@ export const TYPE_VARIANT: Record<
 };
 
 // ---------------------------------------------------------------------------
-// Status badge variant
-// ---------------------------------------------------------------------------
-
-export function statusVariant(
-  status: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (status.toLowerCase()) {
-    case "up":
-      return "default";
-    case "down":
-      return "destructive";
-    default:
-      return "outline";
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Smoothing — client-side moving average over the last N minutes of points.
 // Samples are ~60 s apart, so window 1 ≈ raw, 3 ≈ 3-pt, 5 ≈ 5-pt.
 // ---------------------------------------------------------------------------

@@ -1,8 +1,7 @@
 # Authentication & Two-Factor (2FA)
 
 Users must log in to view data. Login is **password + TOTP 2FA**. This document
-covers the login flow, TOTP enrollment, recovery codes, and re-authentication for
-dangerous reroutes.
+covers the login flow, TOTP enrollment, recovery codes, and lockout.
 
 ## Stack
 
@@ -16,7 +15,7 @@ dangerous reroutes.
   recovery codes). The schema is owned by sqlx migrations in
   `backend-rust/migrations/`.
 - The SPA (see [architecture.md](architecture.md)) talks to the auth endpoints
-  (`/api/auth/login`, `/api/auth/totp`, `/api/auth/logout`, `/api/auth/reauth`)
+  (`/api/auth/login`, `/api/auth/totp`, `/api/auth/logout`, `/api/auth/me`)
   with credentialed fetch; the session cookie is the only client-side state.
 
 ## User table additions
@@ -64,18 +63,11 @@ last_login_ip                (varchar)   -- CF-Connecting-IP
 - Using a recovery code consumes it and should email the user (security event).
 - Admins can reset a user's 2FA (audited); reset forces re-enrollment at next login.
 
-## Re-authentication for dangerous reroutes
-
-High-safety-level reroutes (see [security.md](security.md)) require a fresh
-**password + current TOTP** confirmation immediately before execution
-(`POST /api/auth/reauth`), regardless of an active session. This produces an
-audit record tying the specific action to a freshly-proven identity.
-
 ## Audit events
 
 `login_success`, `login_failed`, `account_locked`, `2fa_enrolled`,
-`2fa_failed`, `2fa_recovery_used`, `2fa_reset_by_admin`, `reauth_for_action`,
-`logout`. Each carries actor, real client IP, and user-agent.
+`2fa_failed`, `2fa_recovery_used`, `2fa_reset_by_admin`, `logout`. Each carries
+actor, real client IP, and user-agent.
 
 ## Cloudflare note
 

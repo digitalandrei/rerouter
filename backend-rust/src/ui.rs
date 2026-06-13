@@ -37,7 +37,7 @@ pub async fn serve_spa(uri: Uri) -> Response {
     if let Some(file) = Dist::get(candidate) {
         return asset_response(candidate, file);
     }
-    // Client-side route (e.g. /assets, /settings) -> index.html fallback.
+    // Client-side route (e.g. /devices, /mitigations, /settings) -> index.html fallback.
     match Dist::get("index.html") {
         Some(file) => asset_response("index.html", file),
         None => (StatusCode::NOT_FOUND, "embedded UI is missing index.html").into_response(),
