@@ -13,6 +13,7 @@ import {
   SlidersHorizontal,
   ToggleLeft,
   ToggleRight,
+  Pencil,
   Trash2,
   ArrowUp,
   ArrowDown,
@@ -32,7 +33,9 @@ import {
 } from "@/lib/api";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
-import { SeverityBadge, toneClass } from "@/components/status-badge";
+import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
+import { EditRuleDialog } from "./rules/edit-rule-dialog";
+import { METRICS, metricLabel } from "./rules/rule-constants";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -283,15 +286,6 @@ const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
-const METRICS = [
-  { value: "rx_bps", label: "Rx bps" },
-  { value: "tx_bps", label: "Tx bps" },
-  { value: "rx_pps", label: "Rx pps" },
-  { value: "tx_pps", label: "Tx pps" },
-  { value: "rx_util_percent", label: "Rx utilization %" },
-  { value: "tx_util_percent", label: "Tx utilization %" },
-];
-
 interface RuleForm {
   name: string;
   device_id: string;
@@ -319,9 +313,7 @@ const DEFAULT_FORM: RuleForm = {
 
 /** Human-readable condition string: "rx_bps > 8000000000" */
 function conditionLabel(rule: Rule): string {
-  const metricLabel =
-    METRICS.find((m) => m.value === rule.metric)?.label ?? rule.metric;
-  return `${metricLabel} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
+  return `${metricLabel(rule.metric)} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
 }
 
 /** Format a metric value with its natural unit. */
@@ -403,6 +395,7 @@ export default function Rules() {
   const [addBusy, setAddBusy] = useState(false);
   const [manageRule, setManageRule] = useState<Rule | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
+  const [editRule, setEditRule] = useState<Rule | null>(null);
 
   const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
@@ -779,11 +772,31 @@ export default function Rules() {
                       <SeverityBadge severity={rule.severity} />
                     </TableCell>
 
-                    {/* Enabled badge */}
-                    <TableCell>
-                      <Badge variant={rule.enabled ? "default" : "outline"}>
-                        {rule.enabled ? "enabled" : "disabled"}
-                      </Badge>
+                    {/* Enabled — green/red on-off switch */}
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      {canEdit ? (
+                        <button
+                          type="button"
+                          onClick={() => void toggleRule(rule)}
+                          title={rule.enabled ? "Disable rule" : "Enable rule"}
+                          className="inline-flex items-center gap-2"
+                        >
+                          {rule.enabled ? (
+                            <ToggleRight className="size-7 text-emerald-600 dark:text-emerald-400" />
+                          ) : (
+                            <ToggleLeft className="size-7 text-red-500 dark:text-red-400" />
+                          )}
+                          <span
+                            className={`text-sm font-medium ${rule.enabled ? "text-emerald-700 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}
+                          >
+                            {rule.enabled ? "enabled" : "disabled"}
+                          </span>
+                        </button>
+                      ) : (
+                        <ToneBadge tone={rule.enabled ? "good" : "bad"}>
+                          {rule.enabled ? "enabled" : "disabled"}
+                        </ToneBadge>
+                      )}
                     </TableCell>
 
                     {/* Mitigation — attached reroute actions + auto/manual */}
@@ -829,17 +842,11 @@ export default function Rules() {
                             <Button
                               size="icon-sm"
                               variant="ghost"
-                              title={rule.enabled ? "Disable rule" : "Enable rule"}
-                              onClick={() => void toggleRule(rule)}
+                              title="Edit rule"
+                              onClick={() => setEditRule(rule)}
                             >
-                              {rule.enabled ? (
-                                <ToggleRight className="size-4 text-primary" />
-                              ) : (
-                                <ToggleLeft className="size-4 text-muted-foreground" />
-                              )}
-                              <span className="sr-only">
-                                {rule.enabled ? "Disable" : "Enable"}
-                              </span>
+                              <Pencil className="size-4" />
+                              <span className="sr-only">Edit</span>
                             </Button>
                             <Button
                               size="icon-sm"
@@ -871,6 +878,16 @@ export default function Rules() {
             setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r)));
             setManageRule(updated);
           }}
+        />
+      )}
+
+      {editRule && (
+        <EditRuleDialog
+          rule={editRule}
+          onClose={() => setEditRule(null)}
+          onSaved={(updated) =>
+            setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r)))
+          }
         />
       )}
 
