@@ -445,9 +445,80 @@ fn classful_len(ip: Ipv4Addr) -> u8 {
     }
 }
 
+// ---- Command allowlist (fail-closed) -------------------------------------------
+
+fn is_ipv4(tok: &str) -> bool {
+    tok.parse::<Ipv4Addr>().is_ok()
+}
+fn is_u32(tok: &str) -> bool {
+    !tok.is_empty() && tok.parse::<u32>().is_ok()
+}
+
+/// True if `cmd` is one of the EXACT command shapes Rerouter is designed to send
+/// (every read, the config-mode entry/exit, and the null-route / BGP-session
+/// templates). Variable tokens (IP, mask, ASN, tag) are validated; anything else
+/// — chaining, free-text, other config verbs — is rejected. IOS output filters
+/// (`| include|section|begin|exclude|count`) are permitted on `show` only, since
+/// they filter output and cannot execute anything.
+fn command_allowed(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    // Peel off an optional output filter at the first pipe.
+    let (base, filter) = match cmd.split_once('|') {
+        Some((b, f)) => (b.trim(), Some(f.trim())),
+        None => (cmd, None),
+    };
+    if let Some(f) = filter {
+        if !base.starts_with("show ") {
+            return false;
+        }
+        let kw = f.split_whitespace().next().unwrap_or("");
+        if !matches!(kw, "include" | "exclude" | "section" | "begin" | "count") {
+            return false;
+        }
+    }
+
+    let toks: Vec<&str> = base.split_whitespace().collect();
+    match toks.as_slice() {
+        // session / reads
+        ["terminal", "length", "0"] => true,
+        ["configure", "terminal"] => true,
+        ["end"] | ["exit"] => true,
+        ["show", "clock"] => true,
+        ["show", "version"] => true,
+        ["show", "running-config"] => true,
+        ["show", "ip", "route", "summary"] => true,
+        ["show", "ip", "route", a] => is_ipv4(a),
+        ["show", "ip", "bgp", "summary"] => true,
+        ["show", "ip", "bgp", "neighbors", a] => is_ipv4(a),
+        // null-route (RTBH to Null0), with the optional name / tag the templates use
+        ["ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
+        ["ip", "route", net, mask, "Null0", "name", _] => is_ipv4(net) && is_ipv4(mask),
+        ["ip", "route", net, mask, "Null0", "tag", tag] => is_ipv4(net) && is_ipv4(mask) && is_u32(tag),
+        ["no", "ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
+        ["no", "ip", "route", net, mask, "Null0", "tag", tag] => {
+            is_ipv4(net) && is_ipv4(mask) && is_u32(tag)
+        }
+        // BGP session shut / no-shut
+        ["router", "bgp", asn] => is_u32(asn),
+        ["neighbor", ip, "shutdown"] => is_ipv4(ip),
+        ["no", "neighbor", ip, "shutdown"] => is_ipv4(ip),
+        _ => false,
+    }
+}
+
 /// Lower-level: run commands against already-loaded credentials. Used by
 /// [`run_commands`]; broken out so the executor can reuse one decrypt.
 pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> {
+    // Fail-closed allowlist: refuse to open a session if ANY command is outside the
+    // exact set Rerouter is designed to send. Defense-in-depth behind template
+    // rendering — even a malformed template or future caller cannot push an
+    // unexpected command to a router. We validate before connecting.
+    for c in commands {
+        if !command_allowed(c) {
+            return Err(anyhow!("refusing to send command not on the allowlist: {c:?}"));
+        }
+    }
+
     let observed = Arc::new(Mutex::new(None::<String>));
     let handler = TofuHandler { expected: dev.expected_fingerprint.clone(), observed: observed.clone() };
 
@@ -642,4 +713,55 @@ fn clean_output(raw: &str, command: &str) -> String {
         }
     }
     lines.join("\n").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_exactly_the_controller_command_set() {
+        for ok in [
+            "terminal length 0",
+            "configure terminal",
+            "end",
+            "exit",
+            "show clock",
+            "show version | include (Version|uptime is)",
+            "show running-config | section ^router bgp",
+            "show ip route summary",
+            "show ip route 203.0.113.0",
+            "show ip bgp summary",
+            "show ip bgp neighbors 198.51.100.7",
+            "ip route 203.0.113.0 255.255.255.0 Null0",
+            "ip route 203.0.113.0 255.255.255.0 Null0 name RRT-BLACKHOLE",
+            "ip route 203.0.113.0 255.255.255.0 Null0 tag 666",
+            "no ip route 203.0.113.0 255.255.255.0 Null0",
+            "no ip route 203.0.113.0 255.255.255.0 Null0 tag 666",
+            "router bgp 65010",
+            "neighbor 198.51.100.7 shutdown",
+            "no neighbor 198.51.100.7 shutdown",
+        ] {
+            assert!(command_allowed(ok), "should allow: {ok}");
+        }
+    }
+
+    #[test]
+    fn rejects_anything_outside_the_set() {
+        for bad in [
+            "reload",
+            "ip route 203.0.113.0 255.255.255.0 10.0.0.1",   // next-hop, not Null0
+            "ip route 203.0.113.0 255.255.255.0 Null0 ; reload",
+            "neighbor 198.51.100.7 remote-as 65000",          // not shutdown
+            "neighbor notanip shutdown",
+            "no neighbor 198.51.100.7 password secret",
+            "router bgp not-a-number",
+            "show running-config | append flash:cfg",         // filter verb not allowed
+            "configure terminal\nreload",
+            "do reload",
+            "write erase",
+        ] {
+            assert!(!command_allowed(bad), "should reject: {bad}");
+        }
+    }
 }

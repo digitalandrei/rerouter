@@ -67,6 +67,39 @@ function asrEnrollment(username: string, publicKey: string): string {
   ].join("\n");
 }
 
+/** The built-in Cisco IOS parser view that limits the controller's account to
+ *  exactly the commands Rerouter issues. Also kept in the repo at
+ *  deploy/cisco/rerouter-bgp-view.ios; surfaced here so it's installable from the
+ *  UI. Secrets are placeholders the operator fills in. */
+const RRT_BGP_VIEW = `! Restricted parser view for the Rerouter SSH account.
+! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Assign via TACACS+
+! (shell:cli-view-name=RRT-BGP, priv 15); local logins use 'enable view RRT-BGP'.
+configure terminal
+ aaa new-model
+ aaa authentication login default local
+ aaa authorization exec default local
+ enable secret <ENABLE_SECRET>
+end
+enable view
+configure terminal
+parser view RRT-BGP
+ secret <VIEW_SECRET>
+ commands exec include terminal length 0
+ commands exec include show clock
+ commands exec include show version
+ commands exec include show ip route
+ commands exec include show ip bgp
+ commands exec include show running-config
+ commands exec include configure terminal
+ commands configure include ip route
+ commands configure include no ip route
+ commands configure include router bgp
+ commands router include neighbor
+ commands router include no neighbor
+ ! uncomment so 'show run' also reveals 'network' statements (prefix discovery):
+ ! commands router include network
+end`;
+
 /** Device settings tab: rename / hostname / SNMP / SSH credentials, plus the
  *  Test SNMP and Test SSH probes. manage_devices only (gated by the caller). */
 export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved: () => void }) {
@@ -382,9 +415,33 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                   )}
                   {caps && caps.some((c) => !c.ok) && (
                     <p className="text-xs text-muted-foreground">
-                      Denied commands usually mean the account's privilege level or parser view is too restrictive. See <code>deploy/cisco/rerouter-bgp-view.ios</code>.
+                      Denied commands usually mean the account's privilege level or parser view is too restrictive. Install the restricted view below.
                     </p>
                   )}
+
+                  <details className="rounded-md border border-border p-3">
+                    <summary className="flex cursor-pointer items-center justify-between text-sm font-medium">
+                      Restricted IOS view (RRT-BGP)
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          copy(RRT_BGP_VIEW, "View config");
+                        }}
+                      >
+                        <Copy className="size-3.5" />
+                        Copy
+                      </Button>
+                    </summary>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      A Cisco parser view that limits this account to exactly the commands Rerouter sends. Replace the two secrets; assign via TACACS+ (<code>cli-view-name=RRT-BGP</code>) or test locally with <code>enable view RRT-BGP</code>.
+                    </p>
+                    <pre className="mt-2 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
+                      {RRT_BGP_VIEW}
+                    </pre>
+                  </details>
                 </div>
               </>
             )}
