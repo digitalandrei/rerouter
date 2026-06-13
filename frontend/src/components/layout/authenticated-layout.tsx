@@ -14,9 +14,12 @@ export function AuthenticatedLayout() {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset className="flex flex-col">
-        <Header />
-        <ObserveBanner />
-        <main className="flex-1 overflow-auto p-4 md:p-6">
+        {/* Fixed top bar (header + observe banner); content scrolls beneath. */}
+        <div className="sticky top-0 z-30">
+          <Header />
+          <ObserveBanner />
+        </div>
+        <main className="flex-1 p-4 md:p-6">
           <Outlet />
         </main>
       </SidebarInset>

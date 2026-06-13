@@ -2,6 +2,7 @@ import { cn } from '@/lib/utils'
 import { SidebarTrigger } from '@/components/ui/sidebar'
 import { Separator } from '@/components/ui/separator'
 import { ThemeToggle } from '@/components/theme-toggle'
+import { UserMenu } from '@/components/layout/user-menu'
 
 interface HeaderProps extends React.ComponentProps<'header'> {
   children?: React.ReactNode
@@ -14,7 +15,7 @@ export function Header({ className, children, ...props }: HeaderProps) {
   return (
     <header
       className={cn(
-        'flex h-14 shrink-0 items-center gap-2 border-b px-4',
+        'flex h-14 shrink-0 items-center gap-2 border-b bg-background px-4',
         className,
       )}
       {...props}
@@ -25,8 +26,9 @@ export function Header({ className, children, ...props }: HeaderProps) {
         className="mr-2 data-[orientation=vertical]:h-4"
       />
       <div className="flex items-center gap-2">{children}</div>
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-1">
         <ThemeToggle />
+        <UserMenu />
       </div>
     </header>
   )

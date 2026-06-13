@@ -3,7 +3,6 @@ import { Shield } from 'lucide-react'
 import {
   Sidebar,
   SidebarContent,
-  SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
   SidebarGroupLabel,
@@ -15,7 +14,6 @@ import {
   SidebarSeparator,
 } from '@/components/ui/sidebar'
 import { sidebarData } from './data/sidebar-data'
-import { NavUser } from './nav-user'
 import { useAuth } from '@/lib/auth'
 import type { NavItem } from '@/components/layout/types'
 
@@ -116,10 +114,6 @@ export function AppSidebar() {
           </div>
         ))}
       </SidebarContent>
-
-      <SidebarFooter>
-        <NavUser />
-      </SidebarFooter>
 
       <SidebarRail />
     </Sidebar>
