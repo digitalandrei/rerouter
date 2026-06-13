@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { Toggle } from "@/components/ui/toggle";
 import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
 import { EditRuleDialog } from "./rules/edit-rule-dialog";
 import { METRICS, metricLabel } from "./rules/rule-constants";
@@ -772,26 +773,20 @@ export default function Rules() {
                       <SeverityBadge severity={rule.severity} />
                     </TableCell>
 
-                    {/* Enabled — green/red on-off switch */}
+                    {/* Enabled — Toggle with text, green when on / red when off */}
                     <TableCell onClick={(e) => e.stopPropagation()}>
                       {canEdit ? (
-                        <button
-                          type="button"
-                          onClick={() => void toggleRule(rule)}
-                          title={rule.enabled ? "Disable rule" : "Enable rule"}
-                          className="inline-flex items-center gap-2"
+                        <Toggle
+                          variant="outline"
+                          size="sm"
+                          pressed={rule.enabled}
+                          onPressedChange={() => void toggleRule(rule)}
+                          aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
+                          className="data-[state=on]:border-emerald-300 data-[state=on]:bg-emerald-100 data-[state=on]:text-emerald-700 data-[state=off]:text-red-600 dark:data-[state=on]:bg-emerald-950/60 dark:data-[state=on]:text-emerald-300 dark:data-[state=off]:text-red-400"
                         >
-                          {rule.enabled ? (
-                            <ToggleRight className="size-7 text-emerald-600 dark:text-emerald-400" />
-                          ) : (
-                            <ToggleLeft className="size-7 text-red-500 dark:text-red-400" />
-                          )}
-                          <span
-                            className={`text-sm font-medium ${rule.enabled ? "text-emerald-700 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}
-                          >
-                            {rule.enabled ? "enabled" : "disabled"}
-                          </span>
-                        </button>
+                          {rule.enabled ? <ToggleRight className="size-4" /> : <ToggleLeft className="size-4" />}
+                          {rule.enabled ? "Enabled" : "Disabled"}
+                        </Toggle>
                       ) : (
                         <ToneBadge tone={rule.enabled ? "good" : "bad"}>
                           {rule.enabled ? "enabled" : "disabled"}
