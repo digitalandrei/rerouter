@@ -2,6 +2,7 @@ import {
   LayoutDashboard,
   Router,
   SlidersHorizontal,
+  FileCode2,
   Shuffle,
   Bell,
   ScrollText,
@@ -22,6 +23,7 @@ export const sidebarData: SidebarData = {
       items: [
         { title: 'Devices', url: '/devices', icon: Router },
         { title: 'Rules', url: '/rules', icon: SlidersHorizontal },
+        { title: 'Templates', url: '/templates', icon: FileCode2 },
         { title: 'Reroutes', url: '/reroutes', icon: Shuffle },
         { title: 'Alerts', url: '/alerts', icon: Bell },
         { title: 'Audit', url: '/audit', icon: ScrollText },

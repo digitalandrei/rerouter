@@ -277,6 +277,49 @@ export interface ManualReroutePayload {
   confirmation: string;
 }
 
+// ---------------------------------------------------------------------------
+// Reroute action templates (the allowlisted, parameterized mitigations)
+// ---------------------------------------------------------------------------
+
+export interface TemplateParamSpec {
+  type: string; // "ip" | "cidr" | "asn" | "string"
+  label?: string;
+  required?: boolean;
+  source?: string; // "bgp_peer" | "bgp_local_as" — UI prefill hint
+}
+
+export interface Template {
+  id: number;
+  name: string;
+  description: string | null;
+  provider_type: string;
+  mode: string;
+  safety_level: string;
+  manual_confirmation_required: boolean;
+  automatic_allowed: boolean;
+  parameter_schema: Record<string, TemplateParamSpec>;
+  plan: unknown;
+  verification: unknown;
+  rollback_template_id: number | null;
+  auto_expiry_seconds: number | null;
+  enabled: boolean;
+}
+
+export interface RenderedPlan {
+  template_id: number;
+  template_name: string;
+  safety_level: string;
+  config_mode: boolean;
+  commands: string[];
+  verify: { command: string; expect: string | null; reject: string | null } | null;
+}
+
+export interface RenderResult {
+  ok: boolean;
+  plan?: RenderedPlan;
+  error?: string;
+}
+
 export interface AuditEntry {
   id: number;
   actor: string;
@@ -428,6 +471,16 @@ export const api = {
       request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
     remove: (id: number) =>
       request<void>(`/api/rules/${id}`, { method: "DELETE" }),
+  },
+
+  templates: {
+    list: () => request<Template[]>("/api/templates"),
+    get: (id: number) => request<Template>(`/api/templates/${id}`),
+    render: (id: number, params: Record<string, unknown>) =>
+      request<RenderResult>(`/api/templates/${id}/render`, {
+        method: "POST",
+        body: { params },
+      }),
   },
 
   alerts: {

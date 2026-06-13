@@ -20,6 +20,7 @@ import Devices from "@/pages/Devices";
 import DeviceDetail from "@/pages/DeviceDetail";
 import InterfaceDetail from "@/pages/InterfaceDetail";
 import Rules from "@/pages/Rules";
+import Templates from "@/pages/Templates";
 import Reroutes from "@/pages/Reroutes";
 import ManualReroute from "@/pages/ManualReroute";
 import Alerts from "@/pages/Alerts";
@@ -68,6 +69,7 @@ export default function App() {
               element={<InterfaceDetail />}
             />
             <Route path="/rules" element={<Rules />} />
+            <Route path="/templates" element={<Templates />} />
             <Route path="/reroutes" element={<Reroutes />} />
             <Route path="/reroutes/manual" element={<ManualReroute />} />
             <Route path="/alerts" element={<Alerts />} />

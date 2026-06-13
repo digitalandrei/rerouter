@@ -13,6 +13,7 @@ pub mod health;
 pub mod assets;
 pub mod providers;
 pub mod rules;
+pub mod templates;
 pub mod reroutes;
 pub mod alerts;
 pub mod audit;
@@ -133,6 +134,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // rules
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", get(rules::show).put(rules::update).delete(rules::remove))
+        // reroute template catalog (read-only) + render/preview
+        .route("/api/templates", get(templates::list))
+        .route("/api/templates/{id}", get(templates::show))
+        .route("/api/templates/{id}/render", post(templates::render))
         // reroutes (authz: session + RBAC + re-auth — see reroutes.rs)
         .route("/api/reroutes", get(reroutes::list))
         .route("/api/reroutes/manual", post(reroutes::manual))
