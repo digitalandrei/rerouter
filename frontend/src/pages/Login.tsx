@@ -12,6 +12,7 @@
  */
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
+import { QRCodeSVG } from "qrcode.react";
 import { useAuth } from "@/lib/auth";
 import { ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -32,6 +33,7 @@ export default function Login() {
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showQr, setShowQr] = useState(false);
 
   if (stage === "authenticated") {
     return <Navigate to="/dashboard" replace />;
@@ -123,21 +125,38 @@ export default function Login() {
             </CardHeader>
             <CardContent className="space-y-4">
               {enrollment && (
-                /* First-login enrollment placeholder: render the otpauth URL
-                   as a QR code (e.g. via a qr component) once the controller
-                   endpoint is live. The raw secret is shown as a manual
-                   fallback per docs/authentication.md. */
+                /* First-login enrollment. The QR is rendered client-side
+                   (qrcode.react) so the otpauth secret never leaves the
+                   browser; it stays hidden behind a toggle. The raw secret is
+                   the manual fallback per docs/authentication.md. */
                 <div className="rounded-md border bg-muted p-4 text-sm">
                   <p className="font-semibold">
                     First login — enroll your authenticator
                   </p>
                   <p className="mt-2 text-muted-foreground">
-                    Scan this otpauth URL (QR rendering TODO):
+                    Scan the QR code with your authenticator app (Google
+                    Authenticator, Authy, 1Password…), or enter the secret
+                    manually.
                   </p>
-                  <code className="mt-1 block break-all text-xs">
-                    {enrollment.otpauth_url}
-                  </code>
-                  <p className="mt-2 text-muted-foreground">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="mt-3"
+                    onClick={() => setShowQr((v) => !v)}
+                  >
+                    {showQr ? "Hide QR code" : "Show QR code"}
+                  </Button>
+                  {showQr && (
+                    <div className="mt-3 flex justify-center rounded-md bg-white p-4">
+                      <QRCodeSVG
+                        value={enrollment.otpauth_url}
+                        size={192}
+                        marginSize={2}
+                      />
+                    </div>
+                  )}
+                  <p className="mt-3 text-muted-foreground">
                     Manual entry secret:
                   </p>
                   <code className="block break-all text-xs">
