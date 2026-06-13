@@ -18,6 +18,7 @@ import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Devices from "@/pages/Devices";
 import DeviceDetail from "@/pages/DeviceDetail";
+import InterfaceDetail from "@/pages/InterfaceDetail";
 import Rules from "@/pages/Rules";
 import Reroutes from "@/pages/Reroutes";
 import ManualReroute from "@/pages/ManualReroute";
@@ -62,6 +63,10 @@ export default function App() {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/devices" element={<Devices />} />
             <Route path="/devices/:id" element={<DeviceDetail />} />
+            <Route
+              path="/devices/:deviceId/interfaces/:ifaceId"
+              element={<InterfaceDetail />}
+            />
             <Route path="/rules" element={<Rules />} />
             <Route path="/reroutes" element={<Reroutes />} />
             <Route path="/reroutes/manual" element={<ManualReroute />} />

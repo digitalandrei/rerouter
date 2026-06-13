@@ -166,6 +166,13 @@ export interface Sample {
   /** Per-interval error counts (errors during this poll interval). */
   in_errors: number;
   out_errors: number;
+  /** Per-interval discard counts (packets dropped during this interval). */
+  in_discards: number;
+  out_discards: number;
+  /** Transceiver optics — null for interfaces without a pluggable. */
+  temp_c: number | null;
+  tx_power_dbm: number | null;
+  rx_power_dbm: number | null;
 }
 
 export interface DeviceTestResult {
