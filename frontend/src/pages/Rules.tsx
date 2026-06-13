@@ -360,6 +360,73 @@ function conditionLabel(rule: Rule): string {
   return `${metricLabel} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
 }
 
+/** Format a metric value with its natural unit. */
+function fmtMetric(metric: string, v: number): string {
+  if (metric.includes("util_percent")) return `${v.toFixed(1)}%`;
+  if (metric.includes("pps")) return `${Math.round(v).toLocaleString()} pps`;
+  if (metric.includes("bps")) {
+    const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+    let n = v;
+    let i = 0;
+    while (n >= 1000 && i < units.length - 1) {
+      n /= 1000;
+      i++;
+    }
+    return `${n.toFixed(n < 10 && i > 0 ? 2 : 0)} ${units[i]}`;
+  }
+  if (metric === "oper_status") return v >= 1 ? "up" : "down";
+  return v.toLocaleString();
+}
+
+/** Is the current value breaching the rule's condition right now? */
+function breaches(op: string, v: number, t: number): boolean {
+  switch (op) {
+    case ">":
+      return v > t;
+    case ">=":
+      return v >= t;
+    case "<":
+      return v < t;
+    case "<=":
+      return v <= t;
+    case "==":
+      return v === t;
+    case "!=":
+      return v !== t;
+    default:
+      return false;
+  }
+}
+
+/** Colored live status: current value, above/below the threshold, breach = red. */
+function RuleStatus({ rule }: { rule: Rule }) {
+  const v = rule.current_value;
+  if (v === null || v === undefined) {
+    return <span className="text-[11px] text-muted-foreground">no data yet</span>;
+  }
+  const stale =
+    rule.last_evaluated_at != null &&
+    Date.now() - new Date(rule.last_evaluated_at).getTime() > 180_000;
+  const breaching = breaches(rule.operator, v, rule.threshold_value);
+  const above = v > rule.threshold_value;
+  const Arrow = above ? ArrowUp : ArrowDown;
+  const dir = above ? "above" : v < rule.threshold_value ? "below" : "at";
+  const cls = stale
+    ? "bg-muted text-muted-foreground"
+    : breaching
+      ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
+      : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300";
+  return (
+    <span
+      className={`inline-flex w-fit items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${cls}`}
+      title={`last evaluated ${rule.last_evaluated_at ? new Date(rule.last_evaluated_at).toLocaleString() : "—"}`}
+    >
+      <Arrow className="size-3" />
+      now {fmtMetric(rule.metric, v)} · {stale ? "stale" : dir}
+    </span>
+  );
+}
+
 type SortDir = "asc" | "desc";
 
 export default function Rules() {
@@ -393,6 +460,17 @@ export default function Rules() {
       .list()
       .then(setDevices)
       .catch(() => setDevices([]));
+  }, []);
+
+  // Quietly refresh the live above/below status every 20s (no loading flicker).
+  useEffect(() => {
+    const t = setInterval(() => {
+      api.rules
+        .list()
+        .then(setRules)
+        .catch(() => {});
+    }, 20000);
+    return () => clearInterval(t);
   }, []);
 
   function setField(field: keyof RuleForm, value: string) {
@@ -696,18 +774,31 @@ export default function Rules() {
                       </div>
                     </TableCell>
 
-                    {/* Target — interface id or asset id */}
-                    <TableCell className="text-xs text-muted-foreground">
-                      {rule.target_kind === "interface" && rule.interface_id
-                        ? `interface #${rule.interface_id}`
-                        : rule.target_kind === "asset" && rule.asset_id
-                          ? `asset #${rule.asset_id}`
-                          : rule.target_kind}
+                    {/* Target — interface name (+ device) or asset */}
+                    <TableCell className="text-xs">
+                      <div className="flex flex-col">
+                        <span className="font-mono">
+                          {rule.target_kind === "interface"
+                            ? (rule.interface_name ||
+                              (rule.interface_id ? `interface #${rule.interface_id}` : "interface"))
+                            : rule.asset_id
+                              ? `asset #${rule.asset_id}`
+                              : rule.target_kind}
+                        </span>
+                        {rule.device_name && (
+                          <span className="text-[11px] text-muted-foreground">
+                            {rule.device_name}
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
 
-                    {/* Condition */}
+                    {/* Condition + live above/below status */}
                     <TableCell>
-                      <code className="text-xs">{conditionLabel(rule)}</code>
+                      <div className="flex flex-col gap-1">
+                        <code className="text-xs">{conditionLabel(rule)}</code>
+                        <RuleStatus rule={rule} />
+                      </div>
                     </TableCell>
 
                     {/* Duration */}

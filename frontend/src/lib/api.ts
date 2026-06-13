@@ -240,6 +240,12 @@ export interface Rule {
   reroute_template_id: number | null;
   action_count?: number;
   actions?: RuleAction[];
+  // Resolved target labels + live evaluation snapshot (from rule_states).
+  interface_name?: string | null;
+  device_name?: string | null;
+  current_state?: "clear" | "matching" | "firing" | null;
+  current_value?: number | null;
+  last_evaluated_at?: string | null;
 }
 
 export interface Alert {

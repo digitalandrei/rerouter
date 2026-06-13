@@ -44,11 +44,25 @@ struct RuleRow {
     enabled: bool,
     automatic_reroute_enabled: bool,
     reroute_template_id: Option<u64>,
+    // Resolved target labels + live evaluation state (for the list UI).
+    interface_name: Option<String>,
+    device_name: Option<String>,
+    current_state: Option<String>,
+    last_metric_value: Option<f64>,
+    last_evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-const RULE_COLS: &str = "id, name, interface_id, device_id, asset_id, metric, operator, \
-     threshold_value, duration_seconds, consecutive_samples, severity, enabled, \
-     automatic_reroute_enabled, reroute_template_id";
+/// Rule columns + resolved target names + the latest evaluation snapshot
+/// (rule_states). Note the table aliases (`r`/`i`/`d`/`rs`).
+const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.asset_id, r.metric, \
+     r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, r.severity, r.enabled, \
+     r.automatic_reroute_enabled, r.reroute_template_id, \
+     i.if_name AS interface_name, d.name AS device_name, \
+     rs.current_state, rs.last_metric_value, rs.last_evaluated_at \
+     FROM rules r \
+     LEFT JOIN device_interfaces i ON i.id = r.interface_id \
+     LEFT JOIN devices d ON d.id = r.device_id \
+     LEFT JOIN rule_states rs ON rs.rule_id = r.id";
 
 fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
     let target_kind = if r.interface_id.is_some() { "interface" } else { "asset" };
@@ -68,6 +82,11 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
         "reroute_template_id": r.reroute_template_id,
+        "interface_name": r.interface_name,
+        "device_name": r.device_name,
+        "current_state": r.current_state,
+        "current_value": r.last_metric_value,
+        "last_evaluated_at": r.last_evaluated_at.map(|t| t.to_rfc3339()),
         "action_count": actions.len(),
         "actions": actions,
     })
@@ -110,7 +129,7 @@ async fn rule_value(pool: &sqlx::MySqlPool, r: &RuleRow) -> Value {
 }
 
 async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
-    let row = sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules WHERE id = ?"))
+    let row = sqlx::query_as::<_, RuleRow>(&format!("{RULE_SELECT} WHERE r.id = ?"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -122,7 +141,7 @@ async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Va
 
 /// GET /api/rules.
 pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
-    match sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules ORDER BY name"))
+    match sqlx::query_as::<_, RuleRow>(&format!("{RULE_SELECT} ORDER BY r.name"))
         .fetch_all(&state.pool)
         .await
     {
@@ -305,7 +324,7 @@ pub async fn update(
     Path(id): Path<u64>,
     Json(body): Json<RuleUpdate>,
 ) -> JsonResp {
-    let Ok(Some(existing)) = sqlx::query_as::<_, RuleRow>(&format!("SELECT {RULE_COLS} FROM rules WHERE id = ?"))
+    let Ok(Some(existing)) = sqlx::query_as::<_, RuleRow>(&format!("{RULE_SELECT} WHERE r.id = ?"))
         .bind(id)
         .fetch_optional(&state.pool)
         .await
