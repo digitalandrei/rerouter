@@ -18,19 +18,6 @@ import {
 } from "@/components/ui/card";
 import { SeverityBadge } from "@/components/status-badge";
 
-function ObserveBanner({ mode }: { mode: string | undefined }) {
-  if (mode === "enforce") return null;
-  return (
-    <div className="flex items-center gap-3 rounded-md border border-yellow-400 bg-yellow-50 px-4 py-3 text-sm font-semibold text-yellow-800">
-      <span className="text-base">&#9888;</span>
-      <span>
-        OBSERVE MODE — read-only / alert-only. No reroutes will execute
-        (automatic or manual). Alerts show the actions that WOULD run.
-      </span>
-    </div>
-  );
-}
-
 export default function Dashboard() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -53,8 +40,6 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <ObserveBanner mode={status?.operating_mode} />
-
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
         {!loadingStatus && status && (

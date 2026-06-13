@@ -38,7 +38,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { ObserveBanner } from "@/components/layout/observe-banner";
 import { ShieldAlert, Shuffle } from "lucide-react";
 
 function RerouteDrawer({
@@ -247,7 +246,6 @@ export default function Reroutes() {
 
   return (
     <div className="space-y-6">
-      <ObserveBanner />
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Mitigations</h1>
         <Button asChild variant="outline">

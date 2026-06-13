@@ -27,7 +27,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { ObserveBanner } from "@/components/layout/observe-banner";
 import { ActionParamsForm } from "@/components/action-params-form";
 
 const inputClass =
@@ -108,7 +107,6 @@ export default function ManualReroute() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
-      <ObserveBanner />
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Manual mitigation</h1>
         <Button asChild variant="ghost" size="sm">

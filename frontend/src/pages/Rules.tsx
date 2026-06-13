@@ -527,11 +527,6 @@ export default function Rules() {
         </Button>
       </div>
 
-      <div className="rounded-md border border-yellow-300 bg-yellow-50 px-4 py-2 text-sm text-yellow-800">
-        In <strong>observe mode</strong>, rule matches generate alerts only — no
-        reroute action executes. Alerts include the would-run action plan.
-      </div>
-
       {showAdd && (
         <Card>
           <CardHeader>
