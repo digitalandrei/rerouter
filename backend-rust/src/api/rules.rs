@@ -34,7 +34,6 @@ struct RuleRow {
     name: String,
     interface_id: Option<u64>,
     device_id: Option<u64>,
-    asset_id: Option<u64>,
     metric: String,
     operator: String,
     threshold_value: f64,
@@ -54,7 +53,7 @@ struct RuleRow {
 
 /// Rule columns + resolved target names + the latest evaluation snapshot
 /// (rule_states). Note the table aliases (`r`/`i`/`d`/`rs`).
-const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.asset_id, r.metric, \
+const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
@@ -65,14 +64,12 @@ const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.a
      LEFT JOIN rule_states rs ON rs.rule_id = r.id";
 
 fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
-    let target_kind = if r.interface_id.is_some() { "interface" } else { "asset" };
     json!({
         "id": r.id,
         "name": r.name,
-        "target_kind": target_kind,
+        "target_kind": "interface",
         "interface_id": r.interface_id,
         "device_id": r.device_id,
-        "asset_id": r.asset_id,
         "metric": r.metric,
         "operator": r.operator,
         "threshold_value": r.threshold_value,
@@ -159,10 +156,7 @@ pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State
 #[derive(Debug, Deserialize)]
 pub struct RuleBody {
     name: String,
-    #[serde(default)]
-    target_kind: Option<String>,
     interface_id: Option<u64>,
-    asset_id: Option<u64>,
     metric: String,
     operator: String,
     threshold_value: f64,
@@ -202,46 +196,25 @@ async fn validate(pool: &sqlx::MySqlPool, body: &RuleBody) -> Result<Option<u64>
     if !matches!(body.operator.as_str(), ">" | "<" | ">=" | "<=" | "==" | "!=") {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "unsupported operator".into()));
     }
-    // Interface XOR asset.
-    match (body.interface_id, body.asset_id) {
-        (Some(_), Some(_)) => {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "a rule targets an interface XOR an asset".into()))
-        }
-        (None, None) => {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id or asset_id is required".into()))
-        }
-        _ => {}
+    // A rule targets an interface (v1 detection is interface-scoped).
+    let Some(iface_id) = body.interface_id else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id is required".into()));
+    };
+    if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("metric must be one of: {}", INTERFACE_METRICS.join(", ")),
+        ));
     }
-    // If the client declared a target_kind, it must agree with the IDs sent.
-    if let Some(kind) = body.target_kind.as_deref() {
-        let consistent = match kind {
-            "interface" => body.interface_id.is_some(),
-            "asset" => body.asset_id.is_some(),
-            _ => return Err((StatusCode::UNPROCESSABLE_ENTITY, "target_kind must be interface or asset".into())),
-        };
-        if !consistent {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "target_kind does not match the target id".into()));
-        }
-    }
-    if let Some(iface_id) = body.interface_id {
-        if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("metric must be one of: {}", INTERFACE_METRICS.join(", ")),
-            ));
-        }
-        // Resolve the owning device; also validates the interface exists.
-        let device_id: Option<u64> = sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
-            .bind(iface_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
-        match device_id {
-            Some(d) => Ok(Some(d)),
-            None => Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id does not exist".into())),
-        }
-    } else {
-        Ok(None)
+    // Resolve the owning device; also validates the interface exists.
+    let device_id: Option<u64> = sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
+        .bind(iface_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
+    match device_id {
+        Some(d) => Ok(Some(d)),
+        None => Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id does not exist".into())),
     }
 }
 
@@ -257,13 +230,12 @@ pub async fn create(
     };
 
     let res = sqlx::query(
-        "INSERT INTO rules (name, asset_id, interface_id, device_id, metric, operator, threshold_value, \
+        "INSERT INTO rules (name, interface_id, device_id, metric, operator, threshold_value, \
             duration_seconds, consecutive_samples, severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
-    .bind(body.asset_id)
     .bind(body.interface_id)
     .bind(device_id)
     .bind(&body.metric)

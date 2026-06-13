@@ -39,7 +39,6 @@ struct PendingAlert {
     id: u64,
     event_type: String,
     severity: String,
-    asset_id: Option<u64>,
     occurrence_count: u32,
     payload_json: Option<sqlx::types::Json<Value>>,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -71,7 +70,7 @@ pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
 /// Process one batch of undelivered alerts.
 async fn drain_once(pool: &MySqlPool, mailer: &super::mailer::Mailer) -> Result<()> {
     let pending = sqlx::query_as::<_, PendingAlert>(
-        "SELECT a.id, a.event_type, a.severity, a.asset_id, a.occurrence_count, a.payload_json, a.created_at \
+        "SELECT a.id, a.event_type, a.severity, a.occurrence_count, a.payload_json, a.created_at \
          FROM alerts a \
          WHERE NOT EXISTS (SELECT 1 FROM alert_deliveries d WHERE d.alert_id = a.id) \
          ORDER BY a.id ASC LIMIT ?",
@@ -142,8 +141,8 @@ async fn dispatch_alert(pool: &MySqlPool, mailer: &super::mailer::Mailer, alert:
 }
 
 /// Resolve the recipient set: verified recipients with an enabled subscription
-/// matching the alert's asset (NULL=all) and event_type (NULL=all). Critical
-/// alerts additionally fan out to every admin user that has a recipient row.
+/// matching the alert's event_type (NULL=all). Critical alerts additionally fan
+/// out to every admin user that has a recipient row.
 async fn resolve_recipients(pool: &MySqlPool, alert: &PendingAlert, is_critical: bool) -> Result<Vec<Recipient>> {
     let mut map: std::collections::BTreeMap<u64, Recipient> = std::collections::BTreeMap::new();
 
@@ -152,10 +151,8 @@ async fn resolve_recipients(pool: &MySqlPool, alert: &PendingAlert, is_critical:
          FROM alert_recipients r \
          JOIN alert_subscriptions s ON s.recipient_id = r.id \
          WHERE r.verified_at IS NOT NULL AND s.enabled = 1 \
-           AND (s.asset_id IS NULL OR s.asset_id = ?) \
            AND (s.event_type IS NULL OR s.event_type = ?)",
     )
-    .bind(alert.asset_id)
     .bind(&alert.event_type)
     .fetch_all(pool)
     .await?;

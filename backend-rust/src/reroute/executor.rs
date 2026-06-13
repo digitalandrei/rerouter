@@ -24,9 +24,6 @@ use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template, VerifyStep};
 use crate::ssh;
 
-/// Same-device action cooldown (doctrine: same asset 5 min).
-const DEVICE_COOLDOWN_SECS: i64 = 300;
-
 /// What to run and on whose behalf.
 pub struct ActionRequest {
     pub device_id: u64,
@@ -110,6 +107,28 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
     if let Ok(Some(until)) = cooldown::active_until(pool, "device", &device_ref).await {
         return blocked(&req, device_name, format!("device is in cooldown until {}", until.to_rfc3339()));
     }
+    // Per-rule re-fire throttle (only for rule-triggered actions).
+    if let Some(rule_id) = req.rule_id {
+        if let Ok(Some(until)) = cooldown::active_until(pool, "rule", &rule_id.to_string()).await {
+            return blocked(&req, device_name, format!("rule {rule_id} is in cooldown until {}", until.to_rfc3339()));
+        }
+    }
+    // Global circuit breaker: cap executed actions per rolling window across all
+    // devices. Counts real reroute rows (manual + automatic + rollback).
+    let rl_count = cfg.safety.global_action_rate_limit_count;
+    if rl_count > 0 {
+        let recent = recent_reroute_count(pool, cfg.safety.global_action_rate_limit_window_seconds).await;
+        if recent >= rl_count as i64 {
+            return blocked(
+                &req,
+                device_name,
+                format!(
+                    "global action rate limit reached ({recent} in {}s; max {rl_count})",
+                    cfg.safety.global_action_rate_limit_window_seconds
+                ),
+            );
+        }
+    }
 
     // State machine.
     let reroute_id = match insert_reroute(pool, &req, &plan).await {
@@ -121,8 +140,25 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
 
     let final_state = run_state_machine(pool, &req, reroute_id, &plan).await;
 
-    // Post-action cooldown on the device.
-    let _ = cooldown::record(pool, "device", &device_ref, DEVICE_COOLDOWN_SECS, "post-action cooldown").await;
+    // Post-action cooldowns: per-device always, per-rule when rule-triggered.
+    let _ = cooldown::record(
+        pool,
+        "device",
+        &device_ref,
+        cfg.safety.same_device_cooldown_seconds as i64,
+        "post-action device cooldown",
+    )
+    .await;
+    if let Some(rule_id) = req.rule_id {
+        let _ = cooldown::record(
+            pool,
+            "rule",
+            &rule_id.to_string(),
+            cfg.safety.same_rule_cooldown_seconds as i64,
+            "post-action rule cooldown",
+        )
+        .await;
+    }
 
     let message = match final_state.as_str() {
         "succeeded" => "reroute executed and verified".to_string(),
@@ -454,6 +490,19 @@ async fn has_uncertain(pool: &MySqlPool, device_id: u64) -> bool {
         .await
         .unwrap_or(1);
     n > 0
+}
+
+/// Count reroute rows created within the last `window_secs` (the global
+/// rate-limit window). On a DB error, returns the limit's worst case via a large
+/// number so the breaker fails safe (blocks).
+async fn recent_reroute_count(pool: &MySqlPool, window_secs: u64) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM reroutes WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(window_secs as i64)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(i64::MAX)
 }
 
 fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> ExecOutcome {

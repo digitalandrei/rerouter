@@ -87,11 +87,16 @@ pub struct Safety {
     #[serde(default)]
     pub operating_mode: OperatingMode,
     pub automatic_actions_enabled: bool,
+    /// Global circuit breaker: at most N executed actions per window across all
+    /// devices (0 = unlimited).
     pub global_action_rate_limit_count: u32,
     pub global_action_rate_limit_window_seconds: u64,
+    /// Per-rule re-fire throttle: after a rule's actions run, that rule is in
+    /// cooldown for this long (0 = none).
     pub same_rule_cooldown_seconds: u64,
-    pub same_asset_cooldown_seconds: u64,
-    pub same_prefix_provider_cooldown_seconds: u64,
+    /// Per-device throttle: after any action on a device, that device is in
+    /// cooldown for this long (0 = none).
+    pub same_device_cooldown_seconds: u64,
     pub mark_running_actions_uncertain_on_startup: bool,
 }
 
@@ -157,8 +162,7 @@ impl Default for Safety {
             global_action_rate_limit_count: 3,
             global_action_rate_limit_window_seconds: 600,
             same_rule_cooldown_seconds: 900,
-            same_asset_cooldown_seconds: 300,
-            same_prefix_provider_cooldown_seconds: 1800,
+            same_device_cooldown_seconds: 300,
             mark_running_actions_uncertain_on_startup: true,
         }
     }

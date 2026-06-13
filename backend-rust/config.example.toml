@@ -48,11 +48,12 @@ hysteresis_seconds = 30
 operating_mode = "observe"
 # Master switch — automatic reroutes are OFF by default (applies in enforce mode).
 automatic_actions_enabled = false
+# Global circuit breaker: at most N executed actions per window (all devices).
 global_action_rate_limit_count = 3
 global_action_rate_limit_window_seconds = 600
+# Per-rule re-fire throttle and per-device post-action throttle.
 same_rule_cooldown_seconds = 900
-same_asset_cooldown_seconds = 300
-same_prefix_provider_cooldown_seconds = 1800
+same_device_cooldown_seconds = 300
 mark_running_actions_uncertain_on_startup = true
 
 [reroute]

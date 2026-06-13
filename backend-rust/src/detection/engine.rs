@@ -409,9 +409,7 @@ async fn interface_label(pool: &MySqlPool, interface_id: u64) -> String {
     }
 }
 
-/// Insert a rule_events row (asset_id is NOT NULL in the schema, but interface
-/// rules have none; the column was added before interface targeting — we use the
-/// rule's asset_id when present and otherwise skip the FK-bound write).
+/// Insert a rule_events row for the rule's timeline (matched / fired / cleared).
 async fn record_event(
     pool: &MySqlPool,
     rule: &InterfaceRule,
@@ -419,40 +417,15 @@ async fn record_event(
     value: f64,
     sampled_at: Option<Ts>,
 ) -> Result<()> {
-    // rule_events.asset_id is NOT NULL with an FK; interface rules have no asset,
-    // so we record the event keyed on a synthetic 0 only if a matching asset
-    // exists. To stay schema-safe we insert just for asset-backed rules and log
-    // interface-rule events via tracing (the alert row already carries the fire).
-    let asset_id: Option<u64> = sqlx::query_scalar("SELECT asset_id FROM rules WHERE id = ?")
-        .bind(rule.id)
-        .fetch_optional(pool)
-        .await?
-        .flatten();
-
-    if let Some(asset_id) = asset_id {
-        sqlx::query(
-            "INSERT INTO rule_events (rule_id, asset_id, event, metric_value, sampled_at) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(rule.id)
-        .bind(asset_id)
-        .bind(event)
-        .bind(value)
-        .bind(sampled_at)
-        .execute(pool)
-        .await?;
-    } else {
-        // Interface rule: no asset FK target. The fire is captured by the alert
-        // row + rule_states; emit a structured event log for the timeline.
-        tracing::info!(
-            event_type = "rule_event",
-            rule_id = rule.id,
-            interface_id = rule.interface_id,
-            event,
-            metric_value = value,
-            "interface rule event"
-        );
-    }
+    sqlx::query(
+        "INSERT INTO rule_events (rule_id, event, metric_value, sampled_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(rule.id)
+    .bind(event)
+    .bind(value)
+    .bind(sampled_at)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

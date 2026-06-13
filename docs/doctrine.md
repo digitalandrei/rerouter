@@ -347,6 +347,8 @@ order. The live gates are **device-scoped** (in `enforce` mode):
 - no action if another action is already running on the same device;
 - no action if a previous action on the device is unresolved (`uncertain`);
 - no repeated action inside the per-device cooldown window;
+- no repeated action from the same rule inside the per-rule cooldown window;
+- no action once the global action rate limit for the window is reached;
 - (manual triggers additionally require the `trigger_manual_reroute`
   permission, enforced by the API before `execute` is called).
 
@@ -355,10 +357,12 @@ detection-confidence gate, the telemetry-stale gate, and the
 newly-discovered-asset gate were **de-scoped** with the provider abstraction;
 the live gates above are the complete set.
 
-Cooldown default: a single **per-device** post-action cooldown of 5 min
-(`DEVICE_COOLDOWN_SECS = 300`). The earlier per-rule / per-prefix cooldowns and
-the global automatic-action rate limit are **not** wired in v1 — some of those
-config fields still exist but are not enforced; do not rely on them.
+Cooldowns / rate limit (all config-driven, `[safety]`, applied to manual and
+automatic actions): per-device cooldown (`same_device_cooldown_seconds`, default
+300), per-rule cooldown (`same_rule_cooldown_seconds`, default 900, rule-triggered
+only), and a global circuit breaker (`global_action_rate_limit_count` actions per
+`global_action_rate_limit_window_seconds`, default 3/600). A `0` disables a
+throttle.
 
 Two-phase action state machine:
 
@@ -418,9 +422,9 @@ device_interfaces (+ encrypted SNMP/SSH credentials, device_bgp_networks,
 device BGP peers), telemetry samples/current, detection rules/states/events
 (+ `rule_actions`), reroute templates/actions/steps/outputs/verifications,
 the global `rtbh_communities` catalog, locks/cooldowns, alerts/alert_deliveries,
-audit logs, system settings. The legacy `protected_assets` and
-`reroute_providers` tables remain for historical FKs but are not on the live
-device-CLI path.
+audit logs, system settings. The asset/provider model (`protected_assets`,
+`reroute_providers`, and their `asset_*` satellites) was **dropped** — the model
+is devices/interfaces end to end.
 
 ---
 

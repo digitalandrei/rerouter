@@ -13,12 +13,9 @@ of schema truth.
 
 ```text
 auth        users, roles, permissions, role_user, permission_role, sessions
-assets      protected_assets, asset_statuses, asset_provider           (vestigial)
-providers   reroute_providers, provider_credentials                    (vestigial)
 devices     devices, device_interfaces, interface_metrics_current, interface_samples,
             device_bgp_peers, device_bgp_networks
 routing     rtbh_communities
-telemetry   asset_metrics_current, traffic_samples                     (vestigial)
 detection   rules, rule_states, rule_events, rule_actions
 reroute     reroute_templates, reroutes, reroute_steps, reroute_outputs,
             reroute_verifications
@@ -27,11 +24,14 @@ alerts      alerts, alert_recipients, alert_subscriptions, alert_deliveries
 core        audit_logs, system_settings
 ```
 
-> **Live vs. vestigial.** The shipped telemetry + mitigation model is
-> **devices / interfaces** (SNMP polling) with `device_cli` reroutes over SSH.
-> The `protected_assets` / `reroute_providers` / `asset_*` / `*_metrics`(asset)
-> tables predate that pivot and still exist, but no live code path drives them —
-> treat them as vestigial.
+> **Asset/provider model dropped.** The original abstract `protected_assets` /
+> `reroute_providers` layer (and `asset_provider`, `asset_statuses`,
+> `provider_credentials`, `asset_metrics_current`, `traffic_samples`) was removed
+> by migration `20260614000100_drop_asset_provider_model.sql`, along with the
+> orphaned `asset_id`/`provider_id` columns it left on the live tables. The
+> shipped telemetry + mitigation model is **devices / interfaces** (SNMP polling)
+> with `device_cli` reroutes over SSH; per-interface telemetry lives in
+> `interface_metrics_current` (latest) + `interface_samples` (history).
 
 ## auth / users
 
@@ -69,71 +69,6 @@ roles:            id, name, created_at, updated_at
 permissions:      id, name, created_at, updated_at
 role_user:        role_id, user_id
 permission_role:  permission_id, role_id
-```
-
-## protected_assets
-
-> **Vestigial.** Superseded by the `devices` / `device_interfaces` model. The
-> table (and `asset_provider`, `asset_statuses`, `reroute_providers`,
-> `provider_credentials`, `asset_metrics_current`) still exists but is not on any
-> live path; documented here for completeness.
-
-```text
-id, name, kind(prefix|ip|service), cidr, address_family(v4|v6),
-description, owner, site, criticality,
-enabled, flow_enabled, bgp_enabled, cloudflare_zone_id,
-auto_reroute_eligible (default 0),
-created_at, updated_at
-```
-
-## asset_provider
-
-Link table: which providers are eligible to reroute which assets (see the
-enrollment flow in [asset-enrollment.md](asset-enrollment.md)).
-
-```text
-asset_id, provider_id   (composite PK; FKs cascade on delete)
-```
-
-## asset_statuses
-
-```text
-asset_id, overall_status, network_status, telemetry_status, provider_status,
-last_successful_sample_at, last_failed_sample_at, last_failure_reason,
-last_seen_at, telemetry_stale, updated_at
-```
-
-## reroute_providers
-
-```text
-id, name, type(cloudflare|bgp_rtbh|flowspec|scrubber), enabled, actions_enabled,
-endpoint, peer_ip, local_asn, remote_asn, blackhole_community, permitted_prefixes_json,
-credential_id, health_status, last_success_at, last_failure_reason,
-created_at, updated_at
-```
-
-## provider_credentials
-
-Only references/metadata in DB; secret material encrypted at rest by the
-controller (AES-256-GCM, key from `SECRETS_KEY`) or file-based.
-
-```text
-id, provider_id, name, kind(api_token|bgp_key|ssh_key|password),
-encrypted_value, key_path, created_at, updated_at
-```
-
-## asset_metrics_current
-
-> **Vestigial** (asset-era). The live per-interface equivalent is
-> `interface_metrics_current`.
-
-Latest normalized metrics per asset (one row per asset).
-
-```text
-asset_id, sampled_at, method, valid_sample, sampling_rate,
-rx_bps, tx_bps, rx_pps, tx_pps,
-new_conns_per_sec, syn_rate, syn_ack_ratio, unique_src_count,
-top_src_asn, top_dst_port, telemetry_stale, updated_at
 ```
 
 ## devices (SNMP)
@@ -190,9 +125,10 @@ admin_status, oper_status, updated_at
 
 ## interface_samples
 
-Retained per-interface rate history (default 7-day retention, like
-`traffic_samples`). Only derived rates; raw counters stay in
-`interface_metrics_current`.
+Retained per-interface rate history — the raw per-interface sample history that
+backs the detail-page charts (the scheduler prunes it on a short window; see
+[Retention defaults](#retention-defaults)). Only derived rates; raw counters stay
+in `interface_metrics_current`.
 
 ```text
 id, interface_id, device_id, sampled_at, valid_sample,
@@ -237,29 +173,16 @@ id, label, kind(standard|large), community, tag (unique),
 created_by, created_at, updated_at
 ```
 
-## traffic_samples
-
-> **Vestigial** (asset-era). The live per-interface history lives in
-> `interface_samples`.
-
-High volume; retention-controlled (default 7 days).
-
-```text
-id, asset_id, sampled_at, method, valid_sample, sampling_rate,
-rx_bps, tx_bps, rx_pps, tx_pps, new_conns_per_sec, syn_rate, syn_ack_ratio,
-unique_src_count, raw_ref, created_at
-```
-
 ## rules
 
-The live rule targets a monitored **interface** (`interface_id` + `device_id`);
-the evaluator only selects `interface_id IS NOT NULL` rows. `asset_id` is nullable
-and belongs to the vestigial asset path. A rule's mitigation is **not** the
-`reroute_template_id` column (now legacy / unused) — its actions live in
+The live rule targets a monitored **interface** (`interface_id` + a denormalized
+`device_id`); the evaluator only selects `interface_id IS NOT NULL` rows. (The old
+`asset_id` column was dropped with the asset model.) A rule's mitigation is **not**
+the `reroute_template_id` column (now legacy / unused) — its actions live in
 `rule_actions` (below).
 
 ```text
-id, asset_id (nullable), interface_id (nullable), device_id (nullable),
+id, interface_id (nullable), device_id (nullable),
 name, metric, operator, threshold_value, threshold_unit,
 duration_seconds, consecutive_samples, severity, schedule_json,
 enabled, automatic_reroute_enabled (default 0), reroute_template_id (legacy/unused),
@@ -277,8 +200,10 @@ last_triggered_reroute_id, updated_at
 
 ## rule_events
 
+Keyed on `rule_id` only (the `asset_id` column was dropped with the asset model).
+
 ```text
-id, rule_id, asset_id, event(matched|fired|cleared), metric_value,
+id, rule_id, event(matched|fired|cleared), metric_value,
 sampled_at, created_at
 ```
 
@@ -313,14 +238,14 @@ rollback_template_id, enabled, created_at, updated_at
 
 ## reroutes (actions)
 
-The real target is now `device_id` (the router the action ran against); `asset_id`
-is nullable and `provider_id` is vestigial (the `device_cli` executor never sets
-either). The `safety_level`, `expires_at`, and `cooldown_until` columns were
-**dropped** (safety levels and auto-expiry removed; cooldowns live in the
-`cooldowns` table keyed on the `device` scope).
+The target is `device_id` (the router the action ran against). The `asset_id` and
+`provider_id` columns were **dropped** with the asset/provider model (the
+`device_cli` executor never set either). The `safety_level`, `expires_at`, and
+`cooldown_until` columns were also **dropped** (safety levels and auto-expiry
+removed; cooldowns live in the `cooldowns` table keyed on the `device` scope).
 
 ```text
-id, asset_id (nullable), device_id (nullable), provider_id (vestigial),
+id, device_id (nullable),
 rule_id, reroute_template_id,
 trigger_type(automatic|manual|rollback), triggered_by_user_id,
 state(planned|pending|running|verifying|succeeded|failed|uncertain),
@@ -346,10 +271,12 @@ checked_at, created_at
 
 ## locks / cooldowns
 
-The device-CLI engine uses the `device` scope on both (the others are vestigial
-asset/provider scopes). A `device` lock is what an `uncertain`/failed action or
-crash recovery sets; the per-device cooldown row is what the 5-min post-action
-window writes.
+In practice only **`device`** and **`global`** locks and **`device`**, **`rule`**,
+and **`global`** cooldowns are written — the device-CLI engine works at the device
+scope. (The ENUMs still list the older asset/provider/prefix scope values from the
+asset era, but no live path sets them.) A `device` lock is what an
+`uncertain`/failed action or crash recovery sets; the per-device cooldown row is
+what the 5-min post-action window writes.
 
 ```text
 locks:     id, scope(global|asset|provider|prefix|template|device), scope_ref,
@@ -361,12 +288,16 @@ cooldowns: id, scope(rule|asset|prefix_provider|global|device), scope_ref,
 
 ## alerts / delivery
 
+`alerts` key on `device_id` / `interface_id` / `rule_id`; `alert_subscriptions`
+match by `event_type` only (NULL = all events). The `asset_id` columns on both were
+**dropped** with the asset model.
+
 ```text
-alerts:              id, event_type, severity, asset_id, device_id, interface_id,
+alerts:              id, event_type, severity, device_id, interface_id,
                      rule_id, reroute_id,
                      payload_json, dedup_key, occurrence_count, created_at
 alert_recipients:    id, user_id, email, verified_at, created_at
-alert_subscriptions: id, recipient_id, asset_id(null=all), event_type(null=all),
+alert_subscriptions: id, recipient_id, event_type(null=all),
                      enabled, created_at
 alert_deliveries:    id, alert_id, recipient_id, channel(email),
                      status(queued|sent|failed|bounced), error, sent_at, created_at
@@ -378,7 +309,7 @@ Append-only. Audit everything.
 
 ```text
 id, actor_type(user|controller|system), actor_user_id, event_type,
-entity_type, entity_id, asset_id, reroute_id, message,
+entity_type, entity_id, reroute_id, message,
 before_json, after_json, ip_address, user_agent, created_at
 ```
 
@@ -398,7 +329,8 @@ global_maintenance_lock    seeded 'false'
 ## Retention defaults
 
 ```text
-traffic_samples:     7 days
+interface_samples:   ~70 minutes (pruned every 10 min by the scheduler; telemetry
+                     is intentionally short-lived — just enough for the 60-min charts)
 rule_events:         90 days
 reroutes/outputs:    365 days
 alert_deliveries:    365 days

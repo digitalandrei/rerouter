@@ -27,7 +27,6 @@ struct AlertRow {
     severity: String,
     device_id: Option<u64>,
     interface_id: Option<u64>,
-    asset_id: Option<u64>,
     rule_id: Option<u64>,
     created_at: chrono::DateTime<chrono::Utc>,
     payload_json: Option<sqlx::types::Json<Value>>,
@@ -41,7 +40,7 @@ pub async fn list(
 ) -> JsonResp {
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let rows = sqlx::query_as::<_, AlertRow>(
-        "SELECT id, event_type, severity, device_id, interface_id, asset_id, rule_id, \
+        "SELECT id, event_type, severity, device_id, interface_id, rule_id, \
                 created_at, payload_json \
          FROM alerts ORDER BY id DESC LIMIT ?",
     )
@@ -60,7 +59,6 @@ pub async fn list(
                         "severity": r.severity,
                         "device_id": r.device_id,
                         "interface_id": r.interface_id,
-                        "asset_id": r.asset_id,
                         "rule_id": r.rule_id,
                         "created_at": r.created_at.to_rfc3339(),
                         "payload": r.payload_json.map(|j| j.0).unwrap_or_else(|| json!({})),

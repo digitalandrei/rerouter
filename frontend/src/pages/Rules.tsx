@@ -458,7 +458,6 @@ export default function Rules() {
         target_kind: "interface",
         interface_id: parseInt(form.interface_id, 10),
         device_id: parseInt(form.device_id, 10),
-        asset_id: null,
         metric: form.metric,
         operator: form.operator,
         threshold_value: parseFloat(form.threshold_value),
@@ -728,16 +727,12 @@ export default function Rules() {
                       </div>
                     </TableCell>
 
-                    {/* Target — interface name (+ device) or asset */}
+                    {/* Target — interface name (+ device) */}
                     <TableCell className="text-xs">
                       <div className="flex flex-col">
                         <span className="font-mono">
-                          {rule.target_kind === "interface"
-                            ? (rule.interface_name ||
-                              (rule.interface_id ? `interface #${rule.interface_id}` : "interface"))
-                            : rule.asset_id
-                              ? `asset #${rule.asset_id}`
-                              : rule.target_kind}
+                          {rule.interface_name ||
+                            (rule.interface_id ? `interface #${rule.interface_id}` : "interface")}
                         </span>
                         {rule.device_name && (
                           <span className="text-[11px] text-muted-foreground">

@@ -251,10 +251,9 @@ export interface RuleAction {
 export interface Rule {
   id: number;
   name: string;
-  target_kind: "interface" | "asset";
+  target_kind: "interface";
   interface_id: number | null;
   device_id: number | null;
-  asset_id: number | null;
   metric: string;
   operator: ">" | "<";
   threshold_value: number;
@@ -280,7 +279,6 @@ export interface Alert {
   severity: string;
   device_id: number | null;
   interface_id: number | null;
-  asset_id: number | null;
   rule_id: number | null;
   created_at: string;
   payload: Record<string, unknown>;

@@ -132,24 +132,28 @@ provider-reachability gate, no permitted-prefix-range gate, and no re-auth / typ
 confirmation step (those were de-scoped along with the multi-provider model and
 the `safety_level` classification).
 
-## Cooldowns
+## Cooldowns & rate limit
 
-Only a **per-device** cooldown is enforced: after any action finishes on a device,
-that device is in cooldown for 5 minutes before another action can run on it.
+Three throttles are enforced by the executor, all config-driven (`[safety]`):
 
 ```text
-same device action cooldown:  5 min (300s)
+same_device_cooldown_seconds      300   per-device: after any action on a device,
+                                          it is in cooldown before the next one
+same_rule_cooldown_seconds        900   per-rule: after a rule's actions run, that
+                                          rule is throttled (rule-triggered only)
+global_action_rate_limit_count      3   global circuit breaker: at most N executed
+  / _window_seconds               600     actions per rolling window, all devices
 ```
 
-The `cooldowns` table can also record other scopes, but the executor enforces the
-device scope only. The per-rule / per-prefix cooldowns and the global automatic
-rate-limit from the original router-CLI design are **not** implemented.
+Per-device and per-rule cooldowns are recorded in the `cooldowns` table
+(scope `device` / `rule`); the global limit counts actual `reroutes` rows in the
+window. Set any value to `0` (cooldowns) or the count to `0` (rate limit) to
+disable that throttle. These apply to manual and automatic actions alike.
 
 ## Locks
 
-Lock scopes: `global`, `asset`, `provider`, `prefix`, `template`, `device`. The
-device-CLI engine uses the `device` scope (and `global`); the others remain for
-the vestigial asset/provider model. Locks can be manual, automatic after a failed
+Lock scopes: the device-CLI engine uses the `device` scope (and `global`). Locks
+can be manual, automatic after a failed
 action, automatic after crash recovery, or automatic after action uncertainty. A
 locked scope blocks all reroutes touching it until cleared (admin ack for
 safety-induced locks).

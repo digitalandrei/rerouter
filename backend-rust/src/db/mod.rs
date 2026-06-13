@@ -111,6 +111,3 @@ fn describe_url(url: &str) -> String {
     format!("user '{user}' @ {host}, database '{db}'")
 }
 
-// TODO(milestone 1): typed query helpers for assets, providers, statuses,
-// metrics_current, traffic_samples. Persist action-state transitions inside a
-// transaction together with the step output (see ../docs/state-recovery.md).
