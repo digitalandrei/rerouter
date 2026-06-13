@@ -9,9 +9,12 @@
  * defaults that loosen safety.
  */
 import { useEffect, useState } from "react";
-import { api, type SystemSettings } from "@/lib/api";
+import { X } from "lucide-react";
+import { api, type SystemSettings, type RtbhCommunity, ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
@@ -19,6 +22,104 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+
+/** Global RTBH community catalog the blackhole templates pick from. */
+function RtbhCard() {
+  const { hasPermission } = useAuth();
+  const canManage = hasPermission("manage_devices");
+  const [items, setItems] = useState<RtbhCommunity[] | null>(null);
+  const [label, setLabel] = useState("");
+  const [community, setCommunity] = useState("");
+  const [tag, setTag] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function load() {
+    api.rtbh.list().then(setItems).catch(() => setItems([]));
+  }
+  useEffect(load, []);
+
+  async function add() {
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await api.rtbh.create({
+        label: label.trim(),
+        community: community.trim(),
+        tag: parseInt(tag, 10),
+      });
+      setItems(updated);
+      setLabel("");
+      setCommunity("");
+      setTag("");
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "failed to add");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg">RTBH communities</CardTitle>
+        <CardDescription>
+          Blackhole communities (standard <code>X:Y</code> or large{" "}
+          <code>X:Y:Z</code>) plus the route tag the routers' RTBH redistribute
+          route-map matches. The blackhole templates pick from this list.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {items === null ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : items.length === 0 ? (
+          <p className="text-sm text-muted-foreground">None defined yet.</p>
+        ) : (
+          <div className="space-y-1">
+            {items.map((c) => (
+              <div
+                key={c.id}
+                className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
+              >
+                <span className="font-medium">{c.label}</span>
+                <code className="text-xs">{c.community}</code>
+                <Badge variant="outline">{c.kind}</Badge>
+                <span className="text-xs text-muted-foreground">tag {c.tag}</span>
+                <span className="flex-1" />
+                {canManage && (
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive"
+                    onClick={() => void api.rtbh.remove(c.id).then(load).catch(() => {})}
+                    title="Remove"
+                  >
+                    <X className="size-4" />
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {canManage && (
+          <div className="grid gap-2 sm:grid-cols-[1fr_1fr_110px_auto]">
+            <Input placeholder="Label" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <Input
+              placeholder="65000:666"
+              value={community}
+              onChange={(e) => setCommunity(e.target.value)}
+            />
+            <Input placeholder="Route tag" value={tag} onChange={(e) => setTag(e.target.value)} />
+            <Button size="sm" disabled={busy} onClick={() => void add()}>
+              Add
+            </Button>
+          </div>
+        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </CardContent>
+    </Card>
+  );
+}
 
 export default function Settings() {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
@@ -129,6 +230,8 @@ export default function Settings() {
           </Button>
         </CardContent>
       </Card>
+
+      <RtbhCard />
     </div>
   );
 }

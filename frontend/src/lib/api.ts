@@ -207,6 +207,21 @@ export interface BgpPeer {
   last_polled_at: string | null;
 }
 
+export interface BgpNetwork {
+  id: number;
+  device_id: number;
+  prefix: string;
+  last_discovered_at: string | null;
+}
+
+export interface RtbhCommunity {
+  id: number;
+  label: string;
+  kind: string; // "standard" | "large"
+  community: string;
+  tag: number;
+}
+
 // ---------------------------------------------------------------------------
 // Rules and Alerts
 // ---------------------------------------------------------------------------
@@ -349,10 +364,13 @@ export interface Lock {
 // ---------------------------------------------------------------------------
 
 export interface TemplateParamSpec {
-  type: string; // "ip" | "cidr" | "asn" | "string"
+  type: string; // "ip" | "cidr" | "asn" | "int" | "string"
   label?: string;
   required?: boolean;
-  source?: string; // "bgp_peer" | "bgp_local_as" — UI prefill hint
+  // UI prefill hint: "bgp_local_as" | "bgp_peer" | "announced_prefix" | "rtbh_tag"
+  source?: string;
+  // this param must be a subprefix of the named param's CIDR (AWS-SG style)
+  subprefix_of?: string;
 }
 
 export interface Template {
@@ -512,6 +530,12 @@ export const api = {
       request<{ discovered: number }>(`/api/devices/${id}/discover-bgp`, {
         method: "POST",
       }),
+    bgpNetworks: (id: number) =>
+      request<BgpNetwork[]>(`/api/devices/${id}/bgp-networks`),
+    discoverPrefixes: (id: number) =>
+      request<{ discovered: number }>(`/api/devices/${id}/discover-prefixes`, {
+        method: "POST",
+      }),
     updateBgpPeer: (deviceId: number, peerId: number, label: string | null) =>
       request<{ ok: boolean }>(`/api/devices/${deviceId}/bgp-peers/${peerId}`, {
         method: "PATCH",
@@ -558,6 +582,14 @@ export const api = {
         method: "POST",
         body: { params },
       }),
+  },
+
+  rtbh: {
+    list: () => request<RtbhCommunity[]>("/api/rtbh-communities"),
+    create: (body: { label: string; kind?: string; community: string; tag: number }) =>
+      request<RtbhCommunity[]>("/api/rtbh-communities", { method: "POST", body }),
+    remove: (id: number) =>
+      request<{ ok: boolean }>(`/api/rtbh-communities/${id}`, { method: "DELETE" }),
   },
 
   alerts: {

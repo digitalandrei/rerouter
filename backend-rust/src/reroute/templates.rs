@@ -170,6 +170,12 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 }
                 subst.insert(name.clone(), Value::String(asn.to_string()));
             }
+            "int" => {
+                let n: u32 = provided
+                    .parse()
+                    .map_err(|_| anyhow!("parameter '{name}' must be a non-negative integer"))?;
+                subst.insert(name.clone(), Value::String(n.to_string()));
+            }
             "cidr" => {
                 let (net, mask, norm) =
                     parse_cidr_v4(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
@@ -186,7 +192,43 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
             }
         }
     }
+
+    // Containment pass: a `subprefix_of` param must sit within its parent CIDR
+    // (the AWS-SG-style "any subnet of, including the whole prefix" rule).
+    for (name, spec) in schema_obj {
+        let Some(parent) = spec.get("subprefix_of").and_then(Value::as_str) else { continue };
+        if let (Some(child), Some(par)) = (
+            subst.get(name).and_then(Value::as_str),
+            subst.get(parent).and_then(Value::as_str),
+        ) {
+            if !cidr_contains(par, child)? {
+                bail!("parameter '{name}' ({child}) must be within {parent} ({par})");
+            }
+        }
+    }
     Ok(subst)
+}
+
+/// True if `child` CIDR is equal to or more-specific than (contained in) `parent`.
+fn cidr_contains(parent: &str, child: &str) -> Result<bool> {
+    let (pnet, plen) = parse_cidr_parts(parent)?;
+    let (cnet, clen) = parse_cidr_parts(child)?;
+    if clen < plen {
+        return Ok(false); // child must be equal or longer (more specific)
+    }
+    let pmask: u32 = if plen == 0 { 0 } else { u32::MAX.checked_shl(32 - plen).unwrap_or(0) };
+    Ok((cnet & pmask) == (pnet & pmask))
+}
+
+/// Parse "a.b.c.d/len" -> (u32 network bits, prefix length).
+fn parse_cidr_parts(s: &str) -> Result<(u32, u32)> {
+    let (ip, len) = s.split_once('/').ok_or_else(|| anyhow!("invalid CIDR '{s}'"))?;
+    let ip: Ipv4Addr = ip.trim().parse().map_err(|_| anyhow!("invalid IPv4 in '{s}'"))?;
+    let len: u32 = len.trim().parse().map_err(|_| anyhow!("invalid prefix length in '{s}'"))?;
+    if len > 32 {
+        bail!("prefix length out of range in '{s}'");
+    }
+    Ok((u32::from(ip), len))
 }
 
 /// Render a device_cli template into its exact command list + verification.
@@ -295,6 +337,20 @@ mod tests {
     fn substitute_rejects_unresolved() {
         let m = Map::new();
         assert!(substitute("router bgp {local_asn}", &m).is_err());
+    }
+
+    #[test]
+    fn subprefix_must_be_within_parent() {
+        let schema = json!({
+            "parent": {"type": "cidr", "required": true, "source": "announced_prefix"},
+            "target": {"type": "cidr", "required": true, "subprefix_of": "parent"},
+        });
+        // more-specific within the parent, and equal to the parent, are allowed.
+        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.2.128/25"})).is_ok());
+        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.2.0/24"})).is_ok());
+        // a different block, or a less-specific block, are rejected.
+        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "198.51.100.0/24"})).is_err());
+        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.0.0/16"})).is_err());
     }
 
     #[test]

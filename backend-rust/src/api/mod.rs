@@ -14,6 +14,7 @@ pub mod assets;
 pub mod providers;
 pub mod rules;
 pub mod templates;
+pub mod rtbh;
 pub mod reroutes;
 pub mod alerts;
 pub mod audit;
@@ -118,6 +119,8 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/discover-bgp", post(devices::discover_bgp))
         .route("/api/devices/{id}/bgp-peers", get(devices::bgp_peers))
         .route("/api/devices/{device_id}/bgp-peers/{peer_id}", patch(devices::update_bgp_peer))
+        .route("/api/devices/{id}/bgp-networks", get(devices::bgp_networks))
+        .route("/api/devices/{id}/discover-prefixes", post(devices::discover_prefixes))
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))
@@ -140,6 +143,9 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/templates", get(templates::list))
         .route("/api/templates/{id}", get(templates::show))
         .route("/api/templates/{id}/render", post(templates::render))
+        // global RTBH community catalog (blackhole tag picker)
+        .route("/api/rtbh-communities", get(rtbh::list).post(rtbh::create))
+        .route("/api/rtbh-communities/{id}", delete(rtbh::remove))
         // reroutes (authz: session + RBAC + re-auth — see reroutes.rs)
         .route("/api/reroutes", get(reroutes::list))
         .route("/api/reroutes/manual", post(reroutes::manual))

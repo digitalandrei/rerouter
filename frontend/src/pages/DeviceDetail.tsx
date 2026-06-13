@@ -32,8 +32,17 @@ import {
   SlidersHorizontal,
   TerminalSquare,
   Network,
+  Globe,
 } from "lucide-react";
-import { api, type Device, type Interface, type Rule, type BgpPeer, ApiError } from "@/lib/api";
+import {
+  api,
+  type Device,
+  type Interface,
+  type Rule,
+  type BgpPeer,
+  type BgpNetwork,
+  ApiError,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -488,6 +497,79 @@ function BgpSessionsCard({ deviceId, canManage }: { deviceId: number; canManage:
               ))}
             </TableBody>
           </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/// Announced BGP prefixes (network statements), SSH-discovered + daily-refreshed.
+/// These feed the blackhole prefix picker and the null-route parent.
+function AnnouncedPrefixesCard({ deviceId, canManage }: { deviceId: number; canManage: boolean }) {
+  const [networks, setNetworks] = useState<BgpNetwork[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api.devices
+      .bgpNetworks(deviceId)
+      .then(setNetworks)
+      .catch(() => setNetworks([]));
+  }, [deviceId]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function discover() {
+    setBusy(true);
+    try {
+      const r = await api.devices.discoverPrefixes(deviceId);
+      load();
+      if (r.discovered === 0) {
+        alert("No announced prefixes found (no `network` statements, or SSH unavailable).");
+      }
+    } catch (e) {
+      alert(`Prefix discovery failed: ${e instanceof Error ? e.message : "error"}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Globe className="size-4 text-muted-foreground" />
+          Announced prefixes
+          <Badge variant="outline" className="ml-1 font-normal text-muted-foreground">
+            via SSH · daily
+          </Badge>
+        </CardTitle>
+        {canManage && (
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void discover()}>
+            <Compass className="size-4" />
+            {busy ? "Discovering…" : "Discover prefixes"}
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent>
+        {networks === null ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : networks.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No announced prefixes discovered yet.
+            {canManage ? ' Use "Discover prefixes" above.' : ""}
+          </p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {networks.map((n) => (
+              <code
+                key={n.id}
+                className="rounded-md border border-border px-2 py-1 text-xs"
+              >
+                {n.prefix}
+              </code>
+            ))}
+          </div>
         )}
       </CardContent>
     </Card>
@@ -963,6 +1045,7 @@ export default function DeviceDetail() {
         <TabsContent value="overview" className="mt-4 space-y-4">
           <OverviewTab device={device} />
           <BgpSessionsCard deviceId={deviceId} canManage={canManage} />
+          <AnnouncedPrefixesCard deviceId={deviceId} canManage={canManage} />
         </TabsContent>
 
         <TabsContent value="interfaces" className="mt-4">

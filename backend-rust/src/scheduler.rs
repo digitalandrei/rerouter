@@ -41,9 +41,35 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     tokio::spawn(prune_samples(pool.clone()));
+    tokio::spawn(discover_prefixes_daily(pool.clone()));
     tokio::spawn(supervise(pool, cfg));
     tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
     Ok(())
+}
+
+/// How often to revalidate announced prefixes over SSH.
+const PREFIX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// Discover each device's announced BGP prefixes over SSH, shortly after boot and
+/// then daily. Best-effort: a device without working SSH is logged and skipped
+/// (manual "Discover prefixes" remains available). The SNMP-cached ASN/neighbors
+/// refresh every poll, so only the SSH-sourced prefixes need this slow loop.
+async fn discover_prefixes_daily(pool: MySqlPool) {
+    tokio::time::sleep(Duration::from_secs(120)).await; // let the box settle after boot
+    loop {
+        match snmp::load_enabled_devices(&pool).await {
+            Ok(devices) => {
+                for d in devices {
+                    match crate::ssh::discover_prefixes_and_store(&pool, d.id).await {
+                        Ok(n) => tracing::debug!(event_type = "prefix_discovery", device_id = d.id, prefixes = n, "announced prefixes refreshed"),
+                        Err(e) => tracing::debug!(event_type = "prefix_discovery_failed", device_id = d.id, error = %e, "announced-prefix discovery failed (non-fatal)"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(event_type = "prefix_discovery_load_failed", error = %e, "could not load devices for prefix discovery"),
+        }
+        tokio::time::sleep(PREFIX_DISCOVERY_INTERVAL).await;
+    }
 }
 
 /// Periodically delete interface_samples older than the retention window so the

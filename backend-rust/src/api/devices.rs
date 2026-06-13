@@ -689,6 +689,61 @@ pub async fn update_bgp_peer(
     }
 }
 
+// ---- Announced prefixes (BGP network statements, discovered over SSH) ----------
+
+/// GET /api/devices/{id}/bgp-networks — discovered announced prefixes.
+pub async fn bgp_networks(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let rows = sqlx::query_as::<_, (u64, u64, String, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT id, device_id, prefix, last_discovered_at FROM device_bgp_networks \
+         WHERE device_id = ? ORDER BY prefix",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let out: Vec<Value> = rows
+                .into_iter()
+                .map(|(rid, device_id, prefix, last)| {
+                    json!({
+                        "id": rid,
+                        "device_id": device_id,
+                        "prefix": prefix,
+                        "last_discovered_at": last.map(fmt_ts),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!(out)))
+        }
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+/// POST /api/devices/{id}/discover-prefixes — SSH-read `network` statements and
+/// reconcile device_bgp_networks. A failure surfaces as a 502 (no panic).
+pub async fn discover_prefixes(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    }
+    match crate::ssh::discover_prefixes_and_store(&state.pool, id).await {
+        Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
 /// True if a sqlx error is a MySQL duplicate-key (1062) violation.
 fn is_dup(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23000"))

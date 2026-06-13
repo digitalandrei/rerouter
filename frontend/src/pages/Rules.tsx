@@ -27,9 +27,9 @@ import {
   type Device,
   type Interface,
   type Template,
-  type BgpPeer,
   ApiError,
 } from "@/lib/api";
+import { ActionParamsForm } from "@/components/action-params-form";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -75,7 +75,6 @@ function RuleActionsDialog({
   const [devices, setDevices] = useState<Device[]>([]);
   const [templateId, setTemplateId] = useState<string>("");
   const [deviceId, setDeviceId] = useState<string>("");
-  const [peers, setPeers] = useState<BgpPeer[]>([]);
   const [values, setValues] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -91,33 +90,8 @@ function RuleActionsDialog({
       .catch(() => setDevices([]));
   }, []);
 
-  useEffect(() => {
-    if (!deviceId) {
-      setPeers([]);
-      return;
-    }
-    api.devices
-      .bgpPeers(parseInt(deviceId, 10))
-      .then(setPeers)
-      .catch(() => setPeers([]));
-  }, [deviceId]);
-
   const template = templates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
-
-  function selectNeighbor(name: string, addr: string) {
-    setValues((v) => {
-      const next = { ...v, [name]: addr };
-      // Auto-fill a local-AS param from the chosen peer.
-      const peer = peers.find((p) => p.peer_remote_addr === addr);
-      if (peer?.local_as != null) {
-        for (const [pname, spec] of Object.entries(schema)) {
-          if (spec.source === "bgp_local_as") next[pname] = String(peer.local_as);
-        }
-      }
-      return next;
-    });
-  }
 
   async function add() {
     if (!template || !deviceId) {
@@ -263,7 +237,10 @@ function RuleActionsDialog({
               <select
                 className={inputClass}
                 value={deviceId}
-                onChange={(e) => setDeviceId(e.target.value)}
+                onChange={(e) => {
+                  setDeviceId(e.target.value);
+                  setValues({});
+                }}
               >
                 <option value="">Select router…</option>
                 {devices.map((d) => (
@@ -276,48 +253,12 @@ function RuleActionsDialog({
           </div>
 
           {template && (
-            <div className="grid gap-3 sm:grid-cols-2">
-              {Object.entries(schema).map(([name, spec]) => (
-                <label key={name} className="block space-y-1 text-sm font-medium">
-                  {spec.label ?? name}{" "}
-                  <span className="text-muted-foreground">({spec.type})</span>
-                  {spec.source === "bgp_peer" ? (
-                    <select
-                      className={inputClass}
-                      value={values[name] ?? ""}
-                      onChange={(e) => selectNeighbor(name, e.target.value)}
-                      disabled={!deviceId}
-                    >
-                      <option value="">
-                        {deviceId ? "Select neighbor…" : "Pick a router first"}
-                      </option>
-                      {peers.map((p) => (
-                        <option key={p.id} value={p.peer_remote_addr}>
-                          {p.peer_remote_addr}
-                          {p.peer_remote_as ? ` · AS${p.peer_remote_as}` : ""}
-                          {p.label ? ` · ${p.label}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      className={inputClass}
-                      value={values[name] ?? ""}
-                      placeholder={
-                        spec.type === "cidr"
-                          ? "e.g. 192.0.2.0/24"
-                          : spec.type === "asn"
-                            ? "e.g. 65001"
-                            : ""
-                      }
-                      onChange={(e) =>
-                        setValues((v) => ({ ...v, [name]: e.target.value }))
-                      }
-                    />
-                  )}
-                </label>
-              ))}
-            </div>
+            <ActionParamsForm
+              schema={schema}
+              deviceId={deviceId ? parseInt(deviceId, 10) : null}
+              values={values}
+              onChange={setValues}
+            />
           )}
 
           {error && (

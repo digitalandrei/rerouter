@@ -20,6 +20,7 @@
 //! the executor's safety gates (operating_mode, locks, cooldowns, …) own that.
 
 use std::borrow::Cow;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -201,6 +202,72 @@ pub async fn run_commands(pool: &MySqlPool, device_id: u64, commands: &[String])
         .await;
     }
     Ok(outcome)
+}
+
+/// Discover the device's announced BGP prefixes (`network` statements) over SSH
+/// and reconcile `device_bgp_networks`. Returns the prefix count. Requires
+/// working SSH; a failure is a structured error (caller logs it).
+pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
+    let cmd = "show running-config | section ^router bgp".to_string();
+    let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
+    let output = outcome.results.first().map(|r| r.output.as_str()).unwrap_or("");
+    let prefixes = parse_network_statements(output);
+
+    for prefix in &prefixes {
+        let _ = sqlx::query(
+            "INSERT INTO device_bgp_networks (device_id, prefix, first_seen_at, last_seen_at, last_discovered_at) \
+             VALUES (?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
+             ON DUPLICATE KEY UPDATE last_seen_at = UTC_TIMESTAMP(), last_discovered_at = UTC_TIMESTAMP()",
+        )
+        .bind(device_id)
+        .bind(prefix)
+        .execute(pool)
+        .await;
+    }
+    Ok(prefixes.len())
+}
+
+/// Parse `network A.B.C.D mask M.M.M.M` (and `network A.B.C.D/len`) lines from a
+/// `router bgp` config section into CIDR strings.
+fn parse_network_statements(config: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("network ") else { continue };
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 3 && parts[1] == "mask" {
+            if let (Ok(ip), Some(len)) = (parts[0].parse::<Ipv4Addr>(), mask_to_len(parts[2])) {
+                out.push(format!("{ip}/{len}"));
+            }
+        } else if parts.len() == 1 {
+            if let Some((ip, len)) = parts[0].split_once('/') {
+                if let (Ok(ip), Ok(len)) = (ip.parse::<Ipv4Addr>(), len.parse::<u8>()) {
+                    if len <= 32 {
+                        out.push(format!("{ip}/{len}"));
+                    }
+                }
+            } else if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
+                out.push(format!("{ip}/{}", classful_len(ip)));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Dotted netmask -> prefix length (counts set bits).
+fn mask_to_len(mask: &str) -> Option<u8> {
+    let ip: Ipv4Addr = mask.parse().ok()?;
+    Some(u32::from(ip).count_ones() as u8)
+}
+
+/// Classful default length for a maskless `network` statement.
+fn classful_len(ip: Ipv4Addr) -> u8 {
+    match ip.octets()[0] {
+        0..=127 => 8,
+        128..=191 => 16,
+        _ => 24,
+    }
 }
 
 /// Lower-level: run commands against already-loaded credentials. Used by
