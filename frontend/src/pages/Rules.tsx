@@ -21,6 +21,7 @@ import {
   Plus,
   X,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   api,
   type Rule,
@@ -30,6 +31,8 @@ import {
   ApiError,
 } from "@/lib/api";
 import { ActionParamsForm } from "@/components/action-params-form";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -313,18 +316,6 @@ const DEFAULT_FORM: RuleForm = {
   severity: "warning",
 };
 
-function severityVariant(
-  severity: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (severity) {
-    case "critical":
-      return "destructive";
-    case "warning":
-      return "secondary";
-    default:
-      return "outline";
-  }
-}
 
 /** Human-readable condition string: "rx_bps > 8000000000" */
 function conditionLabel(rule: Rule): string {
@@ -384,11 +375,7 @@ function RuleStatus({ rule }: { rule: Rule }) {
   const above = v > rule.threshold_value;
   const Arrow = above ? ArrowUp : ArrowDown;
   const dir = above ? "above" : v < rule.threshold_value ? "below" : "at";
-  const cls = stale
-    ? "bg-muted text-muted-foreground"
-    : breaching
-      ? "bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300"
-      : "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300";
+  const cls = stale ? "bg-muted text-muted-foreground" : toneClass(breaching ? "bad" : "good");
   return (
     <span
       className={`inline-flex w-fit items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${cls}`}
@@ -415,6 +402,7 @@ export default function Rules() {
   const [addError, setAddError] = useState<string | null>(null);
   const [addBusy, setAddBusy] = useState(false);
   const [manageRule, setManageRule] = useState<Rule | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
 
   const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
@@ -509,12 +497,12 @@ export default function Rules() {
   }
 
   async function deleteRule(rule: Rule) {
-    if (!confirm(`Delete rule "${rule.name}"?`)) return;
     try {
       await api.rules.remove(rule.id);
       setRules((prev) => prev.filter((r) => r.id !== rule.id));
+      toast.success(`Deleted rule "${rule.name}"`);
     } catch {
-      // ignore
+      toast.error("Failed to delete rule");
     }
   }
 
@@ -788,9 +776,7 @@ export default function Rules() {
 
                     {/* Severity badge */}
                     <TableCell>
-                      <Badge variant={severityVariant(rule.severity)}>
-                        {rule.severity}
-                      </Badge>
+                      <SeverityBadge severity={rule.severity} />
                     </TableCell>
 
                     {/* Enabled badge */}
@@ -860,7 +846,7 @@ export default function Rules() {
                               variant="ghost"
                               title="Delete rule"
                               className="text-destructive hover:text-destructive"
-                              onClick={() => void deleteRule(rule)}
+                              onClick={() => setDeleteTarget(rule)}
                             >
                               <Trash2 className="size-4" />
                               <span className="sr-only">Delete</span>
@@ -887,6 +873,27 @@ export default function Rules() {
           }}
         />
       )}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(v) => !v && setDeleteTarget(null)}
+        title="Delete rule"
+        description={
+          <>
+            Permanently delete the rule <strong>{deleteTarget?.name}</strong> and its
+            attached actions. This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        destructive
+        requireText="CONFIRM"
+        onConfirm={async () => {
+          if (!deleteTarget) return;
+          const rule = deleteTarget;
+          setDeleteTarget(null);
+          await deleteRule(rule);
+        }}
+      />
     </div>
   );
 }

@@ -11,13 +11,16 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { toast } from "sonner";
 import {
   api,
   type Reroute,
   type RerouteDetail,
-  type RerouteState,
   type Lock,
 } from "@/lib/api";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { PromptDialog } from "@/components/prompt-dialog";
+import { StateBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -38,23 +41,6 @@ import {
 import { ObserveBanner } from "@/components/layout/observe-banner";
 import { ShieldAlert, Shuffle } from "lucide-react";
 
-function stateVariant(
-  state: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (state) {
-    case "succeeded":
-      return "default";
-    case "failed":
-    case "uncertain":
-      return "destructive";
-    case "planned":
-    case "pending":
-      return "outline";
-    default:
-      return "secondary";
-  }
-}
-
 function RerouteDrawer({
   id,
   onClose,
@@ -66,6 +52,8 @@ function RerouteDrawer({
 }) {
   const [detail, setDetail] = useState<RerouteDetail | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ackOpen, setAckOpen] = useState(false);
+  const [rollbackOpen, setRollbackOpen] = useState(false);
 
   const load = useCallback(() => {
     api.reroutes.get(id).then(setDetail).catch(() => setDetail(null));
@@ -81,19 +69,20 @@ function RerouteDrawer({
       load();
       onChanged();
     } catch (e) {
-      alert(e instanceof Error ? e.message : "action failed");
+      toast.error(e instanceof Error ? e.message : "action failed");
     } finally {
       setBusy(false);
     }
   }
 
   return (
+    <>
     <Dialog open onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             Reroute #{id}
-            {detail && <Badge variant={stateVariant(detail.state)}>{detail.state}</Badge>}
+            {detail && <StateBadge state={detail.state} />}
           </DialogTitle>
         </DialogHeader>
         {!detail ? (
@@ -188,12 +177,7 @@ function RerouteDrawer({
                   size="sm"
                   variant="destructive"
                   disabled={busy}
-                  onClick={() =>
-                    void act(() => {
-                      const note = window.prompt("Acknowledgement note (what did you verify on the router?)") ?? "";
-                      return api.reroutes.acknowledgeUncertain(detail.id, note);
-                    })
-                  }
+                  onClick={() => setAckOpen(true)}
                 >
                   Acknowledge uncertain (clears device lock)
                 </Button>
@@ -203,14 +187,7 @@ function RerouteDrawer({
                   size="sm"
                   variant="outline"
                   disabled={busy}
-                  onClick={() =>
-                    void act(() => {
-                      if (!window.confirm("Run the rollback of this action now?")) {
-                        return Promise.resolve();
-                      }
-                      return api.reroutes.rollback(detail.id);
-                    })
-                  }
+                  onClick={() => setRollbackOpen(true)}
                 >
                   Roll back
                 </Button>
@@ -220,6 +197,36 @@ function RerouteDrawer({
         )}
       </DialogContent>
     </Dialog>
+
+    {detail && (
+      <PromptDialog
+        open={ackOpen}
+        onOpenChange={setAckOpen}
+        title="Acknowledge uncertain reroute"
+        description="This resolves the action and clears the device lock so reroutes can resume."
+        label="Acknowledgement note (what did you verify on the router?)"
+        multiline
+        submitLabel="Acknowledge"
+        onSubmit={async (note) => {
+          setAckOpen(false);
+          await act(() => api.reroutes.acknowledgeUncertain(detail.id, note));
+        }}
+      />
+    )}
+    {detail && (
+      <ConfirmDialog
+        open={rollbackOpen}
+        onOpenChange={setRollbackOpen}
+        title="Roll back this action"
+        description="Runs the template's rollback against the same router and parameters now."
+        confirmLabel="Roll back"
+        onConfirm={async () => {
+          setRollbackOpen(false);
+          await act(() => api.reroutes.rollback(detail.id));
+        }}
+      />
+    )}
+    </>
   );
 }
 
@@ -307,7 +314,7 @@ export default function Reroutes() {
                     <TableCell>{r.device_name ?? "—"}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{r.trigger_type}</TableCell>
                     <TableCell>
-                      <Badge variant={stateVariant(r.state as RerouteState)}>{r.state}</Badge>
+                      <StateBadge state={r.state} />
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {new Date(r.created_at).toLocaleString()}

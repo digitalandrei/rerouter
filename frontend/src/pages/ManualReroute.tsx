@@ -18,7 +18,7 @@ import {
   type RerouteResult,
   ApiError,
 } from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
+import { StateBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -228,17 +228,7 @@ export default function ManualReroute() {
                   {results.map((r, i) => (
                     <div key={i} className="rounded-md border border-border p-3 text-sm">
                       <div className="flex items-center gap-2">
-                        <Badge
-                          variant={
-                            r.state === "succeeded"
-                              ? "default"
-                              : r.state === "uncertain" || r.state === "failed"
-                                ? "destructive"
-                                : "secondary"
-                          }
-                        >
-                          {r.state ?? (r.executed ? "executed" : "not executed")}
-                        </Badge>
+                        <StateBadge state={r.state ?? (r.executed ? "executed" : "not executed")} />
                         <span className="text-muted-foreground">
                           {r.device_name ?? `device ${r.device_id}`}
                         </span>

@@ -1,815 +1,26 @@
 /**
- * /devices/:id — device detail, organised as an NMS-style tabbed view.
- *
- * Header: back arrow, device name, a reachability badge, a "Read-only · SNMP"
- * badge, and (gated by manage_devices, except Refresh) Refresh / Test SNMP /
- * Discover / Edit / Delete actions.
- *
- * Tabs:
- *  - Overview: a responsive grid of info cards (Device Information, Connectivity,
- *    Status) using uppercase muted labels + bold values and green pills.
- *  - Interfaces: the polished interface table; each row links to the interface
- *    detail page (`/devices/:id/interfaces/:ifaceId`). Per-interface charts live
- *    on the interface page.
- *
- * The device + interface list auto-refresh every 30 s.
+ * /devices/:id — device detail, an NMS-style tabbed view. Thin orchestrator: the
+ * tabs and cards live in ./device-detail/*. Header has a back link, name, a
+ * reachability badge, a read-only badge, a single inventory Refresh, and Delete.
+ * Edit + Test SNMP/SSH live in the Settings tab. Auto-reloads every 30 s.
  */
-import {
-  useEffect,
-  useState,
-  useCallback,
-  useRef,
-  type FormEvent,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate, useSearchParams, Link } from "react-router-dom";
-import {
-  ArrowLeft,
-  Pencil,
-  Trash2,
-  RefreshCw,
-  Activity,
-  Compass,
-  SlidersHorizontal,
-  TerminalSquare,
-  Network,
-  Globe,
-} from "lucide-react";
-import {
-  api,
-  type Device,
-  type Interface,
-  type Rule,
-  type BgpPeer,
-  type BgpNetwork,
-  ApiError,
-} from "@/lib/api";
+import { ArrowLeft, RefreshCw, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { api, type Device, type Interface, type Rule, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
-import {
-  classifyInterface,
-  statusVariant,
-  TYPE_VARIANT,
-  fmtBps,
-  fmtPps,
-} from "@/lib/telemetry";
-
-// ---------------------------------------------------------------------------
-// Shared input class (matches the rest of the app)
-// ---------------------------------------------------------------------------
-
-const inputClass =
-  "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
-
-// ---------------------------------------------------------------------------
-// Info-card label/value primitive
-// ---------------------------------------------------------------------------
-
-function Fact({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-0.5">
-      <dt className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-        {label}
-      </dt>
-      <dd className="text-sm font-semibold break-words">{children}</dd>
-    </div>
-  );
-}
-
-function GreenPill({ children }: { children: React.ReactNode }) {
-  return (
-    <Badge className="border-transparent bg-green-500/15 text-green-700 dark:text-green-400">
-      {children}
-    </Badge>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Edit device form (inside a Dialog) — preserved from the previous page
-// ---------------------------------------------------------------------------
-
-interface EditDeviceForm {
-  name: string;
-  hostname: string;
-  snmp_port: string;
-  poll_interval_seconds: string;
-  enabled: boolean;
-  community: string;
-  ssh_auth_method: string; // "none" | "password" | "key" (display-only)
-  ssh_username: string;
-  ssh_port: string;
-  ssh_password: string;
-  ssh_private_key: string;
-  ssh_key_passphrase: string;
-}
-
-function buildEditForm(device: Device): EditDeviceForm {
-  return {
-    name: device.name,
-    hostname: device.hostname,
-    snmp_port: String(device.snmp_port),
-    poll_interval_seconds: String(device.poll_interval_seconds),
-    enabled: device.enabled,
-    community: "",
-    ssh_auth_method: device.ssh_auth_method ?? "none",
-    ssh_username: device.ssh_username ?? "",
-    ssh_port: String(device.ssh_port ?? 22),
-    ssh_password: "",
-    ssh_private_key: "",
-    ssh_key_passphrase: "",
-  };
-}
-
-interface EditDialogProps {
-  device: Device;
-  open: boolean;
-  onClose: () => void;
-  onSaved: () => void;
-}
-
-function EditDialog({ device, open, onClose, onSaved }: EditDialogProps) {
-  const [form, setForm] = useState<EditDeviceForm>(() => buildEditForm(device));
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (open) {
-      setForm(buildEditForm(device));
-      setError(null);
-    }
-  }, [open, device]);
-
-  function setField<K extends keyof EditDeviceForm>(
-    field: K,
-    value: EditDeviceForm[K],
-  ) {
-    setForm((f) => ({ ...f, [field]: value }));
-  }
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setBusy(true);
-    try {
-      const payload: Parameters<typeof api.devices.update>[1] = {
-        name: form.name.trim(),
-        hostname: form.hostname.trim(),
-        snmp_port: parseInt(form.snmp_port, 10),
-        poll_interval_seconds: parseInt(form.poll_interval_seconds, 10),
-        enabled: form.enabled,
-      };
-
-      if (form.community.trim()) {
-        (payload as Record<string, unknown>).community = form.community.trim();
-      }
-
-      if (form.ssh_auth_method !== "none") {
-        if (form.ssh_username.trim())
-          (payload as Record<string, unknown>).ssh_username = form.ssh_username.trim();
-        if (form.ssh_port)
-          (payload as Record<string, unknown>).ssh_port = parseInt(form.ssh_port, 10);
-        if (form.ssh_auth_method === "password" && form.ssh_password)
-          (payload as Record<string, unknown>).ssh_password = form.ssh_password;
-        if (form.ssh_auth_method === "key" && form.ssh_private_key)
-          (payload as Record<string, unknown>).ssh_private_key = form.ssh_private_key;
-        if (form.ssh_key_passphrase)
-          (payload as Record<string, unknown>).ssh_key_passphrase = form.ssh_key_passphrase;
-      }
-
-      await api.devices.update(device.id, payload);
-      onSaved();
-      onClose();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update device");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const sshConfigured = form.ssh_auth_method !== "none";
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Edit device — {device.name}</DialogTitle>
-        </DialogHeader>
-        <form id="edit-device-form" onSubmit={handleSubmit} className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <label className="block space-y-1 text-sm font-medium">
-              Name
-              <input
-                required
-                className={inputClass}
-                value={form.name}
-                onChange={(e) => setField("name", e.target.value)}
-              />
-            </label>
-            <label className="block space-y-1 text-sm font-medium">
-              Hostname / IP
-              <input
-                required
-                className={inputClass}
-                value={form.hostname}
-                onChange={(e) => setField("hostname", e.target.value)}
-              />
-            </label>
-            <label className="block space-y-1 text-sm font-medium">
-              SNMP port
-              <input
-                type="number"
-                min={1}
-                max={65535}
-                required
-                className={inputClass}
-                value={form.snmp_port}
-                onChange={(e) => setField("snmp_port", e.target.value)}
-              />
-            </label>
-            <label className="block space-y-1 text-sm font-medium">
-              Poll interval (seconds)
-              <input
-                type="number"
-                min={10}
-                required
-                className={inputClass}
-                value={form.poll_interval_seconds}
-                onChange={(e) => setField("poll_interval_seconds", e.target.value)}
-              />
-            </label>
-          </div>
-
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input
-              type="checkbox"
-              checked={form.enabled}
-              onChange={(e) => setField("enabled", e.target.checked)}
-              className="h-4 w-4 rounded border border-input"
-            />
-            Enabled (polling active)
-          </label>
-
-          <label className="block space-y-1 text-sm font-medium">
-            SNMP community string
-            <input
-              className={inputClass}
-              value={form.community}
-              onChange={(e) => setField("community", e.target.value)}
-              placeholder="leave blank to keep stored value"
-              autoComplete="off"
-            />
-          </label>
-
-          {sshConfigured && (
-            <div className="space-y-4 rounded-md border border-border p-4">
-              <div className="flex items-center justify-between">
-                <p className="text-sm font-medium">
-                  SSH access ({form.ssh_auth_method})
-                </p>
-                <span className="text-xs text-muted-foreground">
-                  stored encrypted · leave blank to keep
-                </span>
-              </div>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="block space-y-1 text-sm font-medium">
-                  SSH username
-                  <input
-                    className={inputClass}
-                    value={form.ssh_username}
-                    onChange={(e) => setField("ssh_username", e.target.value)}
-                    placeholder="leave blank to keep"
-                    autoComplete="off"
-                  />
-                </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  SSH port
-                  <input
-                    type="number"
-                    min={1}
-                    max={65535}
-                    className={inputClass}
-                    value={form.ssh_port}
-                    onChange={(e) => setField("ssh_port", e.target.value)}
-                  />
-                </label>
-              </div>
-              {form.ssh_auth_method === "password" && (
-                <label className="block space-y-1 text-sm font-medium">
-                  SSH password
-                  <input
-                    type="password"
-                    className={inputClass}
-                    value={form.ssh_password}
-                    onChange={(e) => setField("ssh_password", e.target.value)}
-                    placeholder="leave blank to keep stored password"
-                    autoComplete="new-password"
-                  />
-                </label>
-              )}
-              {form.ssh_auth_method === "key" && (
-                <div className="space-y-4">
-                  <label className="block space-y-1 text-sm font-medium">
-                    SSH private key
-                    <textarea
-                      rows={5}
-                      className={`${inputClass} font-mono text-xs`}
-                      value={form.ssh_private_key}
-                      onChange={(e) => setField("ssh_private_key", e.target.value)}
-                      placeholder="leave blank to keep stored key"
-                    />
-                  </label>
-                  <label className="block space-y-1 text-sm font-medium">
-                    Key passphrase
-                    <input
-                      type="password"
-                      className={inputClass}
-                      value={form.ssh_key_passphrase}
-                      onChange={(e) => setField("ssh_key_passphrase", e.target.value)}
-                      placeholder="leave blank to keep"
-                      autoComplete="new-password"
-                    />
-                  </label>
-                </div>
-              )}
-            </div>
-          )}
-
-          {error && (
-            <p className="text-sm text-destructive" role="alert">
-              {error}
-            </p>
-          )}
-        </form>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose} disabled={busy}>
-            Cancel
-          </Button>
-          <Button form="edit-device-form" type="submit" disabled={busy}>
-            {busy ? "Saving…" : "Save changes"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Overview tab — info cards
-// ---------------------------------------------------------------------------
-
-function bgpStateVariant(
-  state: string | null,
-): "default" | "secondary" | "destructive" | "outline" {
-  if (state === "established") return "default";
-  if (state === "idle" || state === "active" || state === "connect") return "secondary";
-  return "outline";
-}
-
-/// Discovered BGP sessions (SNMP, read-only). Operators identify the scrubber
-/// neighbor here; rule actions later toggle it (shutdown / no shutdown).
-function BgpSessionsCard({ deviceId, canManage }: { deviceId: number; canManage: boolean }) {
-  const [peers, setPeers] = useState<BgpPeer[] | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(() => {
-    api.devices
-      .bgpPeers(deviceId)
-      .then(setPeers)
-      .catch(() => setPeers([]));
-  }, [deviceId]);
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  async function discover() {
-    setBusy(true);
-    try {
-      const r = await api.devices.discoverBgp(deviceId);
-      load();
-      if (r.discovered === 0) {
-        alert("No BGP sessions found (device may not run BGP, or its BGP4-MIB is empty).");
-      }
-    } catch (e) {
-      alert(`BGP discovery failed: ${e instanceof Error ? e.message : "error"}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function editLabel(p: BgpPeer) {
-    const next = window.prompt(`Label for neighbor ${p.peer_remote_addr}`, p.label ?? "");
-    if (next === null) return;
-    await api.devices.updateBgpPeer(deviceId, p.id, next.trim() || null).catch(() => {});
-    load();
-  }
-
-  return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between gap-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Network className="size-4 text-muted-foreground" />
-          BGP sessions
-          <Badge variant="outline" className="ml-1 font-normal text-muted-foreground">
-            Read-only · SNMP
-          </Badge>
-        </CardTitle>
-        {canManage && (
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => void discover()}>
-            <Compass className="size-4" />
-            {busy ? "Discovering…" : "Discover BGP"}
-          </Button>
-        )}
-      </CardHeader>
-      <CardContent>
-        {peers === null ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : peers.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No BGP sessions discovered yet.
-            {canManage ? ' Use "Discover BGP" above.' : ""}
-          </p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Neighbor</TableHead>
-                <TableHead>Remote AS</TableHead>
-                <TableHead>Session</TableHead>
-                <TableHead>Admin</TableHead>
-                <TableHead>Label</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {peers.map((p) => (
-                <TableRow key={p.id}>
-                  <TableCell className="font-mono text-xs">{p.peer_remote_addr}</TableCell>
-                  <TableCell>{p.peer_remote_as ?? "—"}</TableCell>
-                  <TableCell>
-                    <Badge variant={bgpStateVariant(p.peer_state)}>{p.peer_state ?? "?"}</Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={p.peer_admin_status === "stop" ? "destructive" : "outline"}>
-                      {p.peer_admin_status === "stop"
-                        ? "shutdown"
-                        : p.peer_admin_status === "start"
-                          ? "up"
-                          : "?"}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    {canManage ? (
-                      <button
-                        type="button"
-                        onClick={() => void editLabel(p)}
-                        className="text-left text-primary underline-offset-4 hover:underline"
-                      >
-                        {p.label ?? "set label"}
-                      </button>
-                    ) : (
-                      (p.label ?? "—")
-                    )}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-/// Announced BGP prefixes (network statements), SSH-discovered + daily-refreshed.
-/// These feed the blackhole prefix picker and the null-route parent.
-function AnnouncedPrefixesCard({ deviceId, canManage }: { deviceId: number; canManage: boolean }) {
-  const [networks, setNetworks] = useState<BgpNetwork[] | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(() => {
-    api.devices
-      .bgpNetworks(deviceId)
-      .then(setNetworks)
-      .catch(() => setNetworks([]));
-  }, [deviceId]);
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  async function discover() {
-    setBusy(true);
-    try {
-      const r = await api.devices.discoverPrefixes(deviceId);
-      load();
-      if (r.discovered === 0) {
-        alert("No announced prefixes found (no `network` statements, or SSH unavailable).");
-      }
-    } catch (e) {
-      alert(`Prefix discovery failed: ${e instanceof Error ? e.message : "error"}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between gap-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Globe className="size-4 text-muted-foreground" />
-          Announced prefixes
-          <Badge variant="outline" className="ml-1 font-normal text-muted-foreground">
-            via SSH · daily
-          </Badge>
-        </CardTitle>
-        {canManage && (
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => void discover()}>
-            <Compass className="size-4" />
-            {busy ? "Discovering…" : "Discover prefixes"}
-          </Button>
-        )}
-      </CardHeader>
-      <CardContent>
-        {networks === null ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : networks.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No announced prefixes discovered yet.
-            {canManage ? ' Use "Discover prefixes" above.' : ""}
-          </p>
-        ) : (
-          <div className="flex flex-wrap gap-2">
-            {networks.map((n) => (
-              <code
-                key={n.id}
-                className="rounded-md border border-border px-2 py-1 text-xs"
-              >
-                {n.prefix}
-              </code>
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function OverviewTab({ device }: { device: Device }) {
-  const sshMethodLabel =
-    device.ssh_auth_method === "password"
-      ? "password"
-      : device.ssh_auth_method === "key"
-        ? "SSH key"
-        : "none";
-
-  return (
-    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-      {/* Device Information */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Device Information</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-2 gap-4">
-            <Fact label="Name">{device.name}</Fact>
-            <Fact label="Vendor">{device.vendor ?? "—"}</Fact>
-            <Fact label="Model">{device.model ?? "—"}</Fact>
-            <Fact label="OS Version">{device.os_version ?? "—"}</Fact>
-            <Fact label="Sys Name">{device.sys_name ?? "—"}</Fact>
-            <Fact label="Sys Uptime">{device.sys_uptime ?? "—"}</Fact>
-          </dl>
-        </CardContent>
-      </Card>
-
-      {/* Connectivity */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Connectivity</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-2 gap-4">
-            <Fact label="Hostname / IP">
-              <code className="text-xs">{device.hostname}</code>
-            </Fact>
-            <Fact label="SNMP">
-              {device.snmp_version} · port {device.snmp_port}
-            </Fact>
-            <Fact label="SSH">
-              <span className="flex flex-wrap items-center gap-1.5">
-                {device.ssh_configured ? (
-                  <>
-                    <span>
-                      {device.ssh_username ?? "—"} · {sshMethodLabel}
-                    </span>
-                    <GreenPill>configured</GreenPill>
-                  </>
-                ) : (
-                  <Badge variant="secondary">none</Badge>
-                )}
-              </span>
-            </Fact>
-            <Fact label="Poll Interval">{device.poll_interval_seconds} s</Fact>
-          </dl>
-        </CardContent>
-      </Card>
-
-      {/* Status */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Status</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-2 gap-4">
-            <Fact label="Reachable">
-              {device.reachable ? (
-                <GreenPill>reachable</GreenPill>
-              ) : (
-                <Badge variant="destructive">unreachable</Badge>
-              )}
-            </Fact>
-            <Fact label="Interfaces">{device.interface_count}</Fact>
-            <Fact label="Last Poll">
-              {device.last_poll_at
-                ? new Date(device.last_poll_at).toLocaleString()
-                : "—"}
-            </Fact>
-            <Fact label="Last Error">
-              {device.last_error ? (
-                <span className="text-destructive">{device.last_error}</span>
-              ) : (
-                "—"
-              )}
-            </Fact>
-          </dl>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Interfaces tab — table (rows link to the interface detail page)
-// ---------------------------------------------------------------------------
-
-interface InterfacesTabProps {
-  deviceId: number;
-  interfaces: Interface[];
-  loading: boolean;
-  ruleCountByIfaceId: Map<number, number>;
-}
-
-function InterfacesTab({
-  deviceId,
-  interfaces,
-  loading,
-  ruleCountByIfaceId,
-}: InterfacesTabProps) {
-  const navigate = useNavigate();
-
-  if (loading) {
-    return <p className="px-6 pb-6 text-sm text-muted-foreground">Loading…</p>;
-  }
-  if (interfaces.length === 0) {
-    return (
-      <p className="px-6 pb-6 text-sm text-muted-foreground">
-        No interfaces discovered yet. Use "Discover" above.
-      </p>
-    );
-  }
-
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow className="hover:bg-transparent">
-          <TableHead className="pl-6">Name</TableHead>
-          <TableHead>Type</TableHead>
-          <TableHead>Descr / Alias</TableHead>
-          <TableHead>Speed</TableHead>
-          <TableHead>Status</TableHead>
-          <TableHead>Rx bps / pps</TableHead>
-          <TableHead>Tx bps / pps</TableHead>
-          <TableHead>Util %</TableHead>
-          <TableHead className="pr-6">Rules</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {interfaces.map((iface) => {
-          const ifType = classifyInterface(iface.if_name, iface.if_descr);
-          const valid = iface.metrics && iface.metrics.valid_sample;
-          return (
-            <TableRow
-              key={iface.id}
-              className="cursor-pointer hover:bg-muted/50"
-              onClick={() =>
-                navigate(`/devices/${deviceId}/interfaces/${iface.id}`)
-              }
-            >
-              <TableCell className="pl-6 font-medium">{iface.if_name}</TableCell>
-              <TableCell>
-                <Badge variant={TYPE_VARIANT[ifType]}>{ifType}</Badge>
-              </TableCell>
-              <TableCell className="text-xs text-muted-foreground">
-                {iface.if_alias ?? iface.if_descr ?? "—"}
-              </TableCell>
-              <TableCell className="text-xs">
-                {iface.if_speed_bps !== null ? fmtBps(iface.if_speed_bps) : "—"}
-              </TableCell>
-              <TableCell>
-                <div className="flex items-center gap-1">
-                  <Badge variant={statusVariant(iface.oper_status)}>
-                    {iface.oper_status}
-                  </Badge>
-                  {iface.admin_status !== iface.oper_status && (
-                    <Badge variant="outline">adm:{iface.admin_status}</Badge>
-                  )}
-                </div>
-              </TableCell>
-              <TableCell className="text-xs">
-                {valid ? (
-                  <>
-                    {fmtBps(iface.metrics!.rx_bps)}
-                    <br />
-                    {fmtPps(iface.metrics!.rx_pps)}
-                  </>
-                ) : (
-                  "—"
-                )}
-              </TableCell>
-              <TableCell className="text-xs">
-                {valid ? (
-                  <>
-                    {fmtBps(iface.metrics!.tx_bps)}
-                    <br />
-                    {fmtPps(iface.metrics!.tx_pps)}
-                  </>
-                ) : (
-                  "—"
-                )}
-              </TableCell>
-              <TableCell className="text-xs">
-                {valid ? (
-                  <>
-                    Rx {iface.metrics!.rx_util_percent.toFixed(1)}%
-                    <br />
-                    Tx {iface.metrics!.tx_util_percent.toFixed(1)}%
-                  </>
-                ) : (
-                  "—"
-                )}
-              </TableCell>
-              <TableCell className="pr-6">
-                {(() => {
-                  const count = ruleCountByIfaceId.get(iface.id) ?? 0;
-                  if (count === 0) {
-                    return (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    );
-                  }
-                  return (
-                    <Badge
-                      variant="secondary"
-                      className="inline-flex items-center gap-1"
-                      title={`${count} detection rule${count === 1 ? "" : "s"} target this interface`}
-                    >
-                      <SlidersHorizontal className="size-3" />
-                      {count}
-                    </Badge>
-                  );
-                })()}
-              </TableCell>
-            </TableRow>
-          );
-        })}
-      </TableBody>
-    </Table>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Main page component
-// ---------------------------------------------------------------------------
+import { ToneBadge } from "@/components/status-badge";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { OverviewTab } from "./device-detail/overview-tab";
+import { InterfacesTab } from "./device-detail/interfaces-tab";
+import { BgpSessionsCard } from "./device-detail/bgp-sessions-card";
+import { AnnouncedPrefixesCard } from "./device-detail/announced-prefixes-card";
+import { DeviceSettingsTab } from "./device-detail/device-settings-tab";
 
 export default function DeviceDetail() {
   const { hasPermission } = useAuth();
@@ -818,9 +29,9 @@ export default function DeviceDetail() {
   const deviceId = Number(id);
   const navigate = useNavigate();
 
-  // Keep the active tab in the URL (?tab=…) so a refresh stays put.
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = searchParams.get("tab") === "interfaces" ? "interfaces" : "overview";
+  const raw = searchParams.get("tab");
+  const tab = raw === "settings" && canManage ? "settings" : raw === "interfaces" ? "interfaces" : "overview";
   const setTab = (next: string) =>
     setSearchParams(
       (prev) => {
@@ -838,18 +49,18 @@ export default function DeviceDetail() {
   const [loading, setLoading] = useState(true);
   const [ifLoading, setIfLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [editOpen, setEditOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
-  const ifaceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadDevice = useCallback(() => {
     if (!Number.isFinite(deviceId)) return;
     api.devices
       .get(deviceId)
       .then(setDevice)
-      .catch((err) =>
-        setError(err instanceof ApiError ? err.message : "Failed to load device"),
-      )
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load device"))
       .finally(() => setLoading(false));
   }, [deviceId]);
 
@@ -857,7 +68,7 @@ export default function DeviceDetail() {
     if (!Number.isFinite(deviceId)) return;
     api.devices
       .interfaces(deviceId)
-      .then((ifaces) => setInterfaces(ifaces))
+      .then(setInterfaces)
       .catch(() => setInterfaces([]))
       .finally(() => setIfLoading(false));
   }, [deviceId]);
@@ -866,42 +77,51 @@ export default function DeviceDetail() {
     loadDevice();
     loadInterfaces();
     api.rules.list().then(setRules).catch(() => setRules([]));
-    ifaceTimerRef.current = setInterval(() => {
+    timerRef.current = setInterval(() => {
       loadDevice();
       loadInterfaces();
     }, 30_000);
     return () => {
-      if (ifaceTimerRef.current !== null) clearInterval(ifaceTimerRef.current);
+      if (timerRef.current !== null) clearInterval(timerRef.current);
     };
   }, [loadDevice, loadInterfaces]);
 
-  async function handleDelete() {
-    if (!device) return;
-    if (
-      !confirm(
-        `Delete device "${device.name}"? All interfaces and telemetry data will be removed. This cannot be undone.`,
-      )
-    )
-      return;
+  // The single "Refresh": re-discover the inventory (interfaces, BGP sessions,
+  // announced prefixes) — NOT telemetry — then reload the page + cards.
+  async function refresh() {
+    setRefreshing(true);
     try {
-      await api.devices.remove(device.id);
-      navigate("/devices");
-    } catch (err) {
-      alert(err instanceof ApiError ? err.message : "Delete failed");
+      if (canManage) {
+        await Promise.allSettled([
+          api.devices.discover(deviceId),
+          api.devices.discoverBgp(deviceId),
+          api.devices.discoverPrefixes(deviceId),
+        ]);
+      }
+      loadDevice();
+      loadInterfaces();
+      setRefreshKey((k) => k + 1);
+      toast.success("Refreshed device inventory");
+    } finally {
+      setRefreshing(false);
     }
   }
+
+  const ruleCountByIfaceId = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const r of rules) {
+      if (r.interface_id !== null) m.set(r.interface_id, (m.get(r.interface_id) ?? 0) + 1);
+    }
+    return m;
+  }, [rules]);
 
   if (loading) {
     return <div className="text-sm text-muted-foreground">Loading device…</div>;
   }
-
   if (error || !device) {
     return (
       <div className="space-y-4">
-        <Link
-          to="/devices"
-          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline"
-        >
+        <Link to="/devices" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline">
           <ArrowLeft className="size-4" /> Back to devices
         </Link>
         <p className="text-sm text-destructive">{error ?? "Device not found."}</p>
@@ -911,141 +131,57 @@ export default function DeviceDetail() {
 
   return (
     <div className="space-y-6">
-      {/* ---- Header ---- */}
       <div className="space-y-2">
-        <Link
-          to="/devices"
-          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline"
-        >
+        <Link to="/devices" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline">
           <ArrowLeft className="size-4" /> Devices
         </Link>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-bold tracking-tight">{device.name}</h1>
           {device.reachable ? (
-            <GreenPill>Active · reachable</GreenPill>
+            <ToneBadge tone="good">reachable</ToneBadge>
           ) : (
-            <Badge variant="destructive">Unreachable</Badge>
+            <ToneBadge tone="bad">unreachable</ToneBadge>
           )}
-          <Badge
-            variant="secondary"
-            title="SNMP is read-only telemetry; Rerouter only polls this device."
-          >
+          <Badge variant="secondary" title="SNMP is read-only telemetry; Rerouter only polls this device.">
             Read-only · SNMP
           </Badge>
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                loadDevice();
-                loadInterfaces();
-              }}
-            >
+            <Button size="sm" variant="outline" disabled={refreshing} onClick={() => void refresh()}>
               <RefreshCw className="size-4" />
-              Refresh
+              {refreshing ? "Refreshing…" : "Refresh"}
             </Button>
             {canManage && (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() =>
-                    api.devices.test(device.id).then((r) => {
-                      const msg = r.ok
-                        ? `OK: ${[r.vendor, r.model].filter(Boolean).join(" / ") || "reachable"}`
-                        : `Failed: ${r.error ?? "unknown"}`;
-                      alert(msg);
-                    })
-                  }
-                >
-                  <Activity className="size-4" />
-                  Test SNMP
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() =>
-                    api.devices.discover(device.id).then((r) => {
-                      alert(`Discovered ${r.discovered} interfaces`);
-                      loadInterfaces();
-                    })
-                  }
-                >
-                  <Compass className="size-4" />
-                  Discover
-                </Button>
-                {device.ssh_configured && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() =>
-                      api.devices.sshTest(device.id).then((r) => {
-                        if (r.ok) {
-                          const out = (r.results ?? [])
-                            .map((c) => `$ ${c.command}\n${c.output}`)
-                            .join("\n\n");
-                          alert(
-                            `SSH OK${r.pinned_now ? " (host key pinned)" : ""}\n${r.fingerprint ?? ""}\n\n${out}`,
-                          );
-                        } else {
-                          alert(`SSH failed: ${r.error ?? "unknown"}`);
-                        }
-                      })
-                    }
-                  >
-                    <TerminalSquare className="size-4" />
-                    Test SSH
-                  </Button>
-                )}
-                <Button size="sm" variant="outline" onClick={() => setEditOpen(true)}>
-                  <Pencil className="size-4" />
-                  Edit
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                  onClick={() => void handleDelete()}
-                >
-                  <Trash2 className="size-4" />
-                  Delete
-                </Button>
-              </>
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-destructive hover:text-destructive"
+                onClick={() => setDeleteOpen(true)}
+              >
+                <Trash2 className="size-4" />
+                Delete
+              </Button>
             )}
           </div>
         </div>
         <p className="text-sm text-muted-foreground">
           <code>{device.hostname}</code>
-          {(device.vendor || device.model) &&
-            ` · ${[device.vendor, device.model].filter(Boolean).join(" ")}`}
+          {(device.vendor || device.model) && ` · ${[device.vendor, device.model].filter(Boolean).join(" ")}`}
           {device.os_version && ` · ${device.os_version}`}
         </p>
       </div>
 
-      {/* Edit dialog */}
-      {canManage && (
-        <EditDialog
-          device={device}
-          open={editOpen}
-          onClose={() => setEditOpen(false)}
-          onSaved={() => loadDevice()}
-        />
-      )}
-
-      {/* ---- Tabs (active tab mirrored in ?tab= so refresh stays put) ---- */}
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="interfaces">
-            Interfaces ({device.interface_count})
-          </TabsTrigger>
+          <TabsTrigger value="interfaces">Interfaces ({device.interface_count})</TabsTrigger>
+          {canManage && <TabsTrigger value="settings">Settings</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="overview" className="mt-4 space-y-4">
           <OverviewTab device={device} />
-          <BgpSessionsCard deviceId={deviceId} canManage={canManage} />
-          <AnnouncedPrefixesCard deviceId={deviceId} canManage={canManage} />
+          <BgpSessionsCard deviceId={deviceId} canManage={canManage} refreshKey={refreshKey} />
+          <AnnouncedPrefixesCard deviceId={deviceId} refreshKey={refreshKey} />
         </TabsContent>
 
         <TabsContent value="interfaces" className="mt-4">
@@ -1055,20 +191,43 @@ export default function DeviceDetail() {
                 deviceId={deviceId}
                 interfaces={interfaces}
                 loading={ifLoading}
-                ruleCountByIfaceId={(() => {
-                  const m = new Map<number, number>();
-                  for (const r of rules) {
-                    if (r.interface_id !== null) {
-                      m.set(r.interface_id, (m.get(r.interface_id) ?? 0) + 1);
-                    }
-                  }
-                  return m;
-                })()}
+                ruleCountByIfaceId={ruleCountByIfaceId}
               />
             </CardContent>
           </Card>
         </TabsContent>
+
+        {canManage && (
+          <TabsContent value="settings" className="mt-4">
+            <DeviceSettingsTab device={device} onSaved={loadDevice} />
+          </TabsContent>
+        )}
       </Tabs>
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete device"
+        description={
+          <>
+            Permanently delete <strong>{device.name}</strong> and all its interfaces, telemetry, BGP
+            sessions and prefixes. This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        destructive
+        requireText="CONFIRM"
+        onConfirm={async () => {
+          try {
+            await api.devices.remove(device.id);
+            toast.success("Device deleted");
+            navigate("/devices");
+          } catch (err) {
+            toast.error(err instanceof ApiError ? err.message : "Delete failed");
+            setDeleteOpen(false);
+          }
+        }}
+      />
     </div>
   );
 }

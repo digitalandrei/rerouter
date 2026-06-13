@@ -10,7 +10,6 @@ import { useNavigate } from "react-router-dom";
 import {
   Router,
   Eye,
-  Trash2,
   ArrowUp,
   ArrowDown,
   ChevronsUpDown,
@@ -154,17 +153,6 @@ export default function Devices() {
       setAddError(err instanceof ApiError ? err.message : "Failed to add device");
     } finally {
       setAddBusy(false);
-    }
-  }
-
-  async function handleDelete(e: React.MouseEvent, device: Device) {
-    e.stopPropagation();
-    if (!confirm(`Delete device "${device.name}"? This cannot be undone.`)) return;
-    try {
-      await api.devices.remove(device.id);
-      loadDevices();
-    } catch {
-      // ignore — device list will stay unchanged
     }
   }
 
@@ -510,18 +498,6 @@ export default function Devices() {
                           <Eye className="size-4" />
                           <span className="sr-only">View</span>
                         </Button>
-                        {canEnroll && (
-                          <Button
-                            size="icon-sm"
-                            variant="ghost"
-                            title="Delete device"
-                            className="text-destructive hover:text-destructive"
-                            onClick={(e) => void handleDelete(e, device)}
-                          >
-                            <Trash2 className="size-4" />
-                            <span className="sr-only">Delete</span>
-                          </Button>
-                        )}
                       </div>
                     </TableCell>
                   </TableRow>

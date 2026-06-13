@@ -16,6 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { SeverityBadge } from "@/components/status-badge";
 
 function ObserveBanner({ mode }: { mode: string | undefined }) {
   if (mode === "enforce") return null;
@@ -28,19 +29,6 @@ function ObserveBanner({ mode }: { mode: string | undefined }) {
       </span>
     </div>
   );
-}
-
-function severityVariant(
-  severity: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (severity) {
-    case "critical":
-      return "destructive";
-    case "warning":
-      return "secondary";
-    default:
-      return "outline";
-  }
 }
 
 export default function Dashboard() {
@@ -197,9 +185,7 @@ export default function Dashboard() {
                   key={alert.id}
                   className="flex items-center gap-3 py-3 text-sm"
                 >
-                  <Badge variant={severityVariant(alert.severity)}>
-                    {alert.severity}
-                  </Badge>
+                  <SeverityBadge severity={alert.severity} />
                   <code className="text-xs">{alert.event_type}</code>
                   {alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">

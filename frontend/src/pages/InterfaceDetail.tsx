@@ -26,6 +26,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { SeverityBadge } from "@/components/status-badge";
 import {
   TelemetryChart,
   buildChartData,
@@ -117,19 +118,6 @@ const METRIC_LABELS: Record<string, string> = {
 function conditionLabel(rule: Rule): string {
   const metricLabel = METRIC_LABELS[rule.metric] ?? rule.metric;
   return `${metricLabel} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
-}
-
-function severityVariant(
-  severity: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (severity) {
-    case "critical":
-      return "destructive";
-    case "warning":
-      return "secondary";
-    default:
-      return "outline";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,9 +387,7 @@ export default function InterfaceDetail() {
                       <code className="text-xs text-muted-foreground">
                         {conditionLabel(rule)}
                       </code>
-                      <Badge variant={severityVariant(rule.severity)}>
-                        {rule.severity}
-                      </Badge>
+                      <SeverityBadge severity={rule.severity} />
                       <Badge variant={rule.enabled ? "default" : "outline"}>
                         {rule.enabled ? "enabled" : "disabled"}
                       </Badge>

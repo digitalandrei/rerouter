@@ -7,26 +7,13 @@
  */
 import { useEffect, useState } from "react";
 import { api, type Alert } from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
 import {
   Card,
   CardContent,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-
-function severityVariant(
-  severity: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (severity) {
-    case "critical":
-      return "destructive";
-    case "warning":
-      return "secondary";
-    default:
-      return "outline";
-  }
-}
+import { SeverityBadge } from "@/components/status-badge";
 
 function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
   const metric = typeof payload.metric === "string" ? payload.metric : null;
@@ -98,9 +85,7 @@ export default function Alerts() {
               {alerts.map((alert) => (
                 <li key={alert.id} className="py-3">
                   <div className="flex flex-wrap items-center gap-2 text-sm">
-                    <Badge variant={severityVariant(alert.severity)}>
-                      {alert.severity}
-                    </Badge>
+                    <SeverityBadge severity={alert.severity} />
                     <code className="text-xs">{alert.event_type}</code>
                     {alert.device_id !== null && (
                       <span className="text-xs text-muted-foreground">

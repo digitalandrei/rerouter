@@ -8,7 +8,9 @@
  */
 import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 import { api, type User, ApiError } from "@/lib/api";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -57,6 +59,7 @@ export default function Users() {
   // Per-row inline error messages: userId -> message
   const [rowError, setRowError] = useState<Record<number, string>>({});
   const [rowBusy, setRowBusy] = useState<Record<number, boolean>>({});
+  const [pending, setPending] = useState<{ kind: "delete" | "reset"; user: User } | null>(null);
 
   // Defensive gate: redirect away if permission is missing.
   useEffect(() => {
@@ -133,39 +136,28 @@ export default function Users() {
     }
   }
 
-  async function handleReset2fa(user: User) {
-    if (
-      !confirm(
-        `Reset 2FA for ${user.email}? They will need to re-enroll at next login.`,
-      )
-    )
-      return;
+  async function doReset2fa(user: User) {
     clearRowErr(user.id);
     setRowBusyState(user.id, true);
     try {
       await api.users.reset2fa(user.id);
+      toast.success(`2FA reset for ${user.email}`);
     } catch (err) {
-      setRowErr(
-        user.id,
-        err instanceof ApiError ? err.message : "Failed to reset 2FA",
-      );
+      toast.error(err instanceof ApiError ? err.message : "Failed to reset 2FA");
     } finally {
       setRowBusyState(user.id, false);
     }
   }
 
-  async function handleDelete(user: User) {
-    if (!confirm(`Delete user ${user.email}? This cannot be undone.`)) return;
+  async function doDelete(user: User) {
     clearRowErr(user.id);
     setRowBusyState(user.id, true);
     try {
       await api.users.remove(user.id);
       setUsers((prev) => prev.filter((u) => u.id !== user.id));
+      toast.success(`Deleted ${user.email}`);
     } catch (err) {
-      setRowErr(
-        user.id,
-        err instanceof ApiError ? err.message : "Failed to delete user",
-      );
+      toast.error(err instanceof ApiError ? err.message : "Failed to delete user");
       setRowBusyState(user.id, false);
     }
   }
@@ -305,7 +297,7 @@ export default function Users() {
                       size="sm"
                       variant="outline"
                       disabled={rowBusy[user.id]}
-                      onClick={() => void handleReset2fa(user)}
+                      onClick={() => setPending({ kind: "reset", user })}
                     >
                       Reset 2FA
                     </Button>
@@ -313,7 +305,7 @@ export default function Users() {
                       size="sm"
                       variant="destructive"
                       disabled={rowBusy[user.id]}
-                      onClick={() => void handleDelete(user)}
+                      onClick={() => setPending({ kind: "delete", user })}
                     >
                       Delete
                     </Button>
@@ -329,6 +321,27 @@ export default function Users() {
           )}
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={pending !== null}
+        onOpenChange={(v) => !v && setPending(null)}
+        title={pending?.kind === "delete" ? "Delete user" : "Reset 2FA"}
+        description={
+          pending?.kind === "delete"
+            ? `Permanently delete ${pending?.user.email}. This cannot be undone.`
+            : `Reset 2FA for ${pending?.user.email}? They will have to re-enroll at next login.`
+        }
+        confirmLabel={pending?.kind === "delete" ? "Delete" : "Reset 2FA"}
+        destructive
+        requireText={pending?.kind === "delete" ? "CONFIRM" : undefined}
+        onConfirm={async () => {
+          if (!pending) return;
+          const { kind, user } = pending;
+          setPending(null);
+          if (kind === "delete") await doDelete(user);
+          else await doReset2fa(user);
+        }}
+      />
     </div>
   );
 }

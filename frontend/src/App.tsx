@@ -13,6 +13,7 @@
  */
 import { BrowserRouter, Navigate, Outlet, Route, Routes } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
+import { Toaster } from "@/components/ui/toaster";
 import { AuthenticatedLayout } from "@/components/layout/authenticated-layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
@@ -57,6 +58,7 @@ function RequireAuth() {
 export default function App() {
   return (
     <AuthProvider>
+      <Toaster />
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
