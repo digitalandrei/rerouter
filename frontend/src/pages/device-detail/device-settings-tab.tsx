@@ -44,17 +44,21 @@ function build(device: Device): Form {
 
 /** Cisco ASR (IOS) commands to enroll our public key under the SSH username, so
  *  the controller can authenticate by key. `key-string` takes the raw Base64 body
- *  (the middle field of the OpenSSH line), not the `ssh-rsa … comment` wrapper. */
+ *  (the middle field of the OpenSSH line), not the `ssh-rsa … comment` wrapper.
+ *
+ *  The body MUST be wrapped: a 2048-bit key is ~360 chars but the IOS terminal
+ *  truncates input lines near 256, which yields "%SSH: Failed to decode the Key
+ *  Value". IOS concatenates consecutive key-string lines until `exit`. */
 function asrEnrollment(username: string, publicKey: string): string {
   const parts = publicKey.trim().split(/\s+/);
   const body = parts.length >= 2 ? parts[1] : publicKey.trim();
-  // IOS wraps long key-strings itself; one line is accepted on 15.x.
+  const wrapped = (body.match(/.{1,72}/g) ?? [body]).map((l) => `   ${l}`);
   return [
     "configure terminal",
     " ip ssh pubkey-chain",
     `  username ${username || "rerouter"}`,
     "   key-string",
-    `   ${body}`,
+    ...wrapped,
     "   exit",
     "  exit",
     " end",
