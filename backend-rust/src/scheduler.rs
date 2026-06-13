@@ -30,12 +30,41 @@ use crate::telemetry::snmp;
 /// How often the supervisor reconciles the running loops against the DB.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Spawn the scheduler supervisor and return. Never blocks the control plane.
+/// interface_samples retention: keep a little over the last hour, so the 60-min
+/// detail-page view is always complete. Telemetry is intentionally short-lived.
+const SAMPLE_RETENTION_MINUTES: i64 = 70;
+/// How often to prune old samples.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Spawn the scheduler supervisor + the sample-retention pruner; return. Never
+/// blocks the control plane.
 pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
+    tokio::spawn(prune_samples(pool.clone()));
     tokio::spawn(supervise(pool, cfg));
     tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
     Ok(())
+}
+
+/// Periodically delete interface_samples older than the retention window so the
+/// table only ever holds ~the last hour of per-interface telemetry.
+async fn prune_samples(pool: MySqlPool) {
+    loop {
+        match sqlx::query(
+            "DELETE FROM interface_samples WHERE sampled_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",
+        )
+        .bind(SAMPLE_RETENTION_MINUTES)
+        .execute(&pool)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::debug!(event_type = "samples_pruned", rows = r.rows_affected(), "pruned old interface_samples")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(event_type = "sample_prune_failed", error = %e, "pruning interface_samples failed"),
+        }
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+    }
 }
 
 /// Reconcile per-device poll loops with the set of enabled devices, forever.

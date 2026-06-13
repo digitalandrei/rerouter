@@ -195,8 +195,9 @@ pub async fn metrics(
     }
     let minutes = q.minutes.unwrap_or(60).clamp(1, 7 * 24 * 60);
 
-    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, f64, f64, f64, f64, f64, f64)>(
-        "SELECT sampled_at, rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent \
+    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, f64, f64, f64, f64, f64, f64, u64, u64)>(
+        "SELECT sampled_at, rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
+                in_errors, out_errors \
          FROM interface_samples \
          WHERE interface_id = ? AND valid_sample = 1 \
            AND sampled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE) \
@@ -211,7 +212,7 @@ pub async fn metrics(
         Ok(rows) => {
             let out: Vec<Value> = rows
                 .into_iter()
-                .map(|(ts, rx_bps, tx_bps, rx_pps, tx_pps, rx_u, tx_u)| {
+                .map(|(ts, rx_bps, tx_bps, rx_pps, tx_pps, rx_u, tx_u, in_e, out_e)| {
                     json!({
                         "sampled_at": ts.to_rfc3339(),
                         "rx_bps": rx_bps,
@@ -220,6 +221,8 @@ pub async fn metrics(
                         "tx_pps": tx_pps,
                         "rx_util_percent": rx_u,
                         "tx_util_percent": tx_u,
+                        "in_errors": in_e,
+                        "out_errors": out_e,
                     })
                 })
                 .collect();

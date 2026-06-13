@@ -264,6 +264,19 @@ pub async fn create(
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
 
+    // Auto-discover right after enrollment: probe identity, then walk interfaces,
+    // in the background (best-effort — the scheduler's poll loop also discovers a
+    // device with no interfaces, so this just makes it immediate).
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = snmp::test_and_store(&pool, id).await {
+            tracing::info!(event_type = "auto_test_failed", device_id = id, error = %e, "post-enroll SNMP test failed (will retry on poll)");
+        }
+        if let Err(e) = snmp::discover_and_store(&pool, id).await {
+            tracing::info!(event_type = "auto_discover_failed", device_id = id, error = %e, "post-enroll discovery failed (will retry on poll)");
+        }
+    });
+
     match fetch_device(&state.pool, id).await {
         Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),

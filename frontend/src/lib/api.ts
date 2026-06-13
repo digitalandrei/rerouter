@@ -163,6 +163,9 @@ export interface Sample {
   tx_pps: number;
   rx_util_percent: number;
   tx_util_percent: number;
+  /** Per-interval error counts (errors during this poll interval). */
+  in_errors: number;
+  out_errors: number;
 }
 
 export interface DeviceTestResult {

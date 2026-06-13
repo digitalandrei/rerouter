@@ -347,15 +347,17 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
 
 /// A monitored interface to poll (id + ifIndex + speed for util%).
 #[derive(Debug, Clone)]
-struct MonitoredInterface {
+struct PollInterface {
     interface_id: u64,
     if_index: u32,
     if_speed_bps: u64,
 }
 
-/// Poll every monitored interface on a device: read HC counters + errors,
-/// derive rates against the previous baseline, upsert `interface_metrics_current`
-/// and append `interface_samples`. Returns the number of interfaces updated.
+/// Poll EVERY discovered interface on a device (physical, port-channels,
+/// tunnels, …) — not just rule-targeted ones — so the device page has telemetry
+/// for all of them: read HC counters + errors, derive rates against the previous
+/// baseline, upsert `interface_metrics_current` and append `interface_samples`.
+/// Returns the number of interfaces updated.
 ///
 /// On a transport-level failure the device is marked unreachable (telemetry
 /// stale) with `last_error`; a wrap/reset on a single interface only invalidates
@@ -363,34 +365,21 @@ struct MonitoredInterface {
 pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let dev = load_device(pool, device_id).await?;
 
-    let monitored: Vec<MonitoredInterface> = sqlx::query_as::<_, (u64, u32, u64)>(
-        "SELECT id, if_index, if_speed_bps FROM device_interfaces \
-         WHERE device_id = ? AND enabled_for_monitoring = 1",
+    let ifaces: Vec<PollInterface> = sqlx::query_as::<_, (u64, u32, u64)>(
+        "SELECT id, if_index, if_speed_bps FROM device_interfaces WHERE device_id = ?",
     )
     .bind(device_id)
     .fetch_all(pool)
     .await
-    .context("loading monitored interfaces")?
+    .context("loading device interfaces")?
     .into_iter()
-    .map(|(interface_id, if_index, if_speed_bps)| MonitoredInterface { interface_id, if_index, if_speed_bps })
+    .map(|(interface_id, if_index, if_speed_bps)| PollInterface { interface_id, if_index, if_speed_bps })
     .collect();
 
-    if monitored.is_empty() {
-        // Nothing to poll, but a successful connection still proves reachability.
-        match test(&dev).await {
-            Ok(_) => {
-                sqlx::query("UPDATE devices SET reachable = 1, last_error = NULL, last_poll_at = UTC_TIMESTAMP() WHERE id = ?")
-                    .bind(device_id)
-                    .execute(pool)
-                    .await
-                    .ok();
-                return Ok(0);
-            }
-            Err(e) => {
-                mark_unreachable(pool, device_id, &e.to_string()).await;
-                return Err(e);
-            }
-        }
+    if ifaces.is_empty() {
+        // No interfaces yet (e.g. just enrolled) -> auto-discover now; the next
+        // poll tick will have interfaces to read.
+        return discover_and_store(pool, device_id).await;
     }
 
     let client = match connect(&dev).await {
@@ -422,7 +411,7 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let now = Utc::now();
     let mut updated = 0usize;
 
-    for m in &monitored {
+    for m in &ifaces {
         // Missing a counter for this interface -> skip it (leave its row as-is).
         let (Some(&io), Some(&oo), Some(&ip), Some(&op)) = (
             in_oct.get(&m.if_index),
@@ -440,11 +429,14 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             in_ucast_pkts: ip,
             out_ucast_pkts: op,
         };
-        let previous = load_baseline(pool, m.interface_id).await?;
+        let (previous, prev_in_err, prev_out_err) = load_baseline(pool, m.interface_id).await?;
         let rates = interface_rates(&current, previous.as_ref(), m.if_speed_bps);
 
         let oper_s = oper.get(&m.if_index).map(|&v| oper_status_str(v).to_string());
         let admin_s = admin.get(&m.if_index).map(|&v| admin_status_str(v).to_string());
+
+        let cur_in_err = in_err.get(&m.if_index).copied();
+        let cur_out_err = out_err.get(&m.if_index).copied();
 
         store_metrics(
             pool,
@@ -452,12 +444,15 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             m.interface_id,
             &current,
             &rates,
-            in_err.get(&m.if_index).copied(),
-            out_err.get(&m.if_index).copied(),
+            cur_in_err,
+            cur_out_err,
             in_disc.get(&m.if_index).copied(),
             out_disc.get(&m.if_index).copied(),
             admin_s.as_deref(),
             oper_s.as_deref(),
+            // per-interval error deltas for the history chart (0 on first sample/wrap)
+            err_delta(cur_in_err, prev_in_err),
+            err_delta(cur_out_err, prev_out_err),
         )
         .await?;
         updated += 1;
@@ -472,13 +467,26 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     Ok(updated)
 }
 
-/// Load the previous raw counters (baseline) for an interface, if a valid prior
-/// sample exists.
-async fn load_baseline(pool: &MySqlPool, interface_id: u64) -> Result<Option<InterfaceCounters>> {
+/// Load the previous raw octet/packet counters (rate baseline) plus the previous
+/// cumulative error counters (for per-interval error deltas) from
+/// `interface_metrics_current`.
+async fn load_baseline(
+    pool: &MySqlPool,
+    interface_id: u64,
+) -> Result<(Option<InterfaceCounters>, Option<u64>, Option<u64>)> {
     // sampled_at is a TIMESTAMP column -> DateTime<Utc> (sqlx-mysql maps
     // NaiveDateTime only to DATETIME).
-    let row = sqlx::query_as::<_, (Option<chrono::DateTime<chrono::Utc>>, Option<u64>, Option<u64>, Option<u64>, Option<u64>, bool)>(
-        "SELECT sampled_at, in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, valid_sample \
+    type Row = (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+    );
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT sampled_at, in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, in_errors, out_errors \
          FROM interface_metrics_current WHERE interface_id = ?",
     )
     .bind(interface_id)
@@ -486,8 +494,11 @@ async fn load_baseline(pool: &MySqlPool, interface_id: u64) -> Result<Option<Int
     .await
     .context("loading interface baseline")?;
 
-    Ok(match row {
-        Some((Some(ts), Some(io), Some(oo), Some(ip), Some(op), _valid)) => Some(InterfaceCounters {
+    let Some((ts, io, oo, ip, op, in_e, out_e)) = row else {
+        return Ok((None, None, None));
+    };
+    let counters = match (ts, io, oo, ip, op) {
+        (Some(ts), Some(io), Some(oo), Some(ip), Some(op)) => Some(InterfaceCounters {
             sampled_at: ts,
             in_octets: io,
             out_octets: oo,
@@ -495,7 +506,17 @@ async fn load_baseline(pool: &MySqlPool, interface_id: u64) -> Result<Option<Int
             out_ucast_pkts: op,
         }),
         _ => None,
-    })
+    };
+    Ok((counters, in_e, out_e))
+}
+
+/// Per-interval error count: current minus the previous cumulative counter.
+/// Returns 0 when there is no baseline yet or the counter wrapped (current < previous).
+fn err_delta(current: Option<u64>, previous: Option<u64>) -> u64 {
+    match (current, previous) {
+        (Some(c), Some(p)) if c >= p => c - p,
+        _ => 0,
+    }
 }
 
 /// Upsert `interface_metrics_current` with the new raw counters (next baseline)
@@ -513,6 +534,8 @@ async fn store_metrics(
     out_discards: Option<u64>,
     admin_status: Option<&str>,
     oper_status: Option<&str>,
+    sample_in_errors: u64,
+    sample_out_errors: u64,
 ) -> Result<()> {
     let sampled_at = counters.sampled_at.naive_utc();
     let valid = rates.valid as i32;
@@ -564,8 +587,9 @@ async fn store_metrics(
     sqlx::query(
         "INSERT INTO interface_samples \
             (interface_id, device_id, sampled_at, valid_sample, \
-             rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
+             in_errors, out_errors) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(interface_id)
     .bind(device_id)
@@ -577,6 +601,8 @@ async fn store_metrics(
     .bind(rates.tx_pps)
     .bind(rates.rx_util_percent)
     .bind(rates.tx_util_percent)
+    .bind(sample_in_errors)
+    .bind(sample_out_errors)
     .execute(pool)
     .await
     .context("appending interface_samples")?;
