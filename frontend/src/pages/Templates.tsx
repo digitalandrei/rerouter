@@ -87,21 +87,6 @@ function TemplateCard({ template }: { template: Template }) {
           <Badge variant="outline" className="font-normal text-muted-foreground">
             {template.provider_type}
           </Badge>
-          {template.manual_confirmation_required && (
-            <Badge variant="outline" className="font-normal">
-              typed confirmation
-            </Badge>
-          )}
-          {template.safety_level === "high" && (
-            <Badge variant="outline" className="font-normal">
-              re-auth required
-            </Badge>
-          )}
-          {template.auto_expiry_seconds && (
-            <Badge variant="outline" className="font-normal">
-              auto-expiry {Math.round(template.auto_expiry_seconds / 60)}m
-            </Badge>
-          )}
           {!template.enabled && <Badge variant="secondary">disabled</Badge>}
         </div>
         {template.description && (

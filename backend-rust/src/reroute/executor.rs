@@ -124,17 +124,6 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
     // Post-action cooldown on the device.
     let _ = cooldown::record(pool, "device", &device_ref, DEVICE_COOLDOWN_SECS, "post-action cooldown").await;
 
-    // Auto-expiry for a succeeded, expiring template (rollback sweep clears it).
-    if final_state == "succeeded" {
-        if let Some(secs) = req.template.auto_expiry_seconds {
-            let _ = sqlx::query("UPDATE reroutes SET expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND) WHERE id = ?")
-                .bind(secs as i64)
-                .bind(reroute_id)
-                .execute(pool)
-                .await;
-        }
-    }
-
     let message = match final_state.as_str() {
         "succeeded" => "reroute executed and verified".to_string(),
         "failed" => "reroute failed — verification did not confirm the change".to_string(),
