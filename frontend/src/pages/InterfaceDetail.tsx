@@ -2,7 +2,7 @@
  * /devices/:deviceId/interfaces/:ifaceId — single-interface telemetry view.
  *
  * Header: back to the device, interface name + admin/oper badges, device-name
- * subtitle, Refresh + a monitor on/off toggle (gated by manage_devices).
+ * subtitle, Refresh button.
  *
  * Two info cards (Interface Details, Status & Counters) followed by up to six
  * last-hour recharts panels (Traffic, Packets, Errors, Discards, and — only
@@ -22,7 +22,6 @@ import {
   type Sample,
   ApiError,
 } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -106,8 +105,6 @@ function SmoothingControl({
 // ---------------------------------------------------------------------------
 
 export default function InterfaceDetail() {
-  const { hasPermission } = useAuth();
-  const canManage = hasPermission("manage_devices");
   const { deviceId: deviceIdParam, ifaceId: ifaceIdParam } = useParams<{
     deviceId: string;
     ifaceId: string;
@@ -121,7 +118,6 @@ export default function InterfaceDetail() {
   const [loading, setLoading] = useState(true);
   const [metricsReady, setMetricsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [toggleBusy, setToggleBusy] = useState(false);
   const [smoothing, setSmoothing] = useState<SmoothingWindow>(1);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -176,21 +172,6 @@ export default function InterfaceDetail() {
   async function refreshNow() {
     loadInterface();
     loadMetrics();
-  }
-
-  async function toggleMonitoring() {
-    if (!iface) return;
-    setToggleBusy(true);
-    try {
-      const updated = await api.interfaces.update(iface.id, {
-        enabled_for_monitoring: !iface.enabled_for_monitoring,
-      });
-      setIface(updated);
-    } catch {
-      // leave state unchanged on failure
-    } finally {
-      setToggleBusy(false);
-    }
   }
 
   const chartData = useMemo(
@@ -260,16 +241,6 @@ export default function InterfaceDetail() {
               <RefreshCw className="size-4" />
               Refresh
             </Button>
-            {canManage && (
-              <Button
-                size="sm"
-                variant={iface.enabled_for_monitoring ? "default" : "outline"}
-                disabled={toggleBusy}
-                onClick={() => void toggleMonitoring()}
-              >
-                {iface.enabled_for_monitoring ? "Monitoring On" : "Monitoring Off"}
-              </Button>
-            )}
           </div>
         </div>
         {device && (
@@ -293,15 +264,6 @@ export default function InterfaceDetail() {
               <Fact label="Description">{iface.if_descr ?? "—"}</Fact>
               <Fact label="Alias">{iface.if_alias ?? "—"}</Fact>
               <Fact label="ifIndex">{iface.if_index}</Fact>
-              <Fact label="Monitoring">
-                {iface.enabled_for_monitoring ? (
-                  <Badge className="border-transparent bg-green-500/15 text-green-700 dark:text-green-400">
-                    on
-                  </Badge>
-                ) : (
-                  <Badge variant="secondary">off</Badge>
-                )}
-              </Fact>
             </dl>
           </CardContent>
         </Card>

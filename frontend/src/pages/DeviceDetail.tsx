@@ -9,8 +9,8 @@
  *  - Overview: a responsive grid of info cards (Device Information, Connectivity,
  *    Status) using uppercase muted labels + bold values and green pills.
  *  - Interfaces: the polished interface table; each row links to the interface
- *    detail page (`/devices/:id/interfaces/:ifaceId`), the monitor-toggle cell
- *    stops propagation. Per-interface charts live on the interface page.
+ *    detail page (`/devices/:id/interfaces/:ifaceId`). Per-interface charts live
+ *    on the interface page.
  *
  * The device + interface list auto-refresh every 30 s.
  */
@@ -470,18 +470,12 @@ interface InterfacesTabProps {
   deviceId: number;
   interfaces: Interface[];
   loading: boolean;
-  canManage: boolean;
-  toggleBusy: Record<number, boolean>;
-  onToggle: (iface: Interface) => void;
 }
 
 function InterfacesTab({
   deviceId,
   interfaces,
   loading,
-  canManage,
-  toggleBusy,
-  onToggle,
 }: InterfacesTabProps) {
   const navigate = useNavigate();
 
@@ -507,8 +501,7 @@ function InterfacesTab({
           <TableHead>Status</TableHead>
           <TableHead>Rx bps / pps</TableHead>
           <TableHead>Tx bps / pps</TableHead>
-          <TableHead>Util %</TableHead>
-          <TableHead className="pr-6">Monitor</TableHead>
+          <TableHead className="pr-6">Util %</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -565,7 +558,7 @@ function InterfacesTab({
                   "—"
                 )}
               </TableCell>
-              <TableCell className="text-xs">
+              <TableCell className="pr-6 text-xs">
                 {valid ? (
                   <>
                     Rx {iface.metrics!.rx_util_percent.toFixed(1)}%
@@ -574,27 +567,6 @@ function InterfacesTab({
                   </>
                 ) : (
                   "—"
-                )}
-              </TableCell>
-              <TableCell
-                className="pr-6"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {canManage ? (
-                  <Button
-                    size="sm"
-                    variant={
-                      iface.enabled_for_monitoring ? "default" : "outline"
-                    }
-                    disabled={toggleBusy[iface.id]}
-                    onClick={() => onToggle(iface)}
-                  >
-                    {iface.enabled_for_monitoring ? "On" : "Off"}
-                  </Button>
-                ) : (
-                  <span className="text-xs text-muted-foreground">
-                    {iface.enabled_for_monitoring ? "On" : "Off"}
-                  </span>
                 )}
               </TableCell>
             </TableRow>
@@ -620,7 +592,6 @@ export default function DeviceDetail() {
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
   const [loading, setLoading] = useState(true);
   const [ifLoading, setIfLoading] = useState(true);
-  const [toggleBusy, setToggleBusy] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
 
@@ -671,22 +642,6 @@ export default function DeviceDetail() {
       navigate("/devices");
     } catch (err) {
       alert(err instanceof ApiError ? err.message : "Delete failed");
-    }
-  }
-
-  async function toggleMonitoring(iface: Interface) {
-    setToggleBusy((b) => ({ ...b, [iface.id]: true }));
-    try {
-      const updated = await api.interfaces.update(iface.id, {
-        enabled_for_monitoring: !iface.enabled_for_monitoring,
-      });
-      setInterfaces((prev) =>
-        prev.map((i) => (i.id === updated.id ? updated : i)),
-      );
-    } catch {
-      // silently ignore; state stays unchanged
-    } finally {
-      setToggleBusy((b) => ({ ...b, [iface.id]: false }));
     }
   }
 
@@ -829,9 +784,6 @@ export default function DeviceDetail() {
                 deviceId={deviceId}
                 interfaces={interfaces}
                 loading={ifLoading}
-                canManage={canManage}
-                toggleBusy={toggleBusy}
-                onToggle={(iface) => void toggleMonitoring(iface)}
               />
             </CardContent>
           </Card>

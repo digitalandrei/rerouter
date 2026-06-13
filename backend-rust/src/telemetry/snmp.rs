@@ -319,7 +319,7 @@ pub async fn discover(dev: &DeviceConn) -> Result<Vec<DiscoveredInterface>> {
 }
 
 /// `discover` + reconcile into `device_interfaces` by (device_id, if_index):
-/// insert new, refresh existing (without disturbing `enabled_for_monitoring`).
+/// insert new, refresh existing.
 /// Returns the number of interfaces seen.
 pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let dev = load_device(pool, device_id).await?;

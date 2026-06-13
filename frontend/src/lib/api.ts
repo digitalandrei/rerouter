@@ -151,7 +151,6 @@ export interface Interface {
   if_speed_bps: number | null;
   admin_status: string;
   oper_status: string;
-  enabled_for_monitoring: boolean;
   metrics: InterfaceMetrics | null;
 }
 
@@ -376,11 +375,6 @@ export const api = {
 
   interfaces: {
     get: (id: number) => request<Interface>(`/api/interfaces/${id}`),
-    update: (id: number, data: { enabled_for_monitoring: boolean }) =>
-      request<Interface>(`/api/interfaces/${id}`, {
-        method: "PUT",
-        body: data,
-      }),
     metrics: (id: number, minutes?: number) =>
       request<Sample[]>(
         `/api/interfaces/${id}/metrics${minutes !== undefined ? `?minutes=${minutes}` : ""}`,

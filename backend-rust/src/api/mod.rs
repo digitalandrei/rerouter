@@ -115,7 +115,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/discover", post(devices::discover))
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
         // interfaces
-        .route("/api/interfaces/{id}", get(interfaces::show).put(interfaces::update))
+        .route("/api/interfaces/{id}", get(interfaces::show))
         .route("/api/interfaces/{id}/metrics", get(interfaces::metrics))
         // assets
         .route("/api/assets", get(assets::list).post(assets::create))

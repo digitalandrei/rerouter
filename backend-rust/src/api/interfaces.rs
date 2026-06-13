@@ -1,7 +1,7 @@
-//! Interface read + per-interface monitoring toggle + rate history.
+//! Interface read + rate/optics history. Every discovered interface is polled,
+//! so there is no per-interface monitoring toggle.
 //!
-//! Reads require `view_asset`; toggling `enabled_for_monitoring` requires
-//! `edit_asset`. Field names are pinned by the frontend contract
+//! Reads require `view_asset`. Field names are pinned by the frontend contract
 //! (../../frontend/src/lib/api.ts: Interface / InterfaceMetrics / Sample).
 
 use axum::extract::{Path, Query, State};
@@ -27,7 +27,6 @@ struct InterfaceRow {
     if_speed_bps: Option<u64>,
     admin_status: Option<String>,
     oper_status: Option<String>,
-    enabled_for_monitoring: bool,
 }
 
 /// The latest `interface_metrics_current` row (InterfaceMetrics shape).
@@ -46,7 +45,7 @@ struct MetricsRow {
 }
 
 const IFACE_COLS: &str = "id, device_id, if_index, if_name, if_descr, if_alias, if_speed_bps, \
-     admin_status, oper_status, enabled_for_monitoring";
+     admin_status, oper_status";
 
 const METRIC_COLS: &str = "sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
      rx_util_percent, tx_util_percent, in_errors, out_errors";
@@ -79,7 +78,6 @@ fn interface_json(r: &InterfaceRow, metrics: Option<&MetricsRow>) -> Value {
         "if_speed_bps": r.if_speed_bps,
         "admin_status": r.admin_status.clone().unwrap_or_default(),
         "oper_status": r.oper_status.clone().unwrap_or_default(),
-        "enabled_for_monitoring": r.enabled_for_monitoring,
         "metrics": metrics.map(metrics_json),
     })
 }
@@ -134,39 +132,6 @@ pub async fn show(
     match fetch_interface(&state.pool, id).await {
         Ok(Some(v)) => (StatusCode::OK, Json(v)),
         Ok(None) => err(StatusCode::NOT_FOUND, "interface not found"),
-        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateInterface {
-    enabled_for_monitoring: bool,
-}
-
-/// PUT /api/interfaces/{id} — toggle monitoring. Only monitored interfaces are
-/// polled and rule-evaluated.
-pub async fn update(
-    _g: RequirePermission<markers::ManageDevices>,
-    State(state): State<AppState>,
-    Path(id): Path<u64>,
-    Json(body): Json<UpdateInterface>,
-) -> JsonResp {
-    let res = sqlx::query("UPDATE device_interfaces SET enabled_for_monitoring = ? WHERE id = ?")
-        .bind(body.enabled_for_monitoring)
-        .bind(id)
-        .execute(&state.pool)
-        .await;
-    match res {
-        Ok(r) if r.rows_affected() > 0 => match fetch_interface(&state.pool, id).await {
-            Ok(Some(v)) => (StatusCode::OK, Json(v)),
-            _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-        },
-        // rows_affected == 0 can also mean the value was unchanged; confirm existence.
-        Ok(_) => match fetch_interface(&state.pool, id).await {
-            Ok(Some(v)) => (StatusCode::OK, Json(v)),
-            Ok(None) => err(StatusCode::NOT_FOUND, "interface not found"),
-            Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-        },
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
