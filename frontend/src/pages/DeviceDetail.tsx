@@ -31,8 +31,9 @@ import {
   Compass,
   SlidersHorizontal,
   TerminalSquare,
+  Network,
 } from "lucide-react";
-import { api, type Device, type Interface, type Rule, ApiError } from "@/lib/api";
+import { api, type Device, type Interface, type Rule, type BgpPeer, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -370,6 +371,128 @@ function EditDialog({ device, open, onClose, onSaved }: EditDialogProps) {
 // ---------------------------------------------------------------------------
 // Overview tab — info cards
 // ---------------------------------------------------------------------------
+
+function bgpStateVariant(
+  state: string | null,
+): "default" | "secondary" | "destructive" | "outline" {
+  if (state === "established") return "default";
+  if (state === "idle" || state === "active" || state === "connect") return "secondary";
+  return "outline";
+}
+
+/// Discovered BGP sessions (SNMP, read-only). Operators identify the scrubber
+/// neighbor here; rule actions later toggle it (shutdown / no shutdown).
+function BgpSessionsCard({ deviceId, canManage }: { deviceId: number; canManage: boolean }) {
+  const [peers, setPeers] = useState<BgpPeer[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api.devices
+      .bgpPeers(deviceId)
+      .then(setPeers)
+      .catch(() => setPeers([]));
+  }, [deviceId]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function discover() {
+    setBusy(true);
+    try {
+      const r = await api.devices.discoverBgp(deviceId);
+      load();
+      if (r.discovered === 0) {
+        alert("No BGP sessions found (device may not run BGP, or its BGP4-MIB is empty).");
+      }
+    } catch (e) {
+      alert(`BGP discovery failed: ${e instanceof Error ? e.message : "error"}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function editLabel(p: BgpPeer) {
+    const next = window.prompt(`Label for neighbor ${p.peer_remote_addr}`, p.label ?? "");
+    if (next === null) return;
+    await api.devices.updateBgpPeer(deviceId, p.id, next.trim() || null).catch(() => {});
+    load();
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Network className="size-4 text-muted-foreground" />
+          BGP sessions
+          <Badge variant="outline" className="ml-1 font-normal text-muted-foreground">
+            Read-only · SNMP
+          </Badge>
+        </CardTitle>
+        {canManage && (
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void discover()}>
+            <Compass className="size-4" />
+            {busy ? "Discovering…" : "Discover BGP"}
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent>
+        {peers === null ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : peers.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No BGP sessions discovered yet.
+            {canManage ? ' Use "Discover BGP" above.' : ""}
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Neighbor</TableHead>
+                <TableHead>Remote AS</TableHead>
+                <TableHead>Session</TableHead>
+                <TableHead>Admin</TableHead>
+                <TableHead>Label</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {peers.map((p) => (
+                <TableRow key={p.id}>
+                  <TableCell className="font-mono text-xs">{p.peer_remote_addr}</TableCell>
+                  <TableCell>{p.peer_remote_as ?? "—"}</TableCell>
+                  <TableCell>
+                    <Badge variant={bgpStateVariant(p.peer_state)}>{p.peer_state ?? "?"}</Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={p.peer_admin_status === "stop" ? "destructive" : "outline"}>
+                      {p.peer_admin_status === "stop"
+                        ? "shutdown"
+                        : p.peer_admin_status === "start"
+                          ? "up"
+                          : "?"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    {canManage ? (
+                      <button
+                        type="button"
+                        onClick={() => void editLabel(p)}
+                        className="text-left text-primary underline-offset-4 hover:underline"
+                      >
+                        {p.label ?? "set label"}
+                      </button>
+                    ) : (
+                      (p.label ?? "—")
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 function OverviewTab({ device }: { device: Device }) {
   const sshMethodLabel =
@@ -837,8 +960,9 @@ export default function DeviceDetail() {
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="overview" className="mt-4">
+        <TabsContent value="overview" className="mt-4 space-y-4">
           <OverviewTab device={device} />
+          <BgpSessionsCard deviceId={deviceId} canManage={canManage} />
         </TabsContent>
 
         <TabsContent value="interfaces" className="mt-4">

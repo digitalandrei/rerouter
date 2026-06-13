@@ -195,6 +195,18 @@ export interface SshTestResult {
   error?: string;
 }
 
+export interface BgpPeer {
+  id: number;
+  device_id: number;
+  peer_remote_addr: string;
+  peer_remote_as: number | null;
+  local_as: number | null;
+  peer_state: string | null;
+  peer_admin_status: string | null;
+  label: string | null;
+  last_polled_at: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Rules and Alerts
 // ---------------------------------------------------------------------------
@@ -386,6 +398,17 @@ export const api = {
       request<SshTestResult>(`/api/devices/${id}/ssh-test`, { method: "POST" }),
     interfaces: (id: number) =>
       request<Interface[]>(`/api/devices/${id}/interfaces`),
+    bgpPeers: (id: number) =>
+      request<BgpPeer[]>(`/api/devices/${id}/bgp-peers`),
+    discoverBgp: (id: number) =>
+      request<{ discovered: number }>(`/api/devices/${id}/discover-bgp`, {
+        method: "POST",
+      }),
+    updateBgpPeer: (deviceId: number, peerId: number, label: string | null) =>
+      request<{ ok: boolean }>(`/api/devices/${deviceId}/bgp-peers/${peerId}`, {
+        method: "PATCH",
+        body: { label },
+      }),
   },
 
   interfaces: {

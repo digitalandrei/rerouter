@@ -25,7 +25,7 @@ pub mod users;
 use anyhow::{Context, Result};
 use axum::extract::FromRef;
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use serde_json::{json, Value};
@@ -114,6 +114,9 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/test", post(devices::test))
         .route("/api/devices/{id}/discover", post(devices::discover))
         .route("/api/devices/{id}/ssh-test", post(devices::ssh_test))
+        .route("/api/devices/{id}/discover-bgp", post(devices::discover_bgp))
+        .route("/api/devices/{id}/bgp-peers", get(devices::bgp_peers))
+        .route("/api/devices/{device_id}/bgp-peers/{peer_id}", patch(devices::update_bgp_peer))
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))

@@ -68,6 +68,12 @@ const OID_ENT_PHYS_NAME: &str = "1.3.6.1.2.1.47.1.1.1.1.7";
 const OID_SENSOR_PRECISION: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.3";
 const OID_SENSOR_VALUE: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.4";
 const OID_SENSOR_STATUS: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.5"; // 1 = ok
+// BGP4-MIB (1.3.6.1.2.1.15) — IPv4 BGP peer table, indexed by the peer's remote
+// IP (4 OID arcs). Used to discover scrubber sessions operators can toggle.
+const OID_BGP_LOCAL_AS: &str = "1.3.6.1.2.1.15.2.0"; // scalar
+const OID_BGP_PEER_STATE: &str = "1.3.6.1.2.1.15.3.1.2"; // 1..6 FSM state
+const OID_BGP_PEER_ADMIN_STATUS: &str = "1.3.6.1.2.1.15.3.1.3"; // 1=stop(shut) 2=start
+const OID_BGP_PEER_REMOTE_AS: &str = "1.3.6.1.2.1.15.3.1.9";
 
 fn oid(s: &str) -> Result<ObjectIdentifier> {
     s.parse::<ObjectIdentifier>()
@@ -366,6 +372,116 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
         .ok();
 
     Ok(ifaces.len())
+}
+
+// ---- BGP peer discovery --------------------------------------------------------
+
+/// Discover BGP peers via BGP4-MIB `bgpPeerTable` and reconcile
+/// `device_bgp_peers` by (device_id, peer_remote_addr). Returns the peer count.
+/// IPv4 peers only (classic BGP4-MIB); a device that doesn't run BGP returns 0.
+pub async fn discover_bgp_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
+    let dev = load_device(pool, device_id).await?;
+    let client = connect(&dev).await?;
+
+    let local_as = client
+        .get(oid(OID_BGP_LOCAL_AS)?)
+        .await
+        .ok()
+        .and_then(|v| value_to_u64(&v))
+        .filter(|&n| n > 0);
+
+    let states = walk_ip_u64(&client, OID_BGP_PEER_STATE).await.unwrap_or_default();
+    let admins = walk_ip_u64(&client, OID_BGP_PEER_ADMIN_STATUS).await.unwrap_or_default();
+    let remote_as = walk_ip_u64(&client, OID_BGP_PEER_REMOTE_AS).await.unwrap_or_default();
+
+    // Union of peer IPs seen across the columns (state is the authoritative set).
+    let mut peers: std::collections::BTreeSet<String> = states.keys().cloned().collect();
+    peers.extend(admins.keys().cloned());
+    peers.extend(remote_as.keys().cloned());
+
+    for ip in &peers {
+        let state = states.get(ip).map(|&s| bgp_state_str(s));
+        let admin = admins.get(ip).map(|&a| bgp_admin_str(a));
+        let ras = remote_as.get(ip).copied().filter(|&n| n > 0);
+        sqlx::query(
+            "INSERT INTO device_bgp_peers \
+                (device_id, peer_remote_addr, peer_remote_as, local_as, peer_state, peer_admin_status, \
+                 first_seen_at, last_seen_at, last_polled_at) \
+             VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
+             ON DUPLICATE KEY UPDATE \
+                peer_remote_as = VALUES(peer_remote_as), local_as = VALUES(local_as), \
+                peer_state = VALUES(peer_state), peer_admin_status = VALUES(peer_admin_status), \
+                last_seen_at = UTC_TIMESTAMP(), last_polled_at = UTC_TIMESTAMP()",
+        )
+        .bind(device_id)
+        .bind(ip)
+        .bind(ras)
+        .bind(local_as)
+        .bind(&state)
+        .bind(&admin)
+        .execute(pool)
+        .await
+        .context("upserting BGP peer")?;
+    }
+
+    Ok(peers.len())
+}
+
+/// Walk a BGP4-MIB column indexed by the peer remote IP (4 OID arcs) -> u64.
+async fn walk_ip_u64(client: &Snmp2cClient, base: &str) -> Result<BTreeMap<String, u64>> {
+    let base_oid = oid(base)?;
+    let raw = client
+        .walk_bulk(base_oid, BULK_REPETITIONS)
+        .await
+        .with_context(|| format!("walk {base}"))?;
+    Ok(index_by_ip(&base_oid, raw, |v| value_to_u64(&v)))
+}
+
+/// Reduce a walk result keyed by a trailing 4-arc IPv4 suffix -> T.
+fn index_by_ip<T>(
+    base: &ObjectIdentifier,
+    raw: BTreeMap<ObjectIdentifier, ObjectValue>,
+    map: impl Fn(ObjectValue) -> Option<T>,
+) -> BTreeMap<String, T> {
+    let mut out = BTreeMap::new();
+    for (entry_oid, value) in raw {
+        let Some(rel) = entry_oid.relative_to(base) else { continue };
+        let arcs = rel.as_slice();
+        if arcs.len() < 4 {
+            continue;
+        }
+        let ip = arcs[arcs.len() - 4..]
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(v) = map(value) {
+            out.insert(ip, v);
+        }
+    }
+    out
+}
+
+/// BGP4-MIB bgpPeerState (1..6) -> label.
+fn bgp_state_str(v: u64) -> &'static str {
+    match v {
+        1 => "idle",
+        2 => "connect",
+        3 => "active",
+        4 => "opensent",
+        5 => "openconfirm",
+        6 => "established",
+        _ => "unknown",
+    }
+}
+
+/// BGP4-MIB bgpPeerAdminStatus (1=stop/shut, 2=start) -> label.
+fn bgp_admin_str(v: u64) -> &'static str {
+    match v {
+        1 => "stop",
+        2 => "start",
+        _ => "unknown",
+    }
 }
 
 // ---- poll() --------------------------------------------------------------------

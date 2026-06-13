@@ -588,6 +588,107 @@ pub async fn interfaces(
     }
 }
 
+// ---- BGP sessions (discovered via SNMP, read-only telemetry) -------------------
+
+/// A `device_bgp_peers` row in the SPA's BgpPeer shape.
+#[derive(sqlx::FromRow)]
+struct BgpPeerRow {
+    id: u64,
+    device_id: u64,
+    peer_remote_addr: String,
+    peer_remote_as: Option<u32>,
+    local_as: Option<u32>,
+    peer_state: Option<String>,
+    peer_admin_status: Option<String>,
+    label: Option<String>,
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+const BGP_PEER_COLS: &str = "id, device_id, peer_remote_addr, peer_remote_as, local_as, \
+     peer_state, peer_admin_status, label, last_polled_at";
+
+fn bgp_peer_json(r: &BgpPeerRow) -> Value {
+    json!({
+        "id": r.id,
+        "device_id": r.device_id,
+        "peer_remote_addr": r.peer_remote_addr,
+        "peer_remote_as": r.peer_remote_as,
+        "local_as": r.local_as,
+        "peer_state": r.peer_state,
+        "peer_admin_status": r.peer_admin_status,
+        "label": r.label,
+        "last_polled_at": r.last_polled_at.map(fmt_ts),
+    })
+}
+
+/// GET /api/devices/{id}/bgp-peers — discovered BGP sessions (BgpPeer[]).
+pub async fn bgp_peers(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let rows = match sqlx::query_as::<_, BgpPeerRow>(&format!(
+        "SELECT {BGP_PEER_COLS} FROM device_bgp_peers WHERE device_id = ? ORDER BY peer_remote_addr"
+    ))
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let out: Vec<Value> = rows.iter().map(bgp_peer_json).collect();
+    (StatusCode::OK, Json(json!(out)))
+}
+
+/// POST /api/devices/{id}/discover-bgp — walk BGP4-MIB and reconcile peers.
+/// A failure surfaces as a 502 with the structured error (no panic).
+pub async fn discover_bgp(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    }
+    match snmp::discover_bgp_and_store(&state.pool, id).await {
+        Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBgpPeer {
+    /// Operator-friendly label (e.g. "Scrubber-A GRE"); empty clears it.
+    label: Option<String>,
+}
+
+/// PATCH /api/devices/{device_id}/bgp-peers/{peer_id} — set the operator label.
+pub async fn update_bgp_peer(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path((device_id, peer_id)): Path<(u64, u64)>,
+    Json(body): Json<UpdateBgpPeer>,
+) -> JsonResp {
+    let label = body.label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let res = sqlx::query("UPDATE device_bgp_peers SET label = ? WHERE id = ? AND device_id = ?")
+        .bind(label)
+        .bind(peer_id)
+        .bind(device_id)
+        .execute(&state.pool)
+        .await;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(_) => err(StatusCode::NOT_FOUND, "bgp peer not found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
 /// True if a sqlx error is a MySQL duplicate-key (1062) violation.
 fn is_dup(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23000"))

@@ -144,6 +144,13 @@ async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Resu
         }
     }
 
+    // Refresh BGP session state (read-only; keeps the UI's session up/down live).
+    // Best-effort: a device that doesn't run BGP (or lacks BGP4-MIB) is a no-op,
+    // and a transport error here must not block detection.
+    if let Err(e) = snmp::discover_bgp_and_store(pool, device_id).await {
+        tracing::debug!(event_type = "bgp_discover_failed", device_id, error = %e, "BGP peer discovery failed (non-fatal)");
+    }
+
     // Detection for this device's monitored interfaces.
     match detection::engine::evaluate_device(pool, cfg, device_id).await {
         Ok(fired) if fired > 0 => {
