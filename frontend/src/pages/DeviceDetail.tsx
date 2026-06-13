@@ -1,6 +1,7 @@
 /**
- * /devices/:id — device facts, interface table (with type badges + row
- * selection), and last-hour SNMP telemetry charts for the selected interface.
+ * /devices/:id — device facts, Edit/Delete (manage_devices), interface table
+ * (with type badges + row selection), and last-hour SNMP telemetry charts for
+ * the selected interface.
  *
  * Charts: recharts ResponsiveContainer + LineChart — three panels:
  *   1. Throughput  (rx_bps / tx_bps)
@@ -10,8 +11,8 @@
  * Auto-refreshes the interface list and the selected interface's metrics
  * every 30 s; clears the timer on unmount or interface change.
  */
-import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useEffect, useState, useCallback, useRef, type FormEvent } from "react";
+import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   ResponsiveContainer,
   LineChart,
@@ -22,6 +23,7 @@ import {
   Tooltip,
   Legend,
 } from "recharts";
+import { Pencil, Trash2 } from "lucide-react";
 import { api, type Device, type Interface, type Sample, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +34,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
 
 // ---------------------------------------------------------------------------
 // Formatters
@@ -136,6 +145,291 @@ function operStatusVariant(
     default:
       return "outline";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared input class (matches the rest of the app)
+// ---------------------------------------------------------------------------
+
+const inputClass =
+  "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+// ---------------------------------------------------------------------------
+// Edit device form (inside a Dialog)
+// ---------------------------------------------------------------------------
+
+interface EditDeviceForm {
+  name: string;
+  hostname: string;
+  snmp_port: string;
+  poll_interval_seconds: string;
+  enabled: boolean;
+  // Secrets — only sent when non-empty
+  community: string;
+  ssh_auth_method: string; // "none" | "password" | "key"  (display-only, read from device)
+  ssh_username: string;
+  ssh_port: string;
+  ssh_password: string;
+  ssh_private_key: string;
+  ssh_key_passphrase: string;
+}
+
+function buildEditForm(device: Device): EditDeviceForm {
+  return {
+    name: device.name,
+    hostname: device.hostname,
+    snmp_port: String(device.snmp_port),
+    poll_interval_seconds: String(device.poll_interval_seconds),
+    enabled: device.enabled,
+    community: "",
+    ssh_auth_method: device.ssh_auth_method ?? "none",
+    ssh_username: device.ssh_username ?? "",
+    ssh_port: String(device.ssh_port ?? 22),
+    ssh_password: "",
+    ssh_private_key: "",
+    ssh_key_passphrase: "",
+  };
+}
+
+interface EditDialogProps {
+  device: Device;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}
+
+function EditDialog({ device, open, onClose, onSaved }: EditDialogProps) {
+  const [form, setForm] = useState<EditDeviceForm>(() => buildEditForm(device));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Re-seed the form whenever the dialog opens (device may have been reloaded)
+  useEffect(() => {
+    if (open) {
+      setForm(buildEditForm(device));
+      setError(null);
+    }
+  }, [open, device]);
+
+  function setField<K extends keyof EditDeviceForm>(
+    field: K,
+    value: EditDeviceForm[K],
+  ) {
+    setForm((f) => ({ ...f, [field]: value }));
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      // Build a partial payload: only include fields that exist / changed.
+      // Secrets are omitted when blank.
+      const payload: Parameters<typeof api.devices.update>[1] = {
+        name: form.name.trim(),
+        hostname: form.hostname.trim(),
+        snmp_port: parseInt(form.snmp_port, 10),
+        poll_interval_seconds: parseInt(form.poll_interval_seconds, 10),
+        enabled: form.enabled,
+      };
+
+      // community — only send when operator typed something
+      if (form.community.trim()) {
+        (payload as Record<string, unknown>).community = form.community.trim();
+      }
+
+      // SSH secrets — only update when a new value was provided
+      if (form.ssh_auth_method !== "none") {
+        if (form.ssh_username.trim())
+          (payload as Record<string, unknown>).ssh_username = form.ssh_username.trim();
+        if (form.ssh_port)
+          (payload as Record<string, unknown>).ssh_port = parseInt(form.ssh_port, 10);
+        if (form.ssh_auth_method === "password" && form.ssh_password)
+          (payload as Record<string, unknown>).ssh_password = form.ssh_password;
+        if (form.ssh_auth_method === "key" && form.ssh_private_key)
+          (payload as Record<string, unknown>).ssh_private_key = form.ssh_private_key;
+        if (form.ssh_key_passphrase)
+          (payload as Record<string, unknown>).ssh_key_passphrase = form.ssh_key_passphrase;
+      }
+
+      await api.devices.update(device.id, payload);
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to update device");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const sshConfigured = form.ssh_auth_method !== "none";
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Edit device — {device.name}</DialogTitle>
+        </DialogHeader>
+        <form id="edit-device-form" onSubmit={handleSubmit} className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="block space-y-1 text-sm font-medium">
+              Name
+              <input
+                required
+                className={inputClass}
+                value={form.name}
+                onChange={(e) => setField("name", e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-sm font-medium">
+              Hostname / IP
+              <input
+                required
+                className={inputClass}
+                value={form.hostname}
+                onChange={(e) => setField("hostname", e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-sm font-medium">
+              SNMP port
+              <input
+                type="number"
+                min={1}
+                max={65535}
+                required
+                className={inputClass}
+                value={form.snmp_port}
+                onChange={(e) => setField("snmp_port", e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-sm font-medium">
+              Poll interval (seconds)
+              <input
+                type="number"
+                min={10}
+                required
+                className={inputClass}
+                value={form.poll_interval_seconds}
+                onChange={(e) => setField("poll_interval_seconds", e.target.value)}
+              />
+            </label>
+          </div>
+
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={form.enabled}
+              onChange={(e) => setField("enabled", e.target.checked)}
+              className="h-4 w-4 rounded border border-input"
+            />
+            Enabled (polling active)
+          </label>
+
+          {/* Community — secret, omit when blank */}
+          <label className="block space-y-1 text-sm font-medium">
+            SNMP community string
+            <input
+              className={inputClass}
+              value={form.community}
+              onChange={(e) => setField("community", e.target.value)}
+              placeholder="leave blank to keep stored value"
+              autoComplete="off"
+            />
+          </label>
+
+          {/* SSH — only shown when a method is already configured */}
+          {sshConfigured && (
+            <div className="space-y-4 rounded-md border border-border p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium">
+                  SSH access ({form.ssh_auth_method})
+                </p>
+                <span className="text-xs text-muted-foreground">
+                  stored encrypted · leave blank to keep
+                </span>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="block space-y-1 text-sm font-medium">
+                  SSH username
+                  <input
+                    className={inputClass}
+                    value={form.ssh_username}
+                    onChange={(e) => setField("ssh_username", e.target.value)}
+                    placeholder="leave blank to keep"
+                    autoComplete="off"
+                  />
+                </label>
+                <label className="block space-y-1 text-sm font-medium">
+                  SSH port
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    className={inputClass}
+                    value={form.ssh_port}
+                    onChange={(e) => setField("ssh_port", e.target.value)}
+                  />
+                </label>
+              </div>
+              {form.ssh_auth_method === "password" && (
+                <label className="block space-y-1 text-sm font-medium">
+                  SSH password
+                  <input
+                    type="password"
+                    className={inputClass}
+                    value={form.ssh_password}
+                    onChange={(e) => setField("ssh_password", e.target.value)}
+                    placeholder="leave blank to keep stored password"
+                    autoComplete="new-password"
+                  />
+                </label>
+              )}
+              {form.ssh_auth_method === "key" && (
+                <div className="space-y-4">
+                  <label className="block space-y-1 text-sm font-medium">
+                    SSH private key
+                    <textarea
+                      rows={5}
+                      className={`${inputClass} font-mono text-xs`}
+                      value={form.ssh_private_key}
+                      onChange={(e) => setField("ssh_private_key", e.target.value)}
+                      placeholder="leave blank to keep stored key"
+                    />
+                  </label>
+                  <label className="block space-y-1 text-sm font-medium">
+                    Key passphrase
+                    <input
+                      type="password"
+                      className={inputClass}
+                      value={form.ssh_key_passphrase}
+                      onChange={(e) => setField("ssh_key_passphrase", e.target.value)}
+                      placeholder="leave blank to keep"
+                      autoComplete="new-password"
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+
+          {error && (
+            <p className="text-sm text-destructive" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button form="edit-device-form" type="submit" disabled={busy}>
+            {busy ? "Saving…" : "Save changes"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +649,7 @@ export default function DeviceDetail() {
   const canManage = hasPermission("manage_devices");
   const { id } = useParams<{ id: string }>();
   const deviceId = Number(id);
+  const navigate = useNavigate();
 
   const [device, setDevice] = useState<Device | null>(null);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
@@ -363,6 +658,8 @@ export default function DeviceDetail() {
   const [toggleBusy, setToggleBusy] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [selectedIfaceId, setSelectedIfaceId] = useState<number | null>(null);
+
+  const [editOpen, setEditOpen] = useState(false);
 
   // Auto-refresh timer for the interface list (30 s)
   const ifaceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -410,6 +707,22 @@ export default function DeviceDetail() {
     };
   }, [loadDevice, loadInterfaces]);
 
+  async function handleDelete() {
+    if (!device) return;
+    if (
+      !confirm(
+        `Delete device "${device.name}"? All interfaces and telemetry data will be removed. This cannot be undone.`,
+      )
+    )
+      return;
+    try {
+      await api.devices.remove(device.id);
+      navigate("/devices");
+    } catch (err) {
+      alert(err instanceof ApiError ? err.message : "Delete failed");
+    }
+  }
+
   async function toggleMonitoring(iface: Interface) {
     setToggleBusy((b) => ({ ...b, [iface.id]: true }));
     try {
@@ -449,7 +762,7 @@ export default function DeviceDetail() {
   return (
     <div className="space-y-6">
       {/* Page header */}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <Link
           to="/devices"
           className="text-sm text-muted-foreground hover:underline"
@@ -460,15 +773,47 @@ export default function DeviceDetail() {
         <Badge variant={device.reachable ? "default" : "destructive"}>
           {device.reachable ? "reachable" : "unreachable"}
         </Badge>
-        {/* Read-only badge: every device is an SNMP telemetry source — no
-            write path exists. */}
+        {/* Read-only badge: every device is an SNMP telemetry source */}
         <Badge
           variant="secondary"
           title="SNMP is read-only telemetry; Rerouter only polls this device."
         >
           Read-only · SNMP
         </Badge>
+
+        {/* Edit / Delete — gated by manage_devices */}
+        {canManage && (
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setEditOpen(true)}
+            >
+              <Pencil className="size-4" />
+              Edit
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-destructive hover:text-destructive"
+              onClick={() => void handleDelete()}
+            >
+              <Trash2 className="size-4" />
+              Delete
+            </Button>
+          </div>
+        )}
       </div>
+
+      {/* Edit dialog */}
+      {canManage && (
+        <EditDialog
+          device={device}
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          onSaved={() => { loadDevice(); }}
+        />
+      )}
 
       {/* Device facts */}
       <Card>

@@ -1,13 +1,20 @@
 /**
  * /devices — SNMP device management.
  *
- * Lists enrolled devices with reachability badges. Supports adding a new
- * device (name, hostname, SNMP version, community, port, poll interval)
- * and per-row Test (POST /devices/{id}/test) and Discover
- * (POST /devices/{id}/discover) actions.
+ * Lists enrolled devices with a polished shadcn Table (sortable headers,
+ * icon+badge columns, ghost action buttons). Add-device form is preserved
+ * and gated by manage_devices. Test/Discover actions moved to DeviceDetail.
  */
 import { useEffect, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
+import {
+  Router,
+  Eye,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  ChevronsUpDown,
+} from "lucide-react";
 import { api, type Device, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
@@ -19,6 +26,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -31,8 +46,6 @@ interface AddDeviceForm {
   community: string;
   snmp_port: string;
   poll_interval_seconds: string;
-  // SSH access (password XOR key). "none" | "password" | "key" — "none" skips
-  // SSH enrollment. Kept as a plain string so the shared setField stays simple.
   ssh_auth_method: string;
   ssh_username: string;
   ssh_port: string;
@@ -56,23 +69,41 @@ const DEFAULT_FORM: AddDeviceForm = {
   ssh_key_passphrase: "",
 };
 
-function reachabilityVariant(
-  ok: boolean,
-): "default" | "secondary" | "destructive" | "outline" {
-  return ok ? "default" : "destructive";
+type SortField = "name" | "status";
+type SortDir = "asc" | "desc";
+
+function SortIcon({
+  field,
+  active,
+  dir,
+}: {
+  field: SortField;
+  active: SortField;
+  dir: SortDir;
+}) {
+  if (field !== active)
+    return <ChevronsUpDown className="ml-1 inline-block size-3.5 text-muted-foreground" />;
+  return dir === "asc" ? (
+    <ArrowUp className="ml-1 inline-block size-3.5" />
+  ) : (
+    <ArrowDown className="ml-1 inline-block size-3.5" />
+  );
 }
 
 export default function Devices() {
+  const navigate = useNavigate();
   const { hasPermission } = useAuth();
   const canEnroll = hasPermission("manage_devices");
+
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState<AddDeviceForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
   const [addBusy, setAddBusy] = useState(false);
-  // Per-device test/discover feedback: deviceId -> message
-  const [feedback, setFeedback] = useState<Record<number, string>>({});
+
+  const [sortField, setSortField] = useState<SortField>("name");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
 
   function loadDevices() {
     setLoading(true);
@@ -126,48 +157,36 @@ export default function Devices() {
     }
   }
 
-  async function handleTest(device: Device) {
-    setFeedback((f) => ({ ...f, [device.id]: "Testing…" }));
+  async function handleDelete(e: React.MouseEvent, device: Device) {
+    e.stopPropagation();
+    if (!confirm(`Delete device "${device.name}"? This cannot be undone.`)) return;
     try {
-      const result = await api.devices.test(device.id);
-      if (result.ok) {
-        const info = [result.vendor, result.model, result.os_version]
-          .filter(Boolean)
-          .join(" / ");
-        setFeedback((f) => ({
-          ...f,
-          [device.id]: info ? `OK: ${info}` : "OK",
-        }));
-      } else {
-        setFeedback((f) => ({
-          ...f,
-          [device.id]: `Failed: ${result.error ?? "unknown error"}`,
-        }));
-      }
-    } catch (err) {
-      setFeedback((f) => ({
-        ...f,
-        [device.id]: err instanceof ApiError ? err.message : "Test failed",
-      }));
+      await api.devices.remove(device.id);
+      loadDevices();
+    } catch {
+      // ignore — device list will stay unchanged
     }
   }
 
-  async function handleDiscover(device: Device) {
-    setFeedback((f) => ({ ...f, [device.id]: "Discovering…" }));
-    try {
-      const result = await api.devices.discover(device.id);
-      setFeedback((f) => ({
-        ...f,
-        [device.id]: `Discovered ${result.discovered} interfaces`,
-      }));
-      loadDevices();
-    } catch (err) {
-      setFeedback((f) => ({
-        ...f,
-        [device.id]: err instanceof ApiError ? err.message : "Discover failed",
-      }));
+  function toggleSort(field: SortField) {
+    if (sortField === field) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortField(field);
+      setSortDir("asc");
     }
   }
+
+  const sorted = [...devices].sort((a, b) => {
+    let cmp = 0;
+    if (sortField === "name") {
+      cmp = a.name.localeCompare(b.name);
+    } else {
+      // status: reachable first when asc
+      cmp = Number(b.reachable) - Number(a.reachable);
+    }
+    return sortDir === "asc" ? cmp : -cmp;
+  });
 
   return (
     <div className="space-y-6">
@@ -379,74 +398,136 @@ export default function Devices() {
         <CardHeader>
           <CardTitle className="text-lg">Enrolled devices</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="px-0 pb-0">
           {loading ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
+            <p className="px-6 pb-6 text-sm text-muted-foreground">Loading…</p>
           ) : devices.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
+            <p className="px-6 pb-6 text-sm text-muted-foreground">
               No devices enrolled yet. Use "Add device" to enroll your first
               SNMP-polled router.
             </p>
           ) : (
-            <div className="divide-y">
-              {devices.map((device) => (
-                <div key={device.id} className="py-4">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Link
-                      to={`/devices/${device.id}`}
-                      className="font-medium underline-offset-4 hover:underline"
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead
+                    className="cursor-pointer select-none pl-6"
+                    onClick={() => toggleSort("name")}
+                  >
+                    Name
+                    <SortIcon field="name" active={sortField} dir={sortDir} />
+                  </TableHead>
+                  <TableHead>Vendor / Model</TableHead>
+                  <TableHead>Interfaces</TableHead>
+                  <TableHead>SNMP / SSH</TableHead>
+                  <TableHead
+                    className="cursor-pointer select-none"
+                    onClick={() => toggleSort("status")}
+                  >
+                    Status
+                    <SortIcon field="status" active={sortField} dir={sortDir} />
+                  </TableHead>
+                  <TableHead className="pr-6 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sorted.map((device) => (
+                  <TableRow
+                    key={device.id}
+                    className="cursor-pointer hover:bg-muted/50"
+                    onClick={() => navigate(`/devices/${device.id}`)}
+                  >
+                    {/* Name + hostname */}
+                    <TableCell className="pl-6">
+                      <div className="flex items-start gap-2">
+                        <Router className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-medium">{device.name}</span>
+                            <span
+                              className={[
+                                "inline-block size-1.5 shrink-0 rounded-full",
+                                device.reachable ? "bg-green-500" : "bg-red-500",
+                              ].join(" ")}
+                              title={device.reachable ? "Reachable" : "Unreachable"}
+                            />
+                          </div>
+                          <code className="block text-xs text-muted-foreground">
+                            {device.hostname}
+                          </code>
+                        </div>
+                      </div>
+                    </TableCell>
+
+                    {/* Vendor / Model */}
+                    <TableCell className="text-sm text-muted-foreground">
+                      {device.vendor || device.model
+                        ? [device.vendor, device.model].filter(Boolean).join(" ")
+                        : "—"}
+                    </TableCell>
+
+                    {/* Interface count */}
+                    <TableCell>
+                      <Badge variant="secondary">{device.interface_count}</Badge>
+                    </TableCell>
+
+                    {/* SNMP version + SSH badge */}
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        <Badge variant="secondary">{device.snmp_version}</Badge>
+                        {device.ssh_configured && (
+                          <Badge variant="outline">SSH</Badge>
+                        )}
+                      </div>
+                    </TableCell>
+
+                    {/* Reachability status */}
+                    <TableCell>
+                      {device.reachable ? (
+                        <Badge className="bg-green-500/15 text-green-700 dark:text-green-400 border-transparent">
+                          reachable
+                        </Badge>
+                      ) : (
+                        <Badge variant="destructive">unreachable</Badge>
+                      )}
+                    </TableCell>
+
+                    {/* Actions */}
+                    <TableCell
+                      className="pr-6 text-right"
+                      onClick={(e) => e.stopPropagation()}
                     >
-                      {device.name}
-                    </Link>
-                    <code className="text-xs text-muted-foreground">
-                      {device.hostname}
-                    </code>
-                    <Badge variant={reachabilityVariant(device.reachable)}>
-                      {device.reachable ? "reachable" : "unreachable"}
-                    </Badge>
-                    <Badge variant="secondary">{device.snmp_version}</Badge>
-                    {device.vendor && (
-                      <span className="text-xs text-muted-foreground">
-                        {device.vendor}
-                        {device.model ? ` ${device.model}` : ""}
-                      </span>
-                    )}
-                    <span className="text-xs text-muted-foreground">
-                      {device.interface_count} interfaces
-                    </span>
-                    <span className="flex-1" />
-                    {canEnroll && (
-                      <>
+                      <div className="flex items-center justify-end gap-1">
                         <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void handleTest(device)}
+                          size="icon-sm"
+                          variant="ghost"
+                          title="View device"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigate(`/devices/${device.id}`);
+                          }}
                         >
-                          Test
+                          <Eye className="size-4" />
+                          <span className="sr-only">View</span>
                         </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void handleDiscover(device)}
-                        >
-                          Discover
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                  {feedback[device.id] && (
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {feedback[device.id]}
-                    </p>
-                  )}
-                  {device.last_error && (
-                    <p className="mt-1 text-xs text-destructive">
-                      Last error: {device.last_error}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
+                        {canEnroll && (
+                          <Button
+                            size="icon-sm"
+                            variant="ghost"
+                            title="Delete device"
+                            className="text-destructive hover:text-destructive"
+                            onClick={(e) => void handleDelete(e, device)}
+                          >
+                            <Trash2 className="size-4" />
+                            <span className="sr-only">Delete</span>
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
           )}
         </CardContent>
       </Card>

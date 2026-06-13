@@ -3,13 +3,23 @@
  *
  * Governed by docs/detection-engine.md and docs/doctrine.md §8.
  *
- * Operators pick device → interface, then configure: metric
- * (rx_bps/tx_bps/rx_pps/tx_pps/rx_util_percent/tx_util_percent),
- * operator (> above / < below), threshold value, duration, consecutive
- * samples. In observe mode, firing only generates alerts (no reroute).
+ * Polished shadcn Table with icon, badges, sortable Name header, and ghost
+ * icon-button actions (toggle enable/disable + delete). Create-rule form
+ * preserved. RBAC: edit_rules permission gates toggle and delete (both
+ * roles have it — current behaviour kept).
  */
 import { useEffect, useState, type FormEvent } from "react";
+import {
+  SlidersHorizontal,
+  ToggleLeft,
+  ToggleRight,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  ChevronsUpDown,
+} from "lucide-react";
 import { api, type Rule, type Device, type Interface, ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +29,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -57,7 +75,32 @@ const DEFAULT_FORM: RuleForm = {
   severity: "warning",
 };
 
+function severityVariant(
+  severity: string,
+): "default" | "secondary" | "destructive" | "outline" {
+  switch (severity) {
+    case "critical":
+      return "destructive";
+    case "warning":
+      return "secondary";
+    default:
+      return "outline";
+  }
+}
+
+/** Human-readable condition string: "rx_bps > 8000000000" */
+function conditionLabel(rule: Rule): string {
+  const metricLabel =
+    METRICS.find((m) => m.value === rule.metric)?.label ?? rule.metric;
+  return `${metricLabel} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
+}
+
+type SortDir = "asc" | "desc";
+
 export default function Rules() {
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission("edit_rules");
+
   const [rules, setRules] = useState<Rule[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [deviceInterfaces, setDeviceInterfaces] = useState<Interface[]>([]);
@@ -66,6 +109,8 @@ export default function Rules() {
   const [form, setForm] = useState<RuleForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
   const [addBusy, setAddBusy] = useState(false);
+
+  const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
   function loadRules() {
     setLoading(true);
@@ -87,7 +132,6 @@ export default function Rules() {
   function setField(field: keyof RuleForm, value: string) {
     setForm((f) => {
       const next = { ...f, [field]: value };
-      // When device changes, reset interface selection and reload interfaces
       if (field === "device_id") {
         next.interface_id = "";
       }
@@ -157,18 +201,19 @@ export default function Rules() {
     }
   }
 
-  function severityVariant(
-    severity: string,
-  ): "default" | "secondary" | "destructive" | "outline" {
-    switch (severity) {
-      case "critical":
-        return "destructive";
-      case "warning":
-        return "secondary";
-      default:
-        return "outline";
-    }
+  function toggleNameSort() {
+    setNameSortDir((d) => {
+      if (d === null || d === "desc") return "asc";
+      return "desc";
+    });
   }
+
+  const sorted = nameSortDir
+    ? [...rules].sort((a, b) => {
+        const cmp = a.name.localeCompare(b.name);
+        return nameSortDir === "asc" ? cmp : -cmp;
+      })
+    : rules;
 
   return (
     <div className="space-y-6">
@@ -341,58 +386,124 @@ export default function Rules() {
         <CardHeader>
           <CardTitle className="text-lg">Rules</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="px-0 pb-0">
           {loading ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
+            <p className="px-6 pb-6 text-sm text-muted-foreground">Loading…</p>
           ) : rules.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
+            <p className="px-6 pb-6 text-sm text-muted-foreground">
               No rules yet. Add a threshold rule to start monitoring interfaces.
             </p>
           ) : (
-            <div className="divide-y">
-              {rules.map((rule) => (
-                <div
-                  key={rule.id}
-                  className="flex flex-wrap items-center gap-3 py-3 text-sm"
-                >
-                  <span className="font-medium">{rule.name}</span>
-                  <Badge variant={severityVariant(rule.severity)}>
-                    {rule.severity}
-                  </Badge>
-                  <code className="text-xs text-muted-foreground">
-                    {rule.metric} {rule.operator} {rule.threshold_value}
-                  </code>
-                  <span className="text-xs text-muted-foreground">
-                    {rule.duration_seconds}s / {rule.consecutive_samples} samples
-                  </span>
-                  <span className="flex-1" />
-                  <Badge variant={rule.enabled ? "default" : "outline"}>
-                    {rule.enabled ? "enabled" : "disabled"}
-                  </Badge>
-                  <Badge
-                    variant={
-                      rule.automatic_reroute_enabled ? "destructive" : "secondary"
-                    }
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead
+                    className="cursor-pointer select-none pl-6"
+                    onClick={toggleNameSort}
                   >
-                    auto-reroute: {rule.automatic_reroute_enabled ? "ON" : "off"}
-                  </Badge>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void toggleRule(rule)}
-                  >
-                    {rule.enabled ? "Disable" : "Enable"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void deleteRule(rule)}
-                  >
-                    Delete
-                  </Button>
-                </div>
-              ))}
-            </div>
+                    Name
+                    {nameSortDir === null ? (
+                      <ChevronsUpDown className="ml-1 inline-block size-3.5 text-muted-foreground" />
+                    ) : nameSortDir === "asc" ? (
+                      <ArrowUp className="ml-1 inline-block size-3.5" />
+                    ) : (
+                      <ArrowDown className="ml-1 inline-block size-3.5" />
+                    )}
+                  </TableHead>
+                  <TableHead>Target</TableHead>
+                  <TableHead>Condition</TableHead>
+                  <TableHead>Duration</TableHead>
+                  <TableHead>Severity</TableHead>
+                  <TableHead>Enabled</TableHead>
+                  <TableHead className="pr-6 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sorted.map((rule) => (
+                  <TableRow key={rule.id} className="hover:bg-muted/50">
+                    {/* Name + icon */}
+                    <TableCell className="pl-6">
+                      <div className="flex items-center gap-2">
+                        <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="font-medium">{rule.name}</span>
+                      </div>
+                    </TableCell>
+
+                    {/* Target — interface id or asset id */}
+                    <TableCell className="text-xs text-muted-foreground">
+                      {rule.target_kind === "interface" && rule.interface_id
+                        ? `interface #${rule.interface_id}`
+                        : rule.target_kind === "asset" && rule.asset_id
+                          ? `asset #${rule.asset_id}`
+                          : rule.target_kind}
+                    </TableCell>
+
+                    {/* Condition */}
+                    <TableCell>
+                      <code className="text-xs">{conditionLabel(rule)}</code>
+                    </TableCell>
+
+                    {/* Duration */}
+                    <TableCell className="text-xs text-muted-foreground">
+                      {rule.duration_seconds}s / {rule.consecutive_samples}{" "}
+                      samples
+                    </TableCell>
+
+                    {/* Severity badge */}
+                    <TableCell>
+                      <Badge variant={severityVariant(rule.severity)}>
+                        {rule.severity}
+                      </Badge>
+                    </TableCell>
+
+                    {/* Enabled badge */}
+                    <TableCell>
+                      <Badge variant={rule.enabled ? "default" : "outline"}>
+                        {rule.enabled ? "enabled" : "disabled"}
+                      </Badge>
+                    </TableCell>
+
+                    {/* Actions */}
+                    <TableCell
+                      className="pr-6 text-right"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="flex items-center justify-end gap-1">
+                        {canEdit && (
+                          <>
+                            <Button
+                              size="icon-sm"
+                              variant="ghost"
+                              title={rule.enabled ? "Disable rule" : "Enable rule"}
+                              onClick={() => void toggleRule(rule)}
+                            >
+                              {rule.enabled ? (
+                                <ToggleRight className="size-4 text-primary" />
+                              ) : (
+                                <ToggleLeft className="size-4 text-muted-foreground" />
+                              )}
+                              <span className="sr-only">
+                                {rule.enabled ? "Disable" : "Enable"}
+                              </span>
+                            </Button>
+                            <Button
+                              size="icon-sm"
+                              variant="ghost"
+                              title="Delete rule"
+                              className="text-destructive hover:text-destructive"
+                              onClick={() => void deleteRule(rule)}
+                            >
+                              <Trash2 className="size-4" />
+                              <span className="sr-only">Delete</span>
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
           )}
         </CardContent>
       </Card>
