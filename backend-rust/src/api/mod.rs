@@ -113,6 +113,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}", get(devices::show).put(devices::update).delete(devices::remove))
         .route("/api/devices/{id}/test", post(devices::test))
         .route("/api/devices/{id}/discover", post(devices::discover))
+        .route("/api/devices/{id}/ssh-test", post(devices::ssh_test))
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))

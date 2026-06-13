@@ -56,6 +56,7 @@ hex = "0.4"
 sha2 = "0.10"
 # Cookie max-age durations for axum-extra cookies.
 time = "0.3"
+russh = "0.61.2"
 
 [dev-dependencies]
 # fixtures + parser tests live under tests/

@@ -182,6 +182,19 @@ export interface DeviceTestResult {
   error?: string;
 }
 
+export interface SshCommandResult {
+  command: string;
+  output: string;
+}
+
+export interface SshTestResult {
+  ok: boolean;
+  fingerprint?: string;
+  pinned_now?: boolean;
+  results?: SshCommandResult[];
+  error?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Rules and Alerts
 // ---------------------------------------------------------------------------
@@ -369,6 +382,8 @@ export const api = {
       request<{ discovered: number }>(`/api/devices/${id}/discover`, {
         method: "POST",
       }),
+    sshTest: (id: number) =>
+      request<SshTestResult>(`/api/devices/${id}/ssh-test`, { method: "POST" }),
     interfaces: (id: number) =>
       request<Interface[]>(`/api/devices/${id}/interfaces`),
   },

@@ -13,6 +13,7 @@ pub mod db;
 pub mod auth;
 pub mod alerts;
 pub mod telemetry;
+pub mod ssh;
 pub mod detection;
 pub mod reroute;
 pub mod providers;

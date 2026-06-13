@@ -531,6 +531,42 @@ pub async fn discover(
     }
 }
 
+/// POST /api/devices/{id}/ssh-test — read-only SSH connectivity probe. Opens an
+/// SSH session with the stored credentials and runs a couple of harmless `show`
+/// commands, returning their output (or a structured error). Pins the host key
+/// on first contact (TOFU). This proves the russh ↔ IOS algorithm negotiation
+/// works before any reroute relies on it. `manage_devices` (superadmin) only.
+pub async fn ssh_test(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    }
+    let commands = vec![
+        "show version | include (Version|uptime is)".to_string(),
+        "show clock".to_string(),
+    ];
+    match crate::ssh::run_commands(&state.pool, id, &commands).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "fingerprint": outcome.fingerprint,
+                "pinned_now": outcome.pinned_now,
+                "results": outcome.results,
+            })),
+        ),
+        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+    }
+}
+
 /// GET /api/devices/{id}/interfaces — every interface on the device, each with
 /// its latest metrics (Interface[] in the contract shape).
 pub async fn interfaces(

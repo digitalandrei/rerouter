@@ -30,6 +30,7 @@ import {
   Activity,
   Compass,
   SlidersHorizontal,
+  TerminalSquare,
 } from "lucide-react";
 import { api, type Device, type Interface, type Rule, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -769,6 +770,29 @@ export default function DeviceDetail() {
                   <Compass className="size-4" />
                   Discover
                 </Button>
+                {device.ssh_configured && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      api.devices.sshTest(device.id).then((r) => {
+                        if (r.ok) {
+                          const out = (r.results ?? [])
+                            .map((c) => `$ ${c.command}\n${c.output}`)
+                            .join("\n\n");
+                          alert(
+                            `SSH OK${r.pinned_now ? " (host key pinned)" : ""}\n${r.fingerprint ?? ""}\n\n${out}`,
+                          );
+                        } else {
+                          alert(`SSH failed: ${r.error ?? "unknown"}`);
+                        }
+                      })
+                    }
+                  >
+                    <TerminalSquare className="size-4" />
+                    Test SSH
+                  </Button>
+                )}
                 <Button size="sm" variant="outline" onClick={() => setEditOpen(true)}>
                   <Pencil className="size-4" />
                   Edit
