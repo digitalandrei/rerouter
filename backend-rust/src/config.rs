@@ -52,6 +52,7 @@ impl Default for Auth {
 // SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM) — see alerts::mailer.
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Telemetry {
     pub metrics_rollup_seconds: u64,
     pub reachability_interval_seconds: u64,
@@ -60,6 +61,7 @@ pub struct Telemetry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Detection {
     pub default_consecutive_samples: u32,
     pub default_min_duration_seconds: u64,
@@ -82,9 +84,9 @@ pub enum OperatingMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Safety {
     /// SAFETY: defaults to Observe (read-only / alert-only).
-    #[serde(default)]
     pub operating_mode: OperatingMode,
     pub automatic_actions_enabled: bool,
     /// Global circuit breaker: at most N executed actions per window across all
@@ -101,6 +103,7 @@ pub struct Safety {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Reroute {
     pub require_verification: bool,
 }
