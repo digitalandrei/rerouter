@@ -1,14 +1,11 @@
 /**
- * /reroutes/manual — governed by docs/reroute-engine.md and docs/doctrine.md
- * §8 (safety model) + §9 (re-auth requirement).
+ * /mitigations/manual — governed by docs/reroute-engine.md and docs/doctrine.md §8.
  *
- * Non-negotiable, enforced server-side and mirrored here:
- *  1. Reroutes only via ALLOWLISTED templates with parameter schemas — no
+ * Enforced server-side and mirrored here:
+ *  1. Mitigations only via ALLOWLISTED templates with parameter schemas — no
  *     free-text command box, ever.
  *  2. The EXACT commands are rendered (preview) before submission.
- *  3. High-safety templates require: fresh re-auth (password + TOTP), a TYPED
- *     confirmation, and a mandatory reason — all re-validated by the controller.
- *  4. In observe mode the controller returns the would-run plan and executes
+ *  3. In observe mode the controller returns the would-run plan and executes
  *     nothing. "Sent" is never shown as success — the verified state is.
  */
 import { useCallback, useEffect, useState } from "react";
@@ -37,10 +34,6 @@ const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
-function safetyVariant(level: string): "destructive" | "secondary" | "outline" {
-  return level === "high" ? "destructive" : level === "medium" ? "secondary" : "outline";
-}
-
 export default function ManualReroute() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
@@ -50,10 +43,6 @@ export default function ManualReroute() {
   const [values, setValues] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState<RenderedPlan | null>(null);
   const [reason, setReason] = useState("");
-  const [confirmText, setConfirmText] = useState("");
-  const [pw, setPw] = useState("");
-  const [code, setCode] = useState("");
-  const [reauthDone, setReauthDone] = useState(false);
   const [results, setResults] = useState<RerouteResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -77,15 +66,12 @@ export default function ManualReroute() {
 
   const template = templates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
-  const isHigh = template?.safety_level === "high";
 
   function reset() {
     setValues({});
     setPreview(null);
     setResults(null);
     setError(null);
-    setConfirmText("");
-    setReauthDone(false);
   }
 
   function selectNeighbor(name: string, addr: string) {
@@ -120,18 +106,6 @@ export default function ManualReroute() {
     }
   }
 
-  async function reauth() {
-    setError(null);
-    try {
-      await api.auth.reauth(pw, code);
-      setReauthDone(true);
-      setPw("");
-      setCode("");
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "re-authentication failed");
-    }
-  }
-
   async function submit(dry_run: boolean) {
     if (!template || !deviceId) {
       setError("Pick a template and a router.");
@@ -145,7 +119,6 @@ export default function ManualReroute() {
         template_id: template.id,
         targets: [{ device_id: parseInt(deviceId, 10), params: buildParams() }],
         reason: reason.trim() || undefined,
-        confirm_text: confirmText.trim() || undefined,
         dry_run,
       });
       setResults(res.results);
@@ -156,16 +129,13 @@ export default function ManualReroute() {
     }
   }
 
-  // High-safety execution requires re-auth + typed confirmation + reason.
-  const executeBlocked = isHigh && (!reauthDone || !confirmText.trim() || !reason.trim());
-
   return (
     <div className="mx-auto max-w-2xl space-y-6">
       <ObserveBanner />
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Manual reroute</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Manual mitigation</h1>
         <Button asChild variant="ghost" size="sm">
-          <Link to="/reroutes">Back to history</Link>
+          <Link to="/mitigations">Back to history</Link>
         </Button>
       </div>
 
@@ -192,7 +162,7 @@ export default function ManualReroute() {
                 <option value="">Select template…</option>
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.name} ({t.safety_level})
+                    {t.name}
                   </option>
                 ))}
               </select>
@@ -219,14 +189,9 @@ export default function ManualReroute() {
 
           {template && (
             <>
-              <div className="flex items-center gap-2">
-                <Badge variant={safetyVariant(template.safety_level)}>
-                  {template.safety_level} safety
-                </Badge>
-                {template.description && (
-                  <span className="text-xs text-muted-foreground">{template.description}</span>
-                )}
-              </div>
+              {template.description && (
+                <p className="text-xs text-muted-foreground">{template.description}</p>
+              )}
 
               <div className="grid gap-3 sm:grid-cols-2">
                 {Object.entries(schema).map(([name, spec]) => (
@@ -283,7 +248,7 @@ export default function ManualReroute() {
               )}
 
               <label className="block space-y-1 text-sm font-medium">
-                Reason {isHigh && <span className="text-destructive">*</span>}
+                Reason <span className="font-normal text-muted-foreground">(optional, for the audit log)</span>
                 <input
                   className={inputClass}
                   value={reason}
@@ -291,44 +256,6 @@ export default function ManualReroute() {
                   onChange={(e) => setReason(e.target.value)}
                 />
               </label>
-
-              {isHigh && (
-                <div className="space-y-3 rounded-md border border-destructive/40 p-3">
-                  <p className="text-sm font-medium text-destructive">
-                    High-safety action — re-authentication, typed confirmation, and a reason are required.
-                  </p>
-                  <label className="block space-y-1 text-sm font-medium">
-                    Type <code>CONFIRM</code> to acknowledge
-                    <input
-                      className={inputClass}
-                      value={confirmText}
-                      onChange={(e) => setConfirmText(e.target.value)}
-                    />
-                  </label>
-                  {reauthDone ? (
-                    <Badge variant="default">re-authenticated</Badge>
-                  ) : (
-                    <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
-                      <input
-                        className={inputClass}
-                        type="password"
-                        placeholder="Password"
-                        value={pw}
-                        onChange={(e) => setPw(e.target.value)}
-                      />
-                      <input
-                        className={inputClass}
-                        placeholder="TOTP code"
-                        value={code}
-                        onChange={(e) => setCode(e.target.value)}
-                      />
-                      <Button size="sm" variant="outline" onClick={() => void reauth()}>
-                        Re-authenticate
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              )}
 
               {error && (
                 <p className="text-sm text-destructive" role="alert">
@@ -340,11 +267,7 @@ export default function ManualReroute() {
                 <Button variant="outline" disabled={busy} onClick={() => void submit(true)}>
                   Dry run
                 </Button>
-                <Button
-                  variant="destructive"
-                  disabled={busy || executeBlocked}
-                  onClick={() => void submit(false)}
-                >
+                <Button variant="destructive" disabled={busy} onClick={() => void submit(false)}>
                   Execute
                 </Button>
               </div>
@@ -377,7 +300,7 @@ export default function ManualReroute() {
                       )}
                       {r.reroute_id && (
                         <Link
-                          to="/reroutes"
+                          to="/mitigations"
                           className="text-xs text-primary underline-offset-4 hover:underline"
                         >
                           View in history →

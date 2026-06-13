@@ -70,8 +70,8 @@ export default function App() {
             />
             <Route path="/rules" element={<Rules />} />
             <Route path="/templates" element={<Templates />} />
-            <Route path="/reroutes" element={<Reroutes />} />
-            <Route path="/reroutes/manual" element={<ManualReroute />} />
+            <Route path="/mitigations" element={<Reroutes />} />
+            <Route path="/mitigations/manual" element={<ManualReroute />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/settings" element={<Settings />} />

@@ -25,7 +25,6 @@ fn template_json(t: &templates::Template) -> Value {
         "description": t.description,
         "provider_type": t.provider_type,
         "mode": t.mode,
-        "safety_level": t.safety_level,
         "manual_confirmation_required": t.manual_confirmation_required,
         "automatic_allowed": t.automatic_allowed,
         "parameter_schema": t.parameter_schema,

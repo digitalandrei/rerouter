@@ -24,7 +24,7 @@ export const sidebarData: SidebarData = {
         { title: 'Devices', url: '/devices', icon: Router },
         { title: 'Rules', url: '/rules', icon: SlidersHorizontal },
         { title: 'Templates', url: '/templates', icon: FileCode2 },
-        { title: 'Reroutes', url: '/reroutes', icon: Shuffle },
+        { title: 'Mitigations', url: '/mitigations', icon: Shuffle },
         { title: 'Alerts', url: '/alerts', icon: Bell },
         { title: 'Audit', url: '/audit', icon: ScrollText },
         { title: 'Settings', url: '/settings', icon: Settings },

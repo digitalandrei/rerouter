@@ -55,10 +55,6 @@ function stateVariant(
   }
 }
 
-function safetyVariant(level: string): "destructive" | "secondary" | "outline" {
-  return level === "high" ? "destructive" : level === "medium" ? "secondary" : "outline";
-}
-
 function RerouteDrawer({
   id,
   onClose,
@@ -246,11 +242,11 @@ export default function Reroutes() {
     <div className="space-y-6">
       <ObserveBanner />
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Reroutes</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Mitigations</h1>
         <Button asChild variant="outline">
-          <Link to="/reroutes/manual">
+          <Link to="/mitigations/manual">
             <Shuffle className="size-4" />
-            Manual reroute
+            Manual mitigation
           </Link>
         </Button>
       </div>
@@ -296,7 +292,6 @@ export default function Reroutes() {
                   <TableHead>Template</TableHead>
                   <TableHead>Device</TableHead>
                   <TableHead>Trigger</TableHead>
-                  <TableHead>Safety</TableHead>
                   <TableHead>State</TableHead>
                   <TableHead>When</TableHead>
                   <TableHead className="pr-6 text-right">Actions</TableHead>
@@ -311,9 +306,6 @@ export default function Reroutes() {
                     </TableCell>
                     <TableCell>{r.device_name ?? "—"}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{r.trigger_type}</TableCell>
-                    <TableCell>
-                      <Badge variant={safetyVariant(r.safety_level)}>{r.safety_level}</Badge>
-                    </TableCell>
                     <TableCell>
                       <Badge variant={stateVariant(r.state as RerouteState)}>{r.state}</Badge>
                     </TableCell>

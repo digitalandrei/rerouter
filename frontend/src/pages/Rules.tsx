@@ -253,7 +253,7 @@ function RuleActionsDialog({
                 <option value="">Select template…</option>
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.name} ({t.safety_level})
+                    {t.name}
                   </option>
                 ))}
               </select>

@@ -281,7 +281,6 @@ export interface Reroute {
   template_name: string | null;
   trigger_type: string;
   state: RerouteState;
-  safety_level: string;
   reason: string | null;
   success: boolean | null;
   verification_status: string | null;
@@ -333,7 +332,6 @@ export interface ManualReroutePayload {
   template_id: number;
   targets: { device_id: number; params: Record<string, unknown> }[];
   reason?: string;
-  confirm_text?: string;
   dry_run?: boolean;
 }
 
@@ -363,7 +361,6 @@ export interface Template {
   description: string | null;
   provider_type: string;
   mode: string;
-  safety_level: string;
   manual_confirmation_required: boolean;
   automatic_allowed: boolean;
   parameter_schema: Record<string, TemplateParamSpec>;
@@ -377,7 +374,6 @@ export interface Template {
 export interface RenderedPlan {
   template_id: number;
   template_name: string;
-  safety_level: string;
   config_mode: boolean;
   commands: string[];
   verify: { command: string; expect: string | null; reject: string | null } | null;

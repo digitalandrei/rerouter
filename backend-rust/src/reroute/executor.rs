@@ -327,15 +327,14 @@ async fn insert_reroute(pool: &MySqlPool, req: &ActionRequest, plan: &RenderedPl
     let res = sqlx::query(
         "INSERT INTO reroutes \
             (device_id, rule_id, reroute_template_id, trigger_type, triggered_by_user_id, \
-             state, safety_level, reason, parameters_json, planned_steps_json) \
-         VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)",
+             state, reason, parameters_json, planned_steps_json) \
+         VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
     )
     .bind(req.device_id)
     .bind(req.rule_id)
     .bind(req.template.id)
     .bind(req.trigger_type)
     .bind(req.user_id)
-    .bind(&req.template.safety_level)
     .bind(&req.reason)
     .bind(sqlx::types::Json(&req.params))
     .bind(sqlx::types::Json(&steps))
@@ -395,7 +394,6 @@ async fn enqueue_alert(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, e
         "template": req.template.name,
         "device_id": req.device_id,
         "trigger_type": req.trigger_type,
-        "safety_level": req.template.safety_level,
         "detail": extra,
     });
     let dedup_key = format!("{event_type}:reroute:{reroute_id}");

@@ -25,19 +25,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 
-function safetyVariant(
-  level: string,
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (level) {
-    case "high":
-      return "destructive";
-    case "medium":
-      return "secondary";
-    default:
-      return "outline";
-  }
-}
-
 function paramPlaceholder(spec: TemplateParamSpec): string {
   switch (spec.type) {
     case "ip":
@@ -81,9 +68,6 @@ function TemplateCard({ template }: { template: Template }) {
       <CardHeader>
         <div className="flex flex-wrap items-center gap-2">
           <CardTitle className="text-base font-mono">{template.name}</CardTitle>
-          <Badge variant={safetyVariant(template.safety_level)}>
-            {template.safety_level}
-          </Badge>
           <Badge variant="outline" className="font-normal text-muted-foreground">
             {template.provider_type}
           </Badge>

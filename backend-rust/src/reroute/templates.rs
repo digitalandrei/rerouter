@@ -28,7 +28,6 @@ pub struct Template {
     pub description: Option<String>,
     pub provider_type: String,
     pub mode: String,
-    pub safety_level: String,
     pub manual_confirmation_required: bool,
     pub automatic_allowed: bool,
     pub parameter_schema: Value,
@@ -46,7 +45,6 @@ struct TemplateRow {
     description: Option<String>,
     provider_type: String,
     mode: String,
-    safety_level: String,
     manual_confirmation_required: bool,
     automatic_allowed: bool,
     parameter_schema_json: Option<SqlxJson<Value>>,
@@ -57,7 +55,7 @@ struct TemplateRow {
     enabled: bool,
 }
 
-const COLS: &str = "id, name, description, provider_type, mode, safety_level, \
+const COLS: &str = "id, name, description, provider_type, mode, \
      manual_confirmation_required, automatic_allowed, parameter_schema_json, plan_json, \
      verification_json, rollback_template_id, auto_expiry_seconds, enabled";
 
@@ -69,7 +67,6 @@ impl From<TemplateRow> for Template {
             description: r.description,
             provider_type: r.provider_type,
             mode: r.mode,
-            safety_level: r.safety_level,
             manual_confirmation_required: r.manual_confirmation_required,
             automatic_allowed: r.automatic_allowed,
             parameter_schema: r.parameter_schema_json.map(|j| j.0).unwrap_or(Value::Null),
@@ -109,7 +106,6 @@ pub async fn load_all(pool: &MySqlPool) -> Result<Vec<Template>> {
 pub struct RenderedPlan {
     pub template_id: u64,
     pub template_name: String,
-    pub safety_level: String,
     pub config_mode: bool,
     /// Full command sequence in order (incl. `configure terminal` / `end`).
     pub commands: Vec<String>,
@@ -234,7 +230,6 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
     Ok(RenderedPlan {
         template_id: t.id,
         template_name: t.name.clone(),
-        safety_level: t.safety_level.clone(),
         config_mode,
         commands,
         verify,

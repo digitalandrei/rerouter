@@ -16,14 +16,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{err, AppState};
-use crate::auth::rbac::{markers, reauth_is_fresh, RequirePermission};
+use crate::auth::rbac::{markers, RequirePermission};
 use crate::reroute::executor::{self, ActionRequest};
 use crate::reroute::{locks, rollback, templates};
 
 type JsonResp = (StatusCode, Json<Value>);
-
-/// Max age of a re-auth for a high-safety reroute (seconds).
-const REAUTH_MAX_AGE_SECS: i64 = 300;
 
 #[derive(sqlx::FromRow)]
 struct RerouteRow {
@@ -34,7 +31,6 @@ struct RerouteRow {
     template_name: Option<String>,
     trigger_type: String,
     state: String,
-    safety_level: String,
     reason: Option<String>,
     success: Option<bool>,
     verification_status: Option<String>,
@@ -47,7 +43,7 @@ struct RerouteRow {
 }
 
 const REROUTE_SELECT: &str = "SELECT r.id, r.device_id, d.name AS device_name, \
-     r.reroute_template_id, t.name AS template_name, r.trigger_type, r.state, r.safety_level, \
+     r.reroute_template_id, t.name AS template_name, r.trigger_type, r.state, \
      r.reason, r.success, r.verification_status, r.failure_reason, r.rule_id, u.email AS triggered_by, \
      r.started_at, r.finished_at, r.created_at \
      FROM reroutes r \
@@ -64,7 +60,6 @@ fn reroute_json(r: &RerouteRow) -> Value {
         "template_name": r.template_name,
         "trigger_type": r.trigger_type,
         "state": r.state,
-        "safety_level": r.safety_level,
         "reason": r.reason,
         "success": r.success,
         "verification_status": r.verification_status,
@@ -153,8 +148,6 @@ pub struct ManualBody {
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
-    confirm_text: Option<String>,
-    #[serde(default)]
     dry_run: bool,
 }
 
@@ -175,19 +168,6 @@ pub async fn manual(
     };
     if template.provider_type != "device_cli" {
         return err(StatusCode::UNPROCESSABLE_ENTITY, "only device_cli templates can be executed");
-    }
-
-    // High-safety gating (skipped for dry-run/observe previews, which change nothing).
-    if template.safety_level == "high" && !body.dry_run {
-        if !reauth_is_fresh(&g.session, REAUTH_MAX_AGE_SECS) {
-            return err(StatusCode::FORBIDDEN, "fresh re-authentication required for high-safety reroutes");
-        }
-        if body.confirm_text.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "typed confirmation required for high-safety reroutes");
-        }
-        if body.reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "a reason is required for high-safety reroutes");
-        }
     }
 
     let mut results = Vec::with_capacity(body.targets.len());
@@ -300,18 +280,11 @@ pub async fn rollback(
         return err(StatusCode::UNPROCESSABLE_ENTITY, "reroute has no device/template to roll back");
     };
 
-    // Determine the rollback template's safety for the re-auth gate.
-    let orig = match templates::load(&state.pool, template_id).await {
-        Ok(t) => t,
+    // Confirm the template actually has a rollback before executing.
+    match templates::load(&state.pool, template_id).await {
+        Ok(t) if t.rollback_template_id.is_some() => {}
+        Ok(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
         Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template not found"),
-    };
-    let Some(rb_id) = orig.rollback_template_id else {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback");
-    };
-    if let Ok(rb) = templates::load(&state.pool, rb_id).await {
-        if rb.safety_level == "high" && !reauth_is_fresh(&g.session, REAUTH_MAX_AGE_SECS) {
-            return err(StatusCode::FORBIDDEN, "fresh re-authentication required to roll back a high-safety action");
-        }
     }
 
     let params = params_json.map(|j| j.0).unwrap_or(Value::Null);

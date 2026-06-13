@@ -367,7 +367,6 @@ async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> 
                 Ok(plan) => json!({
                     "commands": plan.commands,
                     "verify": plan.verify,
-                    "safety_level": plan.safety_level,
                 }),
                 Err(e) => json!({ "error": e.to_string() }),
             },
