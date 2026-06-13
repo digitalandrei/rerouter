@@ -21,7 +21,7 @@ import {
   useRef,
   type FormEvent,
 } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams, Link } from "react-router-dom";
 import {
   ArrowLeft,
   Pencil,
@@ -612,6 +612,20 @@ export default function DeviceDetail() {
   const deviceId = Number(id);
   const navigate = useNavigate();
 
+  // Keep the active tab in the URL (?tab=…) so a refresh stays put.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get("tab") === "interfaces" ? "interfaces" : "overview";
+  const setTab = (next: string) =>
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === "overview") p.delete("tab");
+        else p.set("tab", next);
+        return p;
+      },
+      { replace: true },
+    );
+
   const [device, setDevice] = useState<Device | null>(null);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
@@ -790,8 +804,8 @@ export default function DeviceDetail() {
         />
       )}
 
-      {/* ---- Tabs ---- */}
-      <Tabs defaultValue="overview">
+      {/* ---- Tabs (active tab mirrored in ?tab= so refresh stays put) ---- */}
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="interfaces">
