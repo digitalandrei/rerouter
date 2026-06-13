@@ -158,6 +158,18 @@ function RuleActionsDialog({
     }
   }
 
+  async function toggleAuto() {
+    try {
+      const updated = await api.rules.update(current.id, {
+        automatic_reroute_enabled: !current.automatic_reroute_enabled,
+      });
+      setCurrent(updated);
+      onChanged(updated);
+    } catch {
+      /* ignore */
+    }
+  }
+
   const actions = current.actions ?? [];
 
   return (
@@ -166,11 +178,31 @@ function RuleActionsDialog({
         <DialogHeader>
           <DialogTitle>Reroute actions — {current.name}</DialogTitle>
           <DialogDescription>
-            When this rule fires, these mitigations would run on the selected
-            routers. In observe mode they are rendered as a plan only; execution
-            is manual and gated.
+            When this rule fires (its sliding window holds), these mitigations run
+            on the selected routers. Observe mode always renders a plan only.
           </DialogDescription>
         </DialogHeader>
+
+        {/* Auto vs manual */}
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
+          <div className="text-sm">
+            <div className="font-medium">Run automatically when fired</div>
+            <div className="text-xs text-muted-foreground">
+              In <strong>enforce</strong> mode, execute these actions the moment
+              the rule fires (gated by device locks &amp; cooldowns). In observe
+              mode nothing runs. Off = the operator runs them manually.
+            </div>
+          </div>
+          <Button
+            size="sm"
+            variant={current.automatic_reroute_enabled ? "destructive" : "outline"}
+            onClick={() => void toggleAuto()}
+            disabled={actions.length === 0}
+            title={actions.length === 0 ? "Attach an action first" : undefined}
+          >
+            {current.automatic_reroute_enabled ? "Auto: ON" : "Auto: OFF"}
+          </Button>
+        </div>
 
         {/* Existing actions */}
         <div className="space-y-2">
@@ -323,7 +355,7 @@ interface RuleForm {
   metric: string;
   operator: ">" | "<";
   threshold_value: string;
-  duration_seconds: string;
+  window_minutes: string;
   consecutive_samples: string;
   severity: string;
 }
@@ -335,7 +367,7 @@ const DEFAULT_FORM: RuleForm = {
   metric: "rx_bps",
   operator: ">",
   threshold_value: "",
-  duration_seconds: "60",
+  window_minutes: "1",
   consecutive_samples: "3",
   severity: "warning",
 };
@@ -507,7 +539,7 @@ export default function Rules() {
         metric: form.metric,
         operator: form.operator,
         threshold_value: parseFloat(form.threshold_value),
-        duration_seconds: parseInt(form.duration_seconds, 10),
+        duration_seconds: Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60)),
         consecutive_samples: parseInt(form.consecutive_samples, 10),
         severity: form.severity,
         enabled: true,
@@ -677,18 +709,22 @@ export default function Rules() {
                   />
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
-                  Duration (seconds)
+                  Sliding window (minutes)
                   <input
                     type="number"
-                    min={10}
+                    min={0}
+                    step="0.5"
                     required
                     className={inputClass}
-                    value={form.duration_seconds}
-                    onChange={(e) => setField("duration_seconds", e.target.value)}
+                    value={form.window_minutes}
+                    onChange={(e) => setField("window_minutes", e.target.value)}
                   />
+                  <span className="text-[11px] font-normal text-muted-foreground">
+                    how long the metric must stay over/under the threshold
+                  </span>
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
-                  Consecutive samples
+                  …or consecutive samples (poll cycles)
                   <input
                     type="number"
                     min={1}
@@ -801,10 +837,12 @@ export default function Rules() {
                       </div>
                     </TableCell>
 
-                    {/* Duration */}
+                    {/* Sliding window */}
                     <TableCell className="text-xs text-muted-foreground">
-                      {rule.duration_seconds}s / {rule.consecutive_samples}{" "}
-                      samples
+                      {rule.duration_seconds >= 60
+                        ? `${(rule.duration_seconds / 60).toLocaleString(undefined, { maximumFractionDigits: 1 })} min`
+                        : `${rule.duration_seconds}s`}{" "}
+                      / {rule.consecutive_samples} cycles
                     </TableCell>
 
                     {/* Severity badge */}
@@ -821,19 +859,36 @@ export default function Rules() {
                       </Badge>
                     </TableCell>
 
-                    {/* Mitigation — attached reroute actions */}
+                    {/* Mitigation — attached reroute actions + auto/manual */}
                     <TableCell onClick={(e) => e.stopPropagation()}>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 gap-1.5"
-                        onClick={() => setManageRule(rule)}
-                        disabled={!canEdit}
-                        title={canEdit ? "Manage reroute actions" : "Requires edit_rules"}
-                      >
-                        <Workflow className="size-3.5 text-muted-foreground" />
-                        {rule.action_count ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}` : "none"}
-                      </Button>
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 gap-1.5"
+                          onClick={() => setManageRule(rule)}
+                          disabled={!canEdit}
+                          title={canEdit ? "Manage reroute actions" : "Requires edit_rules"}
+                        >
+                          <Workflow className="size-3.5 text-muted-foreground" />
+                          {rule.action_count
+                            ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}`
+                            : "none"}
+                        </Button>
+                        {rule.action_count ? (
+                          <Badge
+                            variant={rule.automatic_reroute_enabled ? "destructive" : "outline"}
+                            className="text-[10px]"
+                            title={
+                              rule.automatic_reroute_enabled
+                                ? "Runs automatically in enforce mode"
+                                : "Renders a plan only; run manually"
+                            }
+                          >
+                            {rule.automatic_reroute_enabled ? "auto" : "manual"}
+                          </Badge>
+                        ) : null}
+                      </div>
                     </TableCell>
 
                     {/* Actions */}

@@ -141,15 +141,21 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
         let ty = spec.get("type").and_then(Value::as_str).unwrap_or("string");
         let required = spec.get("required").and_then(Value::as_bool).unwrap_or(false);
 
+        // Optional schema default, used when the caller omits the param.
+        let default = spec.get("default").and_then(|d| match d {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
+
         let provided = match params_obj.get(name) {
             Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
             Some(Value::Number(n)) => n.to_string(),
-            _ => {
-                if required {
-                    bail!("missing required parameter '{name}'");
-                }
-                continue;
-            }
+            _ => match default {
+                Some(d) => d,
+                None if required => bail!("missing required parameter '{name}'"),
+                None => continue,
+            },
         };
 
         match ty {

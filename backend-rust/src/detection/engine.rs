@@ -41,6 +41,10 @@ struct InterfaceRule {
     consecutive_samples: u32,
     severity: String,
     reroute_template_id: Option<u64>,
+    /// Per-rule switch: in enforce mode, run the rule's actions automatically on
+    /// the firing edge. "The rule decides" — this is the only auto gate besides
+    /// enforce mode + the executor's locks/cooldowns.
+    automatic_reroute_enabled: bool,
 }
 
 /// The latest derived metrics for an interface (only the columns rules read).
@@ -95,7 +99,8 @@ struct RuleStateRow {
 pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<usize> {
     let rules = sqlx::query_as::<_, InterfaceRule>(
         "SELECT id, name, interface_id, device_id, metric, operator, threshold_value, \
-                duration_seconds, consecutive_samples, severity, reroute_template_id \
+                duration_seconds, consecutive_samples, severity, reroute_template_id, \
+                automatic_reroute_enabled \
          FROM rules \
          WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ?",
     )
@@ -264,11 +269,21 @@ async fn on_fire(
     if let Some(plan) = would_run {
         payload["would_run"] = plan;
     }
-    // Multi-target action plan (the rule's attached actions, one per router),
-    // each rendered to its exact commands. Render-only — nothing executes.
-    let would_run_actions = render_would_run_actions(pool, rule.id).await;
-    if !would_run_actions.is_empty() {
-        payload["would_run_actions"] = json!(would_run_actions);
+
+    // "The rule decides": in enforce mode, a rule with auto enabled runs its
+    // actions now (gated further by the executor's locks/cooldowns). Otherwise —
+    // observe mode, or a manual-only rule — we only RENDER the would-run plan.
+    let auto = mode == "enforce" && rule.automatic_reroute_enabled;
+    if auto {
+        let executed = auto_execute_actions(pool, cfg, rule).await;
+        if !executed.is_empty() {
+            payload["executed_actions"] = json!(executed);
+        }
+    } else {
+        let would_run_actions = render_would_run_actions(pool, rule.id).await;
+        if !would_run_actions.is_empty() {
+            payload["would_run_actions"] = json!(would_run_actions);
+        }
     }
 
     let dedup_key = format!("rule_fired:rule:{}:iface:{}", rule.id, rule.interface_id);
@@ -367,6 +382,43 @@ async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> 
             "params": params,
             "rendered": rendered,
         }));
+    }
+    out
+}
+
+/// Execute every attached action of a rule via the reroute executor. Called only
+/// on the firing edge, only in enforce mode, only when the rule's auto switch is
+/// on. The executor re-checks Gate 0 + device locks/cooldowns/uncertain, so a
+/// device that's locked or recently acted on is safely skipped. Returns each
+/// action's outcome for the alert payload.
+async fn auto_execute_actions(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> Vec<Value> {
+    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>)>(
+        "SELECT reroute_template_id, device_id, params_json FROM rule_actions \
+         WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
+    )
+    .bind(rule.id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(specs.len());
+    for (template_id, device_id, params_json) in specs {
+        let template = match crate::reroute::templates::load(pool, template_id).await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
+        let req = crate::reroute::executor::ActionRequest {
+            device_id,
+            template,
+            params,
+            trigger_type: "automatic",
+            rule_id: Some(rule.id),
+            user_id: None,
+            reason: Some(format!("automatic: rule '{}' fired", rule.name)),
+        };
+        let outcome = crate::reroute::executor::execute(pool, cfg, req, false).await;
+        out.push(serde_json::to_value(&outcome).unwrap_or(Value::Null));
     }
     out
 }
