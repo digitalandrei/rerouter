@@ -61,6 +61,13 @@ const OID_IF_IN_DISCARDS: &str = "1.3.6.1.2.1.2.2.1.13";
 const OID_IF_IN_ERRORS: &str = "1.3.6.1.2.1.2.2.1.14";
 const OID_IF_OUT_DISCARDS: &str = "1.3.6.1.2.1.2.2.1.19";
 const OID_IF_OUT_ERRORS: &str = "1.3.6.1.2.1.2.2.1.20";
+// ENTITY-MIB entPhysicalName + CISCO-ENTITY-SENSOR-MIB (transceiver DOM optics).
+// Sensors are named e.g. "subslot 0/0 transceiver 0 Rx Power Sensor" and indexed
+// by entPhysicalIndex; actual reading = entSensorValue / 10^entSensorPrecision.
+const OID_ENT_PHYS_NAME: &str = "1.3.6.1.2.1.47.1.1.1.1.7";
+const OID_SENSOR_PRECISION: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.3";
+const OID_SENSOR_VALUE: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.4";
+const OID_SENSOR_STATUS: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.5"; // 1 = ok
 
 fn oid(s: &str) -> Result<ObjectIdentifier> {
     s.parse::<ObjectIdentifier>()
@@ -235,6 +242,24 @@ pub async fn test_and_store(pool: &MySqlPool, device_id: u64) -> Result<DeviceId
     }
 }
 
+/// Debug helper: SNMP-walk an OID prefix on a device (using its stored,
+/// decrypted credentials) and print `oid = value` lines. For exploring an
+/// agent's MIBs — e.g. CISCO-ENTITY-SENSOR-MIB optics sensors. `--snmp-walk`.
+pub async fn debug_walk(pool: &MySqlPool, device_id: u64, oid_prefix: &str) -> Result<()> {
+    let dev = load_device(pool, device_id).await?;
+    let client = connect(&dev).await?;
+    let base = oid(oid_prefix)?;
+    let raw = client
+        .walk_bulk(base, BULK_REPETITIONS)
+        .await
+        .with_context(|| format!("walk {oid_prefix}"))?;
+    println!("# {} entries under {oid_prefix}", raw.len());
+    for (o, v) in raw {
+        println!("{o} = {}", value_to_string(&v));
+    }
+    Ok(())
+}
+
 // ---- discover() ----------------------------------------------------------------
 
 /// One discovered interface (pre-upsert).
@@ -345,12 +370,15 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
 
 // ---- poll() --------------------------------------------------------------------
 
-/// A monitored interface to poll (id + ifIndex + speed for util%).
+/// An interface to poll (id + ifIndex + speed for util%, name/descr for optics
+/// mapping).
 #[derive(Debug, Clone)]
 struct PollInterface {
     interface_id: u64,
     if_index: u32,
     if_speed_bps: u64,
+    if_name: Option<String>,
+    if_descr: Option<String>,
 }
 
 /// Poll EVERY discovered interface on a device (physical, port-channels,
@@ -365,15 +393,21 @@ struct PollInterface {
 pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let dev = load_device(pool, device_id).await?;
 
-    let ifaces: Vec<PollInterface> = sqlx::query_as::<_, (u64, u32, u64)>(
-        "SELECT id, if_index, if_speed_bps FROM device_interfaces WHERE device_id = ?",
+    let ifaces: Vec<PollInterface> = sqlx::query_as::<_, (u64, u32, u64, Option<String>, Option<String>)>(
+        "SELECT id, if_index, if_speed_bps, if_name, if_descr FROM device_interfaces WHERE device_id = ?",
     )
     .bind(device_id)
     .fetch_all(pool)
     .await
     .context("loading device interfaces")?
     .into_iter()
-    .map(|(interface_id, if_index, if_speed_bps)| PollInterface { interface_id, if_index, if_speed_bps })
+    .map(|(interface_id, if_index, if_speed_bps, if_name, if_descr)| PollInterface {
+        interface_id,
+        if_index,
+        if_speed_bps,
+        if_name,
+        if_descr,
+    })
     .collect();
 
     if ifaces.is_empty() {
@@ -408,6 +442,9 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
         return Err(anyhow!(msg));
     }
 
+    // Transceiver optics (best-effort; empty for agents/ports without DOM).
+    let optics = collect_optics(&client, &ifaces).await;
+
     let now = Utc::now();
     let mut updated = 0usize;
 
@@ -429,7 +466,8 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             in_ucast_pkts: ip,
             out_ucast_pkts: op,
         };
-        let (previous, prev_in_err, prev_out_err) = load_baseline(pool, m.interface_id).await?;
+        let (previous, prev_in_err, prev_out_err, prev_in_disc, prev_out_disc) =
+            load_baseline(pool, m.interface_id).await?;
         let rates = interface_rates(&current, previous.as_ref(), m.if_speed_bps);
 
         let oper_s = oper.get(&m.if_index).map(|&v| oper_status_str(v).to_string());
@@ -437,6 +475,9 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
 
         let cur_in_err = in_err.get(&m.if_index).copied();
         let cur_out_err = out_err.get(&m.if_index).copied();
+        let cur_in_disc = in_disc.get(&m.if_index).copied();
+        let cur_out_disc = out_disc.get(&m.if_index).copied();
+        let opt = optics.get(&m.interface_id);
 
         store_metrics(
             pool,
@@ -446,13 +487,18 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             &rates,
             cur_in_err,
             cur_out_err,
-            in_disc.get(&m.if_index).copied(),
-            out_disc.get(&m.if_index).copied(),
+            cur_in_disc,
+            cur_out_disc,
             admin_s.as_deref(),
             oper_s.as_deref(),
-            // per-interval error deltas for the history chart (0 on first sample/wrap)
+            // per-interval error/discard deltas for the history charts
             err_delta(cur_in_err, prev_in_err),
             err_delta(cur_out_err, prev_out_err),
+            err_delta(cur_in_disc, prev_in_disc),
+            err_delta(cur_out_disc, prev_out_disc),
+            opt.and_then(|o| o.temp_c),
+            opt.and_then(|o| o.tx_power_dbm),
+            opt.and_then(|o| o.rx_power_dbm),
         )
         .await?;
         updated += 1;
@@ -468,12 +514,14 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
 }
 
 /// Load the previous raw octet/packet counters (rate baseline) plus the previous
-/// cumulative error counters (for per-interval error deltas) from
-/// `interface_metrics_current`.
+/// cumulative error and discard counters (for per-interval deltas) from
+/// `interface_metrics_current`. Returns
+/// `(counters, in_errors, out_errors, in_discards, out_discards)`.
+#[allow(clippy::type_complexity)]
 async fn load_baseline(
     pool: &MySqlPool,
     interface_id: u64,
-) -> Result<(Option<InterfaceCounters>, Option<u64>, Option<u64>)> {
+) -> Result<(Option<InterfaceCounters>, Option<u64>, Option<u64>, Option<u64>, Option<u64>)> {
     // sampled_at is a TIMESTAMP column -> DateTime<Utc> (sqlx-mysql maps
     // NaiveDateTime only to DATETIME).
     type Row = (
@@ -484,9 +532,12 @@ async fn load_baseline(
         Option<u64>,
         Option<u64>,
         Option<u64>,
+        Option<u64>,
+        Option<u64>,
     );
     let row = sqlx::query_as::<_, Row>(
-        "SELECT sampled_at, in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, in_errors, out_errors \
+        "SELECT sampled_at, in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, \
+                in_errors, out_errors, in_discards, out_discards \
          FROM interface_metrics_current WHERE interface_id = ?",
     )
     .bind(interface_id)
@@ -494,8 +545,8 @@ async fn load_baseline(
     .await
     .context("loading interface baseline")?;
 
-    let Some((ts, io, oo, ip, op, in_e, out_e)) = row else {
-        return Ok((None, None, None));
+    let Some((ts, io, oo, ip, op, in_e, out_e, in_d, out_d)) = row else {
+        return Ok((None, None, None, None, None));
     };
     let counters = match (ts, io, oo, ip, op) {
         (Some(ts), Some(io), Some(oo), Some(ip), Some(op)) => Some(InterfaceCounters {
@@ -507,7 +558,7 @@ async fn load_baseline(
         }),
         _ => None,
     };
-    Ok((counters, in_e, out_e))
+    Ok((counters, in_e, out_e, in_d, out_d))
 }
 
 /// Per-interval error count: current minus the previous cumulative counter.
@@ -536,6 +587,11 @@ async fn store_metrics(
     oper_status: Option<&str>,
     sample_in_errors: u64,
     sample_out_errors: u64,
+    sample_in_discards: u64,
+    sample_out_discards: u64,
+    temp_c: Option<f64>,
+    tx_power_dbm: Option<f64>,
+    rx_power_dbm: Option<f64>,
 ) -> Result<()> {
     let sampled_at = counters.sampled_at.naive_utc();
     let valid = rates.valid as i32;
@@ -545,8 +601,9 @@ async fn store_metrics(
             (interface_id, device_id, sampled_at, valid_sample, \
              in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, \
              rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
-             in_errors, out_errors, in_discards, out_discards, admin_status, oper_status) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             in_errors, out_errors, in_discards, out_discards, admin_status, oper_status, \
+             temp_c, tx_power_dbm, rx_power_dbm) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON DUPLICATE KEY UPDATE \
             sampled_at = VALUES(sampled_at), valid_sample = VALUES(valid_sample), \
             in_octets = VALUES(in_octets), out_octets = VALUES(out_octets), \
@@ -556,7 +613,8 @@ async fn store_metrics(
             tx_util_percent = VALUES(tx_util_percent), in_errors = VALUES(in_errors), \
             out_errors = VALUES(out_errors), in_discards = VALUES(in_discards), \
             out_discards = VALUES(out_discards), admin_status = VALUES(admin_status), \
-            oper_status = VALUES(oper_status)",
+            oper_status = VALUES(oper_status), temp_c = VALUES(temp_c), \
+            tx_power_dbm = VALUES(tx_power_dbm), rx_power_dbm = VALUES(rx_power_dbm)",
     )
     .bind(interface_id)
     .bind(device_id)
@@ -578,6 +636,9 @@ async fn store_metrics(
     .bind(out_discards)
     .bind(admin_status)
     .bind(oper_status)
+    .bind(temp_c)
+    .bind(tx_power_dbm)
+    .bind(rx_power_dbm)
     .execute(pool)
     .await
     .context("upserting interface_metrics_current")?;
@@ -588,8 +649,9 @@ async fn store_metrics(
         "INSERT INTO interface_samples \
             (interface_id, device_id, sampled_at, valid_sample, \
              rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
-             in_errors, out_errors) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             in_errors, out_errors, in_discards, out_discards, \
+             temp_c, tx_power_dbm, rx_power_dbm) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(interface_id)
     .bind(device_id)
@@ -603,6 +665,11 @@ async fn store_metrics(
     .bind(rates.tx_util_percent)
     .bind(sample_in_errors)
     .bind(sample_out_errors)
+    .bind(sample_in_discards)
+    .bind(sample_out_discards)
+    .bind(temp_c)
+    .bind(tx_power_dbm)
+    .bind(rx_power_dbm)
     .execute(pool)
     .await
     .context("appending interface_samples")?;
@@ -653,6 +720,17 @@ async fn walk_u64(client: &Snmp2cClient, base: &str) -> Result<BTreeMap<u32, u64
     Ok(index_by_suffix(&base_oid, raw, |v| value_to_u64(&v)))
 }
 
+/// Walk a table column and return index -> i64 (signed — e.g. entSensorValue,
+/// where optical power is negative dBm).
+async fn walk_i64(client: &Snmp2cClient, base: &str) -> Result<BTreeMap<u32, i64>> {
+    let base_oid = oid(base)?;
+    let raw = client
+        .walk_bulk(base_oid, BULK_REPETITIONS)
+        .await
+        .with_context(|| format!("walk {base}"))?;
+    Ok(index_by_suffix(&base_oid, raw, |v| value_to_i64(&v)))
+}
+
 /// Reduce a walk result to ifIndex -> T. The ifIndex is the single sub-identifier
 /// remaining after stripping the column base (ifXTable/ifTable are 1-deep).
 fn index_by_suffix<T>(
@@ -694,6 +772,100 @@ fn value_to_u64(v: &ObjectValue) -> Option<u64> {
         ObjectValue::Integer(i) if *i >= 0 => Some(*i as u64),
         _ => None,
     }
+}
+
+/// Coerce a numeric SNMP value to i64 (preserves sign for entSensorValue dBm).
+fn value_to_i64(v: &ObjectValue) -> Option<i64> {
+    match v {
+        ObjectValue::Integer(i) => Some(*i as i64),
+        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => Some(*n as i64),
+        ObjectValue::Counter64(n) => Some(*n as i64),
+        _ => None,
+    }
+}
+
+// ---- optics (CISCO-ENTITY-SENSOR-MIB) ------------------------------------------
+
+/// Per-interface transceiver optics. Any field may be absent.
+#[derive(Debug, Clone, Default)]
+struct Optics {
+    temp_c: Option<f64>,
+    tx_power_dbm: Option<f64>,
+    rx_power_dbm: Option<f64>,
+}
+
+/// Parse "subslot A/B transceiver N <kind> Sensor" -> port path "A/B/N".
+fn transceiver_port(name: &str) -> Option<String> {
+    let toks: Vec<&str> = name.split_whitespace().collect();
+    let subslot = toks.iter().position(|&t| t == "subslot").and_then(|i| toks.get(i + 1))?;
+    let n = toks.iter().position(|&t| t == "transceiver").and_then(|i| toks.get(i + 1))?;
+    if !n.chars().all(|c| c.is_ascii_digit()) {
+        return None; // "transceiver container" / the transceiver entity itself
+    }
+    Some(format!("{subslot}/{n}"))
+}
+
+/// Numeric port path of an interface name/descr (strip leading type letters):
+/// "TenGigabitEthernet0/0/0" / "Te0/0/0" -> "0/0/0".
+fn numeric_path(s: &str) -> &str {
+    s.trim_start_matches(|c: char| !c.is_ascii_digit())
+}
+
+/// Walk the transceiver DOM sensors and map each to one of `ifaces` by port path.
+/// Best-effort: an empty map if the agent exposes no optics. Reading scaling is
+/// `entSensorValue / 10^entSensorPrecision`; kind comes from the entPhysicalName.
+async fn collect_optics(client: &Snmp2cClient, ifaces: &[PollInterface]) -> BTreeMap<u64, Optics> {
+    let names = walk_strings(client, OID_ENT_PHYS_NAME).await.unwrap_or_default();
+    if names.is_empty() {
+        return BTreeMap::new();
+    }
+    let precs = walk_u64(client, OID_SENSOR_PRECISION).await.unwrap_or_default();
+    let vals = walk_i64(client, OID_SENSOR_VALUE).await.unwrap_or_default();
+    let status = walk_u64(client, OID_SENSOR_STATUS).await.unwrap_or_default();
+
+    // entPhysicalIndex sensors -> optics grouped by port path ("0/0/0").
+    let mut by_port: BTreeMap<String, Optics> = BTreeMap::new();
+    for (idx, name) in &names {
+        if status.get(idx).copied() != Some(1) {
+            continue; // not "ok"
+        }
+        let kind = if name.contains("Temperature") {
+            't'
+        } else if name.contains("Tx Power") {
+            'x'
+        } else if name.contains("Rx Power") {
+            'r'
+        } else {
+            continue;
+        };
+        let Some(port) = transceiver_port(name) else { continue };
+        let Some(&val) = vals.get(idx) else { continue };
+        let prec = precs.get(idx).copied().unwrap_or(0);
+        let actual = val as f64 / 10f64.powi(prec as i32);
+        let e = by_port.entry(port).or_default();
+        match kind {
+            't' => e.temp_c = Some(actual),
+            'x' => e.tx_power_dbm = Some(actual),
+            _ => e.rx_power_dbm = Some(actual),
+        }
+    }
+
+    // Map each interface to its port's optics by numeric port path.
+    let mut out = BTreeMap::new();
+    for ifc in ifaces {
+        let path = ifc
+            .if_name
+            .as_deref()
+            .map(numeric_path)
+            .filter(|p| !p.is_empty())
+            .or_else(|| ifc.if_descr.as_deref().map(numeric_path).filter(|p| !p.is_empty()));
+        if let Some(path) = path {
+            if let Some(opt) = by_port.get(path) {
+                out.insert(ifc.interface_id, opt.clone());
+            }
+        }
+    }
+    out
 }
 
 // ---- sysDescr / status parsing -------------------------------------------------

@@ -15,7 +15,7 @@
 //! `uncertain` and its asset is locked until verified or acknowledged. Automatic
 //! reroutes are disabled by default. See ../docs/state-recovery.md.
 
-use rerouter_controller::{alerts, api, config, db, install, reroute, scheduler};
+use rerouter_controller::{alerts, api, config, db, install, reroute, scheduler, telemetry};
 
 use anyhow::Result;
 use clap::Parser;
@@ -76,6 +76,15 @@ struct Cli {
     /// Admin password for --create-admin (min 12 chars; never logged).
     #[arg(long, env = "ADMIN_PASSWORD")]
     admin_password: Option<String>,
+
+    /// Debug: SNMP-walk an OID prefix on a device (by id, using its stored
+    /// creds), print `oid = value`, and exit. For exploring agent MIBs.
+    #[arg(long)]
+    snmp_walk: Option<u64>,
+
+    /// OID prefix for --snmp-walk (default ENTITY-MIB entPhysicalName).
+    #[arg(long, default_value = "1.3.6.1.2.1.47.1.1.1.1.7")]
+    oid: String,
 }
 
 #[tokio::main]
@@ -148,6 +157,10 @@ async fn main() -> Result<()> {
     }
     if cli.create_admin {
         install::create_admin(&pool, cli.admin_email, cli.admin_name, cli.admin_password).await?;
+        return Ok(());
+    }
+    if let Some(dev_id) = cli.snmp_walk {
+        telemetry::snmp::debug_walk(&pool, dev_id, &cli.oid).await?;
         return Ok(());
     }
 
