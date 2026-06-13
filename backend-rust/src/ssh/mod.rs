@@ -108,6 +108,78 @@ pub async fn load_device_ssh(pool: &MySqlPool, device_id: u64) -> Result<DeviceS
     Ok(DeviceSsh { device_id, host, port, username, auth, expected_fingerprint: fingerprint })
 }
 
+// ---- Client key generation -----------------------------------------------------
+
+/// A freshly generated SSH client keypair (no passphrase).
+pub struct GeneratedKey {
+    /// OpenSSH-format private-key PEM — stored encrypted; `decode_secret_key`
+    /// reads it back for publickey auth.
+    pub private_key_openssh: String,
+    /// `ssh-rsa AAAA… comment` — NOT a secret; shown in the UI and enrolled on the
+    /// router via `ip ssh pubkey-chain`.
+    pub public_key_openssh: String,
+    /// SHA-256 fingerprint of the public key (for display only).
+    pub fingerprint: String,
+}
+
+/// rand_core 0.10 CSPRNG backed by the OS, bridging our `rand` 0.9 `OsRng` to the
+/// rand_core 0.10 traits that `ssh-key`'s RSA generation requires. An OS-entropy
+/// failure is unrecoverable and panics — identical to the existing AES-GCM nonce
+/// path in `crypto.rs`; this is a one-shot admin keygen, not a parser path.
+struct OsCsprng;
+
+impl russh::keys::ssh_key::rand_core::TryRng for OsCsprng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        use rand::TryRngCore;
+        rand::rngs::OsRng
+            .try_fill_bytes(dst)
+            .expect("OS CSPRNG (getrandom) failed");
+        Ok(())
+    }
+}
+impl russh::keys::ssh_key::rand_core::TryCryptoRng for OsCsprng {}
+
+/// Generate a 2048-bit RSA client keypair (no passphrase) for SSH publickey auth.
+/// RSA — not ed25519 — because Cisco IOS `ip ssh pubkey-chain` only accepts RSA,
+/// and `ios_preferred()` is RSA-oriented for these 15.4 boxes.
+pub fn generate_rsa_key(comment: &str) -> Result<GeneratedKey> {
+    use russh::keys::ssh_key::{private::RsaKeypair, LineEnding, PrivateKey};
+    let keypair =
+        RsaKeypair::random(&mut OsCsprng, 2048).map_err(|e| anyhow!("generating RSA keypair: {e}"))?;
+    let mut key = PrivateKey::from(keypair);
+    key.set_comment(comment);
+    let private_key_openssh = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| anyhow!("encoding private key: {e}"))?
+        .to_string();
+    let public_key_openssh = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| anyhow!("encoding public key: {e}"))?;
+    let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    Ok(GeneratedKey { private_key_openssh, public_key_openssh, fingerprint })
+}
+
+/// Best-effort: derive the OpenSSH public-key line from a private-key PEM (any
+/// format `decode_secret_key` understands). Returns `None` when the key needs a
+/// passphrase we weren't given or can't be parsed — the caller then stores NULL
+/// and the UI simply shows no public key for that device.
+pub fn derive_public_openssh(private_key_pem: &str, passphrase: Option<&str>) -> Option<String> {
+    let key = decode_secret_key(private_key_pem, passphrase).ok()?;
+    key.public_key().to_openssh().ok()
+}
+
 // ---- Results -------------------------------------------------------------------
 
 /// One command and the device's cleaned response (echo + trailing prompt stripped).

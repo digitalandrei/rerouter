@@ -47,6 +47,9 @@ fn device_json(r: &DeviceRow, interface_count: i64) -> Value {
         "ssh_port": r.ssh_port,
         "ssh_auth_method": r.ssh_auth_method,
         "ssh_configured": r.ssh_has_password != 0 || r.ssh_has_key != 0,
+        // Public key is NOT a secret — always returned so the UI can show it for
+        // enrollment on the router. NULL until a key is generated or derived.
+        "ssh_public_key": r.ssh_public_key,
     })
 }
 
@@ -91,6 +94,7 @@ struct DeviceRow {
     ssh_username: Option<String>,
     ssh_port: u16,
     ssh_auth_method: Option<String>,
+    ssh_public_key: Option<String>,
     // computed presence flags (1/0) — never the ciphertext itself.
     ssh_has_password: i64,
     ssh_has_key: i64,
@@ -98,7 +102,7 @@ struct DeviceRow {
 
 const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled, reachable, \
      vendor, model, os_version, sys_name, sys_uptime, last_poll_at, last_error, poll_interval_seconds, \
-     ssh_username, ssh_port, ssh_auth_method, \
+     ssh_username, ssh_port, ssh_auth_method, ssh_public_key, \
      (ssh_password_encrypted IS NOT NULL) AS ssh_has_password, \
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";
 
@@ -383,6 +387,9 @@ pub async fn update(
     let set_ssh_key = body.ssh_private_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
     if set_ssh_key {
         sets.push("ssh_private_key_encrypted = ?");
+        // Derive and store the matching public key so the UI can show it. Best
+        // effort — a passphrase-protected key we can't open stores NULL (cleared).
+        sets.push("ssh_public_key = ?");
     }
     let set_ssh_pass = body.ssh_key_passphrase.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
     if set_ssh_pass {
@@ -444,6 +451,11 @@ pub async fn update(
     }
     if set_ssh_key {
         q = q.bind(ssh_key_enc);
+        // Public key derived from the pasted private key (NULL if underivable).
+        let pubkey = body.ssh_private_key.as_deref().and_then(|pem| {
+            crate::ssh::derive_public_openssh(pem, body.ssh_key_passphrase.as_deref())
+        });
+        q = q.bind(pubkey);
     }
     if set_ssh_pass {
         q = q.bind(ssh_pass_enc);
@@ -565,6 +577,64 @@ pub async fn ssh_test(
         ),
         Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
     }
+}
+
+/// POST /api/devices/{id}/ssh-generate-key — generate a fresh 2048-bit RSA client
+/// keypair (no passphrase), store the private key encrypted, switch the device to
+/// key auth, persist + return the public key for enrollment on the router.
+/// Regenerating REPLACES the previous key — key auth then fails until the new
+/// public key is enrolled (`ip ssh pubkey-chain`). `manage_devices` (superadmin).
+pub async fn generate_key(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT name, hostname FROM devices WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let Some((name, hostname)) = row else {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    };
+    if !crypto::is_configured() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "encryption key not configured");
+    }
+
+    // A descriptive comment so the key is recognisable in `show run | section pubkey`.
+    let host = if hostname.trim().is_empty() { name.as_str() } else { hostname.as_str() };
+    let comment = format!("rerouter@{host}");
+    let key = match crate::ssh::generate_rsa_key(&comment) {
+        Ok(k) => k,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "key generation failed"),
+    };
+    let enc = match crypto::seal_str(&key.private_key_openssh) {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "encrypting private key failed"),
+    };
+
+    let res = sqlx::query(
+        "UPDATE devices SET ssh_auth_method = 'key', ssh_private_key_encrypted = ?, \
+         ssh_key_passphrase_encrypted = NULL, ssh_public_key = ? WHERE id = ?",
+    )
+    .bind(enc)
+    .bind(&key.public_key_openssh)
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+    if res.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "public_key": key.public_key_openssh,
+            "fingerprint": key.fingerprint,
+        })),
+    )
 }
 
 /// GET /api/devices/{id}/interfaces — every interface on the device, each with

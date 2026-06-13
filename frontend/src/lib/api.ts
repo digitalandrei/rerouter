@@ -110,6 +110,9 @@ export interface Device {
   ssh_port: number;
   ssh_auth_method: "password" | "key" | null;
   ssh_configured: boolean;
+  // OpenSSH public-key line (not a secret) — shown for enrollment on the router.
+  // null until a key is generated in-app or derived from a pasted private key.
+  ssh_public_key: string | null;
 }
 
 /** Payload for enrolling a device. SSH access is optional (password XOR key). */
@@ -522,6 +525,11 @@ export const api = {
       }),
     sshTest: (id: number) =>
       request<SshTestResult>(`/api/devices/${id}/ssh-test`, { method: "POST" }),
+    generateKey: (id: number) =>
+      request<{ ok: boolean; public_key: string; fingerprint: string }>(
+        `/api/devices/${id}/ssh-generate-key`,
+        { method: "POST" },
+      ),
     interfaces: (id: number) =>
       request<Interface[]>(`/api/devices/${id}/interfaces`),
     bgpPeers: (id: number) =>

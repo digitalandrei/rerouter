@@ -9,3 +9,4 @@ frontend/dist/
 *.env
 !deploy/env/rerouter.example.env
 /etc/rerouter/
+.claude/

@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Activity, TerminalSquare } from "lucide-react";
+import { Activity, Copy, KeyRound, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 import { api, type Device, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -41,12 +42,34 @@ function build(device: Device): Form {
   };
 }
 
+/** Cisco ASR (IOS) commands to enroll our public key under the SSH username, so
+ *  the controller can authenticate by key. `key-string` takes the raw Base64 body
+ *  (the middle field of the OpenSSH line), not the `ssh-rsa … comment` wrapper. */
+function asrEnrollment(username: string, publicKey: string): string {
+  const parts = publicKey.trim().split(/\s+/);
+  const body = parts.length >= 2 ? parts[1] : publicKey.trim();
+  // IOS wraps long key-strings itself; one line is accepted on 15.x.
+  return [
+    "configure terminal",
+    " ip ssh pubkey-chain",
+    `  username ${username || "rerouter"}`,
+    "   key-string",
+    `   ${body}`,
+    "   exit",
+    "  exit",
+    " end",
+    "write memory",
+  ].join("\n");
+}
+
 /** Device settings tab: rename / hostname / SNMP / SSH credentials, plus the
  *  Test SNMP and Test SSH probes. manage_devices only (gated by the caller). */
 export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved: () => void }) {
   const [form, setForm] = useState<Form>(() => build(device));
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [regenOpen, setRegenOpen] = useState(false);
 
   // Reset only when navigating to a different device (not on the 30s refresh of
   // the same device, which would wipe in-progress edits).
@@ -89,6 +112,31 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
     } finally {
       setBusy(false);
     }
+  }
+
+  async function generateKey() {
+    setGenerating(true);
+    try {
+      const r = await api.devices.generateKey(device.id);
+      toast.success("SSH key pair generated", {
+        description: "Enroll the new public key on the router, then Test SSH.",
+      });
+      // Reflect the new pubkey + key-auth method immediately.
+      setForm((f) => ({ ...f, ssh_auth_method: "key", ssh_private_key: "", ssh_key_passphrase: "" }));
+      onSaved();
+      return r;
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Key generation failed");
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  function copy(text: string, what: string) {
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => toast.success(`${what} copied`))
+      .catch(() => toast.error("Copy failed"));
   }
 
   async function testSnmp() {
@@ -187,14 +235,91 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                 )}
                 {form.ssh_auth_method === "key" && (
                   <div className="space-y-4">
-                    <label className="block space-y-1 text-sm font-medium">
-                      SSH private key
-                      <textarea rows={5} className={`${inputClass} font-mono text-xs`} value={form.ssh_private_key} onChange={(e) => setField("ssh_private_key", e.target.value)} placeholder="leave blank to keep stored key" />
-                    </label>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Key passphrase
-                      <input type="password" className={inputClass} value={form.ssh_key_passphrase} onChange={(e) => setField("ssh_key_passphrase", e.target.value)} placeholder="leave blank to keep" autoComplete="new-password" />
-                    </label>
+                    {/* Generate / regenerate an in-app RSA key pair (no passphrase).
+                        The private key is stored encrypted; the public key is shown
+                        below for enrollment on the router. */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={generating}
+                        onClick={() => {
+                          if (device.ssh_public_key || device.ssh_configured) setRegenOpen(true);
+                          else void generateKey();
+                        }}
+                      >
+                        <KeyRound className="size-4" />
+                        {generating
+                          ? "Generating…"
+                          : device.ssh_public_key
+                            ? "Regenerate key pair"
+                            : "Generate key pair"}
+                      </Button>
+                      <span className="text-xs text-muted-foreground">
+                        2048-bit RSA, no passphrase. Private key stored encrypted.
+                      </span>
+                    </div>
+
+                    {device.ssh_public_key && (
+                      <div className="space-y-3 rounded-md border border-border p-3">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                              Public key
+                            </span>
+                            <Button type="button" variant="ghost" size="sm" onClick={() => copy(device.ssh_public_key!, "Public key")}>
+                              <Copy className="size-3.5" />
+                              Copy
+                            </Button>
+                          </div>
+                          <pre className="overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap">
+                            {device.ssh_public_key}
+                          </pre>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                              Enroll on Cisco ASR
+                            </span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => copy(asrEnrollment(device.ssh_username ?? form.ssh_username, device.ssh_public_key!), "Enrollment commands")}
+                            >
+                              <Copy className="size-3.5" />
+                              Copy
+                            </Button>
+                          </div>
+                          <pre className="overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
+                            {asrEnrollment(device.ssh_username ?? form.ssh_username, device.ssh_public_key)}
+                          </pre>
+                          <p className="text-xs text-muted-foreground">
+                            Run these on the router, then use <strong>Test SSH</strong> to confirm key auth.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    <details className="rounded-md border border-border p-3">
+                      <summary className="cursor-pointer text-sm font-medium">
+                        Or paste your own private key
+                      </summary>
+                      <div className="mt-3 space-y-4">
+                        <label className="block space-y-1 text-sm font-medium">
+                          SSH private key
+                          <textarea rows={5} className={`${inputClass} font-mono text-xs`} value={form.ssh_private_key} onChange={(e) => setField("ssh_private_key", e.target.value)} placeholder="leave blank to keep stored key" />
+                        </label>
+                        <label className="block space-y-1 text-sm font-medium">
+                          Key passphrase
+                          <input type="password" className={inputClass} value={form.ssh_key_passphrase} onChange={(e) => setField("ssh_key_passphrase", e.target.value)} placeholder="leave blank to keep" autoComplete="new-password" />
+                        </label>
+                        <p className="text-xs text-muted-foreground">
+                          Saving a pasted key replaces the stored one; its public key is shown above after saving.
+                        </p>
+                      </div>
+                    </details>
                   </div>
                 )}
               </>
@@ -216,6 +341,18 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
           </div>
         </form>
       </CardContent>
+
+      <ConfirmDialog
+        open={regenOpen}
+        onOpenChange={setRegenOpen}
+        title="Regenerate SSH key pair?"
+        description="This replaces the stored private key. Key authentication will FAIL until you enroll the new public key on the router. The old key is discarded and cannot be recovered."
+        confirmLabel="Regenerate"
+        onConfirm={async () => {
+          setRegenOpen(false);
+          await generateKey();
+        }}
+      />
     </Card>
   );
 }
