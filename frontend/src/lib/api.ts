@@ -269,25 +269,75 @@ export type RerouteState =
 
 export interface Reroute {
   id: number;
-  asset_id: number;
-  provider_id: number;
-  template: string;
-  parameters: Record<string, unknown>;
+  device_id: number | null;
+  device_name: string | null;
+  reroute_template_id: number | null;
+  template_name: string | null;
+  trigger_type: string;
   state: RerouteState;
   safety_level: string;
   reason: string | null;
-  initiated_by: string;
+  success: boolean | null;
+  verification_status: string | null;
+  failure_reason: string | null;
+  rule_id: number | null;
+  triggered_by: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   created_at: string;
-  updated_at: string;
+}
+
+export interface RerouteStep {
+  step_number: number;
+  description: string | null;
+  mode: string | null;
+  state: string;
+}
+export interface RerouteOutput {
+  step_number: number;
+  request: string | null;
+  response: string | null;
+  status: string | null;
+}
+export interface RerouteVerification {
+  method: string;
+  expected: string | null;
+  observed: string | null;
+  result: string;
+}
+export interface RerouteDetail extends Reroute {
+  steps: RerouteStep[];
+  outputs: RerouteOutput[];
+  verifications: RerouteVerification[];
+}
+
+/** Result of executing/previewing one action against one device. */
+export interface RerouteResult {
+  executed: boolean;
+  reroute_id?: number | null;
+  state?: string | null;
+  message: string;
+  blocked_reason?: string | null;
+  would_run?: RenderedPlan | null;
+  device_id: number;
+  device_name?: string | null;
 }
 
 export interface ManualReroutePayload {
-  asset_id: number;
-  provider_id: number;
-  template: string;
-  parameters: Record<string, unknown>;
-  reason: string;
-  confirmation: string;
+  template_id: number;
+  targets: { device_id: number; params: Record<string, unknown> }[];
+  reason?: string;
+  confirm_text?: string;
+  dry_run?: boolean;
+}
+
+export interface Lock {
+  id: number;
+  scope: string;
+  scope_ref: string | null;
+  reason: string | null;
+  kind: string;
+  created_at: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,21 +562,23 @@ export const api = {
     list: () => request<Alert[]>("/api/alerts"),
   },
 
-  // Legacy reroute endpoints kept for placeholder pages
   reroutes: {
     list: () => request<Reroute[]>("/api/reroutes"),
+    get: (id: number) => request<RerouteDetail>(`/api/reroutes/${id}`),
     manual: (payload: ManualReroutePayload) =>
-      request<Reroute>("/api/reroutes/manual", {
+      request<{ results: RerouteResult[] }>("/api/reroutes/manual", {
         method: "POST",
         body: payload,
       }),
     cancel: (id: number) =>
-      request<Reroute>(`/api/reroutes/${id}/cancel`, { method: "POST" }),
+      request<{ ok: boolean }>(`/api/reroutes/${id}/cancel`, { method: "POST" }),
     acknowledgeUncertain: (id: number, note: string) =>
-      request<Reroute>(`/api/reroutes/${id}/acknowledge-uncertain`, {
+      request<{ ok: boolean }>(`/api/reroutes/${id}/acknowledge-uncertain`, {
         method: "POST",
         body: { note },
       }),
+    rollback: (id: number) =>
+      request<RerouteResult>(`/api/reroutes/${id}/rollback`, { method: "POST" }),
   },
 
   users: {
@@ -550,6 +602,7 @@ export const api = {
   },
 
   locks: {
+    list: () => request<Lock[]>("/api/locks"),
     setGlobal: (reason: string) =>
       request<void>("/api/locks/global", { method: "POST", body: { reason } }),
     clearGlobal: () =>

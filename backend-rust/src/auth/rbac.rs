@@ -182,4 +182,7 @@ pub mod markers {
     marker!(ManageLocks => Permission::ManageLocks);
     marker!(ViewDashboard => Permission::ViewDashboard);
     marker!(ViewAudit => Permission::ViewAudit);
+    marker!(TriggerManualReroute => Permission::TriggerManualReroute);
+    marker!(ApproveDangerousReroute => Permission::ApproveDangerousReroute);
+    marker!(AcknowledgeUncertainReroute => Permission::AcknowledgeUncertainReroute);
 }

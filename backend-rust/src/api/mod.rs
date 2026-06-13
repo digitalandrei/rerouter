@@ -143,12 +143,15 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // reroutes (authz: session + RBAC + re-auth — see reroutes.rs)
         .route("/api/reroutes", get(reroutes::list))
         .route("/api/reroutes/manual", post(reroutes::manual))
+        .route("/api/reroutes/{id}", get(reroutes::show))
         .route("/api/reroutes/{id}/cancel", post(reroutes::cancel))
         .route("/api/reroutes/{id}/acknowledge-uncertain", post(reroutes::acknowledge_uncertain))
+        .route("/api/reroutes/{id}/rollback", post(reroutes::rollback))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))
         .route("/api/audit", get(audit::list))
         // safety locks + global settings
+        .route("/api/locks", get(locks::list))
         .route("/api/locks/global", post(locks::create_global).delete(locks::clear_global))
         .route("/api/settings", get(settings::show).put(settings::update))
         // user management (manage_users / superadmin only)

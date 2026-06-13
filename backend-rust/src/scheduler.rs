@@ -41,9 +41,26 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     tokio::spawn(prune_samples(pool.clone()));
+    tokio::spawn(expiry_sweep(pool.clone(), cfg.clone()));
     tokio::spawn(supervise(pool, cfg));
     tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
     Ok(())
+}
+
+/// How often to run due auto-expiry rollbacks.
+const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Periodically run rollbacks for succeeded reroutes whose auto-expiry elapsed,
+/// so a forgotten mitigation (e.g. a blackhole) self-clears. Only acts in
+/// enforce mode (the executor gates that); a no-op otherwise.
+async fn expiry_sweep(pool: MySqlPool, cfg: Arc<Config>) {
+    loop {
+        let n = crate::reroute::rollback::run_due_expiries(&pool, &cfg).await;
+        if n > 0 {
+            tracing::info!(event_type = "expiry_sweep", rollbacks = n, "ran due auto-expiry rollbacks");
+        }
+        tokio::time::sleep(EXPIRY_SWEEP_INTERVAL).await;
+    }
 }
 
 /// Periodically delete interface_samples older than the retention window so the

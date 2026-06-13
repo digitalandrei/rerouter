@@ -1,225 +1,396 @@
 /**
- * /reroutes/manual — governed by docs/reroute-engine.md and
- * docs/doctrine.md §8 (safety model) + §9 (re-auth requirement).
+ * /reroutes/manual — governed by docs/reroute-engine.md and docs/doctrine.md
+ * §8 (safety model) + §9 (re-auth requirement).
  *
- * Doctrine, non-negotiable, enforced server-side and mirrored here:
+ * Non-negotiable, enforced server-side and mirrored here:
  *  1. Reroutes only via ALLOWLISTED templates with parameter schemas — no
  *     free-text command box, ever.
- *  2. The EXACT reroute preview (template, asset, prefix, provider, method,
- *     resolved parameters) is rendered before submission; dangerous details
- *     are never hidden.
- *  3. High-safety templates require: fresh re-auth (password + TOTP via
- *     POST /api/auth/reauth), a TYPED confirmation phrase, and a mandatory
- *     reason — all validated again by the controller.
- *  4. Submission yields a `planned` action; the two-phase state machine and
- *     verification decide the outcome. "Sent" is never shown as success.
+ *  2. The EXACT commands are rendered (preview) before submission.
+ *  3. High-safety templates require: fresh re-auth (password + TOTP), a TYPED
+ *     confirmation, and a mandatory reason — all re-validated by the controller.
+ *  4. In observe mode the controller returns the would-run plan and executes
+ *     nothing. "Sent" is never shown as success — the verified state is.
  */
-import { useState, type FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
-import { api, ApiError } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import {
+  api,
+  type Template,
+  type Device,
+  type BgpPeer,
+  type RenderedPlan,
+  type RerouteResult,
+  ApiError,
+} from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { ObserveBanner } from "@/components/layout/observe-banner";
 
-const CONFIRMATION_PHRASE = "REROUTE";
+const inputClass =
+  "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+function safetyVariant(level: string): "destructive" | "secondary" | "outline" {
+  return level === "high" ? "destructive" : level === "medium" ? "secondary" : "outline";
+}
 
 export default function ManualReroute() {
-  const { reauth } = useAuth();
-  const navigate = useNavigate();
-
-  // Placeholder selection state — real implementation loads assets,
-  // providers and the allowlisted template catalog (with parameter schemas)
-  // from the API and renders schema-driven fields. No free-text commands.
-  const [assetId] = useState<number | null>(null);
-  const [providerId] = useState<number | null>(null);
-  const [template] = useState<string>("");
-  const [parameters] = useState<Record<string, unknown>>({});
-
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [templateId, setTemplateId] = useState("");
+  const [deviceId, setDeviceId] = useState("");
+  const [peers, setPeers] = useState<BgpPeer[]>([]);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [preview, setPreview] = useState<RenderedPlan | null>(null);
   const [reason, setReason] = useState("");
-  const [confirmation, setConfirmation] = useState("");
-  const [reauthPassword, setReauthPassword] = useState("");
-  const [reauthCode, setReauthCode] = useState("");
+  const [confirmText, setConfirmText] = useState("");
+  const [pw, setPw] = useState("");
+  const [code, setCode] = useState("");
+  const [reauthDone, setReauthDone] = useState(false);
+  const [results, setResults] = useState<RerouteResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
+  useEffect(() => {
+    api.templates
+      .list()
+      .then((ts) => setTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
+      .catch(() => setTemplates([]));
+    api.devices.list().then(setDevices).catch(() => setDevices([]));
+  }, []);
+
+  const loadPeers = useCallback(() => {
+    if (!deviceId) {
+      setPeers([]);
+      return;
+    }
+    api.devices.bgpPeers(parseInt(deviceId, 10)).then(setPeers).catch(() => setPeers([]));
+  }, [deviceId]);
+  useEffect(loadPeers, [loadPeers]);
+
+  const template = templates.find((t) => String(t.id) === templateId) ?? null;
+  const schema = template?.parameter_schema ?? {};
+  const isHigh = template?.safety_level === "high";
+
+  function reset() {
+    setValues({});
+    setPreview(null);
+    setResults(null);
     setError(null);
+    setConfirmText("");
+    setReauthDone(false);
+  }
 
-    if (confirmation !== CONFIRMATION_PHRASE) {
-      setError(`Type ${CONFIRMATION_PHRASE} exactly to confirm.`);
-      return;
-    }
-    if (reason.trim().length === 0) {
-      setError("A reason is required; it is audited.");
-      return;
-    }
-    if (assetId === null || providerId === null || template === "") {
-      setError("Select an asset, provider, and template first.");
-      return;
-    }
+  function selectNeighbor(name: string, addr: string) {
+    setValues((v) => {
+      const next = { ...v, [name]: addr };
+      const peer = peers.find((p) => p.peer_remote_addr === addr);
+      if (peer?.local_as != null) {
+        for (const [pname, spec] of Object.entries(schema)) {
+          if (spec.source === "bgp_local_as") next[pname] = String(peer.local_as);
+        }
+      }
+      return next;
+    });
+  }
 
-    setBusy(true);
+  function buildParams(): Record<string, unknown> {
+    const params: Record<string, unknown> = {};
+    for (const name of Object.keys(schema)) if (values[name]) params[name] = values[name];
+    return params;
+  }
+
+  async function doPreview() {
+    if (!template) return;
+    setError(null);
+    setPreview(null);
     try {
-      // Fresh re-auth immediately before the high-safety action (§9). The
-      // controller independently checks re-auth freshness; this call is the
-      // UX half of that contract.
-      await reauth(reauthPassword, reauthCode);
-      await api.reroutes.manual({
-        asset_id: assetId,
-        provider_id: providerId,
-        template,
-        parameters,
-        reason: reason.trim(),
-        confirmation,
+      const r = await api.templates.render(template.id, buildParams());
+      if (r.ok && r.plan) setPreview(r.plan);
+      else setError(r.error ?? "render failed");
+    } catch {
+      setError("render request failed");
+    }
+  }
+
+  async function reauth() {
+    setError(null);
+    try {
+      await api.auth.reauth(pw, code);
+      setReauthDone(true);
+      setPw("");
+      setCode("");
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "re-authentication failed");
+    }
+  }
+
+  async function submit(dry_run: boolean) {
+    if (!template || !deviceId) {
+      setError("Pick a template and a router.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResults(null);
+    try {
+      const res = await api.reroutes.manual({
+        template_id: template.id,
+        targets: [{ device_id: parseInt(deviceId, 10), params: buildParams() }],
+        reason: reason.trim() || undefined,
+        confirm_text: confirmText.trim() || undefined,
+        dry_run,
       });
-      navigate("/reroutes");
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Reroute rejected");
+      setResults(res.results);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "request failed");
     } finally {
       setBusy(false);
     }
   }
 
-  const inputClass =
-    "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+  // High-safety execution requires re-auth + typed confirmation + reason.
+  const executeBlocked = isHigh && (!reauthDone || !confirmText.trim() || !reason.trim());
 
   return (
-    <div className="max-w-2xl space-y-6">
-      <h1 className="text-2xl font-bold tracking-tight">Manual reroute</h1>
+    <div className="mx-auto max-w-2xl space-y-6">
+      <ObserveBanner />
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold tracking-tight">Manual reroute</h1>
+        <Button asChild variant="ghost" size="sm">
+          <Link to="/reroutes">Back to history</Link>
+        </Button>
+      </div>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">1. Select action</CardTitle>
+          <CardTitle className="text-lg">Choose a mitigation</CardTitle>
           <CardDescription>
-            Placeholder — asset, provider, and allowlisted template pickers
-            with schema-driven parameter fields. Free-text commands are
-            forbidden by doctrine.
+            Commands come only from validated templates. The exact commands are
+            shown before you run anything; in observe mode nothing executes.
           </CardDescription>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
-          Template catalog not wired yet.
-        </CardContent>
-      </Card>
-
-      <Card className="border-destructive">
-        <CardHeader>
-          <CardTitle className="text-lg">2. Exact reroute preview</CardTitle>
-          <CardDescription>
-            The precise action the controller will execute. Never hidden,
-            never summarized.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-[10rem_1fr] gap-y-2 text-sm">
-            <dt className="font-medium">Template</dt>
-            <dd>
-              <code>{template || "—"}</code>
-            </dd>
-            <dt className="font-medium">Asset / prefix</dt>
-            <dd>{assetId ?? "—"}</dd>
-            <dt className="font-medium">Provider / method</dt>
-            <dd>{providerId ?? "—"}</dd>
-            <dt className="font-medium">Parameters</dt>
-            <dd>
-              <pre className="rounded bg-muted p-2 text-xs">
-                {JSON.stringify(parameters, null, 2)}
-              </pre>
-            </dd>
-            <dt className="font-medium">Safety level</dt>
-            <dd>
-              <Badge variant="destructive">high (placeholder)</Badge>
-            </dd>
-            <dt className="font-medium">Rollback</dt>
-            <dd className="text-muted-foreground">
-              Rollback template shown here once a template is selected.
-            </dd>
-          </dl>
-        </CardContent>
-      </Card>
-
-      <form onSubmit={handleSubmit}>
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">3. Confirm and re-auth</CardTitle>
-            <CardDescription>
-              High-safety reroutes require a typed confirmation, a reason, and
-              fresh password + TOTP re-authentication.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2">
             <label className="block space-y-1 text-sm font-medium">
-              Reason (audited, required)
-              <textarea
-                required
+              Template
+              <select
                 className={inputClass}
-                rows={2}
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-              />
+                value={templateId}
+                onChange={(e) => {
+                  setTemplateId(e.target.value);
+                  reset();
+                }}
+              >
+                <option value="">Select template…</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} ({t.safety_level})
+                  </option>
+                ))}
+              </select>
             </label>
             <label className="block space-y-1 text-sm font-medium">
-              Type <code>{CONFIRMATION_PHRASE}</code> to confirm
-              <input
-                required
+              Router
+              <select
                 className={inputClass}
-                value={confirmation}
-                onChange={(e) => setConfirmation(e.target.value)}
-              />
+                value={deviceId}
+                onChange={(e) => {
+                  setDeviceId(e.target.value);
+                  setPreview(null);
+                }}
+              >
+                <option value="">Select router…</option>
+                {devices.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
             </label>
-            <div className="grid gap-4 sm:grid-cols-2">
+          </div>
+
+          {template && (
+            <>
+              <div className="flex items-center gap-2">
+                <Badge variant={safetyVariant(template.safety_level)}>
+                  {template.safety_level} safety
+                </Badge>
+                {template.description && (
+                  <span className="text-xs text-muted-foreground">{template.description}</span>
+                )}
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                {Object.entries(schema).map(([name, spec]) => (
+                  <label key={name} className="block space-y-1 text-sm font-medium">
+                    {spec.label ?? name} <span className="text-muted-foreground">({spec.type})</span>
+                    {spec.source === "bgp_peer" ? (
+                      <select
+                        className={inputClass}
+                        value={values[name] ?? ""}
+                        onChange={(e) => selectNeighbor(name, e.target.value)}
+                        disabled={!deviceId}
+                      >
+                        <option value="">{deviceId ? "Select neighbor…" : "Pick a router first"}</option>
+                        {peers.map((p) => (
+                          <option key={p.id} value={p.peer_remote_addr}>
+                            {p.peer_remote_addr}
+                            {p.peer_remote_as ? ` · AS${p.peer_remote_as}` : ""}
+                            {p.label ? ` · ${p.label}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        className={inputClass}
+                        value={values[name] ?? ""}
+                        placeholder={
+                          spec.type === "cidr" ? "e.g. 192.0.2.0/24" : spec.type === "asn" ? "e.g. 65001" : ""
+                        }
+                        onChange={(e) => setValues((v) => ({ ...v, [name]: e.target.value }))}
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+
+              <Button size="sm" variant="outline" onClick={() => void doPreview()}>
+                Preview commands
+              </Button>
+
+              {preview && (
+                <div className="space-y-2">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Exact commands
+                  </div>
+                  <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
+                    {preview.commands.join("\n")}
+                  </pre>
+                  {preview.verify && (
+                    <div className="text-xs text-muted-foreground">
+                      Verify: <code>{preview.verify.command}</code>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <label className="block space-y-1 text-sm font-medium">
-                Password
+                Reason {isHigh && <span className="text-destructive">*</span>}
                 <input
-                  type="password"
-                  required
-                  autoComplete="current-password"
                   className={inputClass}
-                  value={reauthPassword}
-                  onChange={(e) => setReauthPassword(e.target.value)}
+                  value={reason}
+                  placeholder="Why is this mitigation being applied?"
+                  onChange={(e) => setReason(e.target.value)}
                 />
               </label>
-              <label className="block space-y-1 text-sm font-medium">
-                TOTP code
-                <input
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  required
-                  className={inputClass}
-                  value={reauthCode}
-                  onChange={(e) => setReauthCode(e.target.value)}
-                />
-              </label>
-            </div>
-            {error && (
-              <p className="text-sm text-destructive" role="alert">
-                {error}
-              </p>
-            )}
-          </CardContent>
-          <CardFooter className="gap-2">
-            <Button type="submit" variant="destructive" disabled={busy}>
-              Plan reroute
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => navigate("/reroutes")}
-            >
-              Cancel
-            </Button>
-          </CardFooter>
-        </Card>
-      </form>
+
+              {isHigh && (
+                <div className="space-y-3 rounded-md border border-destructive/40 p-3">
+                  <p className="text-sm font-medium text-destructive">
+                    High-safety action — re-authentication, typed confirmation, and a reason are required.
+                  </p>
+                  <label className="block space-y-1 text-sm font-medium">
+                    Type <code>CONFIRM</code> to acknowledge
+                    <input
+                      className={inputClass}
+                      value={confirmText}
+                      onChange={(e) => setConfirmText(e.target.value)}
+                    />
+                  </label>
+                  {reauthDone ? (
+                    <Badge variant="default">re-authenticated</Badge>
+                  ) : (
+                    <div className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+                      <input
+                        className={inputClass}
+                        type="password"
+                        placeholder="Password"
+                        value={pw}
+                        onChange={(e) => setPw(e.target.value)}
+                      />
+                      <input
+                        className={inputClass}
+                        placeholder="TOTP code"
+                        value={code}
+                        onChange={(e) => setCode(e.target.value)}
+                      />
+                      <Button size="sm" variant="outline" onClick={() => void reauth()}>
+                        Re-authenticate
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {error && (
+                <p className="text-sm text-destructive" role="alert">
+                  {error}
+                </p>
+              )}
+
+              <div className="flex gap-2">
+                <Button variant="outline" disabled={busy} onClick={() => void submit(true)}>
+                  Dry run
+                </Button>
+                <Button
+                  variant="destructive"
+                  disabled={busy || executeBlocked}
+                  onClick={() => void submit(false)}
+                >
+                  Execute
+                </Button>
+              </div>
+
+              {results && (
+                <div className="space-y-2">
+                  {results.map((r, i) => (
+                    <div key={i} className="rounded-md border border-border p-3 text-sm">
+                      <div className="flex items-center gap-2">
+                        <Badge
+                          variant={
+                            r.state === "succeeded"
+                              ? "default"
+                              : r.state === "uncertain" || r.state === "failed"
+                                ? "destructive"
+                                : "secondary"
+                          }
+                        >
+                          {r.state ?? (r.executed ? "executed" : "not executed")}
+                        </Badge>
+                        <span className="text-muted-foreground">
+                          {r.device_name ?? `device ${r.device_id}`}
+                        </span>
+                      </div>
+                      <p className="mt-1">{r.message}</p>
+                      {r.would_run && (
+                        <pre className="mt-2 overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
+                          {r.would_run.commands.join("\n")}
+                        </pre>
+                      )}
+                      {r.reroute_id && (
+                        <Link
+                          to="/reroutes"
+                          className="text-xs text-primary underline-offset-4 hover:underline"
+                        >
+                          View in history →
+                        </Link>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

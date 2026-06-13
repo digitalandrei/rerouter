@@ -3,6 +3,7 @@
 //! ../agents/reroute-safety-agent.md.
 
 pub mod executor;
+pub mod locks;
 pub mod state_machine;
 pub mod templates;
 pub mod rollback;

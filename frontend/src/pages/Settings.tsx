@@ -135,9 +135,7 @@ export default function Settings() {
             variant="destructive"
             size="sm"
             onClick={() =>
-              void api.locks
-                .setGlobal("manual lock via settings page")
-                .then(loadSettings)
+              void api.settings.put({ global_lock: true }).then(setSettings)
             }
             disabled={loading || settings?.global_lock === true}
           >
@@ -146,7 +144,9 @@ export default function Settings() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => void api.locks.clearGlobal().then(loadSettings)}
+            onClick={() =>
+              void api.settings.put({ global_lock: false }).then(setSettings)
+            }
             disabled={loading || settings?.global_lock !== true}
           >
             Clear lock

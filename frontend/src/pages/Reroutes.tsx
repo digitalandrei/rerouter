@@ -2,22 +2,44 @@
  * /reroutes — governed by docs/reroute-engine.md, docs/state-recovery.md and
  * docs/doctrine.md §8.
  *
- * Lists reroute actions with their two-phase state machine state:
+ * Reroute history with the two-phase state machine:
  * planned -> pending -> running -> verifying -> {succeeded, failed, uncertain}.
- * `uncertain` is the most important state on this page: it locks the asset
- * and must be impossible to miss. Cancel and acknowledge-uncertain actions
- * live here (acknowledge requires the acknowledge_uncertain_reroute
- * permission and a note; "sent" is never displayed as success).
+ * `uncertain` is the most important state: it locks the device and must be
+ * impossible to miss. The detail drawer shows every command, its raw output,
+ * and the verification read. Cancel / acknowledge-uncertain / rollback live in
+ * the drawer ("sent" is never shown as success).
  */
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { api, type Reroute, type RerouteState } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import {
+  api,
+  type Reroute,
+  type RerouteDetail,
+  type RerouteState,
+  type Lock,
+} from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { ObserveBanner } from "@/components/layout/observe-banner";
+import { ShieldAlert, Shuffle } from "lucide-react";
 
 function stateVariant(
-  state: RerouteState,
+  state: string,
 ): "default" | "secondary" | "destructive" | "outline" {
   switch (state) {
     case "succeeded":
@@ -33,77 +55,287 @@ function stateVariant(
   }
 }
 
-export default function Reroutes() {
-  const navigate = useNavigate();
-  const [reroutes, setReroutes] = useState<Reroute[]>([]);
+function safetyVariant(level: string): "destructive" | "secondary" | "outline" {
+  return level === "high" ? "destructive" : level === "medium" ? "secondary" : "outline";
+}
 
+function RerouteDrawer({
+  id,
+  onClose,
+  onChanged,
+}: {
+  id: number;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [detail, setDetail] = useState<RerouteDetail | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api.reroutes.get(id).then(setDetail).catch(() => setDetail(null));
+  }, [id]);
   useEffect(() => {
+    load();
+  }, [load]);
+
+  async function act(fn: () => Promise<unknown>) {
+    setBusy(true);
+    try {
+      await fn();
+      load();
+      onChanged();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "action failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            Reroute #{id}
+            {detail && <Badge variant={stateVariant(detail.state)}>{detail.state}</Badge>}
+          </DialogTitle>
+        </DialogHeader>
+        {!detail ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : (
+          <div className="max-h-[70vh] space-y-4 overflow-y-auto">
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <div>
+                <span className="text-muted-foreground">Template: </span>
+                <code className="text-xs">{detail.template_name ?? "—"}</code>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Device: </span>
+                {detail.device_name ?? "—"}
+              </div>
+              <div>
+                <span className="text-muted-foreground">Trigger: </span>
+                {detail.trigger_type}
+              </div>
+              <div>
+                <span className="text-muted-foreground">By: </span>
+                {detail.triggered_by ?? "—"}
+              </div>
+              <div className="col-span-2">
+                <span className="text-muted-foreground">Verification: </span>
+                {detail.verification_status ?? "—"}
+              </div>
+              {detail.reason && (
+                <div className="col-span-2">
+                  <span className="text-muted-foreground">Reason: </span>
+                  {detail.reason}
+                </div>
+              )}
+              {detail.failure_reason && (
+                <div className="col-span-2 text-destructive">{detail.failure_reason}</div>
+              )}
+            </div>
+
+            {detail.outputs.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Commands &amp; output
+                </div>
+                {detail.outputs.map((o, i) => (
+                  <div key={i} className="rounded-md border border-border">
+                    <div className="border-b border-border bg-muted/40 px-2 py-1 font-mono text-xs">
+                      $ {o.request}
+                      {o.status && o.status !== "ok" && (
+                        <span className="ml-2 text-destructive">[{o.status}]</span>
+                      )}
+                    </div>
+                    {o.response && (
+                      <pre className="overflow-x-auto p-2 text-xs">{o.response}</pre>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {detail.verifications.length > 0 && (
+              <div className="space-y-1 text-xs">
+                <div className="font-medium uppercase tracking-wide text-muted-foreground">
+                  Verification
+                </div>
+                {detail.verifications.map((v, i) => (
+                  <div key={i}>
+                    <Badge
+                      variant={v.result === "pass" ? "default" : "destructive"}
+                      className="mr-2"
+                    >
+                      {v.result}
+                    </Badge>
+                    <code>{v.expected}</code>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 border-t border-border pt-3">
+              {(detail.state === "planned" || detail.state === "pending") && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void act(() => api.reroutes.cancel(detail.id))}
+                >
+                  Cancel
+                </Button>
+              )}
+              {detail.state === "uncertain" && (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={busy}
+                  onClick={() =>
+                    void act(() => {
+                      const note = window.prompt("Acknowledgement note (what did you verify on the router?)") ?? "";
+                      return api.reroutes.acknowledgeUncertain(detail.id, note);
+                    })
+                  }
+                >
+                  Acknowledge uncertain (clears device lock)
+                </Button>
+              )}
+              {detail.state === "succeeded" && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() =>
+                    void act(() => {
+                      if (!window.confirm("Run the rollback of this action now?")) {
+                        return Promise.resolve();
+                      }
+                      return api.reroutes.rollback(detail.id);
+                    })
+                  }
+                >
+                  Roll back
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export default function Reroutes() {
+  const [reroutes, setReroutes] = useState<Reroute[]>([]);
+  const [locks, setLocks] = useState<Lock[]>([]);
+  const [openId, setOpenId] = useState<number | null>(null);
+
+  const load = useCallback(() => {
     api.reroutes.list().then(setReroutes).catch(() => setReroutes([]));
+    api.locks.list().then(setLocks).catch(() => setLocks([]));
   }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const safetyLocks = locks.filter((l) => l.kind !== "manual" || l.scope === "device");
 
   return (
     <div className="space-y-6">
+      <ObserveBanner />
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Reroutes</h1>
-        <Button
-          variant="destructive"
-          onClick={() => navigate("/reroutes/manual")}
-        >
-          Manual reroute
+        <Button asChild variant="outline">
+          <Link to="/reroutes/manual">
+            <Shuffle className="size-4" />
+            Manual reroute
+          </Link>
         </Button>
       </div>
+
+      {safetyLocks.length > 0 && (
+        <Card className="border-destructive/50">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base text-destructive">
+              <ShieldAlert className="size-4" />
+              Safety locks active
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1 text-sm">
+            {safetyLocks.map((l) => (
+              <div key={l.id}>
+                <Badge variant="destructive" className="mr-2">
+                  {l.scope}
+                  {l.scope_ref ? ` #${l.scope_ref}` : ""}
+                </Badge>
+                <span className="text-muted-foreground">
+                  {l.kind} — {l.reason ?? ""}
+                </span>
+              </div>
+            ))}
+            <p className="pt-1 text-xs text-muted-foreground">
+              A locked device blocks reroutes until the related uncertain action is acknowledged.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">Actions</CardTitle>
-        </CardHeader>
-        <CardContent>
+        <CardContent className="px-0 py-2">
           {reroutes.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No reroute actions yet (or API not reachable).
+            <p className="px-6 py-4 text-sm text-muted-foreground">
+              No reroute actions yet.
             </p>
           ) : (
-            <ul className="divide-y">
-              {reroutes.map((reroute) => (
-                <li
-                  key={reroute.id}
-                  className="flex items-center gap-3 py-3 text-sm"
-                >
-                  <span className="font-medium">#{reroute.id}</span>
-                  <code className="text-xs">{reroute.template}</code>
-                  <span className="flex-1" />
-                  <Badge variant={stateVariant(reroute.state)}>
-                    {reroute.state}
-                  </Badge>
-                  {(reroute.state === "planned" ||
-                    reroute.state === "pending") && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void api.reroutes.cancel(reroute.id)}
-                    >
-                      Cancel
-                    </Button>
-                  )}
-                  {reroute.state === "uncertain" && (
-                    <Button
-                      size="sm"
-                      variant="destructive"
-                      onClick={() =>
-                        void api.reroutes.acknowledgeUncertain(
-                          reroute.id,
-                          "acknowledged via UI (note dialog TODO)",
-                        )
-                      }
-                    >
-                      Acknowledge uncertain
-                    </Button>
-                  )}
-                </li>
-              ))}
-            </ul>
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="pl-6">#</TableHead>
+                  <TableHead>Template</TableHead>
+                  <TableHead>Device</TableHead>
+                  <TableHead>Trigger</TableHead>
+                  <TableHead>Safety</TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead>When</TableHead>
+                  <TableHead className="pr-6 text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {reroutes.map((r) => (
+                  <TableRow key={r.id} className="hover:bg-muted/50">
+                    <TableCell className="pl-6 font-medium">{r.id}</TableCell>
+                    <TableCell>
+                      <code className="text-xs">{r.template_name ?? "—"}</code>
+                    </TableCell>
+                    <TableCell>{r.device_name ?? "—"}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{r.trigger_type}</TableCell>
+                    <TableCell>
+                      <Badge variant={safetyVariant(r.safety_level)}>{r.safety_level}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={stateVariant(r.state as RerouteState)}>{r.state}</Badge>
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {new Date(r.created_at).toLocaleString()}
+                    </TableCell>
+                    <TableCell className="pr-6 text-right">
+                      <Button size="sm" variant="ghost" onClick={() => setOpenId(r.id)}>
+                        View
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
           )}
         </CardContent>
       </Card>
+
+      {openId !== null && (
+        <RerouteDrawer id={openId} onClose={() => setOpenId(null)} onChanged={load} />
+      )}
     </div>
   );
 }
