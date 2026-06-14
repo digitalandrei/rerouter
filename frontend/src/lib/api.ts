@@ -326,6 +326,7 @@ export interface Rule {
   recovery_mode?: "auto" | "threshold" | "manual";
   recovery_threshold_value?: number | null;
   recovery_window_seconds?: number | null;
+  recovery_consecutive_samples?: number | null;
   severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;

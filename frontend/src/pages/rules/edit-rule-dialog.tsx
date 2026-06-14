@@ -52,8 +52,10 @@ export function EditRuleDialog({
     recovery_mode: (rule.recovery_mode ?? "auto") as "auto" | "threshold" | "manual",
     recovery_threshold_value:
       rule.recovery_threshold_value != null ? String(rule.recovery_threshold_value) : "",
-    recovery_window_seconds:
-      rule.recovery_window_seconds != null ? String(rule.recovery_window_seconds) : "",
+    recovery_window_minutes:
+      rule.recovery_window_seconds != null ? String(rule.recovery_window_seconds / 60) : "",
+    recovery_consecutive_samples:
+      rule.recovery_consecutive_samples != null ? String(rule.recovery_consecutive_samples) : "",
     severity: rule.severity,
   });
   const [busy, setBusy] = useState(false);
@@ -97,8 +99,12 @@ export function EditRuleDialog({
             ? parseFloat(form.recovery_threshold_value)
             : null,
         recovery_window_seconds:
-          form.recovery_mode !== "manual" && form.recovery_window_seconds
-            ? Math.max(0, parseInt(form.recovery_window_seconds, 10))
+          form.recovery_mode === "threshold" && editingIsFlow && form.recovery_window_minutes
+            ? Math.max(0, Math.round(parseFloat(form.recovery_window_minutes) * 60))
+            : null,
+        recovery_consecutive_samples:
+          form.recovery_mode === "threshold" && !editingIsFlow && form.recovery_consecutive_samples
+            ? Math.max(1, parseInt(form.recovery_consecutive_samples, 10))
             : null,
         severity: form.severity,
       });
@@ -250,31 +256,58 @@ export function EditRuleDialog({
                 ))}
               </select>
             </label>
-            {form.recovery_mode !== "manual" && (
-              <label className="block space-y-1 text-sm font-medium">
-                Settle window (seconds)
-                <input
-                  type="number"
-                  min={0}
-                  className={inputClass}
-                  value={form.recovery_window_seconds}
-                  onChange={(e) => set("recovery_window_seconds", e.target.value)}
-                  placeholder="blank = global default"
-                />
-              </label>
+            {form.recovery_mode === "auto" && (
+              <p className="sm:col-span-2 text-[11px] text-muted-foreground">
+                {editingIsFlow
+                  ? "Clears once the metric stays back under the threshold for the same sliding window used to fire."
+                  : "Clears after the same number of consecutive samples back under the threshold that fired it."}
+              </p>
+            )}
+            {form.recovery_mode === "manual" && (
+              <p className="sm:col-span-2 text-[11px] text-muted-foreground">
+                Stays firing until an operator clears it (the “Clear” button on the rule).
+              </p>
             )}
             {form.recovery_mode === "threshold" && (
-              <label className="block space-y-1 text-sm font-medium">
-                Recovery threshold
-                <input
-                  type="number"
-                  step="any"
-                  className={inputClass}
-                  value={form.recovery_threshold_value}
-                  onChange={(e) => set("recovery_threshold_value", e.target.value)}
-                  placeholder="blank = fire threshold"
-                />
-              </label>
+              <>
+                <label className="block space-y-1 text-sm font-medium">
+                  Recovery threshold
+                  <input
+                    type="number"
+                    step="any"
+                    className={inputClass}
+                    value={form.recovery_threshold_value}
+                    onChange={(e) => set("recovery_threshold_value", e.target.value)}
+                    placeholder="blank = fire threshold"
+                  />
+                </label>
+                {editingIsFlow ? (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Recovery window (minutes)
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      className={inputClass}
+                      value={form.recovery_window_minutes}
+                      onChange={(e) => set("recovery_window_minutes", e.target.value)}
+                      placeholder="blank = firing window"
+                    />
+                  </label>
+                ) : (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Recovery samples
+                    <input
+                      type="number"
+                      min={1}
+                      className={inputClass}
+                      value={form.recovery_consecutive_samples}
+                      onChange={(e) => set("recovery_consecutive_samples", e.target.value)}
+                      placeholder="blank = firing samples"
+                    />
+                  </label>
+                )}
+              </>
             )}
             <label className="block space-y-1 text-sm font-medium">
               Severity

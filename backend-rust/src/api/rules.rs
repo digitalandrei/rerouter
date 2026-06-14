@@ -54,6 +54,7 @@ struct RuleRow {
     recovery_mode: String,
     recovery_threshold_value: Option<f64>,
     recovery_window_seconds: Option<u32>,
+    recovery_consecutive_samples: Option<u32>,
     severity: String,
     enabled: bool,
     automatic_reroute_enabled: bool,
@@ -74,7 +75,8 @@ struct RuleRow {
 const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
      r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind, \
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
-     r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, r.severity, r.enabled, \
+     r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, \
+     r.recovery_consecutive_samples, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
@@ -103,6 +105,7 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "recovery_mode": r.recovery_mode,
         "recovery_threshold_value": r.recovery_threshold_value,
         "recovery_window_seconds": r.recovery_window_seconds,
+        "recovery_consecutive_samples": r.recovery_consecutive_samples,
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
@@ -210,6 +213,8 @@ pub struct RuleBody {
     recovery_threshold_value: Option<f64>,
     #[serde(default)]
     recovery_window_seconds: Option<u32>,
+    #[serde(default)]
+    recovery_consecutive_samples: Option<u32>,
     #[serde(default = "default_severity")]
     severity: String,
     #[serde(default = "default_true")]
@@ -307,22 +312,23 @@ pub async fn create(
         (None, None, None, None)
     };
 
-    // Recovery threshold only applies to threshold mode.
-    let recovery_threshold_value = if body.recovery_mode == "threshold" {
-        body.recovery_threshold_value
-    } else {
-        None
-    };
+    // Recovery threshold + persistence overrides only apply to threshold mode.
+    let (recovery_threshold_value, recovery_window_seconds, recovery_consecutive_samples) =
+        if body.recovery_mode == "threshold" {
+            (body.recovery_threshold_value, body.recovery_window_seconds, body.recovery_consecutive_samples)
+        } else {
+            (None, None, None)
+        };
 
     let res = sqlx::query(
         "INSERT INTO rules (name, interface_id, device_id, metric, \
             flow_direction, flow_protocol, flow_port, flow_port_kind, \
             operator, threshold_value, \
             duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
-            recovery_window_seconds, \
+            recovery_window_seconds, recovery_consecutive_samples, \
             severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(body.interface_id)
@@ -338,7 +344,8 @@ pub async fn create(
     .bind(body.consecutive_samples)
     .bind(&body.recovery_mode)
     .bind(recovery_threshold_value)
-    .bind(body.recovery_window_seconds)
+    .bind(recovery_window_seconds)
+    .bind(recovery_consecutive_samples)
     .bind(&body.severity)
     .bind(body.enabled)
     .bind(body.automatic_reroute_enabled)
@@ -385,6 +392,7 @@ pub struct RuleUpdate {
     recovery_mode: Option<String>,
     recovery_threshold_value: Option<Option<f64>>,
     recovery_window_seconds: Option<Option<u32>>,
+    recovery_consecutive_samples: Option<Option<u32>>,
     severity: Option<String>,
     enabled: Option<bool>,
     automatic_reroute_enabled: Option<bool>,
@@ -479,6 +487,9 @@ pub async fn update(
     if body.recovery_window_seconds.is_some() {
         sets.push("recovery_window_seconds = ?");
     }
+    if body.recovery_consecutive_samples.is_some() {
+        sets.push("recovery_consecutive_samples = ?");
+    }
     if body.severity.is_some() {
         sets.push("severity = ?");
     }
@@ -534,6 +545,9 @@ pub async fn update(
     if let Some(v) = &body.recovery_window_seconds {
         q = q.bind(*v);
     }
+    if let Some(v) = &body.recovery_consecutive_samples {
+        q = q.bind(*v);
+    }
     if let Some(v) = &body.severity {
         q = q.bind(v);
     }
@@ -564,6 +578,7 @@ pub async fn update(
         || body.recovery_mode.is_some()
         || body.recovery_threshold_value.is_some()
         || body.recovery_window_seconds.is_some()
+        || body.recovery_consecutive_samples.is_some()
         || body.flow_direction.is_some()
         || body.flow_protocol.is_some()
         || body.flow_port.is_some()
@@ -611,7 +626,7 @@ pub async fn clear(
     if exists.is_none() {
         return err(StatusCode::NOT_FOUND, "rule not found");
     }
-    match crate::detection::engine::clear_rule_manual(&state.pool, id).await {
+    match crate::detection::engine::clear_rule_manual(&state.pool, &state.config, id).await {
         Ok(cleared) => (StatusCode::OK, Json(json!({ "ok": true, "cleared": cleared }))),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }

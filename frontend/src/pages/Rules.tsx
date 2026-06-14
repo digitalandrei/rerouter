@@ -310,7 +310,8 @@ interface RuleForm {
   consecutive_samples: string;
   recovery_mode: "auto" | "threshold" | "manual";
   recovery_threshold_value: string;
-  recovery_window_seconds: string;
+  recovery_window_minutes: string; // threshold-mode flow recovery override
+  recovery_consecutive_samples: string; // threshold-mode SNMP recovery override
   severity: string;
 }
 
@@ -329,7 +330,8 @@ const DEFAULT_FORM: RuleForm = {
   consecutive_samples: "3",
   recovery_mode: "auto",
   recovery_threshold_value: "",
-  recovery_window_seconds: "",
+  recovery_window_minutes: "",
+  recovery_consecutive_samples: "",
   severity: "warning",
 };
 
@@ -541,8 +543,12 @@ export default function Rules() {
             ? parseFloat(form.recovery_threshold_value)
             : null,
         recovery_window_seconds:
-          form.recovery_mode !== "manual" && form.recovery_window_seconds
-            ? Math.max(0, parseInt(form.recovery_window_seconds, 10))
+          form.recovery_mode === "threshold" && isFlow && form.recovery_window_minutes
+            ? Math.max(0, Math.round(parseFloat(form.recovery_window_minutes) * 60))
+            : null,
+        recovery_consecutive_samples:
+          form.recovery_mode === "threshold" && !isFlow && form.recovery_consecutive_samples
+            ? Math.max(1, parseInt(form.recovery_consecutive_samples, 10))
             : null,
         severity: form.severity,
         enabled: true,
@@ -817,31 +823,58 @@ export default function Rules() {
                     ))}
                   </select>
                 </label>
-                {form.recovery_mode !== "manual" && (
-                  <label className="block space-y-1 text-sm font-medium">
-                    Settle window (seconds)
-                    <input
-                      type="number"
-                      min={0}
-                      className={inputClass}
-                      value={form.recovery_window_seconds}
-                      onChange={(e) => setField("recovery_window_seconds", e.target.value)}
-                      placeholder="blank = global default"
-                    />
-                  </label>
+                {form.recovery_mode === "auto" && (
+                  <p className="sm:col-span-2 text-[11px] text-muted-foreground">
+                    {isFlowMetric(form.metric)
+                      ? "Clears once the metric stays back under the threshold for the same sliding window used to fire."
+                      : "Clears after the same number of consecutive samples back under the threshold that fired it."}
+                  </p>
+                )}
+                {form.recovery_mode === "manual" && (
+                  <p className="sm:col-span-2 text-[11px] text-muted-foreground">
+                    Stays firing until an operator clears it (the “Clear” button on the rule).
+                  </p>
                 )}
                 {form.recovery_mode === "threshold" && (
-                  <label className="block space-y-1 text-sm font-medium">
-                    Recovery threshold
-                    <input
-                      type="number"
-                      step="any"
-                      className={inputClass}
-                      value={form.recovery_threshold_value}
-                      onChange={(e) => setField("recovery_threshold_value", e.target.value)}
-                      placeholder="clears when metric crosses back (blank = fire threshold)"
-                    />
-                  </label>
+                  <>
+                    <label className="block space-y-1 text-sm font-medium">
+                      Recovery threshold
+                      <input
+                        type="number"
+                        step="any"
+                        className={inputClass}
+                        value={form.recovery_threshold_value}
+                        onChange={(e) => setField("recovery_threshold_value", e.target.value)}
+                        placeholder="crosses back past this (blank = fire threshold)"
+                      />
+                    </label>
+                    {isFlowMetric(form.metric) ? (
+                      <label className="block space-y-1 text-sm font-medium">
+                        Recovery window (minutes)
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.5"
+                          className={inputClass}
+                          value={form.recovery_window_minutes}
+                          onChange={(e) => setField("recovery_window_minutes", e.target.value)}
+                          placeholder="blank = same as firing window"
+                        />
+                      </label>
+                    ) : (
+                      <label className="block space-y-1 text-sm font-medium">
+                        Recovery samples
+                        <input
+                          type="number"
+                          min={1}
+                          className={inputClass}
+                          value={form.recovery_consecutive_samples}
+                          onChange={(e) => setField("recovery_consecutive_samples", e.target.value)}
+                          placeholder="blank = same as firing samples"
+                        />
+                      </label>
+                    )}
+                  </>
                 )}
                 <label className="block space-y-1 text-sm font-medium">
                   Severity
