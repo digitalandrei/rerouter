@@ -127,7 +127,10 @@ impl<'a> Reader<'a> {
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], FlowError> {
         if self.remaining() < n {
-            return Err(FlowError::Short { needed: n, have: self.remaining() });
+            return Err(FlowError::Short {
+                needed: n,
+                have: self.remaining(),
+            });
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -158,7 +161,10 @@ fn be_uint(bytes: &[u8]) -> u64 {
 /// cache. Returns structured errors; the caller drops + counts on `Err`.
 pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, FlowError> {
     if datagram.len() < HEADER_LEN {
-        return Err(FlowError::Short { needed: HEADER_LEN, have: datagram.len() });
+        return Err(FlowError::Short {
+            needed: HEADER_LEN,
+            have: datagram.len(),
+        });
     }
     let mut r = Reader::new(datagram);
     let version = r.u16()?;
@@ -171,7 +177,11 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
     let sequence = r.u32()?;
     let source_id = r.u32()?;
 
-    let mut out = Decoded { source_id, sequence, ..Default::default() };
+    let mut out = Decoded {
+        source_id,
+        sequence,
+        ..Default::default()
+    };
 
     // Walk FlowSets until the datagram is exhausted. A FlowSet header is
     // flowset_id (u16) + length (u16, includes the 4 header bytes).
@@ -193,17 +203,15 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
             OPTIONS_TEMPLATE_FLOWSET_ID => {
                 out.templates_learned += parse_options_template(body, source_id, cache)?;
             }
-            id if id >= FIRST_DATA_FLOWSET_ID => {
-                match cache.get(source_id, id) {
-                    Some(t) if t.is_options => {
-                        if let Some(rate) = parse_options_data(body, t) {
-                            out.reported_sampling = Some(rate);
-                        }
+            id if id >= FIRST_DATA_FLOWSET_ID => match cache.get(source_id, id) {
+                Some(t) if t.is_options => {
+                    if let Some(rate) = parse_options_data(body, t) {
+                        out.reported_sampling = Some(rate);
                     }
-                    Some(t) => parse_data_records(body, t, &mut out.records),
-                    None => out.data_without_template += 1,
                 }
-            }
+                Some(t) => parse_data_records(body, t, &mut out.records),
+                None => out.data_without_template += 1,
+            },
             // ids 2..=255 are reserved; skip the body.
             _ => {}
         }
@@ -240,7 +248,15 @@ fn parse_templates(
         if record_len == 0 {
             return Err(FlowError::ZeroLengthRecord(template_id));
         }
-        cache.insert(source_id, template_id, Template { fields, record_len, is_options });
+        cache.insert(
+            source_id,
+            template_id,
+            Template {
+                fields,
+                record_len,
+                is_options,
+            },
+        );
         learned += 1;
     }
     Ok(learned)
@@ -278,7 +294,15 @@ fn parse_options_template(
         if record_len == 0 {
             return Err(FlowError::ZeroLengthRecord(template_id));
         }
-        cache.insert(source_id, template_id, Template { fields, record_len, is_options: true });
+        cache.insert(
+            source_id,
+            template_id,
+            Template {
+                fields,
+                record_len,
+                is_options: true,
+            },
+        );
         learned += 1;
     }
     Ok(learned)

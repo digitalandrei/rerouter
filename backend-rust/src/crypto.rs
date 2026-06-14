@@ -18,10 +18,11 @@ const NONCE_LEN: usize = 12; // 96-bit GCM nonce
 /// Load + validate the 32-byte key from `SECRETS_KEY`. Errors name the variable,
 /// never the value.
 fn load_key() -> Result<[u8; 32]> {
-    let hex_key = std::env::var(SECRETS_KEY_ENV)
-        .with_context(|| format!("env {SECRETS_KEY_ENV} not set (needed to encrypt secrets at rest)"))?;
-    let bytes = hex::decode(hex_key.trim())
-        .map_err(|_| anyhow!("{SECRETS_KEY_ENV} is not valid hex"))?;
+    let hex_key = std::env::var(SECRETS_KEY_ENV).with_context(|| {
+        format!("env {SECRETS_KEY_ENV} not set (needed to encrypt secrets at rest)")
+    })?;
+    let bytes =
+        hex::decode(hex_key.trim()).map_err(|_| anyhow!("{SECRETS_KEY_ENV} is not valid hex"))?;
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow!("{SECRETS_KEY_ENV} must decode to exactly 32 bytes (64 hex chars)"))?;
@@ -113,7 +114,10 @@ mod tests {
         with_key(|| {
             let a = seal_str("same").unwrap();
             let b = seal_str("same").unwrap();
-            assert_ne!(a, b, "two seals of the same plaintext must differ (random nonce)");
+            assert_ne!(
+                a, b,
+                "two seals of the same plaintext must differ (random nonce)"
+            );
             assert_eq!(open_str(&a).unwrap(), "same");
             assert_eq!(open_str(&b).unwrap(), "same");
         });

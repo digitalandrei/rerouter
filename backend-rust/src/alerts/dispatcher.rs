@@ -53,7 +53,10 @@ struct Recipient {
 
 /// Long-lived dispatcher loop. Spawned from main via super::spawn_dispatcher.
 pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
-    tracing::info!(event_type = "alert_dispatcher_started", "alert dispatcher running");
+    tracing::info!(
+        event_type = "alert_dispatcher_started",
+        "alert dispatcher running"
+    );
     loop {
         // Re-evaluate SMTP each cycle so configuring it later starts delivery
         // without a restart. When unconfigured we leave alerts queued.
@@ -90,7 +93,11 @@ async fn drain_once(pool: &MySqlPool, mailer: &super::mailer::Mailer) -> Result<
 /// Resolve recipients, apply dedup + rate limit, send, and record deliveries for
 /// one alert. Always records at least one delivery row (even if there are no
 /// recipients) so the alert is not re-scanned forever.
-async fn dispatch_alert(pool: &MySqlPool, mailer: &super::mailer::Mailer, alert: &PendingAlert) -> Result<()> {
+async fn dispatch_alert(
+    pool: &MySqlPool,
+    mailer: &super::mailer::Mailer,
+    alert: &PendingAlert,
+) -> Result<()> {
     let always_immediate = super::ALWAYS_IMMEDIATE.contains(&alert.event_type.as_str());
     let is_critical = alert.severity == "critical";
 
@@ -105,11 +112,19 @@ async fn dispatch_alert(pool: &MySqlPool, mailer: &super::mailer::Mailer, alert:
         // exist in the system; otherwise the EXISTS check would loop. We instead
         // mark via a system recipient row.
         ensure_processed_without_recipient(pool, alert).await?;
-        tracing::info!(event_type = "alert_no_recipients", alert_id = alert.id, "alert had no subscribed recipients");
+        tracing::info!(
+            event_type = "alert_no_recipients",
+            alert_id = alert.id,
+            "alert had no subscribed recipients"
+        );
         return Ok(());
     }
 
-    let subject = body::subject(alert.event_type.as_str(), alert.severity.as_str(), payload(alert));
+    let subject = body::subject(
+        alert.event_type.as_str(),
+        alert.severity.as_str(),
+        payload(alert),
+    );
     let text = body::render(
         alert.event_type.as_str(),
         alert.severity.as_str(),
@@ -122,19 +137,42 @@ async fn dispatch_alert(pool: &MySqlPool, mailer: &super::mailer::Mailer, alert:
         // De-dup: a prior delivery for the same dedup_key within the window
         // collapses this one (unless always-immediate).
         if !always_immediate && recently_delivered(pool, alert, &r).await? {
-            record_delivery(pool, alert.id, r.id, "queued", Some("suppressed: deduplicated within window")).await?;
+            record_delivery(
+                pool,
+                alert.id,
+                r.id,
+                "queued",
+                Some("suppressed: deduplicated within window"),
+            )
+            .await?;
             continue;
         }
         // Rate limit: too many in the last hour -> queue (digest fallback)
         // instead of sending (unless always-immediate).
         if !always_immediate && over_rate_limit(pool, r.id).await? {
-            record_delivery(pool, alert.id, r.id, "queued", Some("rate limited: deferred to digest")).await?;
+            record_delivery(
+                pool,
+                alert.id,
+                r.id,
+                "queued",
+                Some("rate limited: deferred to digest"),
+            )
+            .await?;
             continue;
         }
 
         match mailer.send(&r.email, &subject, text.clone()).await {
             Ok(()) => record_delivery(pool, alert.id, r.id, "sent", None).await?,
-            Err(e) => record_delivery(pool, alert.id, r.id, "failed", Some(&truncate(&e.to_string(), 1000))).await?,
+            Err(e) => {
+                record_delivery(
+                    pool,
+                    alert.id,
+                    r.id,
+                    "failed",
+                    Some(&truncate(&e.to_string(), 1000)),
+                )
+                .await?
+            }
         }
     }
     Ok(())
@@ -143,7 +181,11 @@ async fn dispatch_alert(pool: &MySqlPool, mailer: &super::mailer::Mailer, alert:
 /// Resolve the recipient set: verified recipients with an enabled subscription
 /// matching the alert's event_type (NULL=all). Critical alerts additionally fan
 /// out to every admin user that has a recipient row.
-async fn resolve_recipients(pool: &MySqlPool, alert: &PendingAlert, is_critical: bool) -> Result<Vec<Recipient>> {
+async fn resolve_recipients(
+    pool: &MySqlPool,
+    alert: &PendingAlert,
+    is_critical: bool,
+) -> Result<Vec<Recipient>> {
     let mut map: std::collections::BTreeMap<u64, Recipient> = std::collections::BTreeMap::new();
 
     let subbed = sqlx::query_as::<_, (u64, String)>(
@@ -209,8 +251,18 @@ async fn over_rate_limit(pool: &MySqlPool, recipient_id: u64) -> Result<bool> {
 }
 
 /// Insert an alert_deliveries row. `sent` stamps sent_at.
-async fn record_delivery(pool: &MySqlPool, alert_id: u64, recipient_id: u64, status: &str, error: Option<&str>) -> Result<()> {
-    let sent_at_sql = if status == "sent" { "UTC_TIMESTAMP()" } else { "NULL" };
+async fn record_delivery(
+    pool: &MySqlPool,
+    alert_id: u64,
+    recipient_id: u64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let sent_at_sql = if status == "sent" {
+        "UTC_TIMESTAMP()"
+    } else {
+        "NULL"
+    };
     let sql = format!(
         "INSERT INTO alert_deliveries (alert_id, recipient_id, channel, status, error, sent_at) \
          VALUES (?, ?, 'email', ?, ?, {sent_at_sql})"
@@ -232,28 +284,36 @@ async fn ensure_processed_without_recipient(pool: &MySqlPool, alert: &PendingAle
     // Lazily ensure a sentinel recipient exists (unverified so it never receives
     // real mail). Keyed by a fixed address.
     const SENTINEL: &str = "unrouted@rerouter.local";
-    let id: u64 = match sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
-        .bind(SENTINEL)
-        .fetch_optional(pool)
-        .await?
-    {
-        Some(id) => id,
-        None => {
-            let res = sqlx::query("INSERT IGNORE INTO alert_recipients (email) VALUES (?)")
-                .bind(SENTINEL)
-                .execute(pool)
-                .await?;
-            if res.rows_affected() > 0 {
-                res.last_insert_id()
-            } else {
-                sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
+    let id: u64 =
+        match sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
+            .bind(SENTINEL)
+            .fetch_optional(pool)
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                let res = sqlx::query("INSERT IGNORE INTO alert_recipients (email) VALUES (?)")
                     .bind(SENTINEL)
-                    .fetch_one(pool)
-                    .await?
+                    .execute(pool)
+                    .await?;
+                if res.rows_affected() > 0 {
+                    res.last_insert_id()
+                } else {
+                    sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
+                        .bind(SENTINEL)
+                        .fetch_one(pool)
+                        .await?
+                }
             }
-        }
-    };
-    record_delivery(pool, alert.id, id, "queued", Some("no subscribed recipients")).await
+        };
+    record_delivery(
+        pool,
+        alert.id,
+        id,
+        "queued",
+        Some("no subscribed recipients"),
+    )
+    .await
 }
 
 fn payload(alert: &PendingAlert) -> &Value {

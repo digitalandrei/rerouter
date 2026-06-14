@@ -52,7 +52,12 @@ pub struct ExecOutcome {
 }
 
 /// Execute (or render/observe/dry-run) one action against one device.
-pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run: bool) -> ExecOutcome {
+pub async fn execute(
+    pool: &MySqlPool,
+    cfg: &Config,
+    req: ActionRequest,
+    dry_run: bool,
+) -> ExecOutcome {
     let device_name = device_name(pool, req.device_id).await;
     let device_ref = req.device_id.to_string();
 
@@ -93,31 +98,59 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
 
     // Safety gates (device-scoped).
     if crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await {
-        return blocked(&req, device_name, "global maintenance lock is active".into());
+        return blocked(
+            &req,
+            device_name,
+            "global maintenance lock is active".into(),
+        );
     }
-    if locks::is_blocked(pool, "device", &device_ref).await.unwrap_or(true) {
-        return blocked(&req, device_name, "device is locked (a prior action needs admin acknowledgement)".into());
+    if locks::is_blocked(pool, "device", &device_ref)
+        .await
+        .unwrap_or(true)
+    {
+        return blocked(
+            &req,
+            device_name,
+            "device is locked (a prior action needs admin acknowledgement)".into(),
+        );
     }
     if running_on_device(pool, req.device_id).await {
-        return blocked(&req, device_name, "another reroute is already running on this device".into());
+        return blocked(
+            &req,
+            device_name,
+            "another reroute is already running on this device".into(),
+        );
     }
     if has_uncertain(pool, req.device_id).await {
-        return blocked(&req, device_name, "an unresolved uncertain action exists on this device".into());
+        return blocked(
+            &req,
+            device_name,
+            "an unresolved uncertain action exists on this device".into(),
+        );
     }
     if let Ok(Some(until)) = cooldown::active_until(pool, "device", &device_ref).await {
-        return blocked(&req, device_name, format!("device is in cooldown until {}", until.to_rfc3339()));
+        return blocked(
+            &req,
+            device_name,
+            format!("device is in cooldown until {}", until.to_rfc3339()),
+        );
     }
     // Per-rule re-fire throttle (only for rule-triggered actions).
     if let Some(rule_id) = req.rule_id {
         if let Ok(Some(until)) = cooldown::active_until(pool, "rule", &rule_id.to_string()).await {
-            return blocked(&req, device_name, format!("rule {rule_id} is in cooldown until {}", until.to_rfc3339()));
+            return blocked(
+                &req,
+                device_name,
+                format!("rule {rule_id} is in cooldown until {}", until.to_rfc3339()),
+            );
         }
     }
     // Global circuit breaker: cap executed actions per rolling window across all
     // devices. Counts real reroute rows (manual + automatic + rollback).
     let rl_count = cfg.safety.global_action_rate_limit_count;
     if rl_count > 0 {
-        let recent = recent_reroute_count(pool, cfg.safety.global_action_rate_limit_window_seconds).await;
+        let recent =
+            recent_reroute_count(pool, cfg.safety.global_action_rate_limit_window_seconds).await;
         if recent >= rl_count as i64 {
             return blocked(
                 &req,
@@ -135,8 +168,26 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
         Ok(id) => id,
         Err(e) => return blocked(&req, device_name, format!("could not persist reroute: {e}")),
     };
-    audit(pool, &req, reroute_id, "reroute_planned", &format!("planned '{}' on device {}", req.template.name, req.device_id)).await;
-    enqueue_alert(pool, &req, reroute_id, "reroute_started", "info", json!({ "commands": plan.commands })).await;
+    audit(
+        pool,
+        &req,
+        reroute_id,
+        "reroute_planned",
+        &format!(
+            "planned '{}' on device {}",
+            req.template.name, req.device_id
+        ),
+    )
+    .await;
+    enqueue_alert(
+        pool,
+        &req,
+        reroute_id,
+        "reroute_started",
+        "info",
+        json!({ "commands": plan.commands }),
+    )
+    .await;
 
     let final_state = run_state_machine(pool, &req, reroute_id, &plan).await;
 
@@ -163,7 +214,9 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
     let message = match final_state.as_str() {
         "succeeded" => "reroute executed and verified".to_string(),
         "failed" => "reroute failed — verification did not confirm the change".to_string(),
-        "uncertain" => "reroute UNCERTAIN — device locked pending admin acknowledgement".to_string(),
+        "uncertain" => {
+            "reroute UNCERTAIN — device locked pending admin acknowledgement".to_string()
+        }
         other => format!("reroute ended in state {other}"),
     };
     ExecOutcome {
@@ -180,12 +233,19 @@ pub async fn execute(pool: &MySqlPool, cfg: &Config, req: ActionRequest, dry_run
 
 /// Push the apply commands, verify the result, finalize the state. Returns the
 /// final state string. Persists before/after each phase.
-async fn run_state_machine(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, plan: &RenderedPlan) -> String {
+async fn run_state_machine(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    plan: &RenderedPlan,
+) -> String {
     // -> running
-    let _ = sqlx::query("UPDATE reroutes SET state = 'running', started_at = UTC_TIMESTAMP() WHERE id = ?")
-        .bind(reroute_id)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE reroutes SET state = 'running', started_at = UTC_TIMESTAMP() WHERE id = ?",
+    )
+    .bind(reroute_id)
+    .execute(pool)
+    .await;
 
     // Apply over a single SSH session (config mode state must persist across the
     // command sequence, so this cannot be split into per-command sessions).
@@ -193,7 +253,15 @@ async fn run_state_machine(pool: &MySqlPool, req: &ActionRequest, reroute_id: u6
     let applied_ok = match &apply {
         Ok(out) => {
             for (i, r) in out.results.iter().enumerate() {
-                persist_output(pool, reroute_id, (i + 1) as u32, &r.command, &r.output, "ok").await;
+                persist_output(
+                    pool,
+                    reroute_id,
+                    (i + 1) as u32,
+                    &r.command,
+                    &r.output,
+                    "ok",
+                )
+                .await;
             }
             let _ = sqlx::query("UPDATE reroute_steps SET state = 'done' WHERE reroute_id = ?")
                 .bind(reroute_id)
@@ -243,15 +311,31 @@ enum Verdict {
 }
 
 /// Run the verification `show` read and judge it (substring expect/reject).
-async fn verify(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, plan: &RenderedPlan) -> Verdict {
+async fn verify(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    plan: &RenderedPlan,
+) -> Verdict {
     let Some(vstep) = plan.verify.as_ref() else {
         return Verdict::None;
     };
     match ssh::run_commands(pool, req.device_id, std::slice::from_ref(&vstep.command)).await {
         Ok(out) => {
-            let output = out.results.first().map(|r| r.output.clone()).unwrap_or_default();
+            let output = out
+                .results
+                .first()
+                .map(|r| r.output.clone())
+                .unwrap_or_default();
             let pass = judge(&output, vstep);
-            persist_verification(pool, reroute_id, vstep, &output, if pass { "pass" } else { "fail" }).await;
+            persist_verification(
+                pool,
+                reroute_id,
+                vstep,
+                &output,
+                if pass { "pass" } else { "fail" },
+            )
+            .await;
             if pass {
                 Verdict::Pass
             } else {
@@ -259,7 +343,14 @@ async fn verify(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, plan: &R
             }
         }
         Err(e) => {
-            persist_verification(pool, reroute_id, vstep, &format!("verify read failed: {e}"), "uncertain").await;
+            persist_verification(
+                pool,
+                reroute_id,
+                vstep,
+                &format!("verify read failed: {e}"),
+                "uncertain",
+            )
+            .await;
             Verdict::Uncertain
         }
     }
@@ -282,7 +373,14 @@ fn judge(output: &str, v: &VerifyStep) -> bool {
 }
 
 /// Write the terminal state + side effects (lock on uncertain, alerts, audit).
-async fn finalize(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, state: &str, applied_ok: bool, verdict: Verdict) {
+async fn finalize(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    state: &str,
+    applied_ok: bool,
+    verdict: Verdict,
+) {
     let success: Option<bool> = match state {
         "succeeded" => Some(true),
         "failed" => Some(false),
@@ -344,7 +442,14 @@ async fn finalize(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, state:
         json!({ "verification": verification_status, "failure_reason": failure_reason }),
     )
     .await;
-    audit(pool, req, reroute_id, &format!("reroute_{state}"), &format!("reroute #{reroute_id} {state}")).await;
+    audit(
+        pool,
+        req,
+        reroute_id,
+        &format!("reroute_{state}"),
+        &format!("reroute #{reroute_id} {state}"),
+    )
+    .await;
 
     tracing::info!(
         event_type = "reroute_finalized",
@@ -358,7 +463,11 @@ async fn finalize(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, state:
 
 // ---- persistence helpers -------------------------------------------------------
 
-async fn insert_reroute(pool: &MySqlPool, req: &ActionRequest, plan: &RenderedPlan) -> anyhow::Result<u64> {
+async fn insert_reroute(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    plan: &RenderedPlan,
+) -> anyhow::Result<u64> {
     let steps = json!({ "commands": plan.commands, "verify": plan.verify });
     let res = sqlx::query(
         "INSERT INTO reroutes \
@@ -392,7 +501,14 @@ async fn insert_reroute(pool: &MySqlPool, req: &ActionRequest, plan: &RenderedPl
     Ok(reroute_id)
 }
 
-async fn persist_output(pool: &MySqlPool, reroute_id: u64, step: u32, request: &str, response: &str, status: &str) {
+async fn persist_output(
+    pool: &MySqlPool,
+    reroute_id: u64,
+    step: u32,
+    request: &str,
+    response: &str,
+    status: &str,
+) {
     let _ = sqlx::query(
         "INSERT INTO reroute_outputs (reroute_id, step_number, request, response, status, started_at, finished_at) \
          VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())",
@@ -406,7 +522,13 @@ async fn persist_output(pool: &MySqlPool, reroute_id: u64, step: u32, request: &
     .await;
 }
 
-async fn persist_verification(pool: &MySqlPool, reroute_id: u64, v: &VerifyStep, observed: &str, result: &str) {
+async fn persist_verification(
+    pool: &MySqlPool,
+    reroute_id: u64,
+    v: &VerifyStep,
+    observed: &str,
+    result: &str,
+) {
     let expected = format!(
         "expect={} reject={}",
         v.expect.as_deref().unwrap_or("-"),
@@ -424,7 +546,14 @@ async fn persist_verification(pool: &MySqlPool, reroute_id: u64, v: &VerifyStep,
     .await;
 }
 
-async fn enqueue_alert(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event_type: &str, severity: &str, extra: Value) {
+async fn enqueue_alert(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    event_type: &str,
+    severity: &str,
+    extra: Value,
+) {
     let payload = json!({
         "reroute_id": reroute_id,
         "template": req.template.name,
@@ -448,7 +577,11 @@ async fn enqueue_alert(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, e
 }
 
 async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &str, message: &str) {
-    let actor_type = if req.user_id.is_some() { "user" } else { "controller" };
+    let actor_type = if req.user_id.is_some() {
+        "user"
+    } else {
+        "controller"
+    };
     let _ = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
          VALUES (?, ?, ?, 'reroute', ?, ?, ?)",
@@ -484,11 +617,13 @@ async fn running_on_device(pool: &MySqlPool, device_id: u64) -> bool {
 }
 
 async fn has_uncertain(pool: &MySqlPool, device_id: u64) -> bool {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state = 'uncertain'")
-        .bind(device_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(1);
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state = 'uncertain'",
+    )
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(1);
     n > 0
 }
 

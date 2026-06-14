@@ -65,10 +65,16 @@ pub async fn migrate(pool: &MySqlPool) -> Result<()> {
         .await
         .unwrap_or(0);
     if applied_before == 0 {
-        tracing::info!(event_type = "db_fresh", "fresh database — creating schema and seeds");
+        tracing::info!(
+            event_type = "db_fresh",
+            "fresh database — creating schema and seeds"
+        );
     }
 
-    MIGRATOR.run(pool).await.context("applying sqlx migrations")?;
+    MIGRATOR
+        .run(pool)
+        .await
+        .context("applying sqlx migrations")?;
 
     let applied_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(pool)
@@ -83,7 +89,11 @@ pub async fn migrate(pool: &MySqlPool) -> Result<()> {
             "applied {newly_applied} migration(s) ({applied_after} total)"
         );
     } else {
-        tracing::info!(event_type = "db_schema_current", total = applied_after, "schema up to date");
+        tracing::info!(
+            event_type = "db_schema_current",
+            total = applied_after,
+            "schema up to date"
+        );
     }
     Ok(())
 }
@@ -110,4 +120,3 @@ fn describe_url(url: &str) -> String {
     };
     format!("user '{user}' @ {host}, database '{db}'")
 }
-

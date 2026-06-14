@@ -68,8 +68,8 @@ const OID_ENT_PHYS_NAME: &str = "1.3.6.1.2.1.47.1.1.1.1.7";
 const OID_SENSOR_PRECISION: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.3";
 const OID_SENSOR_VALUE: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.4";
 const OID_SENSOR_STATUS: &str = "1.3.6.1.4.1.9.9.91.1.1.1.1.5"; // 1 = ok
-// BGP4-MIB (1.3.6.1.2.1.15) — IPv4 BGP peer table, indexed by the peer's remote
-// IP (4 OID arcs). Used to discover scrubber sessions operators can toggle.
+                                                                // BGP4-MIB (1.3.6.1.2.1.15) — IPv4 BGP peer table, indexed by the peer's remote
+                                                                // IP (4 OID arcs). Used to discover scrubber sessions operators can toggle.
 const OID_BGP_LOCAL_AS: &str = "1.3.6.1.2.1.15.2.0"; // scalar
 const OID_BGP_PEER_STATE: &str = "1.3.6.1.2.1.15.3.1.2"; // 1..6 FSM state
 const OID_BGP_PEER_ADMIN_STATUS: &str = "1.3.6.1.2.1.15.3.1.3"; // 1=stop(shut) 2=start
@@ -155,7 +155,10 @@ pub async fn load_enabled_devices(pool: &MySqlPool) -> Result<Vec<DeviceConn>> {
 /// decrypts the community. v3 is explicitly unsupported in v1.
 async fn connect(dev: &DeviceConn) -> Result<Snmp2cClient> {
     if dev.snmp_version != "v2c" {
-        return Err(anyhow!("SNMP {} is unsupported in v1 (v2c only)", dev.snmp_version));
+        return Err(anyhow!(
+            "SNMP {} is unsupported in v1 (v2c only)",
+            dev.snmp_version
+        ));
     }
     let community = match &dev.community_encrypted {
         Some(blob) => crypto::open(blob).context("decrypting SNMP community")?,
@@ -178,7 +181,9 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     let host_for_err = host.clone();
     let addrs = tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
-        (host.as_str(), port).to_socket_addrs().map(|it| it.collect::<Vec<_>>())
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
     })
     .await
     .context("DNS resolver task")?
@@ -198,7 +203,10 @@ pub async fn test(dev: &DeviceConn) -> Result<DeviceIdentity> {
     let client = connect(dev).await?;
 
     let descr = get_string(&client, OID_SYS_DESCR).await.ok();
-    let sys_name = get_string(&client, OID_SYS_NAME).await.ok().filter(|s| !s.is_empty());
+    let sys_name = get_string(&client, OID_SYS_NAME)
+        .await
+        .ok()
+        .filter(|s| !s.is_empty());
     let sys_uptime = client
         .get(oid(OID_SYS_UPTIME)?)
         .await
@@ -207,7 +215,9 @@ pub async fn test(dev: &DeviceConn) -> Result<DeviceIdentity> {
 
     // At least sysDescr must answer, or this isn't a usable SNMP agent.
     if descr.is_none() && sys_name.is_none() && sys_uptime.is_none() {
-        return Err(anyhow!("device did not answer SNMP (check community, version, reachability)"));
+        return Err(anyhow!(
+            "device did not answer SNMP (check community, version, reachability)"
+        ));
     }
 
     let (vendor, model, os_version) = descr
@@ -215,7 +225,14 @@ pub async fn test(dev: &DeviceConn) -> Result<DeviceIdentity> {
         .map(parse_sys_descr)
         .unwrap_or((None, None, None));
 
-    Ok(DeviceIdentity { vendor, model, os_version, sys_name, sys_descr: descr, sys_uptime })
+    Ok(DeviceIdentity {
+        vendor,
+        model,
+        os_version,
+        sys_name,
+        sys_descr: descr,
+        sys_uptime,
+    })
 }
 
 /// `test` + persist the identity/reachability back onto the device row. Returns
@@ -287,13 +304,23 @@ pub async fn discover(dev: &DeviceConn) -> Result<Vec<DiscoveredInterface>> {
     let client = connect(dev).await?;
 
     let if_names = walk_strings(&client, OID_IF_NAME).await?;
-    let if_aliases = walk_strings(&client, OID_IF_ALIAS).await.unwrap_or_default();
-    let if_descrs = walk_strings(&client, OID_IF_DESCR).await.unwrap_or_default();
-    let if_high_speed = walk_u64(&client, OID_IF_HIGH_SPEED).await.unwrap_or_default();
+    let if_aliases = walk_strings(&client, OID_IF_ALIAS)
+        .await
+        .unwrap_or_default();
+    let if_descrs = walk_strings(&client, OID_IF_DESCR)
+        .await
+        .unwrap_or_default();
+    let if_high_speed = walk_u64(&client, OID_IF_HIGH_SPEED)
+        .await
+        .unwrap_or_default();
     let if_speed = walk_u64(&client, OID_IF_SPEED).await.unwrap_or_default();
     let if_type = walk_u64(&client, OID_IF_TYPE).await.unwrap_or_default();
-    let if_admin = walk_u64(&client, OID_IF_ADMIN_STATUS).await.unwrap_or_default();
-    let if_oper = walk_u64(&client, OID_IF_OPER_STATUS).await.unwrap_or_default();
+    let if_admin = walk_u64(&client, OID_IF_ADMIN_STATUS)
+        .await
+        .unwrap_or_default();
+    let if_oper = walk_u64(&client, OID_IF_OPER_STATUS)
+        .await
+        .unwrap_or_default();
 
     // The set of ifIndexes from any table that returned rows. ifDescr (ifTable)
     // is the most universally present, so union it with ifName (ifXTable).
@@ -301,7 +328,9 @@ pub async fn discover(dev: &DeviceConn) -> Result<Vec<DiscoveredInterface>> {
     indexes.extend(if_names.keys().copied());
     indexes.extend(if_descrs.keys().copied());
     if indexes.is_empty() {
-        return Err(anyhow!("no interfaces found (ifXTable/ifTable empty or blocked by the agent's MIB view)"));
+        return Err(anyhow!(
+            "no interfaces found (ifXTable/ifTable empty or blocked by the agent's MIB view)"
+        ));
     }
 
     let mut out = Vec::with_capacity(indexes.len());
@@ -318,7 +347,10 @@ pub async fn discover(dev: &DeviceConn) -> Result<Vec<DiscoveredInterface>> {
             if_speed_bps: speed_bps,
             admin_status: if_admin.get(&idx).map(|&v| admin_status_str(v).to_string()),
             oper_status: if_oper.get(&idx).map(|&v| oper_status_str(v).to_string()),
-            is_physical: if_type.get(&idx).map(|&t| is_physical_type(t)).unwrap_or(false),
+            is_physical: if_type
+                .get(&idx)
+                .map(|&t| is_physical_type(t))
+                .unwrap_or(false),
         });
     }
     Ok(out)
@@ -390,9 +422,15 @@ pub async fn discover_bgp_and_store(pool: &MySqlPool, device_id: u64) -> Result<
         .and_then(|v| value_to_u64(&v))
         .filter(|&n| n > 0);
 
-    let states = walk_ip_u64(&client, OID_BGP_PEER_STATE).await.unwrap_or_default();
-    let admins = walk_ip_u64(&client, OID_BGP_PEER_ADMIN_STATUS).await.unwrap_or_default();
-    let remote_as = walk_ip_u64(&client, OID_BGP_PEER_REMOTE_AS).await.unwrap_or_default();
+    let states = walk_ip_u64(&client, OID_BGP_PEER_STATE)
+        .await
+        .unwrap_or_default();
+    let admins = walk_ip_u64(&client, OID_BGP_PEER_ADMIN_STATUS)
+        .await
+        .unwrap_or_default();
+    let remote_as = walk_ip_u64(&client, OID_BGP_PEER_REMOTE_AS)
+        .await
+        .unwrap_or_default();
 
     // Union of peer IPs seen across the columns (state is the authoritative set).
     let mut peers: std::collections::BTreeSet<String> = states.keys().cloned().collect();
@@ -445,7 +483,9 @@ fn index_by_ip<T>(
 ) -> BTreeMap<String, T> {
     let mut out = BTreeMap::new();
     for (entry_oid, value) in raw {
-        let Some(rel) = entry_oid.relative_to(base) else { continue };
+        let Some(rel) = entry_oid.relative_to(base) else {
+            continue;
+        };
         let arcs = rel.as_slice();
         if arcs.len() < 4 {
             continue;
@@ -541,19 +581,40 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     };
 
     // Walk the counter columns once each (GETBULK), then index by ifIndex.
-    let in_oct = walk_u64(&client, OID_IF_HC_IN_OCTETS).await.unwrap_or_default();
-    let out_oct = walk_u64(&client, OID_IF_HC_OUT_OCTETS).await.unwrap_or_default();
-    let in_pkt = walk_u64(&client, OID_IF_HC_IN_UCAST).await.unwrap_or_default();
-    let out_pkt = walk_u64(&client, OID_IF_HC_OUT_UCAST).await.unwrap_or_default();
-    let in_err = walk_u64(&client, OID_IF_IN_ERRORS).await.unwrap_or_default();
-    let out_err = walk_u64(&client, OID_IF_OUT_ERRORS).await.unwrap_or_default();
-    let in_disc = walk_u64(&client, OID_IF_IN_DISCARDS).await.unwrap_or_default();
-    let out_disc = walk_u64(&client, OID_IF_OUT_DISCARDS).await.unwrap_or_default();
-    let oper = walk_u64(&client, OID_IF_OPER_STATUS).await.unwrap_or_default();
-    let admin = walk_u64(&client, OID_IF_ADMIN_STATUS).await.unwrap_or_default();
+    let in_oct = walk_u64(&client, OID_IF_HC_IN_OCTETS)
+        .await
+        .unwrap_or_default();
+    let out_oct = walk_u64(&client, OID_IF_HC_OUT_OCTETS)
+        .await
+        .unwrap_or_default();
+    let in_pkt = walk_u64(&client, OID_IF_HC_IN_UCAST)
+        .await
+        .unwrap_or_default();
+    let out_pkt = walk_u64(&client, OID_IF_HC_OUT_UCAST)
+        .await
+        .unwrap_or_default();
+    let in_err = walk_u64(&client, OID_IF_IN_ERRORS)
+        .await
+        .unwrap_or_default();
+    let out_err = walk_u64(&client, OID_IF_OUT_ERRORS)
+        .await
+        .unwrap_or_default();
+    let in_disc = walk_u64(&client, OID_IF_IN_DISCARDS)
+        .await
+        .unwrap_or_default();
+    let out_disc = walk_u64(&client, OID_IF_OUT_DISCARDS)
+        .await
+        .unwrap_or_default();
+    let oper = walk_u64(&client, OID_IF_OPER_STATUS)
+        .await
+        .unwrap_or_default();
+    let admin = walk_u64(&client, OID_IF_ADMIN_STATUS)
+        .await
+        .unwrap_or_default();
 
     if in_oct.is_empty() && out_oct.is_empty() {
-        let msg = "poll returned no HC octet counters (agent may not support ifXTable / 64-bit counters)";
+        let msg =
+            "poll returned no HC octet counters (agent may not support ifXTable / 64-bit counters)";
         mark_unreachable(pool, device_id, msg).await;
         return Err(anyhow!(msg));
     }
@@ -586,8 +647,12 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             load_baseline(pool, m.interface_id).await?;
         let rates = interface_rates(&current, previous.as_ref(), m.if_speed_bps);
 
-        let oper_s = oper.get(&m.if_index).map(|&v| oper_status_str(v).to_string());
-        let admin_s = admin.get(&m.if_index).map(|&v| admin_status_str(v).to_string());
+        let oper_s = oper
+            .get(&m.if_index)
+            .map(|&v| oper_status_str(v).to_string());
+        let admin_s = admin
+            .get(&m.if_index)
+            .map(|&v| admin_status_str(v).to_string());
 
         let cur_in_err = in_err.get(&m.if_index).copied();
         let cur_out_err = out_err.get(&m.if_index).copied();
@@ -637,7 +702,13 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
 async fn load_baseline(
     pool: &MySqlPool,
     interface_id: u64,
-) -> Result<(Option<InterfaceCounters>, Option<u64>, Option<u64>, Option<u64>, Option<u64>)> {
+) -> Result<(
+    Option<InterfaceCounters>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+)> {
     // sampled_at is a TIMESTAMP column -> DateTime<Utc> (sqlx-mysql maps
     // NaiveDateTime only to DATETIME).
     type Row = (
@@ -811,7 +882,10 @@ async fn mark_unreachable(pool: &MySqlPool, device_id: u64, error: &str) {
 
 /// GET one OID as a UTF-8 string (lossy for non-UTF-8 octet strings).
 async fn get_string(client: &Snmp2cClient, oid_str: &str) -> Result<String> {
-    let v = client.get(oid(oid_str)?).await.with_context(|| format!("GET {oid_str}"))?;
+    let v = client
+        .get(oid(oid_str)?)
+        .await
+        .with_context(|| format!("GET {oid_str}"))?;
     Ok(value_to_string(&v))
 }
 
@@ -823,7 +897,9 @@ async fn walk_strings(client: &Snmp2cClient, base: &str) -> Result<BTreeMap<u32,
         .walk_bulk(base_oid, BULK_REPETITIONS)
         .await
         .with_context(|| format!("walk {base}"))?;
-    Ok(index_by_suffix(&base_oid, raw, |v| Some(value_to_string(&v))))
+    Ok(index_by_suffix(&base_oid, raw, |v| {
+        Some(value_to_string(&v))
+    }))
 }
 
 /// Walk a table column and return ifIndex -> u64 (counters, speeds, statuses).
@@ -856,9 +932,13 @@ fn index_by_suffix<T>(
 ) -> BTreeMap<u32, T> {
     let mut out = BTreeMap::new();
     for (oid, value) in raw {
-        let Some(rel) = oid.relative_to(base) else { continue };
+        let Some(rel) = oid.relative_to(base) else {
+            continue;
+        };
         // ifIndex is the last arc; ifXTable/ifTable have exactly one index arc.
-        let Some(idx) = rel.as_slice().last().copied() else { continue };
+        let Some(idx) = rel.as_slice().last().copied() else {
+            continue;
+        };
         if let Some(v) = map(value) {
             out.insert(idx, v);
         }
@@ -869,11 +949,13 @@ fn index_by_suffix<T>(
 /// Coerce any SNMP value to a string (octet strings decode UTF-8 lossily).
 fn value_to_string(v: &ObjectValue) -> String {
     match v {
-        ObjectValue::String(bytes) | ObjectValue::Opaque(bytes) => {
-            String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string()
-        }
+        ObjectValue::String(bytes) | ObjectValue::Opaque(bytes) => String::from_utf8_lossy(bytes)
+            .trim_end_matches('\0')
+            .to_string(),
         ObjectValue::Integer(i) => i.to_string(),
-        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => n.to_string(),
+        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => {
+            n.to_string()
+        }
         ObjectValue::Counter64(n) => n.to_string(),
         ObjectValue::IpAddress(ip) => ip.to_string(),
         ObjectValue::ObjectId(o) => o.to_string(),
@@ -884,7 +966,9 @@ fn value_to_string(v: &ObjectValue) -> String {
 fn value_to_u64(v: &ObjectValue) -> Option<u64> {
     match v {
         ObjectValue::Counter64(n) => Some(*n),
-        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => Some(*n as u64),
+        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => {
+            Some(*n as u64)
+        }
         ObjectValue::Integer(i) if *i >= 0 => Some(*i as u64),
         _ => None,
     }
@@ -894,7 +978,9 @@ fn value_to_u64(v: &ObjectValue) -> Option<u64> {
 fn value_to_i64(v: &ObjectValue) -> Option<i64> {
     match v {
         ObjectValue::Integer(i) => Some(*i as i64),
-        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => Some(*n as i64),
+        ObjectValue::Counter32(n) | ObjectValue::Unsigned32(n) | ObjectValue::TimeTicks(n) => {
+            Some(*n as i64)
+        }
         ObjectValue::Counter64(n) => Some(*n as i64),
         _ => None,
     }
@@ -913,8 +999,14 @@ struct Optics {
 /// Parse "subslot A/B transceiver N <kind> Sensor" -> port path "A/B/N".
 fn transceiver_port(name: &str) -> Option<String> {
     let toks: Vec<&str> = name.split_whitespace().collect();
-    let subslot = toks.iter().position(|&t| t == "subslot").and_then(|i| toks.get(i + 1))?;
-    let n = toks.iter().position(|&t| t == "transceiver").and_then(|i| toks.get(i + 1))?;
+    let subslot = toks
+        .iter()
+        .position(|&t| t == "subslot")
+        .and_then(|i| toks.get(i + 1))?;
+    let n = toks
+        .iter()
+        .position(|&t| t == "transceiver")
+        .and_then(|i| toks.get(i + 1))?;
     if !n.chars().all(|c| c.is_ascii_digit()) {
         return None; // "transceiver container" / the transceiver entity itself
     }
@@ -931,13 +1023,19 @@ fn numeric_path(s: &str) -> &str {
 /// Best-effort: an empty map if the agent exposes no optics. Reading scaling is
 /// `entSensorValue / 10^entSensorPrecision`; kind comes from the entPhysicalName.
 async fn collect_optics(client: &Snmp2cClient, ifaces: &[PollInterface]) -> BTreeMap<u64, Optics> {
-    let names = walk_strings(client, OID_ENT_PHYS_NAME).await.unwrap_or_default();
+    let names = walk_strings(client, OID_ENT_PHYS_NAME)
+        .await
+        .unwrap_or_default();
     if names.is_empty() {
         return BTreeMap::new();
     }
-    let precs = walk_u64(client, OID_SENSOR_PRECISION).await.unwrap_or_default();
+    let precs = walk_u64(client, OID_SENSOR_PRECISION)
+        .await
+        .unwrap_or_default();
     let vals = walk_i64(client, OID_SENSOR_VALUE).await.unwrap_or_default();
-    let status = walk_u64(client, OID_SENSOR_STATUS).await.unwrap_or_default();
+    let status = walk_u64(client, OID_SENSOR_STATUS)
+        .await
+        .unwrap_or_default();
 
     // entPhysicalIndex sensors -> optics grouped by port path ("0/0/0").
     let mut by_port: BTreeMap<String, Optics> = BTreeMap::new();
@@ -954,7 +1052,9 @@ async fn collect_optics(client: &Snmp2cClient, ifaces: &[PollInterface]) -> BTre
         } else {
             continue;
         };
-        let Some(port) = transceiver_port(name) else { continue };
+        let Some(port) = transceiver_port(name) else {
+            continue;
+        };
         let Some(&val) = vals.get(idx) else { continue };
         let prec = precs.get(idx).copied().unwrap_or(0);
         let actual = val as f64 / 10f64.powi(prec as i32);
@@ -974,7 +1074,12 @@ async fn collect_optics(client: &Snmp2cClient, ifaces: &[PollInterface]) -> BTre
             .as_deref()
             .map(numeric_path)
             .filter(|p| !p.is_empty())
-            .or_else(|| ifc.if_descr.as_deref().map(numeric_path).filter(|p| !p.is_empty()));
+            .or_else(|| {
+                ifc.if_descr
+                    .as_deref()
+                    .map(numeric_path)
+                    .filter(|p| !p.is_empty())
+            });
         if let Some(path) = path {
             if let Some(opt) = by_port.get(path) {
                 out.insert(ifc.interface_id, opt.clone());
@@ -1016,7 +1121,10 @@ pub fn parse_sys_descr(descr: &str) -> (Option<String>, Option<String>, Option<S
             .split_whitespace()
             .find(|t| {
                 let u = t.to_uppercase();
-                u.starts_with("ASR") || u.starts_with("ISR") || u.starts_with("CSR") || u.starts_with("NEXUS")
+                u.starts_with("ASR")
+                    || u.starts_with("ISR")
+                    || u.starts_with("CSR")
+                    || u.starts_with("NEXUS")
             })
             .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string());
         return (vendor, model, version);
@@ -1032,7 +1140,10 @@ pub fn parse_sys_descr(descr: &str) -> (Option<String>, Option<String>, Option<S
 
     if lower.contains("linux") {
         // "Linux host 6.8.0-x ..." — kernel version is the 3rd token.
-        let version = descr.split_whitespace().nth(2).map(|s| format!("Linux {s}"));
+        let version = descr
+            .split_whitespace()
+            .nth(2)
+            .map(|s| format!("Linux {s}"));
         return (Some("Linux".to_string()), None, version);
     }
     if lower.contains("mikrotik") || lower.contains("routeros") {

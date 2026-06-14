@@ -78,12 +78,14 @@ impl From<TemplateRow> for Template {
 
 /// Load one template by id.
 pub async fn load(pool: &MySqlPool, id: u64) -> Result<Template> {
-    let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {COLS} FROM reroute_templates WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .context("loading reroute template")?
-        .ok_or_else(|| anyhow!("reroute template {id} not found"))?;
+    let row = sqlx::query_as::<_, TemplateRow>(&format!(
+        "SELECT {COLS} FROM reroute_templates WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("loading reroute template")?
+    .ok_or_else(|| anyhow!("reroute template {id} not found"))?;
     Ok(row.into())
 }
 
@@ -132,7 +134,10 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
     let mut subst: Map<String, Value> = Map::new();
     for (name, spec) in schema_obj {
         let ty = spec.get("type").and_then(Value::as_str).unwrap_or("string");
-        let required = spec.get("required").and_then(Value::as_bool).unwrap_or(false);
+        let required = spec
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // Optional schema default, used when the caller omits the param.
         let default = spec.get("default").and_then(|d| match d {
@@ -193,7 +198,9 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
     // Containment pass: a `subprefix_of` param must sit within its parent CIDR
     // (the AWS-SG-style "any subnet of, including the whole prefix" rule).
     for (name, spec) in schema_obj {
-        let Some(parent) = spec.get("subprefix_of").and_then(Value::as_str) else { continue };
+        let Some(parent) = spec.get("subprefix_of").and_then(Value::as_str) else {
+            continue;
+        };
         if let (Some(child), Some(par)) = (
             subst.get(name).and_then(Value::as_str),
             subst.get(parent).and_then(Value::as_str),
@@ -213,15 +220,27 @@ fn cidr_contains(parent: &str, child: &str) -> Result<bool> {
     if clen < plen {
         return Ok(false); // child must be equal or longer (more specific)
     }
-    let pmask: u32 = if plen == 0 { 0 } else { u32::MAX.checked_shl(32 - plen).unwrap_or(0) };
+    let pmask: u32 = if plen == 0 {
+        0
+    } else {
+        u32::MAX.checked_shl(32 - plen).unwrap_or(0)
+    };
     Ok((cnet & pmask) == (pnet & pmask))
 }
 
 /// Parse "a.b.c.d/len" -> (u32 network bits, prefix length).
 fn parse_cidr_parts(s: &str) -> Result<(u32, u32)> {
-    let (ip, len) = s.split_once('/').ok_or_else(|| anyhow!("invalid CIDR '{s}'"))?;
-    let ip: Ipv4Addr = ip.trim().parse().map_err(|_| anyhow!("invalid IPv4 in '{s}'"))?;
-    let len: u32 = len.trim().parse().map_err(|_| anyhow!("invalid prefix length in '{s}'"))?;
+    let (ip, len) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid CIDR '{s}'"))?;
+    let ip: Ipv4Addr = ip
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid IPv4 in '{s}'"))?;
+    let len: u32 = len
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid prefix length in '{s}'"))?;
     if len > 32 {
         bail!("prefix length out of range in '{s}'");
     }
@@ -235,8 +254,14 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
     }
     let subst = validate_and_expand(&t.parameter_schema, params)?;
 
-    let plan = t.plan.as_object().ok_or_else(|| anyhow!("template has no plan"))?;
-    let config_mode = plan.get("config_mode").and_then(Value::as_bool).unwrap_or(false);
+    let plan = t
+        .plan
+        .as_object()
+        .ok_or_else(|| anyhow!("template has no plan"))?;
+    let config_mode = plan
+        .get("config_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let apply = plan
         .get("apply")
         .and_then(Value::as_array)
@@ -247,7 +272,9 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
         commands.push("configure terminal".to_string());
     }
     for c in apply {
-        let raw = c.as_str().ok_or_else(|| anyhow!("plan command is not a string"))?;
+        let raw = c
+            .as_str()
+            .ok_or_else(|| anyhow!("plan command is not a string"))?;
         commands.push(substitute(raw, &subst)?);
     }
     if config_mode {
@@ -303,12 +330,22 @@ fn parse_cidr_v4(s: &str) -> Result<(String, String, String)> {
     let (ip_s, len_s) = s
         .split_once('/')
         .ok_or_else(|| anyhow!("expected CIDR a.b.c.d/len"))?;
-    let ip: Ipv4Addr = ip_s.trim().parse().map_err(|_| anyhow!("invalid IPv4 address"))?;
-    let len: u32 = len_s.trim().parse().map_err(|_| anyhow!("invalid prefix length"))?;
+    let ip: Ipv4Addr = ip_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid IPv4 address"))?;
+    let len: u32 = len_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid prefix length"))?;
     if len > 32 {
         bail!("prefix length must be 0..32");
     }
-    let mask: u32 = if len == 0 { 0 } else { u32::MAX.checked_shl(32 - len).unwrap_or(0) };
+    let mask: u32 = if len == 0 {
+        0
+    } else {
+        u32::MAX.checked_shl(32 - len).unwrap_or(0)
+    };
     let net = u32::from(ip) & mask;
     Ok((
         Ipv4Addr::from(net).to_string(),
@@ -343,11 +380,27 @@ mod tests {
             "target": {"type": "cidr", "required": true, "subprefix_of": "parent"},
         });
         // more-specific within the parent, and equal to the parent, are allowed.
-        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.2.128/25"})).is_ok());
-        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.2.0/24"})).is_ok());
+        assert!(validate_and_expand(
+            &schema,
+            &json!({"parent": "192.0.2.0/24", "target": "192.0.2.128/25"})
+        )
+        .is_ok());
+        assert!(validate_and_expand(
+            &schema,
+            &json!({"parent": "192.0.2.0/24", "target": "192.0.2.0/24"})
+        )
+        .is_ok());
         // a different block, or a less-specific block, are rejected.
-        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "198.51.100.0/24"})).is_err());
-        assert!(validate_and_expand(&schema, &json!({"parent": "192.0.2.0/24", "target": "192.0.0.0/16"})).is_err());
+        assert!(validate_and_expand(
+            &schema,
+            &json!({"parent": "192.0.2.0/24", "target": "198.51.100.0/24"})
+        )
+        .is_err());
+        assert!(validate_and_expand(
+            &schema,
+            &json!({"parent": "192.0.2.0/24", "target": "192.0.0.0/16"})
+        )
+        .is_err());
     }
 
     #[test]

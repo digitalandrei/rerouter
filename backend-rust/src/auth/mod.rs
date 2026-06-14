@@ -10,9 +10,9 @@
 //!   * every auth event is audited with actor, real IP, and user-agent.
 
 pub mod password;
-pub mod totp;
-pub mod sessions;
 pub mod rbac;
+pub mod sessions;
+pub mod totp;
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -64,12 +64,28 @@ async fn login(
 
     // Generic failure response — identical for unknown email and bad password.
     let deny = |jar: SignedCookieJar<Key>| {
-        (jar, (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_credentials" }))))
+        (
+            jar,
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_credentials" })),
+            ),
+        )
     };
 
     // Load the user (and lock/2FA state) by email. TIMESTAMP columns decode as
     // DateTime<Utc> (sqlx-mysql maps NaiveDateTime only to DATETIME).
-    let row = sqlx::query_as::<_, (u64, String, String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            u64,
+            String,
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ),
+    >(
         "SELECT id, name, password, two_factor_confirmed_at, locked_until, two_factor_secret \
          FROM users WHERE email = ?",
     )
@@ -89,26 +105,63 @@ async fn login(
     // Lockout check (email + IP throttle expressed as a per-account lock window).
     if let Some(until) = locked_until {
         if until > chrono::Utc::now() {
-            audit(pool, Some(user_id), "login_failed", &ip, &ua, "account locked").await;
-            return (jar, (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "account_locked" }))));
+            audit(
+                pool,
+                Some(user_id),
+                "login_failed",
+                &ip,
+                &ua,
+                "account locked",
+            )
+            .await;
+            return (
+                jar,
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "account_locked" })),
+                ),
+            );
         }
     }
 
     // Verify the password.
     if !password::verify(&body.password, &phc).unwrap_or(false) {
-        register_failure(pool, user_id, cfg.lockout_threshold, cfg.lockout_minutes as i64, &ip, &ua).await;
+        register_failure(
+            pool,
+            user_id,
+            cfg.lockout_threshold,
+            cfg.lockout_minutes as i64,
+            &ip,
+            &ua,
+        )
+        .await;
         return deny(jar);
     }
 
     // Password OK — create a pre-2FA session. "Remember me" picks the longer TTL;
     // the chosen lifetime is persisted in the session row (expires_at) so it
     // survives the token rotation at /totp and an app restart.
-    let ttl_hours = if body.remember { cfg.remember_me_ttl_hours } else { cfg.session_ttl_hours } as i64;
+    let ttl_hours = if body.remember {
+        cfg.remember_me_ttl_hours
+    } else {
+        cfg.session_ttl_hours
+    } as i64;
     let (_session_id, token) = match sessions::create(pool, user_id, &ip, &ua, ttl_hours).await {
         Ok(v) => v,
-        Err(_) => return (jar, (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "session_create_failed" })))),
+        Err(_) => {
+            return (
+                jar,
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "session_create_failed" })),
+                ),
+            )
+        }
     };
-    let jar = jar.add(sessions::build_cookie(token, time::Duration::hours(ttl_hours)));
+    let jar = jar.add(sessions::build_cookie(
+        token,
+        time::Duration::hours(ttl_hours),
+    ));
 
     // Reset the failure counter on a correct password.
     let _ = sqlx::query("UPDATE users SET failed_login_attempts = 0 WHERE id = ?")
@@ -118,8 +171,19 @@ async fn login(
 
     let confirmed = totp_confirmed_at.is_some() && totp_secret_enc.is_some();
     if confirmed {
-        audit(pool, Some(user_id), "login_success", &ip, &ua, "password ok; awaiting totp").await;
-        return (jar, (StatusCode::OK, Json(json!({ "totp_required": true }))));
+        audit(
+            pool,
+            Some(user_id),
+            "login_success",
+            &ip,
+            &ua,
+            "password ok; awaiting totp",
+        )
+        .await;
+        return (
+            jar,
+            (StatusCode::OK, Json(json!({ "totp_required": true }))),
+        );
     }
 
     // No confirmed TOTP -> enrollment. Generate + persist an UNCONFIRMED secret
@@ -134,7 +198,15 @@ async fn login(
                     .execute(pool)
                     .await;
             }
-            audit(pool, Some(user_id), "login_success", &ip, &ua, "password ok; totp enrollment required").await;
+            audit(
+                pool,
+                Some(user_id),
+                "login_success",
+                &ip,
+                &ua,
+                "password ok; totp enrollment required",
+            )
+            .await;
             (
                 jar,
                 (
@@ -146,7 +218,13 @@ async fn login(
                 ),
             )
         }
-        Err(_) => (jar, (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "enrollment_failed" })))),
+        Err(_) => (
+            jar,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "enrollment_failed" })),
+            ),
+        ),
     }
 }
 
@@ -173,26 +251,51 @@ async fn totp_challenge(
 
     // Load the pre-2FA session from the cookie.
     let Some(cookie) = jar.get(sessions::SESSION_COOKIE) else {
-        return (jar, (StatusCode::UNAUTHORIZED, Json(json!({ "error": "no_session" }))));
+        return (
+            jar,
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "no_session" })),
+            ),
+        );
     };
     let session = match sessions::validate_pre2fa(pool, cookie.value()).await {
         Ok(Some(s)) => s,
-        _ => return (jar, (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_session" })))),
+        _ => {
+            return (
+                jar,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "invalid_session" })),
+                ),
+            )
+        }
     };
     let user_id = session.user_id;
 
     // Load the user's email + (encrypted) secret + confirmation state.
-    let Some((email, secret_hex, confirmed_at)) =
-        sqlx::query_as::<_, (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
-            "SELECT email, two_factor_secret, two_factor_confirmed_at FROM users WHERE id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return (jar, (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_session" }))));
+    let Some((email, secret_hex, confirmed_at)) = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT email, two_factor_secret, two_factor_confirmed_at FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten() else {
+        return (
+            jar,
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_session" })),
+            ),
+        );
     };
 
     let first_confirmation = confirmed_at.is_none();
@@ -216,25 +319,55 @@ async fn totp_challenge(
     }
 
     if !ok {
-        audit(pool, Some(user_id), "2fa_failed", &ip, &ua, "invalid totp/recovery code").await;
-        return (jar, (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_code" }))));
+        audit(
+            pool,
+            Some(user_id),
+            "2fa_failed",
+            &ip,
+            &ua,
+            "invalid totp/recovery code",
+        )
+        .await;
+        return (
+            jar,
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_code" })),
+            ),
+        );
     }
 
     // Success. Rotate the session token and mark it verified.
     let new_token = match sessions::mark_totp_verified_and_rotate(pool, session.id).await {
         Ok(t) => t,
-        Err(_) => return (jar, (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "session_update_failed" })))),
+        Err(_) => {
+            return (
+                jar,
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "session_update_failed" })),
+                ),
+            )
+        }
     };
     // Keep the cookie's lifetime aligned with the session row (which already
     // encodes the remember-me choice made at /login).
-    let remaining = (session.expires_at - chrono::Utc::now()).num_seconds().max(60);
-    let jar = jar.add(sessions::build_cookie(new_token, time::Duration::seconds(remaining)));
+    let remaining = (session.expires_at - chrono::Utc::now())
+        .num_seconds()
+        .max(60);
+    let jar = jar.add(sessions::build_cookie(
+        new_token,
+        time::Duration::seconds(remaining),
+    ));
 
     // First confirmation: stamp two_factor_confirmed_at + issue recovery codes.
     let mut new_recovery_codes: Option<Vec<String>> = None;
     if first_confirmation {
         let codes = totp::generate_recovery_codes();
-        let hashes: Vec<String> = codes.iter().filter_map(|c| password::hash(c).ok()).collect();
+        let hashes: Vec<String> = codes
+            .iter()
+            .filter_map(|c| password::hash(c).ok())
+            .collect();
         if let Ok(json_hashes) = serde_json::to_string(&hashes) {
             let _ = sqlx::query(
                 "UPDATE users SET two_factor_confirmed_at = UTC_TIMESTAMP(), two_factor_recovery_codes = ?, \
@@ -247,23 +380,57 @@ async fn totp_challenge(
             .await;
         }
         new_recovery_codes = Some(codes);
-        audit(pool, Some(user_id), "2fa_enrolled", &ip, &ua, "totp confirmed; recovery codes issued").await;
+        audit(
+            pool,
+            Some(user_id),
+            "2fa_enrolled",
+            &ip,
+            &ua,
+            "totp confirmed; recovery codes issued",
+        )
+        .await;
     } else {
-        let _ = sqlx::query("UPDATE users SET last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?")
-            .bind(&ip)
-            .bind(user_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE users SET last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
+        )
+        .bind(&ip)
+        .bind(user_id)
+        .execute(pool)
+        .await;
     }
 
     if used_recovery {
         // Security event — always sent immediately (super::alerts ALWAYS_IMMEDIATE).
-        audit(pool, Some(user_id), "2fa_recovery_used", &ip, &ua, "recovery code consumed").await;
-        let _ = enqueue_security_alert(pool, "2fa_recovery_used", user_id, "a single-use recovery code was used to sign in").await;
+        audit(
+            pool,
+            Some(user_id),
+            "2fa_recovery_used",
+            &ip,
+            &ua,
+            "recovery code consumed",
+        )
+        .await;
+        let _ = enqueue_security_alert(
+            pool,
+            "2fa_recovery_used",
+            user_id,
+            "a single-use recovery code was used to sign in",
+        )
+        .await;
     }
-    audit(pool, Some(user_id), "login_success", &ip, &ua, "2fa complete").await;
+    audit(
+        pool,
+        Some(user_id),
+        "login_success",
+        &ip,
+        &ua,
+        "2fa complete",
+    )
+    .await;
 
-    let user = rbac::load_session_user(pool, user_id).await.unwrap_or(Value::Null);
+    let user = rbac::load_session_user(pool, user_id)
+        .await
+        .unwrap_or(Value::Null);
     let mut resp = json!({ "user": user });
     if let Some(codes) = new_recovery_codes {
         resp["recovery_codes"] = json!(codes); // shown once
@@ -284,7 +451,15 @@ async fn logout(
             let _ = sessions::expire(pool, session.id).await;
             let ip = client_ip(&headers, Some(&socket));
             let ua = user_agent(&headers);
-            audit(pool, Some(session.user_id), "logout", &ip, &ua, "session expired").await;
+            audit(
+                pool,
+                Some(session.user_id),
+                "logout",
+                &ip,
+                &ua,
+                "session expired",
+            )
+            .await;
         }
     }
     let jar = jar.add(sessions::removal_cookie());
@@ -296,16 +471,19 @@ async fn logout(
 async fn me(State(state): State<AppState>, session: Session) -> JsonResp {
     match rbac::load_session_user(&state.pool, session.user_id).await {
         Ok(user) => (StatusCode::OK, Json(user)),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "lookup_failed" }))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "lookup_failed" })),
+        ),
     }
 }
-
 
 // ---- helpers -------------------------------------------------------------------
 
 /// A fixed valid Argon2id PHC string used to spend ~equal CPU when the email is
 /// unknown, so login timing does not leak account existence.
-const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+const DUMMY_PHC: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
 
 /// Decrypt a hex-encoded sealed TOTP secret back to base32.
 fn decrypt_secret(secret_hex: &str) -> Option<String> {
@@ -314,11 +492,20 @@ fn decrypt_secret(secret_hex: &str) -> Option<String> {
 }
 
 /// Increment failed_login_attempts; lock the account when the threshold is hit.
-async fn register_failure(pool: &sqlx::MySqlPool, user_id: u64, threshold: u32, lock_minutes: i64, ip: &str, ua: &str) {
-    let _ = sqlx::query("UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = ?")
-        .bind(user_id)
-        .execute(pool)
-        .await;
+async fn register_failure(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    threshold: u32,
+    lock_minutes: i64,
+    ip: &str,
+    ua: &str,
+) {
+    let _ = sqlx::query(
+        "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = ?",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await;
 
     let current: u32 = sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = ?")
         .bind(user_id)
@@ -338,14 +525,32 @@ async fn register_failure(pool: &sqlx::MySqlPool, user_id: u64, threshold: u32, 
         .bind(user_id)
         .execute(pool)
         .await;
-        audit(pool, Some(user_id), "account_locked", ip, ua, "failed login threshold exceeded").await;
-        let _ = enqueue_security_alert(pool, "account_locked", user_id, "account locked after repeated failed logins").await;
+        audit(
+            pool,
+            Some(user_id),
+            "account_locked",
+            ip,
+            ua,
+            "failed login threshold exceeded",
+        )
+        .await;
+        let _ = enqueue_security_alert(
+            pool,
+            "account_locked",
+            user_id,
+            "account locked after repeated failed logins",
+        )
+        .await;
     }
 }
 
 /// Constant-ish-time single-use recovery-code check. Codes are stored as a JSON
 /// array of Argon2id hashes; on a match, remove that hash (single-use).
-async fn consume_recovery_code(pool: &sqlx::MySqlPool, user_id: u64, code: &str) -> anyhow::Result<bool> {
+async fn consume_recovery_code(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    code: &str,
+) -> anyhow::Result<bool> {
     let Some(json_hashes): Option<String> =
         sqlx::query_scalar("SELECT two_factor_recovery_codes FROM users WHERE id = ?")
             .bind(user_id)
@@ -376,7 +581,14 @@ async fn consume_recovery_code(pool: &sqlx::MySqlPool, user_id: u64, code: &str)
 }
 
 /// Insert an audit_logs row (best-effort; auth must not fail because audit did).
-async fn audit(pool: &sqlx::MySqlPool, user_id: Option<u64>, event: &str, ip: &str, ua: &str, message: &str) {
+async fn audit(
+    pool: &sqlx::MySqlPool,
+    user_id: Option<u64>,
+    event: &str,
+    ip: &str,
+    ua: &str,
+    message: &str,
+) {
     let _ = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
          VALUES ('user', ?, ?, ?, ?, ?)",
@@ -393,7 +605,12 @@ async fn audit(pool: &sqlx::MySqlPool, user_id: Option<u64>, event: &str, ip: &s
 /// Enqueue a security alert (always-immediate event types). Recipient is the
 /// user's own email when present; the dispatcher also fans critical events to
 /// admins. dedup_key namespaces by event+user.
-async fn enqueue_security_alert(pool: &sqlx::MySqlPool, event_type: &str, user_id: u64, message: &str) -> anyhow::Result<()> {
+async fn enqueue_security_alert(
+    pool: &sqlx::MySqlPool,
+    event_type: &str,
+    user_id: u64,
+    message: &str,
+) -> anyhow::Result<()> {
     let payload = json!({ "message": message, "user_id": user_id });
     let dedup_key = format!("{event_type}:user:{user_id}");
     sqlx::query(

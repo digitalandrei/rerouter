@@ -4,6 +4,6 @@
 
 pub mod executor;
 pub mod locks;
+pub mod rollback;
 pub mod state_machine;
 pub mod templates;
-pub mod rollback;

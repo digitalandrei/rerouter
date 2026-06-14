@@ -70,7 +70,10 @@ pub async fn list(
             let out: Vec<Value> = rows
                 .into_iter()
                 .map(|r| {
-                    let actor = r.actor_email.clone().unwrap_or_else(|| r.actor_type.clone());
+                    let actor = r
+                        .actor_email
+                        .clone()
+                        .unwrap_or_else(|| r.actor_type.clone());
                     let subject = match (&r.entity_type, r.entity_id) {
                         (Some(t), Some(id)) => format!("{t}#{id}"),
                         (Some(t), None) => t.clone(),

@@ -9,18 +9,18 @@
 //! CF-Connecting-IP, forwarded by Nginx; trusted because only Cloudflare can
 //! reach Nginx and only Nginx can reach us.
 
-pub mod health;
-pub mod rules;
-pub mod templates;
-pub mod rtbh;
-pub mod reroutes;
 pub mod alerts;
 pub mod audit;
-pub mod locks;
-pub mod settings;
 pub mod devices;
-pub mod interfaces;
 pub mod flows;
+pub mod health;
+pub mod interfaces;
+pub mod locks;
+pub mod reroutes;
+pub mod rtbh;
+pub mod rules;
+pub mod settings;
+pub mod templates;
 pub mod users;
 
 use anyhow::{Context, Result};
@@ -73,7 +73,10 @@ pub fn cookie_key_from_env() -> Result<Key> {
     let secret = std::env::var("SESSION_SECRET")
         .context("env SESSION_SECRET not set (needed to sign session cookies)")?;
     let bytes = hex::decode(secret.trim()).unwrap_or_else(|_| secret.into_bytes());
-    anyhow::ensure!(bytes.len() >= 32, "SESSION_SECRET must be at least 32 bytes");
+    anyhow::ensure!(
+        bytes.len() >= 32,
+        "SESSION_SECRET must be at least 32 bytes"
+    );
     if bytes.len() >= 64 {
         Ok(Key::from(&bytes))
     } else {
@@ -95,7 +98,11 @@ pub(crate) fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
 pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cookie_key = cookie_key_from_env()?;
     let bind = cfg.server.bind.clone();
-    let state = AppState { pool, config: cfg, cookie_key };
+    let state = AppState {
+        pool,
+        config: cfg,
+        cookie_key,
+    };
 
     let app = Router::new()
         // unauthenticated liveness probe — everything else requires a session
@@ -105,17 +112,37 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .nest("/api/auth", auth::router())
         // devices (SNMP) — telemetry source of record in v1
         .route("/api/devices", get(devices::list).post(devices::create))
-        .route("/api/devices/{id}", get(devices::show).put(devices::update).delete(devices::remove))
+        .route(
+            "/api/devices/{id}",
+            get(devices::show)
+                .put(devices::update)
+                .delete(devices::remove),
+        )
         .route("/api/devices/{id}/test", post(devices::test))
         .route("/api/devices/{id}/discover", post(devices::discover))
         .route("/api/devices/{id}/ssh-test", post(devices::ssh_test))
-        .route("/api/devices/{id}/ssh-generate-key", post(devices::generate_key))
-        .route("/api/devices/{id}/ssh-capabilities", post(devices::ssh_capabilities))
-        .route("/api/devices/{id}/discover-bgp", post(devices::discover_bgp))
+        .route(
+            "/api/devices/{id}/ssh-generate-key",
+            post(devices::generate_key),
+        )
+        .route(
+            "/api/devices/{id}/ssh-capabilities",
+            post(devices::ssh_capabilities),
+        )
+        .route(
+            "/api/devices/{id}/discover-bgp",
+            post(devices::discover_bgp),
+        )
         .route("/api/devices/{id}/bgp-peers", get(devices::bgp_peers))
-        .route("/api/devices/{device_id}/bgp-peers/{peer_id}", patch(devices::update_bgp_peer))
+        .route(
+            "/api/devices/{device_id}/bgp-peers/{peer_id}",
+            patch(devices::update_bgp_peer),
+        )
         .route("/api/devices/{id}/bgp-networks", get(devices::bgp_networks))
-        .route("/api/devices/{id}/discover-prefixes", post(devices::discover_prefixes))
+        .route(
+            "/api/devices/{id}/discover-prefixes",
+            post(devices::discover_prefixes),
+        )
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
         // flow telemetry (NetFlow/IPFIX) — read-only second source, see flows.rs
         .route("/api/devices/{id}/flows/top", get(flows::top))
@@ -127,10 +154,16 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/interfaces/{id}/metrics", get(interfaces::metrics))
         // rules
         .route("/api/rules", get(rules::list).post(rules::create))
-        .route("/api/rules/{id}", get(rules::show).put(rules::update).delete(rules::remove))
+        .route(
+            "/api/rules/{id}",
+            get(rules::show).put(rules::update).delete(rules::remove),
+        )
         .route("/api/rules/{id}/clear", post(rules::clear))
         .route("/api/rules/{id}/actions", post(rules::add_action))
-        .route("/api/rules/{rule_id}/actions/{action_id}", delete(rules::remove_action))
+        .route(
+            "/api/rules/{rule_id}/actions/{action_id}",
+            delete(rules::remove_action),
+        )
         // reroute template catalog (read-only) + render/preview
         .route("/api/templates", get(templates::list))
         .route("/api/templates/{id}", get(templates::show))
@@ -143,14 +176,20 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/reroutes/manual", post(reroutes::manual))
         .route("/api/reroutes/{id}", get(reroutes::show))
         .route("/api/reroutes/{id}/cancel", post(reroutes::cancel))
-        .route("/api/reroutes/{id}/acknowledge-uncertain", post(reroutes::acknowledge_uncertain))
+        .route(
+            "/api/reroutes/{id}/acknowledge-uncertain",
+            post(reroutes::acknowledge_uncertain),
+        )
         .route("/api/reroutes/{id}/rollback", post(reroutes::rollback))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))
         .route("/api/audit", get(audit::list))
         // safety locks + global settings
         .route("/api/locks", get(locks::list))
-        .route("/api/locks/global", post(locks::create_global).delete(locks::clear_global))
+        .route(
+            "/api/locks/global",
+            post(locks::create_global).delete(locks::clear_global),
+        )
         .route("/api/settings", get(settings::show).put(settings::update))
         // user management (manage_users / superadmin only)
         .route("/api/users", get(users::list).post(users::create))
@@ -177,10 +216,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
 /// Extract the real client IP: trust CF-Connecting-IP (Nginx forwards it),
 /// falling back to the socket peer address. Used for throttling, lockout, and
 /// audit. See ../docs/authentication.md "Cloudflare note".
-pub fn client_ip(
-    headers: &axum::http::HeaderMap,
-    socket: Option<&std::net::SocketAddr>,
-) -> String {
+pub fn client_ip(headers: &axum::http::HeaderMap, socket: Option<&std::net::SocketAddr>) -> String {
     headers
         .get("CF-Connecting-IP")
         .and_then(|v| v.to_str().ok())

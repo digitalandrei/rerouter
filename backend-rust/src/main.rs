@@ -25,7 +25,11 @@ use clap::Parser;
 struct Cli {
     /// Path to config.toml. If the file is missing, built-in defaults (an exact
     /// mirror of config.example.toml) are used with a warning.
-    #[arg(long, env = "REROUTER_CONFIG", default_value = "/srv/rerouter/config.toml")]
+    #[arg(
+        long,
+        env = "REROUTER_CONFIG",
+        default_value = "/srv/rerouter/config.toml"
+    )]
     config: String,
 
     /// .env file loaded into the process environment at startup. Variables
@@ -127,12 +131,18 @@ async fn main() -> Result<()> {
     let pool = match db::preflight_connect(&cfg).await {
         Ok(pool) => pool,
         Err(e) => {
-            eprintln!("rerouter-controller: {e:#} — fix DATABASE_URL in {} and retry", cli.env_file);
+            eprintln!(
+                "rerouter-controller: {e:#} — fix DATABASE_URL in {} and retry",
+                cli.env_file
+            );
             std::process::exit(1);
         }
     };
     if cli.check_db {
-        tracing::info!(event_type = "check_db_ok", "database credential preflight passed");
+        tracing::info!(
+            event_type = "check_db_ok",
+            "database credential preflight passed"
+        );
         println!("database connection OK");
         return Ok(());
     }
@@ -152,7 +162,10 @@ async fn main() -> Result<()> {
         // Seeds ship as idempotent migrations (INSERT IGNORE), so they were
         // just (re)applied above. TODO(milestone 3): re-seed deliberately
         // deleted templates outside the migration history.
-        tracing::info!(event_type = "seed_templates_done", "starter template seeds applied; exiting");
+        tracing::info!(
+            event_type = "seed_templates_done",
+            "starter template seeds applied; exiting"
+        );
         return Ok(());
     }
     if cli.create_admin {

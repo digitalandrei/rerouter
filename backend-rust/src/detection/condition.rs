@@ -95,7 +95,7 @@ mod tests {
         assert!(Op::Gt.recovered(700.0, 800.0));
         assert!(Op::Gt.recovered(800.0, 800.0));
         assert!(!Op::Gt.recovered(900.0, 800.0)); // still in the band
-        // Fire below 10, recover at/above 20.
+                                                  // Fire below 10, recover at/above 20.
         assert!(Op::Lt.recovered(25.0, 20.0));
         assert!(!Op::Lt.recovered(15.0, 20.0));
     }

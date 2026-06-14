@@ -36,7 +36,10 @@ fn template_json(t: &templates::Template) -> Value {
 }
 
 /// GET /api/templates — the full template catalog.
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
     match templates::load_all(&state.pool).await {
         Ok(ts) => {
             let out: Vec<Value> = ts.iter().map(template_json).collect();
@@ -79,6 +82,9 @@ pub async fn render(
     };
     match templates::render(&t, &body.params) {
         Ok(plan) => (StatusCode::OK, Json(json!({ "ok": true, "plan": plan }))),
-        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }

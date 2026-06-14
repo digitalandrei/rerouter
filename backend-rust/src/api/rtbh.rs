@@ -36,7 +36,10 @@ async fn fetch_list(pool: &sqlx::MySqlPool) -> JsonResp {
 }
 
 /// GET /api/rtbh-communities — the global list.
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
     fetch_list(&state.pool).await
 }
 
@@ -53,7 +56,9 @@ pub struct RtbhBody {
 /// numeric. Returns the inferred kind.
 fn validate_community(community: &str, kind: Option<&str>) -> Result<&'static str, &'static str> {
     let parts: Vec<&str> = community.split(':').collect();
-    let all_numeric = parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    let all_numeric = parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
     if !all_numeric {
         return Err("community must be numeric, like 65000:666 or 65000:0:666");
     }
@@ -80,7 +85,10 @@ pub async fn create(
         return err(StatusCode::UNPROCESSABLE_ENTITY, "label is required");
     }
     if body.tag == 0 {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "tag must be a non-zero route tag");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tag must be a non-zero route tag",
+        );
     }
     let kind = match validate_community(body.community.trim(), body.kind.as_deref()) {
         Ok(k) => k,

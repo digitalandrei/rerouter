@@ -22,7 +22,9 @@ pub async fn rollback_of(
     reason: String,
 ) -> Option<ExecOutcome> {
     let orig = templates::load(pool, template_id).await.ok()?;
-    let rollback = templates::load(pool, orig.rollback_template_id?).await.ok()?;
+    let rollback = templates::load(pool, orig.rollback_template_id?)
+        .await
+        .ok()?;
     let req = ActionRequest {
         device_id,
         template: rollback,

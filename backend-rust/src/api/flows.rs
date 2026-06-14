@@ -111,13 +111,20 @@ pub async fn top(
             top_as(&state.pool, device_id, q.interface_id, minutes, order, kind).await
         }
         "traffic" => top_traffic(&state.pool, device_id, q.interface_id, minutes, order).await,
-        _ => return err(StatusCode::BAD_REQUEST, "dimension must be talkers, ports, as, or traffic"),
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "dimension must be talkers, ports, as, or traffic",
+            )
+        }
     };
 
     match rows {
         Ok(out) => (
             StatusCode::OK,
-            Json(json!({ "dimension": dimension, "minutes": minutes, "interface_filtered": iface_filter, "rows": out })),
+            Json(
+                json!({ "dimension": dimension, "minutes": minutes, "interface_filtered": iface_filter, "rows": out }),
+            ),
         ),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -146,7 +153,14 @@ fn agg_select() -> &'static str {
      CAST(MAX(sampling_confidence = 'low') AS UNSIGNED) AS low_conf"
 }
 
-fn agg_json(est_bytes: u64, est_pkts: u64, raw_bytes: u64, raw_pkts: u64, max_rate: u64, low_conf: u64) -> Value {
+fn agg_json(
+    est_bytes: u64,
+    est_pkts: u64,
+    raw_bytes: u64,
+    raw_pkts: u64,
+    max_rate: u64,
+    low_conf: u64,
+) -> Value {
     json!({
         "est_bytes": est_bytes,
         "est_pkts": est_pkts,
@@ -171,9 +185,10 @@ async fn top_traffic(
         agg = agg_select(),
         where_ = window_clause("flow_iface_buckets", interface_id.is_some()),
     );
-    let mut query = sqlx::query_as::<_, (u32, Option<u64>, String, u64, u64, u64, u64, u64, u64)>(&sql)
-        .bind(device_id)
-        .bind(minutes);
+    let mut query =
+        sqlx::query_as::<_, (u32, Option<u64>, String, u64, u64, u64, u64, u64, u64)>(&sql)
+            .bind(device_id)
+            .bind(minutes);
     if let Some(i) = interface_id {
         query = query.bind(i);
     }
@@ -275,7 +290,9 @@ async fn top_talkers(
         agg = agg_select(),
         where_ = window_clause("flow_talker_buckets", interface_id.is_some()),
     );
-    let mut query = sqlx::query_as::<_, TalkerAggRow>(&sql).bind(device_id).bind(minutes);
+    let mut query = sqlx::query_as::<_, TalkerAggRow>(&sql)
+        .bind(device_id)
+        .bind(minutes);
     if let Some(i) = interface_id {
         query = query.bind(i);
     }
@@ -329,13 +346,21 @@ pub async fn search(
         qb.push(" AND device_id = ").push_bind(d);
     }
     if let Some(s) = clean(&q.src) {
-        qb.push(" AND src_addr LIKE CONCAT(").push_bind(s.to_string()).push(", '%')");
+        qb.push(" AND src_addr LIKE CONCAT(")
+            .push_bind(s.to_string())
+            .push(", '%')");
     }
     if let Some(d) = clean(&q.dst) {
-        qb.push(" AND dst_addr LIKE CONCAT(").push_bind(d.to_string()).push(", '%')");
+        qb.push(" AND dst_addr LIKE CONCAT(")
+            .push_bind(d.to_string())
+            .push(", '%')");
     }
     if let Some(p) = q.port {
-        qb.push(" AND (src_port = ").push_bind(p).push(" OR dst_port = ").push_bind(p).push(")");
+        qb.push(" AND (src_port = ")
+            .push_bind(p)
+            .push(" OR dst_port = ")
+            .push_bind(p)
+            .push(")");
     }
     if let Some(proto) = q.protocol {
         qb.push(" AND protocol = ").push_bind(proto);
@@ -344,10 +369,17 @@ pub async fn search(
     qb.push(order);
     qb.push(" DESC LIMIT ").push_bind(limit);
 
-    match qb.build_query_as::<TalkerAggRow>().fetch_all(&state.pool).await {
+    match qb
+        .build_query_as::<TalkerAggRow>()
+        .fetch_all(&state.pool)
+        .await
+    {
         Ok(rows) => {
             let out: Vec<Value> = rows.into_iter().map(talker_json).collect();
-            (StatusCode::OK, Json(json!({ "minutes": minutes, "rows": out })))
+            (
+                StatusCode::OK,
+                Json(json!({ "minutes": minutes, "rows": out })),
+            )
         }
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -393,7 +425,9 @@ pub async fn suggest(
         if let Some(d) = q.device_id {
             qb.push(" AND device_id = ").push_bind(d);
         }
-        qb.push(" AND CAST(src_port AS CHAR) LIKE CONCAT(").push_bind(prefix.clone()).push(", '%') ");
+        qb.push(" AND CAST(src_port AS CHAR) LIKE CONCAT(")
+            .push_bind(prefix.clone())
+            .push(", '%') ");
         qb.push(
             "UNION SELECT DISTINCT dst_port AS p FROM flow_talker_buckets \
                WHERE dst_port IS NOT NULL AND bucket_ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ",
@@ -402,7 +436,9 @@ pub async fn suggest(
         if let Some(d) = q.device_id {
             qb.push(" AND device_id = ").push_bind(d);
         }
-        qb.push(" AND CAST(dst_port AS CHAR) LIKE CONCAT(").push_bind(prefix.clone()).push(", '%') ");
+        qb.push(" AND CAST(dst_port AS CHAR) LIKE CONCAT(")
+            .push_bind(prefix.clone())
+            .push(", '%') ");
         qb.push(") t ORDER BY p ASC LIMIT ").push_bind(LIMIT);
         qb.build_query_scalar::<u32>()
             .fetch_all(&state.pool)
@@ -416,9 +452,18 @@ pub async fn suggest(
         if let Some(d) = q.device_id {
             qb.push(" AND device_id = ").push_bind(d);
         }
-        qb.push(" AND ").push(column).push(" LIKE CONCAT(").push_bind(prefix.clone()).push(", '%') ");
-        qb.push("ORDER BY ").push(column).push(" ASC LIMIT ").push_bind(LIMIT);
-        qb.build_query_scalar::<String>().fetch_all(&state.pool).await
+        qb.push(" AND ")
+            .push(column)
+            .push(" LIKE CONCAT(")
+            .push_bind(prefix.clone())
+            .push(", '%') ");
+        qb.push("ORDER BY ")
+            .push(column)
+            .push(" ASC LIMIT ")
+            .push_bind(LIMIT);
+        qb.build_query_scalar::<String>()
+            .fetch_all(&state.pool)
+            .await
     };
 
     match values {

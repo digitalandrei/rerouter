@@ -200,19 +200,38 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         // first match. Flow rules use the time window; SNMP rules use consecutive
         // samples (each poll is a fresh sample) — see docs/detection-engine.md.
         let duration_ok = rule.duration_seconds == 0 || held_secs >= rule.duration_seconds as i64;
-        let consecutive_ok = rule.consecutive_samples == 0 || consecutive >= rule.consecutive_samples;
+        let consecutive_ok =
+            rule.consecutive_samples == 0 || consecutive >= rule.consecutive_samples;
         let should_fire = duration_ok && consecutive_ok;
 
         if should_fire && prev_state != "firing" {
             // Rising edge: fire. Reset any prior recovery progress.
-            upsert_state(pool, rule.id, "firing", Some(first_matched), sampled_at, consecutive, value).await?;
+            upsert_state(
+                pool,
+                rule.id,
+                "firing",
+                Some(first_matched),
+                sampled_at,
+                consecutive,
+                value,
+            )
+            .await?;
             set_recovery_progress(pool, rule.id, None, 0).await?;
             on_fire(pool, cfg, rule, value, sampled_at, obs.low_confidence).await?;
             return Ok(true);
         } else if should_fire {
             // Already firing and the firing condition still holds: keep firing,
             // refresh activity (no new alert), and cancel any recovery progress.
-            upsert_state(pool, rule.id, "firing", Some(first_matched), sampled_at, consecutive, value).await?;
+            upsert_state(
+                pool,
+                rule.id,
+                "firing",
+                Some(first_matched),
+                sampled_at,
+                consecutive,
+                value,
+            )
+            .await?;
             set_recovery_progress(pool, rule.id, None, 0).await?;
             return Ok(false);
         } else {
@@ -220,7 +239,16 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             if prev_state == "clear" {
                 let _ = record_event(pool, rule, "matched", value, sampled_at).await;
             }
-            upsert_state(pool, rule.id, "matching", Some(first_matched), sampled_at, consecutive, value).await?;
+            upsert_state(
+                pool,
+                rule.id,
+                "matching",
+                Some(first_matched),
+                sampled_at,
+                consecutive,
+                value,
+            )
+            .await?;
             return Ok(false);
         }
     }
@@ -244,7 +272,9 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         // in the not-matched branch (fire condition false ⇒ recovered). For
         // threshold the recovered side is past the (possibly lower) recovery band.
         let recovered_now = if is_threshold {
-            let rec_threshold = rule.recovery_threshold_value.unwrap_or(rule.threshold_value);
+            let rec_threshold = rule
+                .recovery_threshold_value
+                .unwrap_or(rule.threshold_value);
             op.recovered(value, rec_threshold)
         } else {
             true
@@ -270,7 +300,8 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             if target_secs == 0 || (now - rec_first).num_seconds() >= target_secs {
                 recover_and_clear(pool, cfg, rule, value, sampled_at).await?;
             } else {
-                set_recovery_progress(pool, rule.id, Some(rec_first), prev.recovery_consecutive).await?;
+                set_recovery_progress(pool, rule.id, Some(rec_first), prev.recovery_consecutive)
+                    .await?;
             }
             return Ok(false);
         } else {
@@ -318,7 +349,9 @@ async fn interface_observation(
     .fetch_optional(pool)
     .await?;
 
-    let Some(metrics) = metrics else { return Ok(None) };
+    let Some(metrics) = metrics else {
+        return Ok(None);
+    };
     if !metrics.valid_sample {
         return Ok(None);
     }
@@ -327,8 +360,14 @@ async fn interface_observation(
         Some(ts) if (Utc::now() - ts).num_seconds() <= stale_after => {}
         _ => return Ok(None),
     }
-    let Some(value) = metrics.value(&rule.metric) else { return Ok(None) };
-    Ok(Some(Observation { value, sampled_at: metrics.sampled_at, low_confidence: false }))
+    let Some(value) = metrics.value(&rule.metric) else {
+        return Ok(None);
+    };
+    Ok(Some(Observation {
+        value,
+        sampled_at: metrics.sampled_at,
+        low_confidence: false,
+    }))
 }
 
 /// Read a flow-derived metric (flow_pps / flow_bps) from the latest CLOSED flow
@@ -361,10 +400,18 @@ async fn flow_observation(
                   WHERE interface_id = ? AND direction = ? AND port_kind = ? AND port = ? \
                     AND (? IS NULL OR protocol = ?))"
         ))
-        .bind(rule.interface_id).bind(direction).bind(port_kind).bind(port)
-        .bind(rule.flow_protocol).bind(rule.flow_protocol)
-        .bind(rule.interface_id).bind(direction).bind(port_kind).bind(port)
-        .bind(rule.flow_protocol).bind(rule.flow_protocol)
+        .bind(rule.interface_id)
+        .bind(direction)
+        .bind(port_kind)
+        .bind(port)
+        .bind(rule.flow_protocol)
+        .bind(rule.flow_protocol)
+        .bind(rule.interface_id)
+        .bind(direction)
+        .bind(port_kind)
+        .bind(port)
+        .bind(rule.flow_protocol)
+        .bind(rule.flow_protocol)
         .fetch_one(pool)
         .await?
     } else {
@@ -374,18 +421,23 @@ async fn flow_observation(
                AND bucket_ts = (SELECT MAX(bucket_ts) FROM flow_iface_buckets \
                   WHERE interface_id = ? AND direction = ?)"
         ))
-        .bind(rule.interface_id).bind(direction)
-        .bind(rule.interface_id).bind(direction)
+        .bind(rule.interface_id)
+        .bind(direction)
+        .bind(rule.interface_id)
+        .bind(direction)
         .fetch_one(pool)
         .await?
     };
 
     let (est_pkts, est_bytes, low_conf, bucket_ts) = row;
-    let Some(bucket_ts) = bucket_ts else { return Ok(None) }; // no flow data for the selector.
+    let Some(bucket_ts) = bucket_ts else {
+        return Ok(None);
+    }; // no flow data for the selector.
 
     // Flow buckets lag (bucket close + flush), so allow a wider staleness window
     // than the SNMP path — a few bucket widths.
-    let flow_stale = (cfg.flow.bucket_seconds as i64 * 3).max(cfg.telemetry.stale_after_seconds as i64);
+    let flow_stale =
+        (cfg.flow.bucket_seconds as i64 * 3).max(cfg.telemetry.stale_after_seconds as i64);
     if (Utc::now() - bucket_ts).num_seconds() > flow_stale {
         return Ok(None);
     }
@@ -396,7 +448,11 @@ async fn flow_observation(
         _ => return Ok(None),
     };
     // Unknown confidence is treated as low (cautious): never auto-act on it.
-    Ok(Some(Observation { value, sampled_at: Some(bucket_ts), low_confidence: low_conf.unwrap_or(1) != 0 }))
+    Ok(Some(Observation {
+        value,
+        sampled_at: Some(bucket_ts),
+        low_confidence: low_conf.unwrap_or(1) != 0,
+    }))
 }
 
 /// On the firing edge: record the rule_event and enqueue the alert. In observe
@@ -456,7 +512,11 @@ async fn on_fire(
     // parser confidence blocks automatic actions) — it still alerts + renders.
     if low_confidence && mode == "enforce" && rule.automatic_reroute_enabled {
         payload["auto_suppressed_low_confidence"] = json!(true);
-        tracing::warn!(event_type = "rule_auto_suppressed", rule_id = rule.id, "flow rule fired but auto-action suppressed: low sampling confidence");
+        tracing::warn!(
+            event_type = "rule_auto_suppressed",
+            rule_id = rule.id,
+            "flow rule fired but auto-action suppressed: low sampling confidence"
+        );
     }
     let auto = mode == "enforce" && rule.automatic_reroute_enabled && !low_confidence;
     if auto {
@@ -502,7 +562,17 @@ async fn on_fire(
 /// to its exact would-run commands, for the alert payload. Best-effort and
 /// observe-safe: it loads templates and renders strings; it executes nothing.
 async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> {
-    let rows = sqlx::query_as::<_, (u64, u64, String, u64, String, Option<sqlx::types::Json<Value>>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            u64,
+            u64,
+            String,
+            u64,
+            String,
+            Option<sqlx::types::Json<Value>>,
+        ),
+    >(
         "SELECT ra.id, ra.reroute_template_id, t.name, ra.device_id, d.name, ra.params_json \
          FROM rule_actions ra \
          JOIN reroute_templates t ON t.id = ra.reroute_template_id \
@@ -591,7 +661,9 @@ async fn interface_label(pool: &MySqlPool, interface_id: u64) -> String {
     .flatten();
     match row {
         Some((if_name, if_descr, device)) => {
-            let iface = if_name.or(if_descr).unwrap_or_else(|| format!("if#{interface_id}"));
+            let iface = if_name
+                .or(if_descr)
+                .unwrap_or_else(|| format!("if#{interface_id}"));
             format!("{iface} on {device}")
         }
         None => format!("interface #{interface_id}"),
@@ -674,7 +746,12 @@ async fn clear_state(pool: &MySqlPool, rule_id: u64, value: f64) -> Result<()> {
 
 /// Update recovery progress: the hold start (flow window) and the recovered-side
 /// streak (SNMP samples). Assumes a rule_states row exists (true once firing).
-async fn set_recovery_progress(pool: &MySqlPool, rule_id: u64, first_at: Option<Ts>, consecutive: u32) -> Result<()> {
+async fn set_recovery_progress(
+    pool: &MySqlPool,
+    rule_id: u64,
+    first_at: Option<Ts>,
+    consecutive: u32,
+) -> Result<()> {
     sqlx::query(
         "UPDATE rule_states SET recovery_first_at = ?, recovery_consecutive = ?, \
                 last_evaluated_at = UTC_TIMESTAMP() WHERE rule_id = ?",
@@ -700,14 +777,27 @@ async fn recover_and_clear(
 ) -> Result<()> {
     clear_state(pool, rule.id, value).await?;
     let _ = record_event(pool, rule, "cleared", value, sampled_at).await;
-    run_recovery_rollback(pool, cfg, rule.id, &rule.name, rule.automatic_reroute_enabled).await;
+    run_recovery_rollback(
+        pool,
+        cfg,
+        rule.id,
+        &rule.name,
+        rule.automatic_reroute_enabled,
+    )
+    .await;
     Ok(())
 }
 
 /// Run the rollback of every action attached to a rule, in reverse order. Gated
 /// exactly like auto-execution: only in enforce mode and only when the rule's
 /// auto switch is on. The executor re-checks its own safety gates per action.
-async fn run_recovery_rollback(pool: &MySqlPool, cfg: &Config, rule_id: u64, rule_name: &str, auto_enabled: bool) {
+async fn run_recovery_rollback(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule_id: u64,
+    rule_name: &str,
+    auto_enabled: bool,
+) {
     if !auto_enabled {
         return;
     }
@@ -727,9 +817,30 @@ async fn run_recovery_rollback(pool: &MySqlPool, cfg: &Config, rule_id: u64, rul
     for (template_id, device_id, params_json) in specs {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
         let reason = format!("automatic rollback: rule '{rule_name}' recovered");
-        match crate::reroute::rollback::rollback_of(pool, cfg, device_id, template_id, &params, None, reason).await {
-            Some(_) => tracing::info!(event_type = "rule_recovery_rollback", rule_id, device_id, template_id, "ran rollback on recovery"),
-            None => tracing::debug!(event_type = "rule_recovery_no_rollback", rule_id, template_id, "action template has no rollback; nothing to undo"),
+        match crate::reroute::rollback::rollback_of(
+            pool,
+            cfg,
+            device_id,
+            template_id,
+            &params,
+            None,
+            reason,
+        )
+        .await
+        {
+            Some(_) => tracing::info!(
+                event_type = "rule_recovery_rollback",
+                rule_id,
+                device_id,
+                template_id,
+                "ran rollback on recovery"
+            ),
+            None => tracing::debug!(
+                event_type = "rule_recovery_no_rollback",
+                rule_id,
+                template_id,
+                "action template has no rollback; nothing to undo"
+            ),
         }
     }
 }
@@ -769,7 +880,11 @@ pub async fn clear_rule_manual(pool: &MySqlPool, cfg: &Config, rule_id: u64) -> 
         .bind(rule_id)
         .execute(pool)
         .await?;
-    tracing::info!(event_type = "rule_cleared_manual", rule_id, "rule manually cleared by operator");
+    tracing::info!(
+        event_type = "rule_cleared_manual",
+        rule_id,
+        "rule manually cleared by operator"
+    );
     run_recovery_rollback(pool, cfg, rule_id, &name, auto_enabled).await;
     Ok(true)
 }

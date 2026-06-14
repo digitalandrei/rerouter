@@ -55,21 +55,24 @@ pub struct DeviceSsh {
 
 pub enum SshAuth {
     Password(String),
-    Key { private_key_pem: String, passphrase: Option<String> },
+    Key {
+        private_key_pem: String,
+        passphrase: Option<String>,
+    },
 }
 
 /// Load + decrypt a device's SSH credentials. Errors are structured and never
 /// echo secret material.
 pub async fn load_device_ssh(pool: &MySqlPool, device_id: u64) -> Result<DeviceSsh> {
     type Row = (
-        String,         // hostname
-        Option<String>, // ssh_username
-        u16,            // ssh_port
-        Option<String>, // ssh_auth_method
+        String,          // hostname
+        Option<String>,  // ssh_username
+        u16,             // ssh_port
+        Option<String>,  // ssh_auth_method
         Option<Vec<u8>>, // ssh_password_encrypted
         Option<Vec<u8>>, // ssh_private_key_encrypted
         Option<Vec<u8>>, // ssh_key_passphrase_encrypted
-        Option<String>, // ssh_host_fingerprint
+        Option<String>,  // ssh_host_fingerprint
     );
     let row = sqlx::query_as::<_, Row>(
         "SELECT hostname, ssh_username, ssh_port, ssh_auth_method, ssh_password_encrypted, \
@@ -90,22 +93,42 @@ pub async fn load_device_ssh(pool: &MySqlPool, device_id: u64) -> Result<DeviceS
 
     let auth = match method.as_deref() {
         Some("password") => {
-            let blob = pw_enc.ok_or_else(|| anyhow!("device SSH method is 'password' but no password is stored"))?;
+            let blob = pw_enc.ok_or_else(|| {
+                anyhow!("device SSH method is 'password' but no password is stored")
+            })?;
             SshAuth::Password(crate::crypto::open_str(&blob).context("decrypting SSH password")?)
         }
         Some("key") => {
-            let blob = key_enc.ok_or_else(|| anyhow!("device SSH method is 'key' but no private key is stored"))?;
+            let blob = key_enc.ok_or_else(|| {
+                anyhow!("device SSH method is 'key' but no private key is stored")
+            })?;
             let pem = crate::crypto::open_str(&blob).context("decrypting SSH private key")?;
             let passphrase = match pass_enc {
-                Some(b) => Some(crate::crypto::open_str(&b).context("decrypting SSH key passphrase")?),
+                Some(b) => {
+                    Some(crate::crypto::open_str(&b).context("decrypting SSH key passphrase")?)
+                }
                 None => None,
             };
-            SshAuth::Key { private_key_pem: pem, passphrase }
+            SshAuth::Key {
+                private_key_pem: pem,
+                passphrase,
+            }
         }
-        _ => return Err(anyhow!("device has no SSH credentials configured (set ssh_auth_method)")),
+        _ => {
+            return Err(anyhow!(
+                "device has no SSH credentials configured (set ssh_auth_method)"
+            ))
+        }
     };
 
-    Ok(DeviceSsh { device_id, host, port, username, auth, expected_fingerprint: fingerprint })
+    Ok(DeviceSsh {
+        device_id,
+        host,
+        port,
+        username,
+        auth,
+        expected_fingerprint: fingerprint,
+    })
 }
 
 // ---- Client key generation -----------------------------------------------------
@@ -155,8 +178,8 @@ impl russh::keys::ssh_key::rand_core::TryCryptoRng for OsCsprng {}
 /// and `ios_preferred()` is RSA-oriented for these 15.4 boxes.
 pub fn generate_rsa_key(comment: &str) -> Result<GeneratedKey> {
     use russh::keys::ssh_key::{private::RsaKeypair, LineEnding, PrivateKey};
-    let keypair =
-        RsaKeypair::random(&mut OsCsprng, 2048).map_err(|e| anyhow!("generating RSA keypair: {e}"))?;
+    let keypair = RsaKeypair::random(&mut OsCsprng, 2048)
+        .map_err(|e| anyhow!("generating RSA keypair: {e}"))?;
     let mut key = PrivateKey::from(keypair);
     key.set_comment(comment);
     let private_key_openssh = key
@@ -168,7 +191,11 @@ pub fn generate_rsa_key(comment: &str) -> Result<GeneratedKey> {
         .to_openssh()
         .map_err(|e| anyhow!("encoding public key: {e}"))?;
     let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
-    Ok(GeneratedKey { private_key_openssh, public_key_openssh, fingerprint })
+    Ok(GeneratedKey {
+        private_key_openssh,
+        public_key_openssh,
+        fingerprint,
+    })
 }
 
 /// Best-effort: derive the OpenSSH public-key line from a private-key PEM (any
@@ -209,7 +236,10 @@ struct TofuHandler {
 impl Handler for TofuHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
         let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         *self.observed.lock().await = Some(fp.clone());
         match &self.expected {
@@ -236,8 +266,12 @@ fn ios_preferred() -> Preferred {
         ]),
         key: Cow::Owned(vec![
             Algorithm::Ed25519,
-            Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
-            Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
             // ssh-rsa (SHA-1) — the only host-key type many IOS 15.4 images offer.
             Algorithm::Rsa { hash: None },
         ]),
@@ -259,7 +293,11 @@ fn ios_preferred() -> Preferred {
 /// IOS shell, and return each command's output. Pins the host key on first use;
 /// a changed key fails closed. `commands` are sent verbatim — callers MUST pass
 /// only rendered template commands (typed-param validated), never user free text.
-pub async fn run_commands(pool: &MySqlPool, device_id: u64, commands: &[String]) -> Result<SshOutcome> {
+pub async fn run_commands(
+    pool: &MySqlPool,
+    device_id: u64,
+    commands: &[String],
+) -> Result<SshOutcome> {
     let dev = load_device_ssh(pool, device_id).await?;
     let outcome = run_on(&dev, commands).await?;
 
@@ -284,7 +322,11 @@ pub async fn run_commands(pool: &MySqlPool, device_id: u64, commands: &[String])
 pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let cmd = "show running-config | section ^router bgp".to_string();
     let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
-    let output = outcome.results.first().map(|r| r.output.as_str()).unwrap_or("");
+    let output = outcome
+        .results
+        .first()
+        .map(|r| r.output.as_str())
+        .unwrap_or("");
 
     let prefixes = parse_network_statements(output);
     for prefix in &prefixes {
@@ -323,10 +365,16 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
 fn parse_neighbor_descriptions(config: &str) -> Vec<(Ipv4Addr, String)> {
     let mut out = Vec::new();
     for line in config.lines() {
-        let Some(rest) = line.trim().strip_prefix("neighbor ") else { continue };
+        let Some(rest) = line.trim().strip_prefix("neighbor ") else {
+            continue;
+        };
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let Some(addr_tok) = parts.next() else { continue };
-        let Ok(addr) = addr_tok.parse::<Ipv4Addr>() else { continue };
+        let Some(addr_tok) = parts.next() else {
+            continue;
+        };
+        let Ok(addr) = addr_tok.parse::<Ipv4Addr>() else {
+            continue;
+        };
         let Some(tail) = parts.next() else { continue };
         if let Some(desc) = tail.trim().strip_prefix("description ") {
             let desc = desc.trim();
@@ -373,7 +421,10 @@ fn cisco_denied(output: &str) -> Option<String> {
 pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<CapabilityCheck>> {
     // Reads first, then enter+leave config mode (nothing is applied).
     let probes: [(&str, &str); 4] = [
-        ("Read running-config", "show running-config | section ^router bgp"),
+        (
+            "Read running-config",
+            "show running-config | section ^router bgp",
+        ),
         ("Read routing table", "show ip route summary"),
         ("Read BGP table", "show ip bgp summary"),
         ("Enter configuration mode", "configure terminal"),
@@ -390,7 +441,11 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
         .iter()
         .enumerate()
         .map(|(i, (name, command))| {
-            let output = outcome.results.get(i).map(|r| r.output.as_str()).unwrap_or("");
+            let output = outcome
+                .results
+                .get(i)
+                .map(|r| r.output.as_str())
+                .unwrap_or("");
             let denied = cisco_denied(output);
             CapabilityCheck {
                 name: name.to_string(),
@@ -407,7 +462,9 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
 fn parse_network_statements(config: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in config.lines() {
-        let Some(rest) = line.trim().strip_prefix("network ") else { continue };
+        let Some(rest) = line.trim().strip_prefix("network ") else {
+            continue;
+        };
         let parts: Vec<&str> = rest.split_whitespace().collect();
         if parts.len() >= 3 && parts[1] == "mask" {
             if let (Ok(ip), Some(len)) = (parts[0].parse::<Ipv4Addr>(), mask_to_len(parts[2])) {
@@ -493,7 +550,9 @@ fn command_allowed(cmd: &str) -> bool {
         // null-route (RTBH to Null0), with the optional name / tag the templates use
         ["ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
         ["ip", "route", net, mask, "Null0", "name", _] => is_ipv4(net) && is_ipv4(mask),
-        ["ip", "route", net, mask, "Null0", "tag", tag] => is_ipv4(net) && is_ipv4(mask) && is_u32(tag),
+        ["ip", "route", net, mask, "Null0", "tag", tag] => {
+            is_ipv4(net) && is_ipv4(mask) && is_u32(tag)
+        }
         ["no", "ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
         ["no", "ip", "route", net, mask, "Null0", "tag", tag] => {
             is_ipv4(net) && is_ipv4(mask) && is_u32(tag)
@@ -515,12 +574,17 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
     // unexpected command to a router. We validate before connecting.
     for c in commands {
         if !command_allowed(c) {
-            return Err(anyhow!("refusing to send command not on the allowlist: {c:?}"));
+            return Err(anyhow!(
+                "refusing to send command not on the allowlist: {c:?}"
+            ));
         }
     }
 
     let observed = Arc::new(Mutex::new(None::<String>));
-    let handler = TofuHandler { expected: dev.expected_fingerprint.clone(), observed: observed.clone() };
+    let handler = TofuHandler {
+        expected: dev.expected_fingerprint.clone(),
+        observed: observed.clone(),
+    };
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(60)),
@@ -544,9 +608,19 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
                     }
                 }
             }
-            return Err(anyhow!("SSH connect to {}:{} failed: {e}", dev.host, dev.port));
+            return Err(anyhow!(
+                "SSH connect to {}:{} failed: {e}",
+                dev.host,
+                dev.port
+            ));
         }
-        Err(_) => return Err(anyhow!("SSH connect to {}:{} timed out", dev.host, dev.port)),
+        Err(_) => {
+            return Err(anyhow!(
+                "SSH connect to {}:{} timed out",
+                dev.host,
+                dev.port
+            ))
+        }
     };
 
     // Authenticate (password XOR key).
@@ -555,10 +629,18 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
             .authenticate_password(dev.username.clone(), pw.clone())
             .await
             .context("SSH password authentication")?,
-        SshAuth::Key { private_key_pem, passphrase } => {
+        SshAuth::Key {
+            private_key_pem,
+            passphrase,
+        } => {
             let key = decode_secret_key(private_key_pem, passphrase.as_deref())
                 .context("parsing SSH private key")?;
-            let rsa_hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+            let rsa_hash = session
+                .best_supported_rsa_hash()
+                .await
+                .ok()
+                .flatten()
+                .flatten();
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
             session
                 .authenticate_publickey(dev.username.clone(), key)
@@ -567,7 +649,10 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
         }
     };
     if !authed.success() {
-        return Err(anyhow!("SSH authentication failed for user '{}'", dev.username));
+        return Err(anyhow!(
+            "SSH authentication failed for user '{}'",
+            dev.username
+        ));
     }
 
     let fingerprint = observed
@@ -577,18 +662,29 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
         .ok_or_else(|| anyhow!("internal: no host key observed during handshake"))?;
 
     // Open an interactive shell (IOS commonly disables the bare `exec` channel).
-    let mut channel = session.channel_open_session().await.context("opening SSH channel")?;
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .context("opening SSH channel")?;
     channel
         .request_pty(false, "vt100", 200, 512, 0, 0, &[])
         .await
         .context("requesting PTY")?;
-    channel.request_shell(false).await.context("requesting interactive shell")?;
+    channel
+        .request_shell(false)
+        .await
+        .context("requesting interactive shell")?;
 
     let session_start = Instant::now();
 
     // Read the login banner up to the first prompt; derive the device hostname so
     // subsequent prompt detection is anchored to THIS device (not stray output).
-    let banner = read_until(&mut channel, &mut |buf| tail_prompt(buf).is_some(), session_start).await?;
+    let banner = read_until(
+        &mut channel,
+        &mut |buf| tail_prompt(buf).is_some(),
+        session_start,
+    )
+    .await?;
     let base_prompt = tail_prompt(&banner).unwrap_or_default();
     let hostname = prompt_hostname(&base_prompt);
 
@@ -599,11 +695,16 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
         if session_start.elapsed() > SESSION_BUDGET {
-            return Err(anyhow!("SSH session exceeded its time budget before '{command}'"));
+            return Err(anyhow!(
+                "SSH session exceeded its time budget before '{command}'"
+            ));
         }
         send_line(&mut channel, command).await?;
         let raw = read_until(&mut channel, &mut prompt_matcher(&hostname), session_start).await?;
-        results.push(CommandResult { command: command.clone(), output: clean_output(&raw, command) });
+        results.push(CommandResult {
+            command: command.clone(),
+            output: clean_output(&raw, command),
+        });
     }
 
     // Best-effort clean exit; ignore errors (we already have the results).
@@ -659,7 +760,9 @@ async fn read_until(
             }
         }
         if cmd_start.elapsed() > COMMAND_BUDGET || session_start.elapsed() > SESSION_BUDGET {
-            return Err(anyhow!("device did not return to a prompt within the time budget"));
+            return Err(anyhow!(
+                "device did not return to a prompt within the time budget"
+            ));
         }
     }
     Ok(buf)
@@ -668,7 +771,11 @@ async fn read_until(
 /// Returns the last line if it looks like a Cisco prompt (`name#`, `name>`,
 /// `name(config)#`, …): no spaces, ends in `#`/`>`.
 fn tail_prompt(buf: &str) -> Option<String> {
-    let last = buf.trim_end_matches([' ', '\r', '\n']).lines().last()?.trim();
+    let last = buf
+        .trim_end_matches([' ', '\r', '\n'])
+        .lines()
+        .last()?
+        .trim();
     if last.len() >= 2 && !last.contains(' ') && (last.ends_with('#') || last.ends_with('>')) {
         Some(last.to_string())
     } else {
@@ -700,12 +807,17 @@ fn prompt_matcher(hostname: &str) -> impl FnMut(&str) -> bool + '_ {
 /// raw response so only the device's actual output remains.
 fn clean_output(raw: &str, command: &str) -> String {
     let mut lines: Vec<&str> = raw.split('\n').map(|l| l.trim_end_matches('\r')).collect();
-    if lines.first().map(|l| l.trim() == command.trim()).unwrap_or(false) {
+    if lines
+        .first()
+        .map(|l| l.trim() == command.trim())
+        .unwrap_or(false)
+    {
         lines.remove(0);
     }
     while let Some(last) = lines.last() {
         let lt = last.trim();
-        let is_prompt = lt.len() >= 2 && !lt.contains(' ') && (lt.ends_with('#') || lt.ends_with('>'));
+        let is_prompt =
+            lt.len() >= 2 && !lt.contains(' ') && (lt.ends_with('#') || lt.ends_with('>'));
         if lt.is_empty() || is_prompt {
             lines.pop();
         } else {
@@ -750,13 +862,13 @@ mod tests {
     fn rejects_anything_outside_the_set() {
         for bad in [
             "reload",
-            "ip route 203.0.113.0 255.255.255.0 10.0.0.1",   // next-hop, not Null0
+            "ip route 203.0.113.0 255.255.255.0 10.0.0.1", // next-hop, not Null0
             "ip route 203.0.113.0 255.255.255.0 Null0 ; reload",
-            "neighbor 198.51.100.7 remote-as 65000",          // not shutdown
+            "neighbor 198.51.100.7 remote-as 65000", // not shutdown
             "neighbor notanip shutdown",
             "no neighbor 198.51.100.7 password secret",
             "router bgp not-a-number",
-            "show running-config | append flash:cfg",         // filter verb not allowed
+            "show running-config | append flash:cfg", // filter verb not allowed
             "configure terminal\nreload",
             "do reload",
             "write erase",

@@ -90,6 +90,9 @@ pub async fn recover_on_startup(pool: &MySqlPool, cfg: &Config) -> Result<()> {
             "marked in-flight reroutes uncertain and locked their devices"
         );
     }
-    tracing::info!(event_type = "recovery_complete", "startup state recovery done");
+    tracing::info!(
+        event_type = "recovery_complete",
+        "startup state recovery done"
+    );
     Ok(())
 }

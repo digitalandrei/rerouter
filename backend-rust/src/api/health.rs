@@ -30,11 +30,15 @@ pub async fn status(
     let stale_after = state.config.telemetry.stale_after_seconds as i64;
 
     let devices_total: i64 = scalar(pool, "SELECT COUNT(*) FROM devices").await;
-    let devices_reachable: i64 = scalar(pool, "SELECT COUNT(*) FROM devices WHERE reachable = 1").await;
+    let devices_reachable: i64 =
+        scalar(pool, "SELECT COUNT(*) FROM devices WHERE reachable = 1").await;
     // Every discovered interface is polled/charted, so "monitored" == all of them.
     let interfaces_monitored: i64 = scalar(pool, "SELECT COUNT(*) FROM device_interfaces").await;
-    let active_rule_matches: i64 =
-        scalar(pool, "SELECT COUNT(*) FROM rule_states WHERE current_state = 'firing'").await;
+    let active_rule_matches: i64 = scalar(
+        pool,
+        "SELECT COUNT(*) FROM rule_states WHERE current_state = 'firing'",
+    )
+    .await;
     let alerts_24h: i64 = scalar(
         pool,
         "SELECT COUNT(*) FROM alerts WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)",

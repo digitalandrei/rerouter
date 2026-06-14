@@ -33,7 +33,11 @@ pub async fn serve_spa(uri: Uri) -> Response {
     }
 
     let trimmed = path.trim_start_matches('/');
-    let candidate = if trimmed.is_empty() { "index.html" } else { trimmed };
+    let candidate = if trimmed.is_empty() {
+        "index.html"
+    } else {
+        trimmed
+    };
     if let Some(file) = Dist::get(candidate) {
         return asset_response(candidate, file);
     }
@@ -53,7 +57,10 @@ fn asset_response(path: &str, file: rust_embed::EmbeddedFile) -> Response {
         "no-cache"
     };
     (
-        [(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)],
+        [
+            (header::CONTENT_TYPE, mime.as_ref()),
+            (header::CACHE_CONTROL, cache),
+        ],
         file.data.into_owned(),
     )
         .into_response()

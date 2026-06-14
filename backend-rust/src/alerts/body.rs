@@ -10,8 +10,14 @@ pub fn subject(event_type: &str, severity: &str, payload: &Value) -> String {
     let sev = severity.to_uppercase();
     match event_type {
         "rule_fired" => {
-            let rule = payload.get("rule_name").and_then(Value::as_str).unwrap_or("rule");
-            let iface = payload.get("interface").and_then(Value::as_str).unwrap_or("");
+            let rule = payload
+                .get("rule_name")
+                .and_then(Value::as_str)
+                .unwrap_or("rule");
+            let iface = payload
+                .get("interface")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if iface.is_empty() {
                 format!("[{sev}] Rule fired: {rule}")
             } else {
@@ -35,7 +41,10 @@ pub fn render(
     s.push_str("==============\n\n");
     s.push_str(&format!("Event:     {event_type}\n"));
     s.push_str(&format!("Severity:  {severity}\n"));
-    s.push_str(&format!("Time:      {} UTC\n", created_at.format("%Y-%m-%d %H:%M:%S")));
+    s.push_str(&format!(
+        "Time:      {} UTC\n",
+        created_at.format("%Y-%m-%d %H:%M:%S")
+    ));
     if occurrence_count > 1 {
         s.push_str(&format!("Occurrences: {occurrence_count} (collapsed)\n"));
     }
@@ -53,12 +62,24 @@ pub fn render(
 }
 
 fn render_rule_fired(s: &mut String, payload: &Value) {
-    let metric = payload.get("metric").and_then(Value::as_str).unwrap_or("metric");
-    let operator = payload.get("operator").and_then(Value::as_str).unwrap_or("");
+    let metric = payload
+        .get("metric")
+        .and_then(Value::as_str)
+        .unwrap_or("metric");
+    let operator = payload
+        .get("operator")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let threshold = payload.get("threshold_value").and_then(Value::as_f64);
     let observed = payload.get("observed_value").and_then(Value::as_f64);
-    let direction = payload.get("direction").and_then(Value::as_str).unwrap_or("above");
-    let iface = payload.get("interface").and_then(Value::as_str).unwrap_or("");
+    let direction = payload
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("above");
+    let iface = payload
+        .get("interface")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     if !iface.is_empty() {
         s.push_str(&format!("Interface: {iface}\n"));
@@ -70,7 +91,10 @@ fn render_rule_fired(s: &mut String, payload: &Value) {
         s.push_str(&format!("Observed:  {metric} = {obs}\n"));
         s.push_str(&format!("Threshold: {th}\n"));
     } else {
-        s.push_str(&format!("Condition: {metric} {operator} {}\n", threshold.unwrap_or(0.0)));
+        s.push_str(&format!(
+            "Condition: {metric} {operator} {}\n",
+            threshold.unwrap_or(0.0)
+        ));
     }
 
     // Would-run actions (observe mode, or a manual-only rule: nothing executed —
@@ -80,8 +104,14 @@ fn render_rule_fired(s: &mut String, payload: &Value) {
             s.push('\n');
             s.push_str("Mitigations (NOT executed — observe mode):\n");
             for action in actions {
-                let template = action.get("template_name").and_then(Value::as_str).unwrap_or("action");
-                let device = action.get("device_name").and_then(Value::as_str).unwrap_or("device");
+                let template = action
+                    .get("template_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("action");
+                let device = action
+                    .get("device_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("device");
                 s.push_str(&format!("  {template} on {device}:\n"));
                 if let Some(cmds) = action
                     .get("rendered")

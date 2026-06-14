@@ -75,10 +75,14 @@ fn reroute_json(r: &RerouteRow) -> Value {
 }
 
 /// GET /api/reroutes — recent reroutes (newest first).
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
-    let rows = sqlx::query_as::<_, RerouteRow>(&format!("{REROUTE_SELECT} ORDER BY r.id DESC LIMIT 200"))
-        .fetch_all(&state.pool)
-        .await;
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
+    let rows =
+        sqlx::query_as::<_, RerouteRow>(&format!("{REROUTE_SELECT} ORDER BY r.id DESC LIMIT 200"))
+            .fetch_all(&state.pool)
+            .await;
     match rows {
         Ok(rows) => {
             let out: Vec<Value> = rows.iter().map(reroute_json).collect();
@@ -89,7 +93,11 @@ pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State
 }
 
 /// GET /api/reroutes/{id} — a reroute with its steps, outputs, and verifications.
-pub async fn show(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>, Path(id): Path<u64>) -> JsonResp {
+pub async fn show(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
     let row = sqlx::query_as::<_, RerouteRow>(&format!("{REROUTE_SELECT} WHERE r.id = ?"))
         .bind(id)
         .fetch_optional(&state.pool)
@@ -162,14 +170,20 @@ pub async fn manual(
     Json(body): Json<ManualBody>,
 ) -> JsonResp {
     if body.targets.is_empty() {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "at least one target router is required");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "at least one target router is required",
+        );
     }
     let template = match templates::load(&state.pool, body.template_id).await {
         Ok(t) => t,
         Err(_) => return err(StatusCode::NOT_FOUND, "template not found"),
     };
     if template.provider_type != "device_cli" {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "only device_cli templates can be executed");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "only device_cli templates can be executed",
+        );
     }
 
     let mut results = Vec::with_capacity(body.targets.len());
@@ -208,7 +222,10 @@ pub async fn cancel(
     .await;
     match res {
         Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
-        Ok(_) => err(StatusCode::CONFLICT, "reroute is not in a cancellable state"),
+        Ok(_) => err(
+            StatusCode::CONFLICT,
+            "reroute is not in a cancellable state",
+        ),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
@@ -227,15 +244,20 @@ pub async fn acknowledge_uncertain(
     Path(id): Path<u64>,
     Json(body): Json<AckBody>,
 ) -> JsonResp {
-    let row = sqlx::query_as::<_, (String, Option<u64>)>("SELECT state, device_id FROM reroutes WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await;
+    let row = sqlx::query_as::<_, (String, Option<u64>)>(
+        "SELECT state, device_id FROM reroutes WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await;
     let Ok(Some((rstate, device_id))) = row else {
         return err(StatusCode::NOT_FOUND, "reroute not found");
     };
     if rstate != "uncertain" {
-        return err(StatusCode::CONFLICT, "reroute is not in the uncertain state");
+        return err(
+            StatusCode::CONFLICT,
+            "reroute is not in the uncertain state",
+        );
     }
 
     let note = body.note.unwrap_or_default();
@@ -249,7 +271,13 @@ pub async fn acknowledge_uncertain(
     .await;
 
     if let Some(dev) = device_id {
-        let _ = locks::clear(&state.pool, "device", Some(&dev.to_string()), Some(g.session.user_id)).await;
+        let _ = locks::clear(
+            &state.pool,
+            "device",
+            Some(&dev.to_string()),
+            Some(g.session.user_id),
+        )
+        .await;
     }
     let _ = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
@@ -279,7 +307,10 @@ pub async fn rollback(
     .fetch_optional(&state.pool)
     .await;
     let Ok(Some((Some(device_id), Some(template_id), params_json))) = row else {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "reroute has no device/template to roll back");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reroute has no device/template to roll back",
+        );
     };
 
     // Confirm the template actually has a rollback before executing.
@@ -301,7 +332,10 @@ pub async fn rollback(
     )
     .await
     {
-        Some(outcome) => (StatusCode::OK, Json(serde_json::to_value(outcome).unwrap_or_else(|_| json!({})))),
+        Some(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(outcome).unwrap_or_else(|_| json!({}))),
+        ),
         None => err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
     }
 }

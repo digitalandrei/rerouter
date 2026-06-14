@@ -26,7 +26,13 @@ pub async fn active_until(
 }
 
 /// Record a cooldown window of `seconds` from now for a scope/ref.
-pub async fn record(pool: &MySqlPool, scope: &str, scope_ref: &str, seconds: i64, reason: &str) -> Result<()> {
+pub async fn record(
+    pool: &MySqlPool,
+    scope: &str,
+    scope_ref: &str,
+    seconds: i64,
+    reason: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO cooldowns (scope, scope_ref, until, reason) \
          VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND), ?)",

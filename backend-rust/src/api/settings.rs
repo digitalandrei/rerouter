@@ -27,11 +27,12 @@ type JsonResp = (StatusCode, Json<Value>);
 /// row, or the config fallback (observe) if the row is missing/unreadable. Used
 /// by /status, the detection engine (GATE 0), and the settings response.
 pub async fn operating_mode(pool: &sqlx::MySqlPool, cfg: &Config) -> &'static str {
-    let stored: Option<String> = sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = 'operating_mode'")
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = 'operating_mode'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     match stored.as_deref() {
         Some("enforce") => "enforce",
         Some("observe") => "observe",
@@ -45,12 +46,13 @@ pub async fn operating_mode(pool: &sqlx::MySqlPool, cfg: &Config) -> &'static st
 
 /// Read a boolean setting (`"true"`/`"false"`), defaulting to `default`.
 pub async fn bool_setting(pool: &sqlx::MySqlPool, key: &str, default: bool) -> bool {
-    let stored: Option<String> = sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = ?")
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = ?")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     match stored.as_deref() {
         Some("true") => true,
         Some("false") => false,
@@ -79,7 +81,10 @@ fn settings_json(map: &BTreeMap<String, String>, cfg: &Config) -> Value {
             OperatingMode::Observe => "observe",
         },
     };
-    let automatic = map.get("automatic_actions_enabled").map(|v| v == "true").unwrap_or(false);
+    let automatic = map
+        .get("automatic_actions_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let global_lock = map
         .get("global_maintenance_lock")
         .map(|v| v == "true")
@@ -91,7 +96,10 @@ fn settings_json(map: &BTreeMap<String, String>, cfg: &Config) -> Value {
     obj.insert("global_lock".into(), json!(global_lock));
     // Surface any additional keys verbatim (raw string values).
     for (k, v) in map {
-        if k == "operating_mode" || k == "automatic_actions_enabled" || k == "global_maintenance_lock" {
+        if k == "operating_mode"
+            || k == "automatic_actions_enabled"
+            || k == "global_maintenance_lock"
+        {
             continue;
         }
         obj.entry(k.clone()).or_insert(json!(v));
@@ -134,7 +142,10 @@ pub async fn update(
     // operating_mode: must be "observe" | "enforce".
     if let Some(v) = body.get("operating_mode").and_then(Value::as_str) {
         if v != "observe" && v != "enforce" {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "operating_mode must be observe or enforce");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "operating_mode must be observe or enforce",
+            );
         }
         let prev = before.get("operating_mode").cloned().unwrap_or_default();
         if prev != v {
@@ -154,11 +165,20 @@ pub async fn update(
     }
 
     // automatic_actions_enabled: boolean.
-    if let Some(b) = body.get("automatic_actions_enabled").and_then(Value::as_bool) {
+    if let Some(b) = body
+        .get("automatic_actions_enabled")
+        .and_then(Value::as_bool)
+    {
         let v = if b { "true" } else { "false" };
-        let prev = before.get("automatic_actions_enabled").cloned().unwrap_or_default();
+        let prev = before
+            .get("automatic_actions_enabled")
+            .cloned()
+            .unwrap_or_default();
         if prev != v {
-            if upsert(pool, "automatic_actions_enabled", v, session.user_id).await.is_err() {
+            if upsert(pool, "automatic_actions_enabled", v, session.user_id)
+                .await
+                .is_err()
+            {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
             }
             audit(
@@ -176,9 +196,15 @@ pub async fn update(
     // global_lock maps to the global_maintenance_lock row.
     if let Some(b) = body.get("global_lock").and_then(Value::as_bool) {
         let v = if b { "true" } else { "false" };
-        let prev = before.get("global_maintenance_lock").cloned().unwrap_or_default();
+        let prev = before
+            .get("global_maintenance_lock")
+            .cloned()
+            .unwrap_or_default();
         if prev != v {
-            if upsert(pool, "global_maintenance_lock", v, session.user_id).await.is_err() {
+            if upsert(pool, "global_maintenance_lock", v, session.user_id)
+                .await
+                .is_err()
+            {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
             }
             audit(
@@ -198,7 +224,12 @@ pub async fn update(
 }
 
 /// Upsert one system_settings row, stamping updated_by.
-async fn upsert(pool: &sqlx::MySqlPool, key: &str, value: &str, user_id: u64) -> anyhow::Result<()> {
+async fn upsert(
+    pool: &sqlx::MySqlPool,
+    key: &str,
+    value: &str,
+    user_id: u64,
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO system_settings (`key`, `value`, updated_by) VALUES (?, ?, ?) \
          ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_by = VALUES(updated_by)",
@@ -212,7 +243,14 @@ async fn upsert(pool: &sqlx::MySqlPool, key: &str, value: &str, user_id: u64) ->
 }
 
 /// Best-effort audit row for a settings change.
-async fn audit(pool: &sqlx::MySqlPool, user_id: u64, event: &str, ip: &str, ua: &str, message: &str) {
+async fn audit(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    event: &str,
+    ip: &str,
+    ua: &str,
+    message: &str,
+) {
     let _ = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
          VALUES ('user', ?, ?, ?, ?, ?)",

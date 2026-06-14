@@ -16,7 +16,9 @@ fn instance(secret: Secret, account_email: &str) -> Result<TOTP> {
         6,
         1, // skew: accept ±1 step
         30,
-        secret.to_bytes().map_err(|e| anyhow!("decoding totp secret: {e:?}"))?,
+        secret
+            .to_bytes()
+            .map_err(|e| anyhow!("decoding totp secret: {e:?}"))?,
         Some(ISSUER.to_string()),
         account_email.to_string(),
     )
@@ -36,7 +38,8 @@ pub fn enroll(account_email: &str) -> Result<(String, String)> {
 /// Verify a 6-digit code against the (decrypted) base32 secret, ±1 step.
 pub fn verify(secret_base32: &str, code: &str, account_email: &str) -> Result<bool> {
     let totp = instance(Secret::Encoded(secret_base32.to_string()), account_email)?;
-    totp.check_current(code).map_err(|e| anyhow!("system time: {e}"))
+    totp.check_current(code)
+        .map_err(|e| anyhow!("system time: {e}"))
 }
 
 /// Generate 8 single-use recovery codes (display once; persist Argon2id hashes

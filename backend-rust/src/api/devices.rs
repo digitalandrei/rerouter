@@ -67,7 +67,9 @@ fn seal_opt(plain: Option<&str>) -> Result<Option<Vec<u8>>, &'static str> {
             if !crypto::is_configured() {
                 return Err("encryption key not configured");
             }
-            crypto::seal_str(s).map(Some).map_err(|_| "encrypting secret failed")
+            crypto::seal_str(s)
+                .map(Some)
+                .map_err(|_| "encrypting secret failed")
         }
         _ => Ok(None),
     }
@@ -107,35 +109,43 @@ const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled,
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";
 
 async fn fetch_device(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
-    let row = sqlx::query_as::<_, DeviceRow>(&format!("SELECT {DEVICE_COLS} FROM devices WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query_as::<_, DeviceRow>(&format!("SELECT {DEVICE_COLS} FROM devices WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     let Some(row) = row else { return Ok(None) };
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_interfaces WHERE device_id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_interfaces WHERE device_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
     Ok(Some(device_json(&row, count)))
 }
 
 /// GET /api/devices — every device with its interface count.
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
-    let rows = match sqlx::query_as::<_, DeviceRow>(&format!("SELECT {DEVICE_COLS} FROM devices ORDER BY name"))
-        .fetch_all(&state.pool)
-        .await
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
+    let rows = match sqlx::query_as::<_, DeviceRow>(&format!(
+        "SELECT {DEVICE_COLS} FROM devices ORDER BY name"
+    ))
+    .fetch_all(&state.pool)
+    .await
     {
         Ok(r) => r,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
     // interface counts in one query, then zip.
-    let counts: std::collections::HashMap<u64, i64> =
-        sqlx::query_as::<_, (u64, i64)>("SELECT device_id, COUNT(*) FROM device_interfaces GROUP BY device_id")
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+    let counts: std::collections::HashMap<u64, i64> = sqlx::query_as::<_, (u64, i64)>(
+        "SELECT device_id, COUNT(*) FROM device_interfaces GROUP BY device_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
     let out: Vec<Value> = rows
         .iter()
         .map(|r| device_json(r, counts.get(&r.id).copied().unwrap_or(0)))
@@ -215,10 +225,16 @@ pub async fn create(
     Json(body): Json<CreateDevice>,
 ) -> JsonResp {
     if body.name.trim().is_empty() || body.hostname.trim().is_empty() {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "name and hostname are required");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name and hostname are required",
+        );
     }
     if body.snmp_version != "v2c" {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "only SNMP v2c is supported in v1");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "only SNMP v2c is supported in v1",
+        );
     }
     // Validate SSH access (password XOR key) before touching the DB.
     let ssh_username = match validate_ssh(
@@ -239,7 +255,12 @@ pub async fn create(
         seal_opt(body.ssh_key_passphrase.as_deref()),
     ) {
         (Ok(c), Ok(p), Ok(k), Ok(pp)) => (c, p, k, pp),
-        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "encrypting credentials failed"),
+        _ => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encrypting credentials failed",
+            )
+        }
     };
 
     let res = sqlx::query(
@@ -264,7 +285,12 @@ pub async fn create(
 
     let id = match res {
         Ok(r) => r.last_insert_id(),
-        Err(e) if is_dup(&e) => return err(StatusCode::CONFLICT, "a device with that name already exists"),
+        Err(e) if is_dup(&e) => {
+            return err(
+                StatusCode::CONFLICT,
+                "a device with that name already exists",
+            )
+        }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
 
@@ -338,12 +364,18 @@ pub async fn update(
     }
     if let Some(v) = &body.snmp_version {
         if v != "v2c" {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "only SNMP v2c is supported in v1");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "only SNMP v2c is supported in v1",
+            );
         }
     }
     if let Some(m) = body.ssh_auth_method.as_deref() {
         if m != "password" && m != "key" {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "ssh_auth_method must be 'password' or 'key'");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ssh_auth_method must be 'password' or 'key'",
+            );
         }
     }
 
@@ -367,7 +399,11 @@ pub async fn update(
     if body.enabled.is_some() {
         sets.push("enabled = ?");
     }
-    let set_community = body.community.as_deref().map(|c| !c.is_empty()).unwrap_or(false);
+    let set_community = body
+        .community
+        .as_deref()
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
     if set_community {
         sets.push("community_encrypted = ?");
     }
@@ -380,18 +416,30 @@ pub async fn update(
     if body.ssh_auth_method.is_some() {
         sets.push("ssh_auth_method = ?");
     }
-    let set_ssh_pw = body.ssh_password.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let set_ssh_pw = body
+        .ssh_password
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     if set_ssh_pw {
         sets.push("ssh_password_encrypted = ?");
     }
-    let set_ssh_key = body.ssh_private_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let set_ssh_key = body
+        .ssh_private_key
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     if set_ssh_key {
         sets.push("ssh_private_key_encrypted = ?");
         // Derive and store the matching public key so the UI can show it. Best
         // effort — a passphrase-protected key we can't open stores NULL (cleared).
         sets.push("ssh_public_key = ?");
     }
-    let set_ssh_pass = body.ssh_key_passphrase.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    let set_ssh_pass = body
+        .ssh_key_passphrase
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     if set_ssh_pass {
         sets.push("ssh_key_passphrase_encrypted = ?");
     }
@@ -411,7 +459,12 @@ pub async fn update(
         seal_opt(body.ssh_key_passphrase.as_deref()),
     ) {
         (Ok(c), Ok(p), Ok(k), Ok(pp)) => (c, p, k, pp),
-        _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "encrypting credentials failed"),
+        _ => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encrypting credentials failed",
+            )
+        }
     };
 
     let sql = format!("UPDATE devices SET {} WHERE id = ?", sets.join(", "));
@@ -464,7 +517,12 @@ pub async fn update(
 
     match q.execute(&state.pool).await {
         Ok(_) => {}
-        Err(e) if is_dup(&e) => return err(StatusCode::CONFLICT, "a device with that name already exists"),
+        Err(e) if is_dup(&e) => {
+            return err(
+                StatusCode::CONFLICT,
+                "a device with that name already exists",
+            )
+        }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 
@@ -517,7 +575,10 @@ pub async fn test(
                 "os_version": ident.os_version,
             })),
         ),
-        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
@@ -539,7 +600,10 @@ pub async fn discover(
     }
     match snmp::discover_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -575,7 +639,10 @@ pub async fn ssh_test(
                 "results": outcome.results,
             })),
         ),
-        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
@@ -597,8 +664,14 @@ pub async fn ssh_capabilities(
         return err(StatusCode::NOT_FOUND, "device not found");
     }
     match crate::ssh::probe_capabilities(&state.pool, id).await {
-        Ok(checks) => (StatusCode::OK, Json(json!({ "ok": true, "checks": checks }))),
-        Err(e) => (StatusCode::OK, Json(json!({ "ok": false, "error": e.to_string() }))),
+        Ok(checks) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "checks": checks })),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
     }
 }
 
@@ -622,11 +695,18 @@ pub async fn generate_key(
         return err(StatusCode::NOT_FOUND, "device not found");
     };
     if !crypto::is_configured() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "encryption key not configured");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "encryption key not configured",
+        );
     }
 
     // A descriptive comment so the key is recognisable in `show run | section pubkey`.
-    let host = if hostname.trim().is_empty() { name.as_str() } else { hostname.as_str() };
+    let host = if hostname.trim().is_empty() {
+        name.as_str()
+    } else {
+        hostname.as_str()
+    };
     let comment = format!("rerouter@{host}");
     let key = match crate::ssh::generate_rsa_key(&comment) {
         Ok(k) => k,
@@ -634,7 +714,12 @@ pub async fn generate_key(
     };
     let enc = match crypto::seal_str(&key.private_key_openssh) {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "encrypting private key failed"),
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encrypting private key failed",
+            )
+        }
     };
 
     let res = sqlx::query(
@@ -751,7 +836,10 @@ pub async fn discover_bgp(
     }
     match snmp::discover_bgp_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -768,7 +856,10 @@ pub async fn update_bgp_peer(
     Path((device_id, peer_id)): Path<(u64, u64)>,
     Json(body): Json<UpdateBgpPeer>,
 ) -> JsonResp {
-    let label = body.label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let label = body
+        .label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let res = sqlx::query("UPDATE device_bgp_peers SET label = ? WHERE id = ? AND device_id = ?")
         .bind(label)
         .bind(peer_id)
@@ -833,7 +924,10 @@ pub async fn discover_prefixes(
     }
     match crate::ssh::discover_prefixes_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
     }
 }
 

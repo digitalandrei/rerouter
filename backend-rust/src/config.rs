@@ -48,7 +48,12 @@ pub struct Auth {
 
 impl Default for Auth {
     fn default() -> Self {
-        Self { session_ttl_hours: 12, remember_me_ttl_hours: 168, lockout_threshold: 5, lockout_minutes: 15 }
+        Self {
+            session_ttl_hours: 12,
+            remember_me_ttl_hours: 168,
+            lockout_threshold: 5,
+            lockout_minutes: 15,
+        }
     }
 }
 
@@ -112,7 +117,6 @@ pub struct Reroute {
     pub require_verification: bool,
 }
 
-
 /// Retention windows enforced by the controller's cleanup task
 /// (TODO(milestone 2): the task itself).
 #[derive(Debug, Clone, Deserialize)]
@@ -171,13 +175,17 @@ impl Default for Flow {
 
 impl Default for Server {
     fn default() -> Self {
-        Self { bind: "127.0.0.1:9277".into() }
+        Self {
+            bind: "127.0.0.1:9277".into(),
+        }
     }
 }
 
 impl Default for Database {
     fn default() -> Self {
-        Self { url_env: "DATABASE_URL".into() }
+        Self {
+            url_env: "DATABASE_URL".into(),
+        }
     }
 }
 
@@ -219,13 +227,19 @@ impl Default for Safety {
 
 impl Default for Reroute {
     fn default() -> Self {
-        Self { require_verification: true }
+        Self {
+            require_verification: true,
+        }
     }
 }
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { traffic_samples_days: 7, rule_events_days: 90, reroute_logs_days: 365 }
+        Self {
+            traffic_samples_days: 7,
+            rule_events_days: 90,
+            reroute_logs_days: 365,
+        }
     }
 }
 
@@ -247,8 +261,8 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {path}"))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
         let cfg: Config = toml::from_str(&raw).context("parsing config.toml")?;
         cfg.validate()?;
         Ok(cfg)

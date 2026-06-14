@@ -137,19 +137,31 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
     .await
     .unwrap_or_default();
     rows.into_iter()
-        .map(|(id, template_id, template_name, template_display_name, device_id, device_name, params, enabled, position)| {
-            json!({
-                "id": id,
-                "reroute_template_id": template_id,
-                "template_name": template_name,
-                "template_display_name": template_display_name,
-                "device_id": device_id,
-                "device_name": device_name,
-                "params": params.map(|j| j.0).unwrap_or(Value::Null),
-                "enabled": enabled,
-                "position": position,
-            })
-        })
+        .map(
+            |(
+                id,
+                template_id,
+                template_name,
+                template_display_name,
+                device_id,
+                device_name,
+                params,
+                enabled,
+                position,
+            )| {
+                json!({
+                    "id": id,
+                    "reroute_template_id": template_id,
+                    "template_name": template_name,
+                    "template_display_name": template_display_name,
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "params": params.map(|j| j.0).unwrap_or(Value::Null),
+                    "enabled": enabled,
+                    "position": position,
+                })
+            },
+        )
         .collect()
 }
 
@@ -171,7 +183,10 @@ async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Va
 }
 
 /// GET /api/rules.
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
     match sqlx::query_as::<_, RuleRow>(&format!("{RULE_SELECT} ORDER BY r.name"))
         .fetch_all(&state.pool)
         .await
@@ -246,46 +261,77 @@ fn default_true() -> bool {
 
 /// Validate operator + metric + target. Returns the resolved device_id for an
 /// interface rule (looked up from the interface) on success.
-async fn validate(pool: &sqlx::MySqlPool, body: &RuleBody) -> Result<Option<u64>, (StatusCode, String)> {
+async fn validate(
+    pool: &sqlx::MySqlPool,
+    body: &RuleBody,
+) -> Result<Option<u64>, (StatusCode, String)> {
     if body.name.trim().is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "name is required".into()));
     }
     // Operators: the contract pins > and < for interface rules.
-    if !matches!(body.operator.as_str(), ">" | "<" | ">=" | "<=" | "==" | "!=") {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "unsupported operator".into()));
+    if !matches!(
+        body.operator.as_str(),
+        ">" | "<" | ">=" | "<=" | "==" | "!="
+    ) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported operator".into(),
+        ));
     }
     // A rule targets an interface (v1 detection is interface-scoped).
     let Some(iface_id) = body.interface_id else {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id is required".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "interface_id is required".into(),
+        ));
     };
     if is_flow_metric(&body.metric) {
         // Flow rule: a direction is required; protocol/port are optional selectors.
-        if !matches!(body.flow_direction.as_deref(), Some("ingress") | Some("egress")) {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, "flow_direction must be ingress or egress".into()));
+        if !matches!(
+            body.flow_direction.as_deref(),
+            Some("ingress") | Some("egress")
+        ) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "flow_direction must be ingress or egress".into(),
+            ));
         }
         if let Some(pk) = body.flow_port_kind.as_deref() {
             if !matches!(pk, "src" | "dst") {
-                return Err((StatusCode::UNPROCESSABLE_ENTITY, "flow_port_kind must be src or dst".into()));
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "flow_port_kind must be src or dst".into(),
+                ));
             }
         }
     } else if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("metric must be one of: {}, or flow_pps / flow_bps", INTERFACE_METRICS.join(", ")),
+            format!(
+                "metric must be one of: {}, or flow_pps / flow_bps",
+                INTERFACE_METRICS.join(", ")
+            ),
         ));
     }
     if !valid_recovery_mode(&body.recovery_mode) {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "recovery_mode must be auto, threshold, or manual".into()));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "recovery_mode must be auto, threshold, or manual".into(),
+        ));
     }
     // Resolve the owning device; also validates the interface exists.
-    let device_id: Option<u64> = sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
-        .bind(iface_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
+    let device_id: Option<u64> =
+        sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
+            .bind(iface_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
     match device_id {
         Some(d) => Ok(Some(d)),
-        None => Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id does not exist".into())),
+        None => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "interface_id does not exist".into(),
+        )),
     }
 }
 
@@ -302,12 +348,18 @@ pub async fn create(
 
     // Flow selectors only apply to flow metrics; force NULL otherwise. A flow_port
     // without an explicit kind defaults to destination port.
-    let (flow_direction, flow_protocol, flow_port, flow_port_kind) = if is_flow_metric(&body.metric) {
+    let (flow_direction, flow_protocol, flow_port, flow_port_kind) = if is_flow_metric(&body.metric)
+    {
         let kind = body
             .flow_port_kind
             .clone()
             .or_else(|| body.flow_port.map(|_| "dst".to_string()));
-        (body.flow_direction.clone(), body.flow_protocol, body.flow_port, kind)
+        (
+            body.flow_direction.clone(),
+            body.flow_protocol,
+            body.flow_port,
+            kind,
+        )
     } else {
         (None, None, None, None)
     };
@@ -315,7 +367,11 @@ pub async fn create(
     // Recovery threshold + persistence overrides only apply to threshold mode.
     let (recovery_threshold_value, recovery_window_seconds, recovery_consecutive_samples) =
         if body.recovery_mode == "threshold" {
-            (body.recovery_threshold_value, body.recovery_window_seconds, body.recovery_consecutive_samples)
+            (
+                body.recovery_threshold_value,
+                body.recovery_window_seconds,
+                body.recovery_consecutive_samples,
+            )
         } else {
             (None, None, None)
         };
@@ -425,25 +481,40 @@ pub async fn update(
             // Changing into a flow metric requires the rule to already be a flow
             // rule (has a selector). Recreate the rule to change metric family.
             if existing.flow_direction.is_none() {
-                return err(StatusCode::UNPROCESSABLE_ENTITY, "recreate the rule to switch to a flow metric");
+                return err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "recreate the rule to switch to a flow metric",
+                );
             }
         } else if existing.interface_id.is_some() && !INTERFACE_METRICS.contains(&metric.as_str()) {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported interface metric");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported interface metric",
+            );
         }
     }
     if let Some(pk) = &body.flow_port_kind {
         if !matches!(pk.as_str(), "src" | "dst") {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "flow_port_kind must be src or dst");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "flow_port_kind must be src or dst",
+            );
         }
     }
     if let Some(dir) = &body.flow_direction {
         if !matches!(dir.as_str(), "ingress" | "egress") {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "flow_direction must be ingress or egress");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "flow_direction must be ingress or egress",
+            );
         }
     }
     if let Some(m) = &body.recovery_mode {
         if !valid_recovery_mode(m) {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "recovery_mode must be auto, threshold, or manual");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "recovery_mode must be auto, threshold, or manual",
+            );
         }
     }
 
@@ -627,7 +698,10 @@ pub async fn clear(
         return err(StatusCode::NOT_FOUND, "rule not found");
     }
     match crate::detection::engine::clear_rule_manual(&state.pool, &state.config, id).await {
-        Ok(cleared) => (StatusCode::OK, Json(json!({ "ok": true, "cleared": cleared }))),
+        Ok(cleared) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "cleared": cleared })),
+        ),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
@@ -662,14 +736,20 @@ pub async fn add_action(
         return err(StatusCode::NOT_FOUND, "rule not found");
     }
 
-    let template = match crate::reroute::templates::load(&state.pool, body.reroute_template_id).await {
-        Ok(t) => t,
-        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template not found"),
-    };
+    let template =
+        match crate::reroute::templates::load(&state.pool, body.reroute_template_id).await {
+            Ok(t) => t,
+            Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template not found"),
+        };
     if template.provider_type != "device_cli" {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "only device_cli templates can be attached as rule actions");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "only device_cli templates can be attached as rule actions",
+        );
     }
-    if let Err(e) = crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params) {
+    if let Err(e) =
+        crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params)
+    {
         return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
     }
 

@@ -124,7 +124,10 @@ fn data_before_template_is_counted_then_decodes_after() {
     let mut cache = TemplateCache::new();
     let d1 = decode(&p1.body, &mut cache).expect("decode");
     assert_eq!(d1.records.len(), 0);
-    assert_eq!(d1.data_without_template, 1, "undecodable data must be counted, not errored");
+    assert_eq!(
+        d1.data_without_template, 1,
+        "undecodable data must be counted, not errored"
+    );
 
     // Template arrives.
     let mut p2 = header(42, 2);
@@ -146,7 +149,14 @@ fn multiple_records_in_one_data_set() {
     // two records back-to-back (50 bytes), flowset length = 4 + 50.
     let one = {
         let mut rec = PacketBuilder::default();
-        rec.bytes(&[10, 0, 0, 1]).bytes(&[10, 0, 0, 2]).u16(1).u16(2).u8(6).u32(3).u32(5).u32(500);
+        rec.bytes(&[10, 0, 0, 1])
+            .bytes(&[10, 0, 0, 2])
+            .u16(1)
+            .u16(2)
+            .u8(6)
+            .u32(3)
+            .u32(5)
+            .u32(500);
         rec.body
     };
     data.bytes(&one).bytes(&one);
@@ -192,7 +202,11 @@ fn options_template_reports_sampling_interval() {
     let mut cache = TemplateCache::new();
     let d = decode(&p.body, &mut cache).expect("decode");
     assert_eq!(d.reported_sampling, Some(1000));
-    assert_eq!(d.records.len(), 0, "options data carries metadata, not flows");
+    assert_eq!(
+        d.records.len(),
+        0,
+        "options data carries metadata, not flows"
+    );
 }
 
 #[test]
@@ -260,9 +274,15 @@ fn sampling_precedence_reported_then_snmp_then_default() {
 
     // Nothing known, default is unsampled (1:1) -> trustworthy.
     let s = resolve_sampling(None, None, None, 1);
-    assert_eq!((s.rate, s.source, s.high_confidence), (1, SamplingSource::Default, true));
+    assert_eq!(
+        (s.rate, s.source, s.high_confidence),
+        (1, SamplingSource::Default, true)
+    );
 
     // Nothing known but an assumed >1 default -> low confidence (blocks auto-actions).
     let s = resolve_sampling(None, None, None, 1000);
-    assert_eq!((s.rate, s.source, s.high_confidence), (1000, SamplingSource::Default, false));
+    assert_eq!(
+        (s.rate, s.source, s.high_confidence),
+        (1000, SamplingSource::Default, false)
+    );
 }

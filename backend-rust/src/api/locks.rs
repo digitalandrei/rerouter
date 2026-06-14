@@ -15,7 +15,10 @@ use crate::reroute::locks;
 type JsonResp = (StatusCode, Json<Value>);
 
 /// GET /api/locks — the active (uncleared) locks.
-pub async fn list(_g: RequirePermission<markers::ViewAsset>, State(state): State<AppState>) -> JsonResp {
+pub async fn list(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
     match locks::list_active(&state.pool).await {
         Ok(v) => (StatusCode::OK, Json(json!(v))),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
@@ -34,23 +37,47 @@ pub async fn create_global(
     State(state): State<AppState>,
     Json(body): Json<GlobalLockBody>,
 ) -> JsonResp {
-    let reason = body.reason.unwrap_or_else(|| "global maintenance lock".into());
-    if locks::create(&state.pool, "global", None, "manual", &reason, Some(g.session.user_id))
-        .await
-        .is_err()
+    let reason = body
+        .reason
+        .unwrap_or_else(|| "global maintenance lock".into());
+    if locks::create(
+        &state.pool,
+        "global",
+        None,
+        "manual",
+        &reason,
+        Some(g.session.user_id),
+    )
+    .await
+    .is_err()
     {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
-    audit(&state.pool, g.session.user_id, "global_lock_created", &reason).await;
+    audit(
+        &state.pool,
+        g.session.user_id,
+        "global_lock_created",
+        &reason,
+    )
+    .await;
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 /// DELETE /api/locks/global — clear the global maintenance lock(s).
-pub async fn clear_global(g: RequirePermission<markers::ManageLocks>, State(state): State<AppState>) -> JsonResp {
+pub async fn clear_global(
+    g: RequirePermission<markers::ManageLocks>,
+    State(state): State<AppState>,
+) -> JsonResp {
     let n = locks::clear(&state.pool, "global", None, Some(g.session.user_id))
         .await
         .unwrap_or(0);
-    audit(&state.pool, g.session.user_id, "global_lock_cleared", &format!("cleared {n} global lock(s)")).await;
+    audit(
+        &state.pool,
+        g.session.user_id,
+        "global_lock_cleared",
+        &format!("cleared {n} global lock(s)"),
+    )
+    .await;
     (StatusCode::OK, Json(json!({ "ok": true, "cleared": n })))
 }
 

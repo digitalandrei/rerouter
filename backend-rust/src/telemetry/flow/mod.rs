@@ -34,7 +34,11 @@ impl Direction {
     /// NetFlow DIRECTION field value -> Direction. Anything but 1 is ingress
     /// (Cisco exports ingress flows by default).
     pub fn from_netflow(v: u8) -> Self {
-        if v == 1 { Direction::Egress } else { Direction::Ingress }
+        if v == 1 {
+            Direction::Egress
+        } else {
+            Direction::Ingress
+        }
     }
 }
 
@@ -131,7 +135,11 @@ pub struct Sampling {
 
 impl Sampling {
     pub fn confidence_str(&self) -> &'static str {
-        if self.high_confidence { "high" } else { "low" }
+        if self.high_confidence {
+            "high"
+        } else {
+            "low"
+        }
     }
 }
 
@@ -153,15 +161,31 @@ pub fn resolve_sampling(
     default_rate: u32,
 ) -> Sampling {
     if let Some(rate) = configured.filter(|r| *r >= 1) {
-        return Sampling { rate, source: SamplingSource::Config, high_confidence: true };
+        return Sampling {
+            rate,
+            source: SamplingSource::Config,
+            high_confidence: true,
+        };
     }
     if let Some(rate) = reported.filter(|r| *r >= 1) {
-        return Sampling { rate, source: SamplingSource::Reported, high_confidence: true };
+        return Sampling {
+            rate,
+            source: SamplingSource::Reported,
+            high_confidence: true,
+        };
     }
     if let Some(rate) = snmp_derived.filter(|r| *r >= 1) {
-        return Sampling { rate, source: SamplingSource::SnmpDerived, high_confidence: true };
+        return Sampling {
+            rate,
+            source: SamplingSource::SnmpDerived,
+            high_confidence: true,
+        };
     }
     let rate = default_rate.max(1);
     // An unsampled (1:1) default is trustworthy; any assumed >1 rate is not.
-    Sampling { rate, source: SamplingSource::Default, high_confidence: rate == 1 }
+    Sampling {
+        rate,
+        source: SamplingSource::Default,
+        high_confidence: rate == 1,
+    }
 }

@@ -54,7 +54,11 @@ impl Permission {
 
 /// Does the session's user hold `permission` through any of their roles?
 /// Deny by default — any DB error returns false.
-pub async fn has_permission(pool: &MySqlPool, session: &Session, permission: Permission) -> Result<bool> {
+pub async fn has_permission(
+    pool: &MySqlPool,
+    session: &Session,
+    permission: Permission,
+) -> Result<bool> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM role_user ru \
          JOIN permission_role pr ON pr.role_id = ru.role_id \
@@ -85,7 +89,10 @@ pub async fn is_admin(pool: &MySqlPool, user_id: u64) -> Result<bool> {
 }
 
 /// The roles + permissions for a user.
-pub async fn roles_and_permissions(pool: &MySqlPool, user_id: u64) -> Result<(Vec<String>, Vec<String>)> {
+pub async fn roles_and_permissions(
+    pool: &MySqlPool,
+    user_id: u64,
+) -> Result<(Vec<String>, Vec<String>)> {
     let roles: Vec<String> = sqlx::query_scalar(
         "SELECT r.name FROM role_user ru JOIN roles r ON r.id = ru.role_id WHERE ru.user_id = ? ORDER BY r.name",
     )
@@ -119,7 +126,9 @@ pub async fn load_session_user(pool: &MySqlPool, user_id: u64) -> Result<Value> 
     .await
     .context("loading user")?;
     let (roles, permissions) = roles_and_permissions(pool, user_id).await?;
-    Ok(json!({ "id": id, "email": email, "name": name, "roles": roles, "permissions": permissions }))
+    Ok(
+        json!({ "id": id, "email": email, "name": name, "roles": roles, "permissions": permissions }),
+    )
 }
 
 /// Generic permission-gated extractor: `RequirePermission::<EditRules>` in a
@@ -139,10 +148,16 @@ pub trait PermissionMarker {
 impl<P: PermissionMarker> FromRequestParts<AppState> for RequirePermission<P> {
     type Rejection = (StatusCode, &'static str);
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let session = Session::from_request_parts(parts, state).await?;
         match has_permission(&state.pool, &session, P::PERMISSION).await {
-            Ok(true) => Ok(RequirePermission { session, _marker: std::marker::PhantomData }),
+            Ok(true) => Ok(RequirePermission {
+                session,
+                _marker: std::marker::PhantomData,
+            }),
             Ok(false) => Err((StatusCode::FORBIDDEN, "forbidden")),
             Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "authz check failed")),
         }

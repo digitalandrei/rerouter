@@ -75,7 +75,10 @@ impl Accum {
             Some(i) => i,
             None => return, // no interface to attribute to.
         };
-        self.iface.entry((ifindex, dir)).or_default().add(fr.pkts, fr.bytes);
+        self.iface
+            .entry((ifindex, dir))
+            .or_default()
+            .add(fr.pkts, fr.bytes);
 
         if fr.has_ports() {
             if let Some(sp) = fr.src_port {
@@ -95,14 +98,28 @@ impl Accum {
         // AS dimension — only when the exporter collects AS and it's a real ASN
         // (0 = unknown / no BGP route).
         if let Some(asn) = fr.src_as.filter(|a| *a != 0) {
-            self.as_.entry((ifindex, dir, PortKind::Src, asn)).or_default().add(fr.pkts, fr.bytes);
+            self.as_
+                .entry((ifindex, dir, PortKind::Src, asn))
+                .or_default()
+                .add(fr.pkts, fr.bytes);
         }
         if let Some(asn) = fr.dst_as.filter(|a| *a != 0) {
-            self.as_.entry((ifindex, dir, PortKind::Dst, asn)).or_default().add(fr.pkts, fr.bytes);
+            self.as_
+                .entry((ifindex, dir, PortKind::Dst, asn))
+                .or_default()
+                .add(fr.pkts, fr.bytes);
         }
 
         self.talker
-            .entry((ifindex, dir, fr.src_addr, fr.dst_addr, fr.src_port, fr.dst_port, fr.protocol))
+            .entry((
+                ifindex,
+                dir,
+                fr.src_addr,
+                fr.dst_addr,
+                fr.src_port,
+                fr.dst_port,
+                fr.protocol,
+            ))
             .or_default()
             .add(fr.pkts, fr.bytes);
     }
@@ -220,7 +237,10 @@ async fn recv_loop(socket: Arc<UdpSocket>, cfg: Arc<Config>, state: Arc<Mutex<St
             continue;
         }
 
-        let exporter = st.exporters.entry(src_ip).or_insert_with(|| Exporter::new(device_id));
+        let exporter = st
+            .exporters
+            .entry(src_ip)
+            .or_insert_with(|| Exporter::new(device_id));
         // Keep the device mapping fresh if the allowlist learned it later.
         if exporter.device_id.is_none() {
             exporter.device_id = device_id;
@@ -266,11 +286,15 @@ async fn refresh_allowlist(pool: MySqlPool, state: Arc<Mutex<State>>) {
                                 allow.insert(a.ip(), d.id);
                             }
                         }
-                        Err(e) => tracing::debug!(event_type = "flow_allowlist_resolve_failed", device_id = d.id, host = %d.hostname, error = %e, "could not resolve device host for flow allowlist"),
+                        Err(e) => {
+                            tracing::debug!(event_type = "flow_allowlist_resolve_failed", device_id = d.id, host = %d.hostname, error = %e, "could not resolve device host for flow allowlist")
+                        }
                     }
                 }
             }
-            Err(e) => tracing::warn!(event_type = "flow_allowlist_load_failed", error = %e, "could not load devices for flow allowlist"),
+            Err(e) => {
+                tracing::warn!(event_type = "flow_allowlist_load_failed", error = %e, "could not load devices for flow allowlist")
+            }
         }
         if let Ok(mut st) = state.lock() {
             st.allow = allow;
@@ -354,7 +378,9 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                     }
                 }
                 Ok(None) => {}
-                Err(e) => tracing::warn!(event_type = "flow_flush_failed", error = %e, "flushing flow buckets failed"),
+                Err(e) => {
+                    tracing::warn!(event_type = "flow_flush_failed", error = %e, "flushing flow buckets failed")
+                }
             }
         }
     }
@@ -403,7 +429,12 @@ async fn flush_exporter(
 
     // Sampling resolution uses the config override (authoritative), else reported,
     // else snmp_derived, else the global default.
-    let sampling = resolve_sampling(configured, f.reported_rate, snmp_derived, cfg.flow.default_sampling_rate);
+    let sampling = resolve_sampling(
+        configured,
+        f.reported_rate,
+        snmp_derived,
+        cfg.flow.default_sampling_rate,
+    );
 
     // Write buckets only when the exporter maps to a device (FK requires it).
     if let Some(device_id) = f.device_id {
@@ -413,11 +444,23 @@ async fn flush_exporter(
         closed.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
         for (idx, (ts, acc)) in closed.iter().enumerate() {
             let bucket_ts = Utc.timestamp_opt(*ts, 0).single().unwrap_or_else(Utc::now);
-            let ctx = BucketCtx { exporter_id, device_id, bucket_ts };
+            let ctx = BucketCtx {
+                exporter_id,
+                device_id,
+                bucket_ts,
+            };
             write_bucket(pool, cfg, &ctx, acc, &sampling, &mut iface_id_cache).await?;
             if idx == 0 {
-                if let Some((ratio, derived)) =
-                    cross_calibrate(pool, cfg, device_id, acc, &sampling, configured, f.reported_rate).await
+                if let Some((ratio, derived)) = cross_calibrate(
+                    pool,
+                    cfg,
+                    device_id,
+                    acc,
+                    &sampling,
+                    configured,
+                    f.reported_rate,
+                )
+                .await
                 {
                     xcal_ratio = Some(ratio);
                     if derived.is_some() {
@@ -429,7 +472,12 @@ async fn flush_exporter(
     }
 
     // Re-resolve with any freshly derived rate so the stored health row reflects it.
-    let sampling = resolve_sampling(configured, f.reported_rate, snmp_derived, cfg.flow.default_sampling_rate);
+    let sampling = resolve_sampling(
+        configured,
+        f.reported_rate,
+        snmp_derived,
+        cfg.flow.default_sampling_rate,
+    );
 
     sqlx::query(
         "UPDATE flow_exporters SET \
@@ -495,7 +543,11 @@ async fn write_bucket(
     sampling: &super::Sampling,
     iface_cache: &mut HashMap<u32, Option<u64>>,
 ) -> anyhow::Result<()> {
-    let BucketCtx { exporter_id, device_id, bucket_ts } = *ctx;
+    let BucketCtx {
+        exporter_id,
+        device_id,
+        bucket_ts,
+    } = *ctx;
     let rate = sampling.rate;
     let conf = sampling.confidence_str();
     let mut tx = pool.begin().await?;
@@ -550,7 +602,12 @@ async fn write_bucket(
     talkers.sort_by_key(|(_, c)| std::cmp::Reverse(c.bytes));
     let top_k = cfg.flow.top_k_talkers.max(1);
     if talkers.len() > top_k {
-        tracing::debug!(event_type = "flow_talkers_truncated", kept = top_k, total = talkers.len(), "truncated talker tail (count preserved in flow_iface_buckets)");
+        tracing::debug!(
+            event_type = "flow_talkers_truncated",
+            kept = top_k,
+            total = talkers.len(),
+            "truncated talker tail (count preserved in flow_iface_buckets)"
+        );
     }
     for ((if_index, dir, src, dst, sport, dport, proto), c) in talkers.into_iter().take(top_k) {
         let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
@@ -604,13 +661,14 @@ async fn cross_calibrate(
             .flatten();
     let iface_id = iface_id?;
     // SNMP's current rx rate for that interface (only trust a valid sample).
-    let snmp: Option<(f64, bool)> =
-        sqlx::query_as("SELECT rx_bps, valid_sample FROM interface_metrics_current WHERE interface_id = ?")
-            .bind(iface_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    let snmp: Option<(f64, bool)> = sqlx::query_as(
+        "SELECT rx_bps, valid_sample FROM interface_metrics_current WHERE interface_id = ?",
+    )
+    .bind(iface_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
     let (snmp_rx_bps, valid) = snmp?;
     if !valid || snmp_rx_bps <= 0.0 {
         return None;
@@ -642,14 +700,26 @@ async fn cross_calibrate(
 async fn prune_loop(pool: MySqlPool, cfg: Arc<Config>) {
     let minutes = cfg.flow.retention_minutes.max(1);
     loop {
-        for table in ["flow_iface_buckets", "flow_port_buckets", "flow_as_buckets", "flow_talker_buckets"] {
+        for table in [
+            "flow_iface_buckets",
+            "flow_port_buckets",
+            "flow_as_buckets",
+            "flow_talker_buckets",
+        ] {
             let sql = format!("DELETE FROM {table} WHERE bucket_ts < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)");
             match sqlx::query(&sql).bind(minutes).execute(&pool).await {
                 Ok(r) if r.rows_affected() > 0 => {
-                    tracing::debug!(event_type = "flow_buckets_pruned", table, rows = r.rows_affected(), "pruned old flow buckets")
+                    tracing::debug!(
+                        event_type = "flow_buckets_pruned",
+                        table,
+                        rows = r.rows_affected(),
+                        "pruned old flow buckets"
+                    )
                 }
                 Ok(_) => {}
-                Err(e) => tracing::warn!(event_type = "flow_prune_failed", table, error = %e, "pruning flow buckets failed"),
+                Err(e) => {
+                    tracing::warn!(event_type = "flow_prune_failed", table, error = %e, "pruning flow buckets failed")
+                }
             }
         }
         tokio::time::sleep(PRUNE_INTERVAL).await;

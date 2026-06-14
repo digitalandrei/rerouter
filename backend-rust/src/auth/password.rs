@@ -3,7 +3,9 @@
 //! the argon2 crate; never log or echo plaintext material.
 
 use anyhow::{anyhow, Result};
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 
 /// Hash a password (or recovery code) with Argon2id and a random salt.
@@ -19,5 +21,7 @@ pub fn hash(plain: &str) -> Result<String> {
 /// mismatch; Err only for malformed stored hashes.
 pub fn verify(plain: &str, phc: &str) -> Result<bool> {
     let parsed = PasswordHash::new(phc).map_err(|e| anyhow!("parsing stored hash: {e}"))?;
-    Ok(Argon2::default().verify_password(plain.as_bytes(), &parsed).is_ok())
+    Ok(Argon2::default()
+        .verify_password(plain.as_bytes(), &parsed)
+        .is_ok())
 }

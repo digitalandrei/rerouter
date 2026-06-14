@@ -84,7 +84,10 @@ fn interface_json(r: &InterfaceRow, metrics: Option<&MetricsRow>) -> Value {
 
 /// Load every interface on a device with its latest metrics (used by both the
 /// device-scoped list and the single-interface fetch).
-pub async fn load_interfaces_for_device(pool: &sqlx::MySqlPool, device_id: u64) -> anyhow::Result<Vec<Value>> {
+pub async fn load_interfaces_for_device(
+    pool: &sqlx::MySqlPool,
+    device_id: u64,
+) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query_as::<_, InterfaceRow>(&format!(
         "SELECT {IFACE_COLS} FROM device_interfaces WHERE device_id = ? \
          ORDER BY display_order, if_index"
@@ -162,9 +165,19 @@ pub async fn metrics(
 
     type SampleRow = (
         chrono::DateTime<chrono::Utc>,
-        f64, f64, f64, f64, f64, f64,
-        u64, u64, u64, u64,
-        Option<f64>, Option<f64>, Option<f64>,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        u64,
+        u64,
+        u64,
+        u64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
     );
     let rows = sqlx::query_as::<_, SampleRow>(
         "SELECT sampled_at, rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
@@ -184,24 +197,41 @@ pub async fn metrics(
         Ok(rows) => {
             let out: Vec<Value> = rows
                 .into_iter()
-                .map(|(ts, rx_bps, tx_bps, rx_pps, tx_pps, rx_u, tx_u, in_e, out_e, in_d, out_d, temp, txp, rxp)| {
-                    json!({
-                        "sampled_at": ts.to_rfc3339(),
-                        "rx_bps": rx_bps,
-                        "tx_bps": tx_bps,
-                        "rx_pps": rx_pps,
-                        "tx_pps": tx_pps,
-                        "rx_util_percent": rx_u,
-                        "tx_util_percent": tx_u,
-                        "in_errors": in_e,
-                        "out_errors": out_e,
-                        "in_discards": in_d,
-                        "out_discards": out_d,
-                        "temp_c": temp,
-                        "tx_power_dbm": txp,
-                        "rx_power_dbm": rxp,
-                    })
-                })
+                .map(
+                    |(
+                        ts,
+                        rx_bps,
+                        tx_bps,
+                        rx_pps,
+                        tx_pps,
+                        rx_u,
+                        tx_u,
+                        in_e,
+                        out_e,
+                        in_d,
+                        out_d,
+                        temp,
+                        txp,
+                        rxp,
+                    )| {
+                        json!({
+                            "sampled_at": ts.to_rfc3339(),
+                            "rx_bps": rx_bps,
+                            "tx_bps": tx_bps,
+                            "rx_pps": rx_pps,
+                            "tx_pps": tx_pps,
+                            "rx_util_percent": rx_u,
+                            "tx_util_percent": tx_u,
+                            "in_errors": in_e,
+                            "out_errors": out_e,
+                            "in_discards": in_d,
+                            "out_discards": out_d,
+                            "temp_c": temp,
+                            "tx_power_dbm": txp,
+                            "rx_power_dbm": rxp,
+                        })
+                    },
+                )
                 .collect();
             (StatusCode::OK, Json(json!(out)))
         }

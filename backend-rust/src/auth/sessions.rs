@@ -178,7 +178,10 @@ pub fn removal_cookie() -> Cookie<'static> {
 impl FromRequestParts<AppState> for Session {
     type Rejection = (StatusCode, &'static str);
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let jar = SignedCookieJar::<Key>::from_request_parts(parts, state)
             .await
             .map_err(|e| match e {})?; // Infallible
@@ -190,7 +193,11 @@ impl FromRequestParts<AppState> for Session {
             Ok(Some(_)) => Err((StatusCode::UNAUTHORIZED, "2fa required")),
             Ok(None) => Err((StatusCode::UNAUTHORIZED, "invalid session")),
             Err(e) => {
-                tracing::error!(event_type = "session_validate_error", error = format!("{e:#}"), "session lookup failed");
+                tracing::error!(
+                    event_type = "session_validate_error",
+                    error = format!("{e:#}"),
+                    "session lookup failed"
+                );
                 Err((StatusCode::INTERNAL_SERVER_ERROR, "session lookup failed"))
             }
         }

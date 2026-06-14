@@ -9,7 +9,13 @@ use rerouter_controller::telemetry::{
     InterfaceCounters,
 };
 
-fn counters(secs_ago: i64, in_oct: u64, out_oct: u64, in_pkt: u64, out_pkt: u64) -> InterfaceCounters {
+fn counters(
+    secs_ago: i64,
+    in_oct: u64,
+    out_oct: u64,
+    in_pkt: u64,
+    out_pkt: u64,
+) -> InterfaceCounters {
     InterfaceCounters {
         sampled_at: Utc::now() - Duration::seconds(secs_ago),
         in_octets: in_oct,
@@ -62,12 +68,24 @@ fn full_sample_derivation_is_correct() {
 
     assert!(r.valid);
     assert!((r.rx_bps - 1_000_000.0).abs() < 1.0, "rx_bps {}", r.rx_bps);
-    assert!((r.tx_bps - 10_000_000.0).abs() < 10.0, "tx_bps {}", r.tx_bps);
+    assert!(
+        (r.tx_bps - 10_000_000.0).abs() < 10.0,
+        "tx_bps {}",
+        r.tx_bps
+    );
     assert!((r.rx_pps - 1_000.0).abs() < 0.1, "rx_pps {}", r.rx_pps);
     assert!((r.tx_pps - 2_000.0).abs() < 0.1, "tx_pps {}", r.tx_pps);
     // 1 Mbps / 100 Mbps = 1%, 10 Mbps / 100 Mbps = 10%.
-    assert!((r.rx_util_percent - 1.0).abs() < 0.01, "rx_util {}", r.rx_util_percent);
-    assert!((r.tx_util_percent - 10.0).abs() < 0.01, "tx_util {}", r.tx_util_percent);
+    assert!(
+        (r.rx_util_percent - 1.0).abs() < 0.01,
+        "rx_util {}",
+        r.rx_util_percent
+    );
+    assert!(
+        (r.tx_util_percent - 10.0).abs() < 0.01,
+        "tx_util {}",
+        r.tx_util_percent
+    );
 }
 
 #[test]

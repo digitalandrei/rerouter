@@ -7,17 +7,17 @@
 //!
 //! See ../docs/architecture.md for the system overview.
 
+pub mod alerts;
+pub mod api;
+pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod db;
-pub mod auth;
-pub mod alerts;
-pub mod telemetry;
-pub mod ssh;
 pub mod detection;
-pub mod reroute;
-pub mod api;
-pub mod scheduler;
 pub mod install;
+pub mod reroute;
+pub mod scheduler;
+pub mod ssh;
+pub mod telemetry;
 #[cfg(feature = "embed-ui")]
 pub mod ui;

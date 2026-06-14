@@ -46,7 +46,10 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     // unless [flow].enabled; binds its own UDP socket (see docs/flow-telemetry.md).
     tokio::spawn(flow::collector::run(pool.clone(), cfg.clone()));
     tokio::spawn(supervise(pool, cfg));
-    tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
+    tracing::info!(
+        event_type = "scheduler_started",
+        "scheduler supervisor spawned (per-device SNMP poll loops)"
+    );
     Ok(())
 }
 
@@ -64,12 +67,21 @@ async fn discover_prefixes_daily(pool: MySqlPool) {
             Ok(devices) => {
                 for d in devices {
                     match crate::ssh::discover_prefixes_and_store(&pool, d.id).await {
-                        Ok(n) => tracing::debug!(event_type = "prefix_discovery", device_id = d.id, prefixes = n, "announced prefixes refreshed"),
-                        Err(e) => tracing::debug!(event_type = "prefix_discovery_failed", device_id = d.id, error = %e, "announced-prefix discovery failed (non-fatal)"),
+                        Ok(n) => tracing::debug!(
+                            event_type = "prefix_discovery",
+                            device_id = d.id,
+                            prefixes = n,
+                            "announced prefixes refreshed"
+                        ),
+                        Err(e) => {
+                            tracing::debug!(event_type = "prefix_discovery_failed", device_id = d.id, error = %e, "announced-prefix discovery failed (non-fatal)")
+                        }
                     }
                 }
             }
-            Err(e) => tracing::warn!(event_type = "prefix_discovery_load_failed", error = %e, "could not load devices for prefix discovery"),
+            Err(e) => {
+                tracing::warn!(event_type = "prefix_discovery_load_failed", error = %e, "could not load devices for prefix discovery")
+            }
         }
         tokio::time::sleep(PREFIX_DISCOVERY_INTERVAL).await;
     }
@@ -103,7 +115,8 @@ async fn supervise(pool: MySqlPool, cfg: Arc<Config>) {
     loop {
         match snmp::load_enabled_devices(&pool).await {
             Ok(devices) => {
-                let enabled_ids: std::collections::HashSet<u64> = devices.iter().map(|d| d.id).collect();
+                let enabled_ids: std::collections::HashSet<u64> =
+                    devices.iter().map(|d| d.id).collect();
 
                 // Drop loops for devices that are gone, disabled, or finished.
                 running.retain(|id, handle| {
@@ -165,7 +178,12 @@ async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Resu
     // nothing fresh and harmlessly no-ops.
     match snmp::poll(pool, device_id).await {
         Ok(updated) => {
-            tracing::debug!(event_type = "device_polled", device_id, interfaces = updated, "poll complete");
+            tracing::debug!(
+                event_type = "device_polled",
+                device_id,
+                interfaces = updated,
+                "poll complete"
+            );
         }
         Err(e) => {
             // Already recorded as last_error; surface and skip detection.
@@ -183,10 +201,17 @@ async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Resu
     // Detection for this device's monitored interfaces.
     match detection::engine::evaluate_device(pool, cfg, device_id).await {
         Ok(fired) if fired > 0 => {
-            tracing::info!(event_type = "device_detection", device_id, fired, "rules fired on poll");
+            tracing::info!(
+                event_type = "device_detection",
+                device_id,
+                fired,
+                "rules fired on poll"
+            );
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(event_type = "detection_failed", device_id, error = %e, "detection pass failed"),
+        Err(e) => {
+            tracing::warn!(event_type = "detection_failed", device_id, error = %e, "detection pass failed")
+        }
     }
     Ok(())
 }

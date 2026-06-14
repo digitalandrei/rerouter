@@ -30,20 +30,27 @@ pub async fn create(
     reason: &str,
     by: Option<u64>,
 ) -> Result<u64> {
-    let res = sqlx::query("INSERT INTO locks (scope, scope_ref, reason, kind, created_by) VALUES (?, ?, ?, ?, ?)")
-        .bind(scope)
-        .bind(scope_ref)
-        .bind(reason)
-        .bind(kind)
-        .bind(by)
-        .execute(pool)
-        .await
-        .context("creating lock")?;
+    let res = sqlx::query(
+        "INSERT INTO locks (scope, scope_ref, reason, kind, created_by) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(scope)
+    .bind(scope_ref)
+    .bind(reason)
+    .bind(kind)
+    .bind(by)
+    .execute(pool)
+    .await
+    .context("creating lock")?;
     Ok(res.last_insert_id())
 }
 
 /// Clear all active locks for a scope/ref. Returns the number cleared.
-pub async fn clear(pool: &MySqlPool, scope: &str, scope_ref: Option<&str>, by: Option<u64>) -> Result<u64> {
+pub async fn clear(
+    pool: &MySqlPool,
+    scope: &str,
+    scope_ref: Option<&str>,
+    by: Option<u64>,
+) -> Result<u64> {
     let res = match scope_ref {
         Some(r) => {
             sqlx::query(

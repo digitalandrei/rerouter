@@ -46,20 +46,27 @@ const USER_COLS: &str = "u.id, u.email, u.name, \
     (u.two_factor_confirmed_at IS NOT NULL) AS twofa_enrolled, u.created_at";
 
 async fn fetch_user(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
-    let row = sqlx::query_as::<_, UserRow>(&format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query_as::<_, UserRow>(&format!("SELECT {USER_COLS} FROM users u WHERE u.id = ?"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.as_ref().map(user_json))
 }
 
 /// GET /api/users — every account with its role + 2FA-enrollment state.
-pub async fn list(_g: RequirePermission<markers::ManageUsers>, State(state): State<AppState>) -> JsonResp {
+pub async fn list(
+    _g: RequirePermission<markers::ManageUsers>,
+    State(state): State<AppState>,
+) -> JsonResp {
     match sqlx::query_as::<_, UserRow>(&format!("SELECT {USER_COLS} FROM users u ORDER BY u.email"))
         .fetch_all(&state.pool)
         .await
     {
-        Ok(rows) => (StatusCode::OK, Json(json!(rows.iter().map(user_json).collect::<Vec<_>>()))),
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(json!(rows.iter().map(user_json).collect::<Vec<_>>())),
+        ),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
@@ -81,34 +88,57 @@ pub async fn create(
     let email = body.email.trim();
     let name = body.name.trim();
     if email.is_empty() || name.is_empty() {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "email and name are required");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "email and name are required",
+        );
     }
     if !ASSIGNABLE_ROLES.contains(&body.role.as_str()) {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "role must be superadmin or admin");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "role must be superadmin or admin",
+        );
     }
     if body.password.len() < 12 {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "password must be at least 12 characters");
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "password must be at least 12 characters",
+        );
     }
     let phc = match password::hash(&body.password) {
         Ok(h) => h,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "hashing failed"),
     };
 
-    let res = sqlx::query("INSERT INTO users (name, email, password, two_factor_confirmed_at) VALUES (?, ?, ?, NULL)")
-        .bind(name)
-        .bind(email)
-        .bind(&phc)
-        .execute(&state.pool)
-        .await;
+    let res = sqlx::query(
+        "INSERT INTO users (name, email, password, two_factor_confirmed_at) VALUES (?, ?, ?, NULL)",
+    )
+    .bind(name)
+    .bind(email)
+    .bind(&phc)
+    .execute(&state.pool)
+    .await;
     let id = match res {
         Ok(r) => r.last_insert_id(),
-        Err(e) if is_dup(&e) => return err(StatusCode::CONFLICT, "a user with that email already exists"),
+        Err(e) if is_dup(&e) => {
+            return err(
+                StatusCode::CONFLICT,
+                "a user with that email already exists",
+            )
+        }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
     if set_role(&state.pool, id, &body.role).await.is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "assigning role failed");
     }
-    audit(&state.pool, g.session.user_id, "user_created", id, &format!("{email} as {}", body.role)).await;
+    audit(
+        &state.pool,
+        g.session.user_id,
+        "user_created",
+        id,
+        &format!("{email} as {}", body.role),
+    )
+    .await;
 
     match fetch_user(&state.pool, id).await {
         Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
@@ -141,12 +171,19 @@ pub async fn update(
 
     if let Some(name) = body.name.as_deref().map(str::trim) {
         if !name.is_empty() {
-            let _ = sqlx::query("UPDATE users SET name = ? WHERE id = ?").bind(name).bind(id).execute(&state.pool).await;
+            let _ = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+                .bind(name)
+                .bind(id)
+                .execute(&state.pool)
+                .await;
         }
     }
     if let Some(role) = &body.role {
         if !ASSIGNABLE_ROLES.contains(&role.as_str()) {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, "role must be superadmin or admin");
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "role must be superadmin or admin",
+            );
         }
         if role != "superadmin" && is_only_superadmin(&state.pool, id).await {
             return err(StatusCode::CONFLICT, "cannot demote the last superadmin");
@@ -154,7 +191,14 @@ pub async fn update(
         if set_role(&state.pool, id, role).await.is_err() {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "assigning role failed");
         }
-        audit(&state.pool, g.session.user_id, "user_role_changed", id, &format!("role -> {role}")).await;
+        audit(
+            &state.pool,
+            g.session.user_id,
+            "user_role_changed",
+            id,
+            &format!("role -> {role}"),
+        )
+        .await;
     }
 
     match fetch_user(&state.pool, id).await {
@@ -178,7 +222,14 @@ pub async fn reset_2fa(
     .await;
     match res {
         Ok(r) if r.rows_affected() > 0 => {
-            audit(&state.pool, g.session.user_id, "user_2fa_reset", id, "TOTP cleared; re-enroll at next login").await;
+            audit(
+                &state.pool,
+                g.session.user_id,
+                "user_2fa_reset",
+                id,
+                "TOTP cleared; re-enroll at next login",
+            )
+            .await;
             (StatusCode::OK, Json(json!({ "ok": true })))
         }
         Ok(_) => err(StatusCode::NOT_FOUND, "user not found"),
@@ -198,10 +249,20 @@ pub async fn remove(
     if is_only_superadmin(&state.pool, id).await {
         return err(StatusCode::CONFLICT, "cannot delete the last superadmin");
     }
-    let res = sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&state.pool).await;
+    let res = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id)
+        .execute(&state.pool)
+        .await;
     match res {
         Ok(r) if r.rows_affected() > 0 => {
-            audit(&state.pool, g.session.user_id, "user_deleted", id, "account deleted").await;
+            audit(
+                &state.pool,
+                g.session.user_id,
+                "user_deleted",
+                id,
+                "account deleted",
+            )
+            .await;
             (StatusCode::OK, Json(json!({ "ok": true })))
         }
         Ok(_) => err(StatusCode::NOT_FOUND, "user not found"),
@@ -212,7 +273,10 @@ pub async fn remove(
 /// Replace the user's role assignment with exactly `role` (one role per user).
 async fn set_role(pool: &sqlx::MySqlPool, user_id: u64, role: &str) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM role_user WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM role_user WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("INSERT INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = ?")
         .bind(user_id)
         .bind(role)

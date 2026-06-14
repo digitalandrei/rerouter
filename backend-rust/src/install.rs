@@ -150,7 +150,9 @@ pub fn run_install(prefix: &str) -> Result<()> {
 
     let mut systemd_ready = false;
     if prefix_is_root {
-        match systemctl(&["daemon-reload"]).and_then(|()| systemctl(&["enable", "rerouter-controller"])) {
+        match systemctl(&["daemon-reload"])
+            .and_then(|()| systemctl(&["enable", "rerouter-controller"]))
+        {
             Ok(()) => {
                 systemd_ready = true;
                 tracing::info!(
@@ -239,9 +241,14 @@ pub async fn create_admin(
             let plain = match password_plain {
                 Some(v) => v,
                 // No extra crates allowed for no-echo input — warn instead.
-                None => prompt("Admin password (input will echo; prefer --admin-password/ADMIN_PASSWORD)")?,
+                None => prompt(
+                    "Admin password (input will echo; prefer --admin-password/ADMIN_PASSWORD)",
+                )?,
             };
-            anyhow::ensure!(plain.len() >= 12, "admin password must be at least 12 characters");
+            anyhow::ensure!(
+                plain.len() >= 12,
+                "admin password must be at least 12 characters"
+            );
             let phc = password::hash(&plain)?;
             let res = sqlx::query(
                 "INSERT INTO users (name, email, password, two_factor_confirmed_at) VALUES (?, ?, ?, NULL)",
@@ -274,7 +281,9 @@ pub async fn create_admin(
         "admin bootstrap complete"
     );
     if created {
-        println!("created admin user '{email}' (id {user_id}); 2FA enrollment happens at first login");
+        println!(
+            "created admin user '{email}' (id {user_id}); 2FA enrollment happens at first login"
+        );
     } else {
         println!("user '{email}' already exists (id {user_id}); password left unchanged");
     }
@@ -312,7 +321,10 @@ fn ensure_system_user(prefix_is_root: bool) -> bool {
         .status()
     {
         Ok(s) if s.success() => {
-            tracing::info!(event_type = "install_user_created", "created system user 'rerouter'");
+            tracing::info!(
+                event_type = "install_user_created",
+                "created system user 'rerouter'"
+            );
             true
         }
         _ => {
@@ -348,7 +360,11 @@ fn systemctl(args: &[&str]) -> Result<()> {
         .args(args)
         .status()
         .with_context(|| format!("running systemctl {}", args.join(" ")))?;
-    anyhow::ensure!(status.success(), "systemctl {} exited with {status}", args.join(" "));
+    anyhow::ensure!(
+        status.success(),
+        "systemctl {} exited with {status}",
+        args.join(" ")
+    );
     Ok(())
 }
 
@@ -364,7 +380,9 @@ fn prompt(label: &str) -> Result<String> {
     print!("{label}: ");
     std::io::stdout().flush().context("flushing stdout")?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).context("reading stdin")?;
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading stdin")?;
     let value = line.trim().to_string();
     anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
     Ok(value)
