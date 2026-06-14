@@ -285,6 +285,20 @@ function TopCard({
   );
 }
 
+/** Compact "time ago" for the exporter's last datagram (staleness at a glance). */
+function lastSeen(iso: string | null): string {
+  if (!iso) return "never";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
   if (exporters.length === 0) return null;
   return (
@@ -297,6 +311,8 @@ function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="pl-6">Source</TableHead>
+              <TableHead>Domain</TableHead>
+              <TableHead>Last datagram</TableHead>
               <TableHead>Sampling</TableHead>
               <TableHead>SNMP cross-check</TableHead>
               <TableHead>Datagrams</TableHead>
@@ -304,26 +320,42 @@ function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {exporters.map((e) => (
-              <TableRow key={e.id}>
-                <TableCell className="pl-6 font-mono text-xs">{e.source_addr}</TableCell>
-                <TableCell className="text-xs">
-                  <div className="flex items-center gap-1">
-                    {e.effective_sampling_rate}:1
-                    <Badge variant={e.sampling_confidence === "high" ? "secondary" : "destructive"}>
-                      {e.sampling_source}
-                    </Badge>
-                  </div>
-                </TableCell>
-                <TableCell className="text-xs">
-                  {e.snmp_xcal_ratio == null ? "—" : `${e.snmp_xcal_ratio.toFixed(2)}×`}
-                </TableCell>
-                <TableCell className="text-xs">{e.datagrams_total}</TableCell>
-                <TableCell className="pr-6 text-xs">
-                  {e.dropped_no_template} / {e.dropped_malformed}
-                </TableCell>
-              </TableRow>
-            ))}
+            {exporters.map((e) => {
+              const stale =
+                e.last_packet_at != null &&
+                Date.now() - new Date(e.last_packet_at).getTime() > 60 * 60 * 1000;
+              return (
+                <TableRow key={e.id}>
+                  <TableCell className="pl-6 font-mono text-xs">{e.source_addr}</TableCell>
+                  <TableCell className="text-xs">{e.observation_domain}</TableCell>
+                  <TableCell
+                    className="text-xs"
+                    title={e.last_packet_at ?? undefined}
+                  >
+                    {stale ? (
+                      <Badge variant="destructive">{lastSeen(e.last_packet_at)}</Badge>
+                    ) : (
+                      lastSeen(e.last_packet_at)
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <div className="flex items-center gap-1">
+                      {e.effective_sampling_rate}:1
+                      <Badge variant={e.sampling_confidence === "high" ? "secondary" : "destructive"}>
+                        {e.sampling_source}
+                      </Badge>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {e.snmp_xcal_ratio == null ? "—" : `${e.snmp_xcal_ratio.toFixed(2)}×`}
+                  </TableCell>
+                  <TableCell className="text-xs">{e.datagrams_total}</TableCell>
+                  <TableCell className="pr-6 text-xs">
+                    {e.dropped_no_template} / {e.dropped_malformed}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </CardContent>

@@ -332,6 +332,9 @@ pub struct SearchQuery {
     port: Option<u16>,
     /// Exact match on the IP protocol number (6=TCP, 17=UDP, …).
     protocol: Option<u16>,
+    /// Restrict to one interface by its SNMP ifIndex (the searchable interface
+    /// dropdown sends this; always populated on a bucket, unlike interface_id).
+    if_index: Option<u32>,
     minutes: Option<i64>,
     metric: Option<String>,
     limit: Option<i64>,
@@ -364,6 +367,9 @@ pub async fn search(
     qb.push(" MINUTE)");
     if let Some(d) = q.device_id {
         qb.push(" AND device_id = ").push_bind(d);
+    }
+    if let Some(idx) = q.if_index {
+        qb.push(" AND if_index = ").push_bind(idx);
     }
     if let Some(s) = clean(&q.src) {
         qb.push(" AND src_addr LIKE CONCAT(")

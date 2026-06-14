@@ -9,7 +9,15 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Waves } from "lucide-react";
-import { api, type Device, type FlowTopRow, type FlowDetailResponse, ApiError } from "@/lib/api";
+import {
+  api,
+  type Device,
+  type FlowTopRow,
+  type FlowDetailResponse,
+  ApiError,
+} from "@/lib/api";
+import { SearchableSelect, type SelectOption } from "@/components/searchable-select";
+import { PROTOCOLS } from "@/lib/protocols";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -127,6 +135,8 @@ function SearchTab({ devices }: { devices: Device[] }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FlowTopRow | null>(null);
+  const [ifIndex, setIfIndex] = useState(""); // "" = all interfaces
+  const [interfaces, setInterfaces] = useState<SelectOption[]>([]);
   const seqRef = useRef(0);
 
   // Suggestion fetchers, memoized on the selected device so the autocomplete's
@@ -149,6 +159,38 @@ function SearchTab({ devices }: { devices: Device[] }) {
     return Number.isFinite(n) && String(n) === port.trim() ? n : undefined;
   }, [port]);
   const protoNum = useMemo(() => (proto === "" ? undefined : parseInt(proto, 10)), [proto]);
+  const ifIndexNum = useMemo(
+    () => (ifIndex === "" ? undefined : parseInt(ifIndex, 10)),
+    [ifIndex],
+  );
+
+  // Load the selected device's interfaces for the interface filter dropdown.
+  useEffect(() => {
+    if (deviceId === null) {
+      setInterfaces([]);
+      setIfIndex("");
+      return;
+    }
+    let cancelled = false;
+    setIfIndex(""); // reset the interface filter when the device changes
+    api.devices
+      .interfaces(deviceId)
+      .then((ifs) => {
+        if (!cancelled)
+          setInterfaces(
+            ifs.map((i) => ({
+              value: String(i.if_index),
+              label: i.if_name || i.if_descr || `if${i.if_index}`,
+            })),
+          );
+      })
+      .catch(() => {
+        if (!cancelled) setInterfaces([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId]);
 
   // Lazy search: debounced on any filter change, with a sequence guard so a
   // slower earlier response can't overwrite a newer one.
@@ -163,6 +205,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
           dst: dst.trim() || undefined,
           port: portNum,
           protocol: protoNum,
+          ifIndex: ifIndexNum,
           metric,
           limit: 100,
         })
@@ -181,7 +224,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
         });
     }, 350);
     return () => clearTimeout(t);
-  }, [deviceId, src, dst, portNum, protoNum, metric]);
+  }, [deviceId, src, dst, portNum, protoNum, ifIndexNum, metric]);
 
   const windowSecs = WINDOW_MINUTES * 60;
   const rate = (r: FlowTopRow) =>
@@ -192,10 +235,20 @@ function SearchTab({ devices }: { devices: Device[] }) {
   return (
     <div className="space-y-4">
       <Card>
-        <CardContent className="grid grid-cols-1 gap-4 py-4 md:grid-cols-6">
+        <CardContent className="grid grid-cols-1 gap-4 py-4 md:grid-cols-3 xl:grid-cols-7">
           <div className="space-y-1">
             <Label>Device</Label>
             <DeviceSelect devices={devices} value={deviceId} onChange={setDeviceId} allowAll />
+          </div>
+          <div className="space-y-1">
+            <Label>Interface</Label>
+            <SearchableSelect
+              options={[{ value: "", label: "All interfaces" }, ...interfaces]}
+              value={ifIndex}
+              onChange={setIfIndex}
+              placeholder={deviceId === null ? "Select a device first" : "All interfaces"}
+              disabled={deviceId === null}
+            />
           </div>
           <div className="space-y-1">
             <Label>Source</Label>
@@ -228,17 +281,12 @@ function SearchTab({ devices }: { devices: Device[] }) {
           </div>
           <div className="space-y-1">
             <Label>Protocol</Label>
-            <select
-              className="h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            <SearchableSelect
+              options={PROTOCOLS}
               value={proto}
-              onChange={(e) => setProto(e.target.value)}
-            >
-              <option value="">Any</option>
-              <option value="6">TCP</option>
-              <option value="17">UDP</option>
-              <option value="1">ICMP</option>
-              <option value="132">SCTP</option>
-            </select>
+              onChange={setProto}
+              placeholder="Any protocol"
+            />
           </div>
           <div className="space-y-1">
             <Label>Rank by</Label>

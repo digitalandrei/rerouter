@@ -382,8 +382,18 @@ export interface Alert {
   device_id: number | null;
   interface_id: number | null;
   rule_id: number | null;
+  device_name: string | null;
+  interface_name: string | null;
+  rule_name: string | null;
   created_at: string;
   payload: Record<string, unknown>;
+}
+
+export interface AlertPage {
+  rows: Alert[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +703,7 @@ export const api = {
       dst?: string;
       port?: number;
       protocol?: number;
+      ifIndex?: number;
       minutes?: number;
       metric?: "bytes" | "pkts";
       limit?: number;
@@ -703,6 +714,7 @@ export const api = {
       if (opts.dst) p.set("dst", opts.dst);
       if (opts.port !== undefined) p.set("port", String(opts.port));
       if (opts.protocol !== undefined) p.set("protocol", String(opts.protocol));
+      if (opts.ifIndex !== undefined) p.set("if_index", String(opts.ifIndex));
       if (opts.minutes !== undefined) p.set("minutes", String(opts.minutes));
       if (opts.metric) p.set("metric", opts.metric);
       if (opts.limit !== undefined) p.set("limit", String(opts.limit));
@@ -782,7 +794,14 @@ export const api = {
   },
 
   alerts: {
-    list: () => request<Alert[]>("/api/alerts"),
+    list: (opts?: { limit?: number; offset?: number; days?: number }) => {
+      const p = new URLSearchParams();
+      if (opts?.limit !== undefined) p.set("limit", String(opts.limit));
+      if (opts?.offset !== undefined) p.set("offset", String(opts.offset));
+      if (opts?.days !== undefined) p.set("days", String(opts.days));
+      const qs = p.toString();
+      return request<AlertPage>(`/api/alerts${qs ? `?${qs}` : ""}`);
+    },
   },
 
   reroutes: {

@@ -32,8 +32,8 @@ export default function Dashboard() {
       .finally(() => setLoadingStatus(false));
 
     api.alerts
-      .list()
-      .then((all) => setAlerts(all.slice(0, 10)))
+      .list({ limit: 10 })
+      .then((page) => setAlerts(page.rows))
       .catch(() => setAlerts([]))
       .finally(() => setLoadingAlerts(false));
   }, []);

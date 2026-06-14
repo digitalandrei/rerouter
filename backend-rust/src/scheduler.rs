@@ -87,8 +87,9 @@ async fn discover_prefixes_daily(pool: MySqlPool) {
     }
 }
 
-/// Periodically delete interface_samples older than the retention window so the
-/// table only ever holds ~the last hour of per-interface telemetry.
+/// Periodically delete interface_samples older than the retention window (so the
+/// table only ever holds ~the last hour of per-interface telemetry) and drop
+/// flow exporters that have gone silent for over a day.
 async fn prune_samples(pool: MySqlPool) {
     loop {
         match sqlx::query(
@@ -104,6 +105,25 @@ async fn prune_samples(pool: MySqlPool) {
             Ok(_) => {}
             Err(e) => tracing::warn!(event_type = "sample_prune_failed", error = %e, "pruning interface_samples failed"),
         }
+
+        // Drop flow exporters idle for >1 day so the exporter-health view doesn't
+        // accumulate stale entries (their buckets are already gone via retention;
+        // the FK cascade covers any remainder). COALESCE handles an exporter row
+        // that was created but never sent a datagram.
+        match sqlx::query(
+            "DELETE FROM flow_exporters \
+             WHERE COALESCE(last_packet_at, created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 DAY)",
+        )
+        .execute(&pool)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(event_type = "flow_exporters_pruned", rows = r.rows_affected(), "pruned stale flow exporters (>1d idle)")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(event_type = "exporter_prune_failed", error = %e, "pruning flow_exporters failed"),
+        }
+
         tokio::time::sleep(PRUNE_INTERVAL).await;
     }
 }
