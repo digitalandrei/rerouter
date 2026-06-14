@@ -37,6 +37,8 @@ pub struct Database {
 #[serde(default)]
 pub struct Auth {
     pub session_ttl_hours: u64,
+    /// Session TTL when the user ticks "remember me" at login (default 7 days).
+    pub remember_me_ttl_hours: u64,
     /// Failed logins (per email + real client IP) before lockout.
     pub lockout_threshold: u32,
     pub lockout_minutes: u64,
@@ -44,7 +46,7 @@ pub struct Auth {
 
 impl Default for Auth {
     fn default() -> Self {
-        Self { session_ttl_hours: 12, lockout_threshold: 5, lockout_minutes: 15 }
+        Self { session_ttl_hours: 12, remember_me_ttl_hours: 168, lockout_threshold: 5, lockout_minutes: 15 }
     }
 }
 

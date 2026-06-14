@@ -41,6 +41,9 @@ type JsonResp = (StatusCode, Json<Value>);
 struct LoginBody {
     email: String,
     password: String,
+    /// "Remember me" — use the longer remember-me TTL (default 7 days).
+    #[serde(default)]
+    remember: bool,
 }
 
 /// POST /api/auth/login — verify email + password (throttled by email + real
@@ -97,12 +100,15 @@ async fn login(
         return deny(jar);
     }
 
-    // Password OK — create a pre-2FA session.
-    let (_session_id, token) = match sessions::create(pool, user_id, &ip, &ua, cfg.session_ttl_hours as i64).await {
+    // Password OK — create a pre-2FA session. "Remember me" picks the longer TTL;
+    // the chosen lifetime is persisted in the session row (expires_at) so it
+    // survives the token rotation at /totp and an app restart.
+    let ttl_hours = if body.remember { cfg.remember_me_ttl_hours } else { cfg.session_ttl_hours } as i64;
+    let (_session_id, token) = match sessions::create(pool, user_id, &ip, &ua, ttl_hours).await {
         Ok(v) => v,
         Err(_) => return (jar, (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "session_create_failed" })))),
     };
-    let jar = jar.add(sessions::build_cookie(token, cfg.session_ttl_hours as i64));
+    let jar = jar.add(sessions::build_cookie(token, time::Duration::hours(ttl_hours)));
 
     // Reset the failure counter on a correct password.
     let _ = sqlx::query("UPDATE users SET failed_login_attempts = 0 WHERE id = ?")
@@ -219,7 +225,10 @@ async fn totp_challenge(
         Ok(t) => t,
         Err(_) => return (jar, (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "session_update_failed" })))),
     };
-    let jar = jar.add(sessions::build_cookie(new_token, state.config.auth.session_ttl_hours as i64));
+    // Keep the cookie's lifetime aligned with the session row (which already
+    // encodes the remember-me choice made at /login).
+    let remaining = (session.expires_at - chrono::Utc::now()).num_seconds().max(60);
+    let jar = jar.add(sessions::build_cookie(new_token, time::Duration::seconds(remaining)));
 
     // First confirmation: stamp two_factor_confirmed_at + issue recovery codes.
     let mut new_recovery_codes: Option<Vec<String>> = None;

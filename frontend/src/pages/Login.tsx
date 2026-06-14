@@ -36,6 +36,7 @@ export default function Login() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -50,7 +51,7 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      await login(email, password);
+      await login(email, password, remember);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Login failed");
     } finally {
@@ -106,6 +107,15 @@ export default function Login() {
                     onChange={(e) => setPassword(e.target.value)}
                   />
                 </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border border-input"
+                    checked={remember}
+                    onChange={(e) => setRemember(e.target.checked)}
+                  />
+                  Remember me for 7 days
+                </label>
                 {error && (
                   <p className="text-sm text-destructive" role="alert">
                     {error}

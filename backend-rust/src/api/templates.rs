@@ -22,6 +22,7 @@ fn template_json(t: &templates::Template) -> Value {
     json!({
         "id": t.id,
         "name": t.name,
+        "display_name": t.display_name,
         "description": t.description,
         "provider_type": t.provider_type,
         "mode": t.mode,

@@ -91,7 +91,7 @@ function RerouteDrawer({
             <div className="grid grid-cols-2 gap-2 text-sm">
               <div>
                 <span className="text-muted-foreground">Template: </span>
-                <code className="text-xs">{detail.template_name ?? "—"}</code>
+                {detail.template_display_name ?? detail.template_name ?? "—"}
               </div>
               <div>
                 <span className="text-muted-foreground">Device: </span>
@@ -307,7 +307,7 @@ export default function Reroutes() {
                   <TableRow key={r.id} className="hover:bg-muted/50">
                     <TableCell className="pl-6 font-medium">{r.id}</TableCell>
                     <TableCell>
-                      <code className="text-xs">{r.template_name ?? "—"}</code>
+                      {r.template_display_name ?? r.template_name ?? "—"}
                     </TableCell>
                     <TableCell>{r.device_name ?? "—"}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{r.trigger_type}</TableCell>

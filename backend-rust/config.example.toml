@@ -18,6 +18,8 @@ url_env = "DATABASE_URL"
 # Session cookies are backed by the DB sessions table. SESSION_SECRET and
 # SECRETS_KEY come from the environment; TWO_FACTOR_ISSUER=Rerouter.
 session_ttl_hours = 12
+# Session TTL when the user ticks "remember me" at login (default 7 days).
+remember_me_ttl_hours = 168
 # Failed logins (per email + real client IP) before account lockout.
 lockout_threshold = 5
 lockout_minutes = 15

@@ -148,16 +148,16 @@ fn cookie_secure() -> bool {
     )
 }
 
-/// Build the session cookie carrying `token`. HttpOnly + SameSite=Lax, path=/,
-/// Secure per `cookie_secure()`; the SignedCookieJar adds the SESSION_SECRET
-/// signature on the way out.
-pub fn build_cookie(token: String, ttl_hours: i64) -> Cookie<'static> {
+/// Build the session cookie carrying `token`, with `max_age` matching the session
+/// row's lifetime. HttpOnly + SameSite=Lax, path=/, Secure per `cookie_secure()`;
+/// the SignedCookieJar adds the SESSION_SECRET signature on the way out.
+pub fn build_cookie(token: String, max_age: time::Duration) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, token))
         .http_only(true)
         .secure(cookie_secure())
         .same_site(SameSite::Lax)
         .path("/")
-        .max_age(time::Duration::hours(ttl_hours))
+        .max_age(max_age)
         .build()
 }
 

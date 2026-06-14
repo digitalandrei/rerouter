@@ -137,7 +137,7 @@ export default function ManualReroute() {
                 <option value="">Select template…</option>
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.name}
+                    {t.display_name || t.name}
                   </option>
                 ))}
               </select>

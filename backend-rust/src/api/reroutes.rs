@@ -28,6 +28,7 @@ struct RerouteRow {
     device_name: Option<String>,
     reroute_template_id: Option<u64>,
     template_name: Option<String>,
+    template_display_name: Option<String>,
     trigger_type: String,
     state: String,
     reason: Option<String>,
@@ -42,7 +43,8 @@ struct RerouteRow {
 }
 
 const REROUTE_SELECT: &str = "SELECT r.id, r.device_id, d.name AS device_name, \
-     r.reroute_template_id, t.name AS template_name, r.trigger_type, r.state, \
+     r.reroute_template_id, t.name AS template_name, t.display_name AS template_display_name, \
+     r.trigger_type, r.state, \
      r.reason, r.success, r.verification_status, r.failure_reason, r.rule_id, u.email AS triggered_by, \
      r.started_at, r.finished_at, r.created_at \
      FROM reroutes r \
@@ -57,6 +59,7 @@ fn reroute_json(r: &RerouteRow) -> Value {
         "device_name": r.device_name,
         "reroute_template_id": r.reroute_template_id,
         "template_name": r.template_name,
+        "template_display_name": r.template_display_name,
         "trigger_type": r.trigger_type,
         "state": r.state,
         "reason": r.reason,

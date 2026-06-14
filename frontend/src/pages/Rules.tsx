@@ -195,7 +195,7 @@ function RuleActionsDialog({
                 key={a.id}
                 className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
               >
-                <code className="text-xs">{a.template_name}</code>
+                <span className="font-medium">{a.template_display_name || a.template_name}</span>
                 <span className="text-muted-foreground">on</span>
                 <span className="font-medium">{a.device_name}</span>
                 <span className="text-xs text-muted-foreground">
@@ -234,7 +234,7 @@ function RuleActionsDialog({
                 <option value="">Select template…</option>
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.name}
+                    {t.display_name || t.name}
                   </option>
                 ))}
               </select>

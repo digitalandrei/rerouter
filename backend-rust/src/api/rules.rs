@@ -92,8 +92,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
 /// Load a rule's attached actions (template + target router + params) for the
 /// rule JSON. Joins display names so the SPA needn't re-resolve them.
 async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
-    let rows = sqlx::query_as::<_, (u64, u64, String, u64, String, Option<sqlx::types::Json<Value>>, bool, u32)>(
-        "SELECT ra.id, ra.reroute_template_id, t.name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position \
+    let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32)>(
+        "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position \
          FROM rule_actions ra \
          JOIN reroute_templates t ON t.id = ra.reroute_template_id \
          JOIN devices d ON d.id = ra.device_id \
@@ -104,11 +104,12 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
     .await
     .unwrap_or_default();
     rows.into_iter()
-        .map(|(id, template_id, template_name, device_id, device_name, params, enabled, position)| {
+        .map(|(id, template_id, template_name, template_display_name, device_id, device_name, params, enabled, position)| {
             json!({
                 "id": id,
                 "reroute_template_id": template_id,
                 "template_name": template_name,
+                "template_display_name": template_display_name,
                 "device_id": device_id,
                 "device_name": device_name,
                 "params": params.map(|j| j.0).unwrap_or(Value::Null),

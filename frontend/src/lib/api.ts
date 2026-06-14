@@ -241,6 +241,7 @@ export interface RuleAction {
   id: number;
   reroute_template_id: number;
   template_name: string;
+  template_display_name: string | null;
   device_id: number;
   device_name: string;
   params: Record<string, unknown>;
@@ -303,6 +304,7 @@ export interface Reroute {
   device_name: string | null;
   reroute_template_id: number | null;
   template_name: string | null;
+  template_display_name: string | null;
   trigger_type: string;
   state: RerouteState;
   reason: string | null;
@@ -385,6 +387,7 @@ export interface TemplateParamSpec {
 export interface Template {
   id: number;
   name: string;
+  display_name: string | null;
   description: string | null;
   provider_type: string;
   mode: string;
@@ -489,10 +492,10 @@ async function request<T>(
 
 export const api = {
   auth: {
-    login: (email: string, password: string) =>
+    login: (email: string, password: string, remember = false) =>
       request<LoginResponse>("/api/auth/login", {
         method: "POST",
-        body: { email, password },
+        body: { email, password, remember },
       }),
     totp: (code: string) =>
       request<TotpResponse>("/api/auth/totp", {

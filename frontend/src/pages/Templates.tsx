@@ -67,7 +67,8 @@ function TemplateCard({ template }: { template: Template }) {
     <Card>
       <CardHeader>
         <div className="flex flex-wrap items-center gap-2">
-          <CardTitle className="text-base font-mono">{template.name}</CardTitle>
+          <CardTitle className="text-base">{template.display_name || template.name}</CardTitle>
+          <code className="text-xs text-muted-foreground">{template.name}</code>
           <Badge variant="outline" className="font-normal text-muted-foreground">
             {template.provider_type}
           </Badge>

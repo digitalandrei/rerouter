@@ -25,6 +25,7 @@ use sqlx::MySqlPool;
 pub struct Template {
     pub id: u64,
     pub name: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub provider_type: String,
     pub mode: String,
@@ -40,6 +41,7 @@ pub struct Template {
 struct TemplateRow {
     id: u64,
     name: String,
+    display_name: Option<String>,
     description: Option<String>,
     provider_type: String,
     mode: String,
@@ -51,7 +53,7 @@ struct TemplateRow {
     enabled: bool,
 }
 
-const COLS: &str = "id, name, description, provider_type, mode, \
+const COLS: &str = "id, name, display_name, description, provider_type, mode, \
      automatic_allowed, parameter_schema_json, plan_json, \
      verification_json, rollback_template_id, enabled";
 
@@ -60,6 +62,7 @@ impl From<TemplateRow> for Template {
         Template {
             id: r.id,
             name: r.name,
+            display_name: r.display_name,
             description: r.description,
             provider_type: r.provider_type,
             mode: r.mode,

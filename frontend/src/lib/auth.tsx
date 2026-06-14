@@ -30,7 +30,7 @@ export interface AuthState {
   user: SessionUser | null;
   /** Present during the `totp` stage on first login only. */
   enrollment: LoginResponse["totp_enrollment"] | null;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, remember?: boolean) => Promise<void>;
   submitTotp: (code: string) => Promise<void>;
   logout: () => Promise<void>;
   /** Fresh password+TOTP check before high-safety reroutes. */
@@ -66,8 +66,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const login = useCallback(async (email: string, password: string) => {
-    const res = await api.auth.login(email, password);
+  const login = useCallback(async (email: string, password: string, remember = false) => {
+    const res = await api.auth.login(email, password, remember);
     setEnrollment(res.totp_enrollment ?? null);
     setStage("totp");
   }, []);
