@@ -323,6 +323,8 @@ export interface Rule {
   threshold_value: number;
   duration_seconds: number;
   consecutive_samples: number;
+  recovery_mode?: "auto" | "threshold" | "manual";
+  recovery_threshold_value?: number | null;
   severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;
@@ -688,6 +690,10 @@ export const api = {
       request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
     remove: (id: number) =>
       request<void>(`/api/rules/${id}`, { method: "DELETE" }),
+    clear: (id: number) =>
+      request<{ ok: boolean; cleared: boolean }>(`/api/rules/${id}/clear`, {
+        method: "POST",
+      }),
     addAction: (
       ruleId: number,
       body: {

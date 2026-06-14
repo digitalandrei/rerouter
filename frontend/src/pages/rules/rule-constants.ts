@@ -29,3 +29,27 @@ export const FLOW_PROTOCOLS = [
 export function metricLabel(value: string): string {
   return METRICS.find((m) => m.value === value)?.label ?? value;
 }
+
+/** Recovery policy: how a firing rule clears. */
+export const RECOVERY_MODES = [
+  { value: "auto", label: "Auto — clear after settle window" },
+  { value: "threshold", label: "Threshold — clear below a recovery value" },
+  { value: "manual", label: "Manual — operator clears it" },
+];
+
+/** A unit-appropriate placeholder for the threshold input, by metric. */
+export function thresholdHint(metric: string): string {
+  if (metric === "flow_pps" || metric === "rx_pps" || metric === "tx_pps") {
+    return "packets/sec — e.g. 500000 for 500 Kpps";
+  }
+  if (metric === "flow_bps" || metric === "rx_bps" || metric === "tx_bps") {
+    return "bits/sec — e.g. 1000000000 for 1 Gbps";
+  }
+  if (metric === "rx_util_percent" || metric === "tx_util_percent") {
+    return "percent — e.g. 90";
+  }
+  if (metric === "oper_status") {
+    return "1 = up, 0 = down";
+  }
+  return "threshold value";
+}

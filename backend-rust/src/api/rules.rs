@@ -51,6 +51,8 @@ struct RuleRow {
     threshold_value: f64,
     duration_seconds: u32,
     consecutive_samples: u32,
+    recovery_mode: String,
+    recovery_threshold_value: Option<f64>,
     severity: String,
     enabled: bool,
     automatic_reroute_enabled: bool,
@@ -67,7 +69,8 @@ struct RuleRow {
 /// (rule_states). Note the table aliases (`r`/`i`/`d`/`rs`).
 const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
      r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind, \
-     r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, r.severity, r.enabled, \
+     r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
+     r.recovery_mode, r.recovery_threshold_value, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at \
@@ -92,6 +95,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "threshold_value": r.threshold_value,
         "duration_seconds": r.duration_seconds,
         "consecutive_samples": r.consecutive_samples,
+        "recovery_mode": r.recovery_mode,
+        "recovery_threshold_value": r.recovery_threshold_value,
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
@@ -191,6 +196,10 @@ pub struct RuleBody {
     duration_seconds: u32,
     #[serde(default = "default_consecutive")]
     consecutive_samples: u32,
+    #[serde(default = "default_recovery_mode")]
+    recovery_mode: String,
+    #[serde(default)]
+    recovery_threshold_value: Option<f64>,
     #[serde(default = "default_severity")]
     severity: String,
     #[serde(default = "default_true")]
@@ -208,6 +217,13 @@ fn default_consecutive() -> u32 {
 }
 fn default_severity() -> String {
     "warning".to_string()
+}
+fn default_recovery_mode() -> String {
+    "auto".to_string()
+}
+
+fn valid_recovery_mode(m: &str) -> bool {
+    matches!(m, "auto" | "threshold" | "manual")
 }
 fn default_true() -> bool {
     true
@@ -242,6 +258,9 @@ async fn validate(pool: &sqlx::MySqlPool, body: &RuleBody) -> Result<Option<u64>
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("metric must be one of: {}, or flow_pps / flow_bps", INTERFACE_METRICS.join(", ")),
         ));
+    }
+    if !valid_recovery_mode(&body.recovery_mode) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "recovery_mode must be auto, threshold, or manual".into()));
     }
     // Resolve the owning device; also validates the interface exists.
     let device_id: Option<u64> = sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
@@ -278,13 +297,21 @@ pub async fn create(
         (None, None, None, None)
     };
 
+    // Recovery threshold only applies to threshold mode.
+    let recovery_threshold_value = if body.recovery_mode == "threshold" {
+        body.recovery_threshold_value
+    } else {
+        None
+    };
+
     let res = sqlx::query(
         "INSERT INTO rules (name, interface_id, device_id, metric, \
             flow_direction, flow_protocol, flow_port, flow_port_kind, \
             operator, threshold_value, \
-            duration_seconds, consecutive_samples, severity, enabled, automatic_reroute_enabled, \
+            duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
+            severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(body.interface_id)
@@ -298,6 +325,8 @@ pub async fn create(
     .bind(body.threshold_value)
     .bind(body.duration_seconds)
     .bind(body.consecutive_samples)
+    .bind(&body.recovery_mode)
+    .bind(recovery_threshold_value)
     .bind(&body.severity)
     .bind(body.enabled)
     .bind(body.automatic_reroute_enabled)
@@ -341,6 +370,8 @@ pub struct RuleUpdate {
     threshold_value: Option<f64>,
     duration_seconds: Option<u32>,
     consecutive_samples: Option<u32>,
+    recovery_mode: Option<String>,
+    recovery_threshold_value: Option<Option<f64>>,
     severity: Option<String>,
     enabled: Option<bool>,
     automatic_reroute_enabled: Option<bool>,
@@ -389,6 +420,11 @@ pub async fn update(
             return err(StatusCode::UNPROCESSABLE_ENTITY, "flow_direction must be ingress or egress");
         }
     }
+    if let Some(m) = &body.recovery_mode {
+        if !valid_recovery_mode(m) {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "recovery_mode must be auto, threshold, or manual");
+        }
+    }
 
     let mut sets: Vec<&str> = Vec::new();
     if body.name.is_some() {
@@ -420,6 +456,12 @@ pub async fn update(
     }
     if body.consecutive_samples.is_some() {
         sets.push("consecutive_samples = ?");
+    }
+    if body.recovery_mode.is_some() {
+        sets.push("recovery_mode = ?");
+    }
+    if body.recovery_threshold_value.is_some() {
+        sets.push("recovery_threshold_value = ?");
     }
     if body.severity.is_some() {
         sets.push("severity = ?");
@@ -467,6 +509,12 @@ pub async fn update(
     if let Some(v) = body.consecutive_samples {
         q = q.bind(v);
     }
+    if let Some(v) = &body.recovery_mode {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.recovery_threshold_value {
+        q = q.bind(*v);
+    }
     if let Some(v) = &body.severity {
         q = q.bind(v);
     }
@@ -504,6 +552,28 @@ pub async fn remove(
     {
         Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
         Ok(_) => err(StatusCode::NOT_FOUND, "rule not found"),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+/// POST /api/rules/{id}/clear — operator-initiated clear of a firing rule (the
+/// recovery path for recovery_mode = manual, or an admin override). Observe-safe:
+/// it only resets detection state + records a `cleared` event; it executes nothing.
+pub async fn clear(
+    _g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM rules WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "rule not found");
+    }
+    match crate::detection::engine::clear_rule_manual(&state.pool, id).await {
+        Ok(cleared) => (StatusCode::OK, Json(json!({ "ok": true, "cleared": cleared }))),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }

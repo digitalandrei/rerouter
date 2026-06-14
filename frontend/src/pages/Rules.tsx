@@ -36,7 +36,14 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 import { Toggle } from "@/components/ui/toggle";
 import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
 import { EditRuleDialog } from "./rules/edit-rule-dialog";
-import { METRICS, metricLabel, isFlowMetric, FLOW_PROTOCOLS } from "./rules/rule-constants";
+import {
+  METRICS,
+  metricLabel,
+  isFlowMetric,
+  FLOW_PROTOCOLS,
+  RECOVERY_MODES,
+  thresholdHint,
+} from "./rules/rule-constants";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -301,6 +308,8 @@ interface RuleForm {
   threshold_value: string;
   window_minutes: string;
   consecutive_samples: string;
+  recovery_mode: "auto" | "threshold" | "manual";
+  recovery_threshold_value: string;
   severity: string;
 }
 
@@ -317,6 +326,8 @@ const DEFAULT_FORM: RuleForm = {
   threshold_value: "",
   window_minutes: "1",
   consecutive_samples: "3",
+  recovery_mode: "auto",
+  recovery_threshold_value: "",
   severity: "warning",
 };
 
@@ -462,14 +473,21 @@ export default function Rules() {
     }
     setAddBusy(true);
     try {
-      const flow = isFlowMetric(form.metric)
+      const isFlow = isFlowMetric(form.metric);
+      const flow = isFlow
         ? {
-            flow_direction: form.flow_direction,
+            flow_direction: "ingress" as const, // locked to ingress for now
             flow_protocol: form.flow_protocol ? parseInt(form.flow_protocol, 10) : null,
             flow_port: form.flow_port ? parseInt(form.flow_port, 10) : null,
             flow_port_kind: form.flow_port ? form.flow_port_kind : null,
           }
         : {};
+      // Persistence is per family: flows use the time window, SNMP uses
+      // consecutive samples. The unused control is sent as 0 (disabled).
+      const duration_seconds = isFlow
+        ? Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60))
+        : 0;
+      const consecutive_samples = isFlow ? 0 : Math.max(1, parseInt(form.consecutive_samples, 10) || 1);
       await api.rules.create({
         name: form.name.trim(),
         target_kind: "interface",
@@ -479,8 +497,13 @@ export default function Rules() {
         ...flow,
         operator: form.operator,
         threshold_value: parseFloat(form.threshold_value),
-        duration_seconds: Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60)),
-        consecutive_samples: parseInt(form.consecutive_samples, 10),
+        duration_seconds,
+        consecutive_samples,
+        recovery_mode: form.recovery_mode,
+        recovery_threshold_value:
+          form.recovery_mode === "threshold" && form.recovery_threshold_value
+            ? parseFloat(form.recovery_threshold_value)
+            : null,
         severity: form.severity,
         enabled: true,
         automatic_reroute_enabled: false,
@@ -493,6 +516,16 @@ export default function Rules() {
       setAddError(err instanceof ApiError ? err.message : "Failed to create rule");
     } finally {
       setAddBusy(false);
+    }
+  }
+
+  async function clearRule(rule: Rule) {
+    try {
+      const res = await api.rules.clear(rule.id);
+      if (res.cleared) toast.success(`Cleared "${rule.name}"`);
+      loadRules();
+    } catch {
+      toast.error("Failed to clear rule");
     }
   }
 
@@ -623,13 +656,15 @@ export default function Rules() {
                     <label className="block space-y-1 text-sm font-medium">
                       Flow direction
                       <select
-                        className={inputClass}
-                        value={form.flow_direction}
-                        onChange={(e) => setField("flow_direction", e.target.value)}
+                        className={`${inputClass} opacity-60`}
+                        value="ingress"
+                        disabled
                       >
                         <option value="ingress">ingress</option>
-                        <option value="egress">egress</option>
                       </select>
+                      <span className="text-[11px] font-normal text-muted-foreground">
+                        ingress only for now
+                      </span>
                     </label>
                     <label className="block space-y-1 text-sm font-medium">
                       Protocol
@@ -693,37 +728,68 @@ export default function Rules() {
                     className={inputClass}
                     value={form.threshold_value}
                     onChange={(e) => setField("threshold_value", e.target.value)}
-                    placeholder="e.g. 1000000000 for 1 Gbps"
+                    placeholder={thresholdHint(form.metric)}
                   />
                 </label>
+                {isFlowMetric(form.metric) ? (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Sliding window (minutes)
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      required
+                      className={inputClass}
+                      value={form.window_minutes}
+                      onChange={(e) => setField("window_minutes", e.target.value)}
+                    />
+                    <span className="text-[11px] font-normal text-muted-foreground">
+                      flows are bucketed per minute — persist by time
+                    </span>
+                  </label>
+                ) : (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Consecutive samples (poll cycles)
+                    <input
+                      type="number"
+                      min={1}
+                      required
+                      className={inputClass}
+                      value={form.consecutive_samples}
+                      onChange={(e) => setField("consecutive_samples", e.target.value)}
+                    />
+                    <span className="text-[11px] font-normal text-muted-foreground">
+                      fire after N consecutive polls past the threshold
+                    </span>
+                  </label>
+                )}
                 <label className="block space-y-1 text-sm font-medium">
-                  Sliding window (minutes)
-                  <input
-                    type="number"
-                    min={0}
-                    step="0.5"
-                    required
+                  Recovery
+                  <select
                     className={inputClass}
-                    value={form.window_minutes}
-                    onChange={(e) => setField("window_minutes", e.target.value)}
-                  />
-                  <span className="text-[11px] font-normal text-muted-foreground">
-                    how long the metric must stay over/under the threshold
-                  </span>
+                    value={form.recovery_mode}
+                    onChange={(e) => setField("recovery_mode", e.target.value)}
+                  >
+                    {RECOVERY_MODES.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
                 </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  …or consecutive samples (poll cycles)
-                  <input
-                    type="number"
-                    min={1}
-                    required
-                    className={inputClass}
-                    value={form.consecutive_samples}
-                    onChange={(e) =>
-                      setField("consecutive_samples", e.target.value)
-                    }
-                  />
-                </label>
+                {form.recovery_mode === "threshold" && (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Recovery threshold
+                    <input
+                      type="number"
+                      step="any"
+                      className={inputClass}
+                      value={form.recovery_threshold_value}
+                      onChange={(e) => setField("recovery_threshold_value", e.target.value)}
+                      placeholder="clears when metric crosses back (blank = fire threshold)"
+                    />
+                  </label>
+                )}
                 <label className="block space-y-1 text-sm font-medium">
                   Severity
                   <select
@@ -893,6 +959,17 @@ export default function Rules() {
                       onClick={(e) => e.stopPropagation()}
                     >
                       <div className="flex items-center justify-end gap-1">
+                        {canEdit && rule.current_state === "firing" && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7"
+                            title="Clear this firing rule (resets detection state; executes nothing)"
+                            onClick={() => void clearRule(rule)}
+                          >
+                            Clear
+                          </Button>
+                        )}
                         {canEdit && (
                           <>
                             <Button

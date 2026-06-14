@@ -128,6 +128,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // rules
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", get(rules::show).put(rules::update).delete(rules::remove))
+        .route("/api/rules/{id}/clear", post(rules::clear))
         .route("/api/rules/{id}/actions", post(rules::add_action))
         .route("/api/rules/{rule_id}/actions/{action_id}", delete(rules::remove_action))
         // reroute template catalog (read-only) + render/preview

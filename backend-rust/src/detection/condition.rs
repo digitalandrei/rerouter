@@ -50,6 +50,22 @@ impl Op {
             Op::Between | Op::Outside | Op::Changed | Op::Stale => false,
         }
     }
+
+    /// Whether the metric has crossed back to the "recovered" side of a recovery
+    /// threshold — the inverse direction of the firing comparison. Used by
+    /// threshold-based recovery (a hysteresis band: fire above Thi, recover below
+    /// Tlo). Returns false for operators where recovery isn't meaningful.
+    pub fn recovered(self, value: f64, recovery_threshold: f64) -> bool {
+        match self {
+            Op::Gt => value <= recovery_threshold,
+            Op::Ge => value < recovery_threshold,
+            Op::Lt => value >= recovery_threshold,
+            Op::Le => value > recovery_threshold,
+            Op::Eq => (value - recovery_threshold).abs() >= f64::EPSILON, // recovered = no longer equal
+            Op::Ne => (value - recovery_threshold).abs() < f64::EPSILON,
+            Op::Between | Op::Outside | Op::Changed | Op::Stale => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +87,16 @@ mod tests {
         assert!(Op::Lt.compare(1.0, 2.0));
         assert!(Op::Ge.compare(5.0, 5.0));
         assert!(Op::Le.compare(5.0, 5.0));
+    }
+
+    #[test]
+    fn recovered_is_inverse_direction() {
+        // Fire above 1000, recover at/below 800 (hysteresis band).
+        assert!(Op::Gt.recovered(700.0, 800.0));
+        assert!(Op::Gt.recovered(800.0, 800.0));
+        assert!(!Op::Gt.recovered(900.0, 800.0)); // still in the band
+        // Fire below 10, recover at/above 20.
+        assert!(Op::Lt.recovered(25.0, 20.0));
+        assert!(!Op::Lt.recovered(15.0, 20.0));
     }
 }

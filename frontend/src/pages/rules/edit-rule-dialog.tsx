@@ -1,7 +1,8 @@
 /**
- * Edit an existing detection rule. The target (interface) is immutable on the
- * server (recreate to retarget), so this edits name / condition / window /
- * severity only.
+ * Edit an existing detection rule. The target (interface) and the flow selector
+ * are immutable on the server (recreate to retarget); this edits name /
+ * condition / persistence / recovery / severity. Persistence is per metric
+ * family: flow rules use a time window, SNMP rules use consecutive samples.
  */
 import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
@@ -14,7 +15,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { METRICS, SEVERITIES } from "./rule-constants";
+import {
+  METRICS,
+  SEVERITIES,
+  RECOVERY_MODES,
+  isFlowMetric,
+  thresholdHint,
+} from "./rule-constants";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -29,17 +36,25 @@ export function EditRuleDialog({
   onClose: () => void;
   onSaved: (updated: Rule) => void;
 }) {
+  const ruleIsFlow = isFlowMetric(rule.metric);
   const [form, setForm] = useState({
     name: rule.name,
     metric: rule.metric,
     operator: rule.operator as ">" | "<",
     threshold_value: String(rule.threshold_value),
     window_minutes: String(rule.duration_seconds / 60),
-    consecutive_samples: String(rule.consecutive_samples),
+    consecutive_samples: String(rule.consecutive_samples || 3),
+    recovery_mode: (rule.recovery_mode ?? "auto") as "auto" | "threshold" | "manual",
+    recovery_threshold_value:
+      rule.recovery_threshold_value != null ? String(rule.recovery_threshold_value) : "",
     severity: rule.severity,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Keep the metric within its family — switching families needs a recreate.
+  const metricOptions = METRICS.filter((m) => isFlowMetric(m.value) === ruleIsFlow);
+  const editingIsFlow = isFlowMetric(form.metric);
 
   function set<K extends keyof typeof form>(field: K, value: (typeof form)[K]) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -55,8 +70,17 @@ export function EditRuleDialog({
         metric: form.metric,
         operator: form.operator,
         threshold_value: parseFloat(form.threshold_value),
-        duration_seconds: Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60)),
-        consecutive_samples: parseInt(form.consecutive_samples, 10),
+        duration_seconds: editingIsFlow
+          ? Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60))
+          : 0,
+        consecutive_samples: editingIsFlow
+          ? 0
+          : Math.max(1, parseInt(form.consecutive_samples, 10) || 1),
+        recovery_mode: form.recovery_mode,
+        recovery_threshold_value:
+          form.recovery_mode === "threshold" && form.recovery_threshold_value
+            ? parseFloat(form.recovery_threshold_value)
+            : null,
         severity: form.severity,
       });
       toast.success(`Updated rule "${updated.name}"`);
@@ -84,7 +108,7 @@ export function EditRuleDialog({
             <label className="block space-y-1 text-sm font-medium">
               Metric
               <select className={inputClass} value={form.metric} onChange={(e) => set("metric", e.target.value)}>
-                {METRICS.map((m) => (
+                {metricOptions.map((m) => (
                   <option key={m.value} value={m.value}>
                     {m.label}
                   </option>
@@ -111,6 +135,7 @@ export function EditRuleDialog({
                 className={inputClass}
                 value={form.threshold_value}
                 onChange={(e) => set("threshold_value", e.target.value)}
+                placeholder={thresholdHint(form.metric)}
               />
             </label>
             <label className="block space-y-1 text-sm font-medium">
@@ -123,29 +148,59 @@ export function EditRuleDialog({
                 ))}
               </select>
             </label>
+            {editingIsFlow ? (
+              <label className="block space-y-1 text-sm font-medium">
+                Sliding window (minutes)
+                <input
+                  type="number"
+                  min={0}
+                  step="0.5"
+                  required
+                  className={inputClass}
+                  value={form.window_minutes}
+                  onChange={(e) => set("window_minutes", e.target.value)}
+                />
+              </label>
+            ) : (
+              <label className="block space-y-1 text-sm font-medium">
+                Consecutive samples
+                <input
+                  type="number"
+                  min={1}
+                  required
+                  className={inputClass}
+                  value={form.consecutive_samples}
+                  onChange={(e) => set("consecutive_samples", e.target.value)}
+                />
+              </label>
+            )}
             <label className="block space-y-1 text-sm font-medium">
-              Sliding window (minutes)
-              <input
-                type="number"
-                min={0}
-                step="0.5"
-                required
+              Recovery
+              <select
                 className={inputClass}
-                value={form.window_minutes}
-                onChange={(e) => set("window_minutes", e.target.value)}
-              />
+                value={form.recovery_mode}
+                onChange={(e) => set("recovery_mode", e.target.value as typeof form.recovery_mode)}
+              >
+                {RECOVERY_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
             </label>
-            <label className="block space-y-1 text-sm font-medium">
-              …or consecutive samples
-              <input
-                type="number"
-                min={1}
-                required
-                className={inputClass}
-                value={form.consecutive_samples}
-                onChange={(e) => set("consecutive_samples", e.target.value)}
-              />
-            </label>
+            {form.recovery_mode === "threshold" && (
+              <label className="block space-y-1 text-sm font-medium">
+                Recovery threshold
+                <input
+                  type="number"
+                  step="any"
+                  className={inputClass}
+                  value={form.recovery_threshold_value}
+                  onChange={(e) => set("recovery_threshold_value", e.target.value)}
+                  placeholder="blank = fire threshold"
+                />
+              </label>
+            )}
           </div>
           {error && (
             <p className="text-sm text-destructive" role="alert">

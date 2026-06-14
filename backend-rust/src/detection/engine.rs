@@ -62,6 +62,10 @@ struct InterfaceRule {
     threshold_value: f64,
     duration_seconds: u32,
     consecutive_samples: u32,
+    /// How a firing rule clears: auto | threshold | manual.
+    recovery_mode: String,
+    /// Recovery threshold for `threshold` mode (defaults to threshold_value).
+    recovery_threshold_value: Option<f64>,
     severity: String,
     /// Per-rule switch: in enforce mode, run the rule's actions automatically on
     /// the firing edge. "The rule decides" — this is the only auto gate besides
@@ -112,6 +116,7 @@ struct RuleStateRow {
     current_state: Option<String>,
     first_matched_at: Option<Ts>,
     last_matched_at: Option<Ts>,
+    recovery_first_at: Option<Ts>,
     consecutive_match_count: u32,
 }
 
@@ -123,7 +128,8 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
         "SELECT id, name, interface_id, device_id, metric, \
                 flow_direction, flow_protocol, flow_port, flow_port_kind, \
                 operator, threshold_value, \
-                duration_seconds, consecutive_samples, severity, \
+                duration_seconds, consecutive_samples, \
+                recovery_mode, recovery_threshold_value, severity, \
                 automatic_reroute_enabled \
          FROM rules \
          WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ?",
@@ -166,7 +172,8 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
 
     // Load prior state.
     let prev = sqlx::query_as::<_, RuleStateRow>(
-        "SELECT current_state, first_matched_at, last_matched_at, consecutive_match_count \
+        "SELECT current_state, first_matched_at, last_matched_at, recovery_first_at, \
+                consecutive_match_count \
          FROM rule_states WHERE rule_id = ?",
     )
     .bind(rule.id)
@@ -183,21 +190,28 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         let first_matched = prev.first_matched_at.unwrap_or(now);
         let held_secs = (now - first_matched).num_seconds();
 
+        // Persistence: each control is OPT-IN (0 = disabled). The rule fires only
+        // when EVERY enabled control is satisfied; with none set it fires on the
+        // first match. Flow rules use the time window; SNMP rules use consecutive
+        // samples (each poll is a fresh sample) — see docs/detection-engine.md.
         let duration_ok = rule.duration_seconds == 0 || held_secs >= rule.duration_seconds as i64;
-        let consecutive_ok = consecutive >= rule.consecutive_samples.max(1);
-        let should_fire = duration_ok || consecutive_ok;
+        let consecutive_ok = rule.consecutive_samples == 0 || consecutive >= rule.consecutive_samples;
+        let should_fire = duration_ok && consecutive_ok;
 
         if should_fire && prev_state != "firing" {
-            // Rising edge: fire.
+            // Rising edge: fire. Reset any prior recovery progress.
             upsert_state(pool, rule.id, "firing", Some(first_matched), sampled_at, consecutive, value).await?;
+            set_recovery_first(pool, rule.id, None).await?;
             on_fire(pool, cfg, rule, value, sampled_at, obs.low_confidence).await?;
             return Ok(true);
         } else if should_fire {
-            // Already firing: keep firing, refresh activity (no new alert).
+            // Already firing and the firing condition still holds: keep firing,
+            // refresh activity (no new alert), and cancel any recovery progress.
             upsert_state(pool, rule.id, "firing", Some(first_matched), sampled_at, consecutive, value).await?;
+            set_recovery_first(pool, rule.id, None).await?;
             return Ok(false);
         } else {
-            // Matching but threshold-for-duration not yet met.
+            // Matching but persistence not yet met.
             if prev_state == "clear" {
                 let _ = record_event(pool, rule, "matched", value, sampled_at).await;
             }
@@ -206,22 +220,49 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         }
     }
 
-    // Not matched this tick. Hysteresis: a firing rule only clears once the
-    // settle window has elapsed since the last match (anti-flap).
+    // Firing condition not matched this tick. How the rule clears depends on its
+    // recovery_mode (docs/detection-engine.md).
     let hysteresis = cfg.detection.hysteresis_seconds as i64;
     if prev_state == "firing" {
-        let since_last_match = prev
-            .last_matched_at
-            .map(|t| (now - t).num_seconds())
-            .unwrap_or(i64::MAX);
-        if since_last_match < hysteresis {
-            // Still within hysteresis: hold the firing state.
-            return Ok(false);
+        match rule.recovery_mode.as_str() {
+            // Operator must clear it; never auto-recovers.
+            "manual" => return Ok(false),
+            // Clear once the metric crosses to the recovered side of the recovery
+            // threshold (hysteresis band) and holds there for the settle window.
+            "threshold" => {
+                let rec_threshold = rule.recovery_threshold_value.unwrap_or(rule.threshold_value);
+                let recovered = op.recovered(value, rec_threshold);
+                if !recovered {
+                    // Still in the band (past fire threshold but not yet recovered):
+                    // hold firing and reset the recovery timer.
+                    set_recovery_first(pool, rule.id, None).await?;
+                    return Ok(false);
+                }
+                let rec_first = prev.recovery_first_at.unwrap_or(now);
+                if (now - rec_first).num_seconds() < hysteresis {
+                    // Recovering, but the settle window hasn't elapsed yet.
+                    set_recovery_first(pool, rule.id, Some(rec_first)).await?;
+                    return Ok(false);
+                }
+                clear_state(pool, rule.id, value).await?;
+                let _ = record_event(pool, rule, "cleared", value, sampled_at).await;
+                return Ok(false);
+            }
+            // auto (default): clear once the settle window has elapsed since the
+            // last firing-condition match (anti-flap).
+            _ => {
+                let since_last_match = prev
+                    .last_matched_at
+                    .map(|t| (now - t).num_seconds())
+                    .unwrap_or(i64::MAX);
+                if since_last_match < hysteresis {
+                    return Ok(false);
+                }
+                clear_state(pool, rule.id, value).await?;
+                let _ = record_event(pool, rule, "cleared", value, sampled_at).await;
+                return Ok(false);
+            }
         }
-        // Settled: clear.
-        clear_state(pool, rule.id, value).await?;
-        let _ = record_event(pool, rule, "cleared", value, sampled_at).await;
-        return Ok(false);
     }
 
     // Was matching but the condition dropped before firing, or already clear.
@@ -592,7 +633,8 @@ async fn clear_state(pool: &MySqlPool, rule_id: u64, value: f64) -> Result<()> {
              last_cleared_at, last_evaluated_at) \
          VALUES (?, 'clear', 0, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
          ON DUPLICATE KEY UPDATE \
-            current_state = 'clear', first_matched_at = NULL, consecutive_match_count = 0, \
+            current_state = 'clear', first_matched_at = NULL, recovery_first_at = NULL, \
+            consecutive_match_count = 0, \
             last_metric_value = VALUES(last_metric_value), last_cleared_at = UTC_TIMESTAMP(), \
             last_evaluated_at = UTC_TIMESTAMP()",
     )
@@ -601,4 +643,42 @@ async fn clear_state(pool: &MySqlPool, rule_id: u64, value: f64) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Set (or clear, with None) the threshold-recovery hold start. Only touches
+/// recovery_first_at; assumes a rule_states row already exists (it does once the
+/// rule has fired).
+async fn set_recovery_first(pool: &MySqlPool, rule_id: u64, at: Option<Ts>) -> Result<()> {
+    sqlx::query(
+        "UPDATE rule_states SET recovery_first_at = ?, last_evaluated_at = UTC_TIMESTAMP() \
+         WHERE rule_id = ?",
+    )
+    .bind(at)
+    .bind(rule_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Operator-initiated clear of a firing rule (recovery_mode = manual, or any rule
+/// an admin wants to reset). Returns true if a firing rule was cleared. Records a
+/// `cleared` rule_event tagged manual. Never executes anything.
+pub async fn clear_rule_manual(pool: &MySqlPool, rule_id: u64) -> Result<bool> {
+    let cur: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT current_state FROM rule_states WHERE rule_id = ?",
+    )
+    .bind(rule_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    if cur.as_deref() != Some("firing") {
+        return Ok(false);
+    }
+    clear_state(pool, rule_id, 0.0).await?;
+    sqlx::query("INSERT INTO rule_events (rule_id, event, metric_value, sampled_at) VALUES (?, 'cleared', NULL, NULL)")
+        .bind(rule_id)
+        .execute(pool)
+        .await?;
+    tracing::info!(event_type = "rule_cleared_manual", rule_id, "rule manually cleared by operator");
+    Ok(true)
 }

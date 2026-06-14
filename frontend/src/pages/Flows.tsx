@@ -196,7 +196,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
               value={src}
               onChange={setSrc}
               fetchSuggestions={fetchSrc}
-              placeholder="e.g. 192.168."
+              placeholder="e.g. 192.168.200.92 (partial ok)"
             />
           </div>
           <div className="space-y-1">
@@ -205,7 +205,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
               value={dst}
               onChange={setDst}
               fetchSuggestions={fetchDst}
-              placeholder="e.g. 23.45."
+              placeholder="e.g. 23.45.23.208 (partial ok)"
             />
           </div>
           <div className="space-y-1">
