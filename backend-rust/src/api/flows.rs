@@ -194,18 +194,20 @@ async fn top_traffic(
     }
     let rows = query.fetch_all(pool).await?;
 
-    // Resolve interface_id -> a human label (if_name, falling back to if_descr)
-    // so the UI can show "TenGigabitEthernet1/1" instead of a raw ifIndex.
-    let names: std::collections::HashMap<u64, String> =
-        sqlx::query_as::<_, (u64, Option<String>, Option<String>)>(
-            "SELECT id, if_name, if_descr FROM device_interfaces WHERE device_id = ?",
+    // Resolve if_index -> a human label (if_name, falling back to if_descr) so
+    // the UI shows "TenGigabitEthernet1/1" instead of a raw ifIndex. Keyed by
+    // if_index (always present on a flow bucket); the bucket's interface_id FK is
+    // often NULL when the exporter's ifIndex wasn't mapped to an enrolled row.
+    let names: std::collections::HashMap<u32, String> =
+        sqlx::query_as::<_, (u32, Option<String>, Option<String>)>(
+            "SELECT if_index, if_name, if_descr FROM device_interfaces WHERE device_id = ?",
         )
         .bind(device_id)
         .fetch_all(pool)
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(id, name, descr)| name.or(descr).map(|n| (id, n)))
+        .filter_map(|(idx, name, descr)| name.or(descr).map(|n| (idx, n)))
         .collect();
 
     Ok(rows
@@ -214,7 +216,7 @@ async fn top_traffic(
             let mut v = agg_json(eb, ep, rb, rp, mr, lc);
             v["if_index"] = json!(if_index);
             v["interface_id"] = json!(iface_id);
-            if let Some(name) = iface_id.and_then(|id| names.get(&id)) {
+            if let Some(name) = names.get(&if_index) {
                 v["if_name"] = json!(name);
             }
             v["direction"] = json!(direction);
@@ -401,6 +403,111 @@ pub async fn search(
         }
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DetailQuery {
+    device_id: Option<u64>,
+    src: String,
+    dst: String,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    protocol: u16,
+    minutes: Option<i64>,
+}
+
+/// Per-interface detail row: if_index, direction, device_id, if_name, the six
+/// agg columns, then first/last-seen (pre-formatted as RFC3339-ish UTC strings
+/// to avoid TIMESTAMP/DATETIME decode ambiguity on MIN/MAX).
+type DetailRow = (
+    u32,
+    String,
+    u64,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    String,
+    String,
+);
+
+/// GET /api/flows/detail — full breakdown of ONE 5-tuple over the window: every
+/// (interface, direction) it was observed on (the "in/out" interfaces, names
+/// resolved by device+ifIndex), each with its own est/raw totals, sampling, and
+/// first/last-seen. Read-only.
+pub async fn detail(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Query(q): Query<DetailQuery>,
+) -> JsonResp {
+    let minutes = q.minutes.unwrap_or(60).clamp(1, 1440);
+
+    let mut qb: QueryBuilder<MySql> = QueryBuilder::new(
+        "SELECT t.if_index, t.direction, t.device_id, \
+         MAX(COALESCE(di.if_name, di.if_descr)) AS if_name, ",
+    );
+    qb.push(agg_select());
+    qb.push(
+        ", DATE_FORMAT(MIN(t.bucket_ts), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
+           DATE_FORMAT(MAX(t.bucket_ts), '%Y-%m-%dT%H:%i:%sZ') AS last_seen \
+         FROM flow_talker_buckets t \
+         LEFT JOIN device_interfaces di \
+             ON di.device_id = t.device_id AND di.if_index = t.if_index \
+         WHERE t.bucket_ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ",
+    );
+    qb.push_bind(minutes);
+    qb.push(" MINUTE)");
+    qb.push(" AND t.src_addr = ").push_bind(q.src.clone());
+    qb.push(" AND t.dst_addr = ").push_bind(q.dst.clone());
+    // Null-safe port match (`<=>`) so non-port protocols (NULL ports) compare ok.
+    qb.push(" AND t.src_port <=> ").push_bind(q.src_port);
+    qb.push(" AND t.dst_port <=> ").push_bind(q.dst_port);
+    qb.push(" AND t.protocol = ").push_bind(q.protocol);
+    if let Some(d) = q.device_id {
+        qb.push(" AND t.device_id = ").push_bind(d);
+    }
+    qb.push(" GROUP BY t.if_index, t.direction, t.device_id ORDER BY est_bytes DESC");
+
+    let rows = match qb
+        .build_query_as::<DetailRow>()
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+
+    let interfaces: Vec<Value> = rows
+        .into_iter()
+        .map(
+            |(if_index, direction, device_id, if_name, eb, ep, rb, rp, mr, lc, first, last)| {
+                let mut v = agg_json(eb, ep, rb, rp, mr, lc);
+                v["if_index"] = json!(if_index);
+                v["if_name"] = json!(if_name);
+                v["direction"] = json!(direction);
+                v["device_id"] = json!(device_id);
+                v["first_seen"] = json!(first);
+                v["last_seen"] = json!(last);
+                v
+            },
+        )
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "minutes": minutes,
+            "src_addr": q.src,
+            "dst_addr": q.dst,
+            "src_port": q.src_port,
+            "dst_port": q.dst_port,
+            "protocol": q.protocol,
+            "interfaces": interfaces,
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]

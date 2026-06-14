@@ -148,6 +148,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/flows/top", get(flows::top))
         .route("/api/devices/{id}/flow-exporters", get(flows::exporters))
         .route("/api/flows/search", get(flows::search))
+        .route("/api/flows/detail", get(flows::detail))
         .route("/api/flows/suggest", get(flows::suggest))
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))

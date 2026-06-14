@@ -218,6 +218,33 @@ export interface FlowTopResponse {
   rows: FlowTopRow[];
 }
 
+/** One (interface, direction) the searched 5-tuple was observed on. */
+export interface FlowDetailIface {
+  if_index: number;
+  if_name?: string | null;
+  direction: "ingress" | "egress";
+  device_id: number;
+  est_bytes: number;
+  est_pkts: number;
+  raw_bytes: number;
+  raw_pkts: number;
+  sampling_rate: number;
+  estimated: boolean;
+  low_confidence: boolean;
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface FlowDetailResponse {
+  minutes: number;
+  src_addr: string;
+  dst_addr: string;
+  src_port?: number | null;
+  dst_port?: number | null;
+  protocol: number;
+  interfaces: FlowDetailIface[];
+}
+
 export interface FlowExporter {
   id: number;
   source_addr: string;
@@ -687,6 +714,25 @@ export const api = {
       const p = new URLSearchParams({ field, q });
       if (deviceId !== undefined) p.set("device_id", String(deviceId));
       return request<string[]>(`/api/flows/suggest?${p.toString()}`);
+    },
+    detail: (opts: {
+      deviceId?: number;
+      src: string;
+      dst: string;
+      srcPort?: number | null;
+      dstPort?: number | null;
+      protocol: number;
+      minutes?: number;
+    }) => {
+      const p = new URLSearchParams();
+      if (opts.deviceId !== undefined) p.set("device_id", String(opts.deviceId));
+      p.set("src", opts.src);
+      p.set("dst", opts.dst);
+      if (opts.srcPort != null) p.set("src_port", String(opts.srcPort));
+      if (opts.dstPort != null) p.set("dst_port", String(opts.dstPort));
+      p.set("protocol", String(opts.protocol));
+      if (opts.minutes !== undefined) p.set("minutes", String(opts.minutes));
+      return request<FlowDetailResponse>(`/api/flows/detail?${p.toString()}`);
     },
   },
 

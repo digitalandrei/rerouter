@@ -9,7 +9,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Waves } from "lucide-react";
-import { api, type Device, type FlowTopRow, ApiError } from "@/lib/api";
+import { api, type Device, type FlowTopRow, type FlowDetailResponse, ApiError } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -324,6 +324,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
 
       <FlowDetailDialog
         row={selected}
+        deviceId={deviceId ?? undefined}
         windowMinutes={WINDOW_MINUTES}
         onClose={() => setSelected(null)}
       />
@@ -331,25 +332,69 @@ function SearchTab({ devices }: { devices: Device[] }) {
   );
 }
 
-/** Read-only detail view for one searched flow (uses the row we already have). */
+/** Read-only full detail for one searched flow: the 5-tuple summary (from the
+ *  clicked row) plus the per-(interface, direction) in/out breakdown fetched
+ *  from /api/flows/detail. */
 function FlowDetailDialog({
   row,
+  deviceId,
   windowMinutes,
   onClose,
 }: {
   row: FlowTopRow | null;
+  deviceId?: number;
   windowMinutes: number;
   onClose: () => void;
 }) {
+  const [detail, setDetail] = useState<FlowDetailResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (row == null) {
+      setDetail(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.flows
+      .detail({
+        deviceId,
+        src: row.src_addr ?? "",
+        dst: row.dst_addr ?? "",
+        srcPort: row.src_port,
+        dstPort: row.dst_port,
+        protocol: row.protocol ?? 0,
+        minutes: windowMinutes,
+      })
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof ApiError ? e.message : "Failed to load flow detail");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [row, deviceId, windowMinutes]);
+
   if (row == null) return null;
   const windowSecs = windowMinutes * 60;
+  const dirLabel = (d: string) => (d === "ingress" ? "in (ingress)" : "out (egress)");
+
   return (
     <Dialog open={row != null} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>Flow detail</DialogTitle>
         </DialogHeader>
-        <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-2 text-sm">
+
+        <dl className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1.5 text-sm">
           <DetailRow label="Source">
             <span className="font-mono text-xs">
               {row.src_addr}
@@ -363,22 +408,56 @@ function FlowDetailDialog({
             </span>
           </DetailRow>
           <DetailRow label="Protocol">{protoName(row.protocol)}</DetailRow>
-          <DetailRow label="Direction">{row.direction}</DetailRow>
-          <DetailRow label="Rate">{fmtBps((row.est_bytes * 8) / windowSecs)}</DetailRow>
-          <DetailRow label="Packets/s">{fmtPps(row.est_pkts / windowSecs)}</DetailRow>
-          <DetailRow label={`Bytes (last ${windowMinutes}m)`}>
-            {row.est_bytes.toLocaleString()} est · {row.raw_bytes.toLocaleString()} sampled
-          </DetailRow>
-          <DetailRow label={`Packets (last ${windowMinutes}m)`}>
-            {row.est_pkts.toLocaleString()} est · {row.raw_pkts.toLocaleString()} sampled
-          </DetailRow>
-          <DetailRow label="Sampling">
-            <span className="inline-flex items-center gap-1">
-              {row.estimated ? `${row.sampling_rate}:1 (scaled estimate)` : "1:1 (unsampled)"}
-              {row.low_confidence && <Badge variant="destructive">low conf</Badge>}
-            </span>
-          </DetailRow>
         </dl>
+
+        <div className="mt-3">
+          <p className="mb-1 text-xs font-medium text-muted-foreground">
+            Interfaces (in / out) · last {windowMinutes} min
+          </p>
+          {loading ? (
+            <p className="py-2 text-sm text-muted-foreground">Loading…</p>
+          ) : error ? (
+            <p className="py-2 text-sm text-destructive">{error}</p>
+          ) : detail && detail.interfaces.length > 0 ? (
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="pl-0">Interface</TableHead>
+                  <TableHead>Direction</TableHead>
+                  <TableHead className="text-right">Rate</TableHead>
+                  <TableHead className="text-right">Packets/s</TableHead>
+                  <TableHead className="pr-0 text-right">Sampling</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {detail.interfaces.map((iface, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="pl-0 font-medium">
+                      {iface.if_name ?? `if${iface.if_index}`}
+                    </TableCell>
+                    <TableCell>{dirLabel(iface.direction)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      {fmtBps((iface.est_bytes * 8) / windowSecs)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      {fmtPps(iface.est_pkts / windowSecs)}
+                    </TableCell>
+                    <TableCell className="pr-0 text-right">
+                      <span className="inline-flex items-center justify-end gap-1">
+                        {iface.estimated ? `${iface.sampling_rate}:1` : "1:1"}
+                        {iface.low_confidence && <Badge variant="destructive">low</Badge>}
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : (
+            <p className="py-2 text-sm text-muted-foreground">
+              No per-interface data in the last {windowMinutes} min.
+            </p>
+          )}
+        </div>
       </DialogContent>
     </Dialog>
   );
