@@ -7,19 +7,33 @@ authorization are first-class. See also [authentication.md](authentication.md)
 ## Roles
 
 ```text
-admin     full control, user management, mode flips, lock management
-operator  trigger manual reroutes, manage rules, acknowledge uncertain
-viewer    read-only dashboards and data
-auditor   read audit logs and configuration, no changes
+superadmin  everything — a strict superset of admin, plus user management
+            and device enrollment (manage_users + manage_devices)
+admin       broad control (rules, locks, alerts, manual reroutes, mode flips,
+            view everything) EXCEPT user management and device enrollment
+operator    trigger manual reroutes, manage rules, acknowledge uncertain
+viewer      read-only dashboards and data
+auditor     read audit logs and configuration, no changes
 ```
+
+`superadmin` was added in migration `20260613000100_user_management.sql` and is a
+strict superset of `admin`; the controller's `is_admin()` accepts **both** roles
+for admin-tier checks (critical-event fan-out, mode flips). The same migration
+**downgraded** `admin`: `manage_users` and `manage_devices` are now reserved to
+`superadmin` — the bootstrap admin created by `--create-admin` is a `superadmin`,
+and any pre-existing `admin` is reduced to the narrower scope.
 
 ## Permissions
 
+The `Permission` enum (`src/auth/rbac.rs`) and the seeded `permissions` table list
+**14** permissions:
+
 ```text
 view_dashboard
-view_asset
-edit_asset
-edit_provider
+view_asset                  (compat alias — gates DEVICE read endpoints)
+edit_asset                  (compat alias — gates DEVICE write/enroll endpoints)
+manage_devices              superadmin-only: device enrollment/management
+edit_provider               (compat alias — retained, device-scoped)
 edit_credentials
 view_credentials_metadata
 edit_rules
@@ -28,8 +42,20 @@ acknowledge_uncertain_reroute
 manage_locks
 manage_alerts
 view_audit
-manage_users
+manage_users                superadmin-only: user management
 ```
+
+`view_asset` / `edit_asset` / `edit_provider` are **retained compatibility
+aliases**: the names predate the device/interface model but are still the live
+permission strings, and they now gate the **device** endpoints (read / write /
+enroll) rather than any "asset" or "provider" abstraction. There is no
+asset/provider model in v1.
+
+> **Vestigial seed — `approve_dangerous_reroute`.** Migration
+> `20260612000100_users_and_auth.sql` also seeds an `approve_dangerous_reroute`
+> permission, but it exists in **neither** the `Permission` enum **nor** any
+> handler/extractor — nothing checks it. It is a legacy seed slated for removal;
+> do not treat it as a working gate.
 
 RBAC is implemented with explicit `roles` / `permissions` / `role_user` /
 `permission_role` tables (see [database.md](database.md)) and enforced by axum
@@ -76,8 +102,8 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   stored encrypted the same way.
 - File-based keys live under `/etc/rerouter/keys/`, owner `rerouter`, mode `0600`.
 - The controller runs as a dedicated `rerouter` system user.
-- Better later: HashiCorp Vault, per-provider rotation, never re-expose secrets in
-  the UI after creation.
+- Better later: HashiCorp Vault, per-device credential rotation, never re-expose
+  secrets in the UI after creation.
 
 ## Network access
 

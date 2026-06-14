@@ -1,54 +1,50 @@
 ---
 name: cloudflare-api
-description: Using the Cloudflare API as a Rerouter reroute provider — Under-Attack mode, firewall/rate-limit rules, analytics polling, token scoping, and verification. Also covers Cloudflare fronting the app itself.
+description: Cloudflare's role in Rerouter — it fronts the controller's own UI/API (CDN + WAF + CF-Connecting-IP), and is NOT a reroute/mitigation provider. Covers token scoping for the fronting role and why no Cloudflare reroute path exists.
 ---
 
-# Skill: Cloudflare API
+# Skill: Cloudflare (app fronting only)
 
-Cloudflare plays two roles in Rerouter. Keep them separate.
+> **Cloudflare is NOT a reroute provider in Rerouter.** It is **only** the
+> app-fronting / CDN + WAF layer in front of the controller's **own** web UI and
+> API. The controller never calls the Cloudflare API to mitigate customer traffic;
+> mitigation is Cisco IOS over SSH (see
+> [bgp-reroute-safety](bgp-reroute-safety.md)). The old "Cloudflare reroute
+> provider" (Under-Attack / firewall / rate-limit templates, `provider_type =
+> cloudflare`) was **de-scoped**: the enum value lingers with no executor, and
+> there are no `cloudflare_*` reroute templates.
 
-1. **Fronting the app** — `rerouter.cloudcraft.ro` is proxied through Cloudflare;
-   the origin (Nginx) restricts inbound 443 to Cloudflare IPs and forwards
-   `CF-Connecting-IP` to the controller, which trusts it as the real client IP
-   for login throttling, lockout, and audit — safe because only Cloudflare can
-   reach Nginx and only Nginx can reach the controller.
-   See [../docs/deployment.md](../docs/deployment.md).
-2. **A reroute provider** — Rerouter can mitigate Cloudflare-fronted *protected
-   assets* via the Cloudflare API.
+## The one role: fronting the app
 
-Use **separate API tokens** for these roles, each least-privilege.
+`rerouter.cloudcraft.ro` is proxied through Cloudflare; the origin (Nginx)
+restricts inbound 443 to **Cloudflare IP ranges** and forwards `CF-Connecting-IP`
+to the controller, which trusts it as the real client IP for login throttling,
+account lockout, and audit — safe because **only** Cloudflare can reach Nginx and
+**only** Nginx can reach the loopback-bound controller. See
+[../docs/deployment.md](../docs/deployment.md) and
+[../docs/security.md](../docs/security.md).
 
-## Auth & tokens
+That is the whole integration. There is no controller → Cloudflare API egress
+path in v1: no zone-settings edits, no firewall/WAF rule creation, no analytics
+polling. (`docs/telemetry-model.md` lists Cloudflare zone analytics only as a
+*future, not-implemented* detection signal.)
 
-- Use scoped **API tokens** (not the global API key). Store as encrypted provider
-  credentials (see [../docs/security.md](../docs/security.md)).
-- Token scopes: only the zones in play, only the permissions needed
-  (Zone Settings edit, Firewall Services edit, Analytics read).
+## Tokens & trust (fronting role)
 
-## Reroute operations (provider type `cloudflare`)
+- This deployment is configured in the Cloudflare dashboard / DNS, not via an API
+  token the controller holds. If a token is ever introduced for managing the
+  fronting zone, use a **scoped API token** (not the global key), least-privilege,
+  and store it as an encrypted secret — never re-expose it in the UI (see
+  [../docs/security.md](../docs/security.md)).
+- Trust `CF-Connecting-IP` **only** over the Cloudflare → Nginx → loopback path.
+  Never trust a client-supplied `CF-Connecting-IP` reaching the controller by any
+  other route.
 
-| Template | API action | Verify by |
-| --- | --- | --- |
-| `cloudflare_under_attack` | set zone `security_level` = `under_attack` | read `security_level` back |
-| `cloudflare_restore_security_level` | restore prior `security_level` | read back |
-| `cloudflare_firewall_rule` | create a firewall/WAF custom rule (block/challenge) | list rules, confirm present |
-| `cloudflare_rate_limit` | create a rate-limit rule | list rules, confirm present |
+## If asked to "reroute through Cloudflare"
 
-Always **read back** the resulting state — never treat the API 200 as success.
-Store the prior value so rollback restores exactly what was there.
-
-## Analytics (detection + verification)
-
-Poll zone analytics / firewall-events GraphQL for request rate, threat scores, and
-challenge/block counts. Use as a detection signal for L7 floods and to confirm an
-Under-Attack/firewall reroute is taking effect.
-
-## Practical notes
-
-- Respect API rate limits; back off on 429. Treat 5xx as retryable, 4xx as a
-  config/permission error to surface, not retry blindly.
-- Record the request and response in `reroute_outputs` (redact the token).
-- Capture the rule ID returned on create so rollback can delete exactly that rule.
+Surface the conflict: it contradicts the de-scoped model. v1 mitigates on the
+routers it manages (Null0 null-route, tagged-Null0 RTBH the router redistributes
+upstream, BGP neighbor shut/no-shut) over SSH via templates — not via Cloudflare.
 
 > When integrating the Anthropic/Claude API anywhere in this project, consult the
 > `claude-api` skill for current model IDs and patterns — do not hardcode model

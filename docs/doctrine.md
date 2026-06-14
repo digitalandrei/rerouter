@@ -455,8 +455,9 @@ execution. The shipped default is `observe` mode (read-only / alert-only — see
    include the **would-run action plan**. **No reroutes.**
 3. **Reroute engine — manual + per-rule automatic. [BUILT]** Device-CLI
    templates over SSH, command preview, manual trigger (`trigger_manual_reroute`
-   + optional reason), per-rule automatic execution on the firing edge when
-   `automatic_reroute_enabled` is on (enforce mode only), output capture,
+   + optional reason), per-rule automatic execution on the firing edge when the
+   global switch (`automatic_actions_enabled`) and the rule's
+   `automatic_reroute_enabled` are on (enforce mode only), output capture,
    verification, audit log, device-scoped locks & cooldowns, crash recovery
    (`uncertain` + device lock + admin ack). The full automatic-execution
    machinery — global + per-rule enable, safety locks, cooldown, state recovery,
@@ -495,7 +496,8 @@ explicit, audited, reversible where possible, and blocked whenever state is
 uncertain. The app must prefer doing nothing over doing the wrong thing.
 
 Automatic remediation is allowed only when: the controller is in `enforce`
-mode and the rule's automatic switch is on; the rule matched for its configured
+mode, the global automatic switch (`automatic_actions_enabled`) is on, and the
+rule's automatic switch is on; the rule matched for its configured
 duration / sample count; the action comes from an approved device-CLI template;
 the target device is not locked and has no action running or unresolved
 (`uncertain`); the per-device cooldown allows it; the exact target is known; and

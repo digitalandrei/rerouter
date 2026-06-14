@@ -7,31 +7,36 @@ task so alerting never blocks API requests, detection, or reroutes.
 
 ## Triggers
 
-An alert is generated on:
+An alert (an `alerts` row) is generated on:
 
-- `rule_fired` — a detection rule fired (threshold crossed above/below for
-  the configured duration); in observe mode the payload carries the would-run
-  action plan;
-- `operating_mode_changed` — observe/enforce flipped (admin-only, audited);
-- `reroute_planned` / `reroute_started` / `reroute_succeeded` / `reroute_failed`;
+- `rule_fired` — a detection rule on a monitored **interface** (or device)
+  crossed its threshold above/below for the configured settle window; the payload
+  carries the device, interface, rule, metric/observed value, and — in observe
+  mode — the rendered would-run action plan;
+- reroute lifecycle: `reroute_planned` / `reroute_started` / `reroute_failed`;
 - `reroute_uncertain` — action left ambiguous (see [state-recovery.md](state-recovery.md));
-- `asset_unreachable` / `telemetry_stale`;
-- `lock_created` / `lock_cleared`;
 - security events: `2fa_recovery_used`, `account_locked`.
 
+> Operating-mode flips (`operating_mode_changed`) and lock changes
+> (`global_lock_created` / `global_lock_cleared`) are recorded in the **audit
+> log**, not emailed as alerts, in v1. Device-unreachable / telemetry-stale show
+> up via `GET /api/status` (`telemetry_stale_count`) and stale UI state rather
+> than a dedicated alert email.
+
 Each alert type has a default severity and can be enabled/disabled per recipient
-and per asset.
+via subscriptions (by **role** and/or **event type**).
 
 ## Pipeline
 
 ```text
-controller writes an `alerts` row (event_type, severity, asset, rule, action, payload)
+controller writes an `alerts` row
+   (event_type, severity, device_id, interface_id, rule_id, payload_json, dedup_key)
         |
         v
 alert-dispatcher task (async, in-process) picks up new alerts
         |
         v
-resolve recipients (by role + per-asset subscriptions)
+resolve recipients (by role + event-type subscriptions)
         |
         v
 de-duplicate + rate-limit (see below)
@@ -50,17 +55,21 @@ an alert; the dispatcher resumes from unsent rows.
 
 Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 
-- collapse repeats of the same `(event_type, asset, rule)` within a window
-  (default 10 min) into one email, with an occurrence count;
+- collapse repeats with the same `alerts.dedup_key` (per event type + the firing
+  device/rule, or user for security events) within a window (default 10 min) into
+  one email, with an occurrence count;
 - per-recipient rate cap (default max 20 emails / hour) with a digest fallback;
 - always send `reroute_uncertain`, `reroute_failed`, and security events
   immediately (these are never collapsed away).
 
 ## Recipients & subscriptions
 
-- Recipients are users (or external addresses) with verified email.
-- Subscriptions: by role (e.g. all `operator`s) and/or per-asset opt-in.
-- Critical alerts (`uncertain`, `failed`) always go to `admin`s.
+- Recipients are users (or external addresses) with verified email
+  (`alert_recipients`).
+- Subscriptions (`alert_subscriptions`): by role (e.g. all `operator`s) and/or by
+  event type (a NULL event type matches all).
+- Critical alerts (`uncertain`, `failed`, security events) always fan out to the
+  admin tier (`admin` / `superadmin`).
 
 ## Configuration
 
@@ -78,11 +87,12 @@ audit and troubleshooting.
 
 ## Content
 
-Every alert email includes: event type + severity, asset and prefix, the rule and
-metric value that fired (and whether it crossed above or below the threshold),
-the reroute (if any) and its state, a timestamp, and a deep link to the relevant
-UI page. In **observe** mode (read-only / alert-only — see
-[reroute-engine.md](reroute-engine.md) "Operating mode"), `rule_fired`
-alerts additionally include the rendered **would-run action plan**: the exact
-template, target device(s), prefix, and parameters that `enforce` mode would have
-executed. Never include secrets or raw credentials.
+Every alert email includes: event type + severity, the **device** and (for
+interface rules) the **interface**, the rule and metric value that fired (and
+whether it crossed above or below the threshold), the reroute (if any) and its
+state, a timestamp, and a deep link to the relevant UI page. In **observe** mode
+(read-only / alert-only — see [reroute-engine.md](reroute-engine.md) "Operating
+mode"), `rule_fired` alerts additionally include the rendered **would-run action
+plan**: the exact template, target device, prefix, and parameters that `enforce`
+mode would have executed. Never include secrets or raw credentials (no SNMP
+community, SSH password/key, or full command output beyond the rendered plan).

@@ -1,67 +1,84 @@
 ---
 name: traffic-telemetry
-description: How to collect and normalize traffic telemetry for Rerouter — NetFlow v9 / IPFIX / sFlow, sampling-rate handling, rate derivation, counter wrap/reset, and the BGP feed used for reroute verification.
+description: How Rerouter collects and normalizes traffic telemetry — SNMP v2c interface polling (the v1 source) and the read-only NetFlow v9 collector (second source), counter-rate derivation, wrap/reset handling, sampling-rate handling, and on-router verification. 
 ---
 
 # Skill: Traffic telemetry
 
 Implementation guidance for the telemetry layer. See
-[../docs/telemetry-model.md](../docs/telemetry-model.md) for the model.
+[../docs/telemetry-model.md](../docs/telemetry-model.md) (rate math) and
+[../docs/flow-telemetry.md](../docs/flow-telemetry.md) (the flow collector).
+Everything is normalized **per monitored interface**, not per "asset".
 
-## Flow protocols
+## Sources
 
-- **NetFlow v9 / IPFIX** (template-based) and **sFlow** (packet-sampled).
-- Listen on the configured UDP port(s); decode templates before data records
-  (NetFlow v9/IPFIX carry templates you must cache per exporter).
-- Each record yields src/dst IP, ports, proto, packets, bytes, TCP flags.
+- **SNMP v2c interface polling — the v1 source** (`telemetry::snmp`). Read-only,
+  needs no device-side config — exactly what observe mode wants. Polls 64-bit
+  `ifXTable`/`ifTable` counters for interfaces with `enabled_for_monitoring = 1`.
+- **NetFlow v9 collector — second source, off by default** (`telemetry::flow`).
+  A read-only UDP listener that adds per-tuple visibility (top talkers, ports,
+  source ASNs) SNMP can't see. Sampled, so the sampling rate matters.
 
-## Sampling rate — critical
+There is **no** continuous BGP feed and **no** Cloudflare analytics source in v1.
 
-Flow is sampled (e.g. 1:1000). **Multiply** packet/byte counts by the sampling
-rate to estimate real volume. Store the rate per exporter and per sample. A wrong
-or missing sampling rate is the #1 cause of false triggers and missed attacks.
+## SNMP rate derivation — primary path
 
-## Derived signals (per asset, per interval)
+Derive rates by differencing consecutive polls (`telemetry::interface_rates`),
+preferring the 64-bit `ifHC*` counters (wrap is then extremely rare):
 
 ```text
-rx_bps / tx_bps          from bytes * 8 * sampling_rate / elapsed
-rx_pps / tx_pps          from packets * sampling_rate / elapsed
-new_conns_per_sec        new 5-tuples / elapsed
-syn_rate                 count(TCP SYN, !ACK) * sampling_rate / elapsed
-syn_ack_ratio            syn_ack / syn  (low ratio => SYN flood)
-unique_src_count         distinct source IPs (sketch/HLL for scale)
-top_src_asn / top_dst_port  compact summary for triage
+rx_bps = ((cur_in_octets - prev_in_octets) * 8) / elapsed_seconds
+rx_pps =  (cur_in_pkts   - prev_in_pkts)        / elapsed_seconds
+rx_util_percent = rx_bps / if_speed_bps * 100      (ifHighSpeed×1e6, else ifSpeed)
 ```
 
-## Counter wrap / reset (for counter-based sources)
+Also surface `in_errors` / `out_errors` / `in_discards` / `out_discards` and
+admin/oper status for display.
+
+## Counter wrap / reset (SNMP)
 
 ```text
 if current < previous:
-    mark sample invalid for rate calc
-    set baseline = current
+    mark the sample invalid (valid_sample = 0), emit no rate
+    keep the new raw counters as the next baseline regardless
     do NOT trigger rules from this derivative
 ```
 
+The **first** poll of an interface has no baseline, so it is `valid_sample = 0`
+too. Detection ignores invalid samples.
+
+## NetFlow sampling rate — critical for the flow source
+
+Flow is sampled (e.g. 1:1000). **Multiply** packet/byte counts by the sampling
+rate to estimate real volume; store the rate per exporter and per sample. A wrong
+or missing sampling rate is the #1 cause of false triggers from flow data. The
+collector cross-calibrates flow volume against the SNMP interface counters — see
+[../docs/flow-telemetry.md](../docs/flow-telemetry.md).
+
 ## Staleness
 
-Track `last_sample_age` per asset. Beyond a threshold, set `telemetry_stale` and
-stop evaluating traffic thresholds (the detection engine already ignores stale
-samples). Surface staleness in the UI.
+Track poll health per device (`devices.reachable`, `last_poll_at`, `last_error`).
+A device not polled within `telemetry.stale_after_seconds` (or never polled) makes
+its interfaces' metrics stale; the detection engine stops evaluating thresholds
+against stale values. Surface staleness in the UI.
 
-## BGP feed
+## Verification (no feed)
 
-Maintain current announcement state per protected prefix (announced/withdrawn,
-next-hop, communities) from the BGP session. This is what reroute **verification**
-reads to confirm a blackhole/withdraw/divert actually took effect.
+Reroutes are verified by an **on-router `show` read-back** over SSH (the template's
+`verification_json`), not by a telemetry feed — see
+[bgp-reroute-safety](bgp-reroute-safety.md). A successful mitigation should also
+show as a traffic drop on the monitored interface.
 
-## Cloudflare analytics
+## Output (current tables)
 
-For fronted assets, poll zone analytics + firewall events for request rate, threat
-score, and whether Under-Attack mode is active — both a detection signal and a
-verification source for Cloudflare-side reroutes.
+- SNMP: write the latest to `interface_metrics_current` (one row/interface,
+  carrying the raw `*_octets` / `*_pkts` counters that are the next delta baseline)
+  and a retained history row to `interface_samples`. Keep raw vs derived separate.
+- NetFlow: write bucketed rollups — `flow_iface_buckets`, `flow_port_buckets`,
+  `flow_talker_buckets`, `flow_as_buckets` (top-K, exporters in `flow_exporters`).
 
-## Output
-
-Write `asset_metrics_current` (latest) and `traffic_samples` (retained), each with
-`method`, `valid_sample`, `sampling_rate`, staleness. Keep raw vs derived separate.
-Parsers return structured errors, never panic; keep a `raw_ref` for debugging.
+There is no `asset_metrics_current` / `traffic_samples` table — that asset-era
+schema was dropped (migration `20260614000100_drop_asset_provider_model.sql`).
+Each normalized sample carries `valid_sample`, `sampled_at`, and (for flow) the
+`sampling_rate`. Parsers return structured errors, never panic; keep a raw ref for
+debugging.

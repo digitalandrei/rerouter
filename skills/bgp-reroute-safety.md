@@ -1,69 +1,100 @@
 ---
 name: bgp-reroute-safety
-description: Safe BGP-based rerouting for Rerouter — RTBH blackhole, FlowSpec, and scrubbing diversion via announce/withdraw, with permitted-prefix checks, verification against the BGP feed, rollback, and auto-expiry. Use for any provider that changes routing.
+description: Safe routing-change mitigations for Rerouter — Cisco IOS over SSH (Null0 null-route, tagged-Null0 RTBH the router redistributes upstream, and BGP neighbor shut/no-shut), with parameter validation, on-router read-back verification, rollback, and locks. Use for any reroute that changes routing.
 ---
 
-# Skill: BGP reroute safety
+# Skill: Routing-change reroute safety
 
-Guidance for reroute providers that change routing (`bgp_rtbh`, `flowspec`,
-`scrubber`). These are the highest-blast-radius actions in Rerouter. Pair with
-[../docs/reroute-engine.md](../docs/reroute-engine.md) and the
-[reroute-safety-agent](../agents/reroute-safety-agent.md).
+Guidance for reroutes that change routing. These are the highest-blast-radius
+actions in Rerouter. Pair with [../docs/reroute-engine.md](../docs/reroute-engine.md)
+and the [reroute-safety-agent](../agents/reroute-safety-agent.md).
 
-## Speaker
+> **The controller does NOT speak BGP.** There is no ExaBGP/BGP speaker, no
+> FlowSpec, and no scrubber/Cloudflare adapter in v1. Every mitigation is a Cisco
+> **IOS CLI command pushed over SSH** (`backend-rust/src/ssh/`) from a validated
+> **template** (`provider_type = device_cli`, `mode = ios_ssh`). Any upstream BGP
+> effect comes from **the router's own config** (a route-map redistributing a
+> tagged Null0 static into BGP, or a neighbor being shut), not from the
+> controller announcing routes. The `bgp_rtbh` / `flowspec` / `scrubber` provider
+> types are de-scoped legacy enum values with no executor behind them.
 
-- Use a controlled BGP speaker (e.g. ExaBGP as a subprocess, or a vetted Rust BGP
-  crate) that the controller drives via a narrow command interface.
-- The speaker peers with the upstream that honours your blackhole community /
-  FlowSpec. The controller never crafts arbitrary BGP by free text.
+## Mitigations (shipped device_cli templates)
 
-## RTBH blackhole
+### Local null-route (Null0)
 
-- Announce the victim host route (`/32` or `/128`) tagged with the agreed
-  **blackhole community**; the upstream drops it at its edge.
-- **Permitted-prefix check**: refuse to announce anything outside the provider's
-  `permitted_prefixes`, and refuse prefixes shorter than the agreed max (never
-  blackhole an aggregate by mistake).
-- Effect: the victim host is fully offline. This protects the rest of the network,
-  not the victim. Always alert and prefer **auto-expiry** so it lifts when the
-  attack ends unless renewed.
+- `null_route_prefix` — `ip route {target_net} {target_mask} Null0`. Drops **all**
+  traffic to the destination subprefix **on this router**. Stops collateral damage
+  to the local link, but the destination is offline locally.
+- Rollback: `null_route_withdraw` (`no ip route … Null0`).
 
-## FlowSpec
+### Tagged-Null0 RTBH (dropped upstream)
 
-- Match `{src, dst, proto, port}` and apply drop or rate-limit upstream — surgical
-  and keeps the host online.
-- Validate the match is specific enough; a too-broad FlowSpec rule is its own
-  outage. Confirm the upstream supports the action before relying on it.
+- `blackhole_prefix` — `ip route {prefix_net} {prefix_mask} Null0 tag {tag}`. The
+  router's **own** RTBH route-map matches the tag and redistributes the static into
+  BGP with the agreed blackhole community, so upstreams drop the prefix at **their**
+  edge (true RTBH). The controller only installs the tagged static over SSH; it
+  never originates the BGP advertisement itself.
+- **Requires the route-map to already exist on the router.** If the tag isn't
+  matched, you get only a local black hole, not upstream RTBH.
+- Effect: the host/prefix is fully offline upstream. This protects the rest of the
+  network, not the victim. Always alert.
+- Rollback: `blackhole_withdraw` (`no ip route … Null0 tag {tag}`).
 
-## Scrubbing diversion
+### BGP neighbor shut / no-shut (router config)
 
-- Announce the prefix to the scrubber and accept the cleaned return path.
-- Verify **both** the diversion announcement *and* a healthy return path before
-  declaring success — a half-applied divert is a black hole.
+- `bgp_session_disable` — `router bgp {local_asn}` ; `neighbor {neighbor_ip}
+  shutdown`. Administratively downs a neighbor (e.g. to stop accepting an attacked
+  transit, or to pull a diversion session).
+- `bgp_session_enable` — the inverse (`no neighbor … shutdown`), e.g. bring up a
+  GRE scrubber session so the router announces and traffic diverts.
+- These edit **neighbor state in the router's BGP config** over SSH. The
+  controller is not a BGP peer.
 
-## Verification (mandatory)
+## Parameters are typed, never free text
 
-Read the **BGP feed** (see [traffic-telemetry](traffic-telemetry.md)) back:
+The template renderer substitutes only **type-checked** parameter values
+(`ip` / `cidr` / `asn` / `int`); a `cidr` param `X` also exposes `{X_net}` /
+`{X_mask}`. Validated values contain no whitespace or newlines, so no extra
+commands can be smuggled into the line. The device-CLI layer additionally enforces
+a **fail-closed allowlist** — only the exact `Null0` route and `neighbor …
+shutdown` forms pass. Refuse a prefix shorter than your agreed RTBH max so an
+aggregate is never blackholed by mistake (enforce this in the template/parameter
+constraints, not by trusting the operator).
 
-- blackhole: the `/32` with the blackhole community is present; asset bps drops at
-  the edge;
-- withdraw: the announcement is gone;
-- divert: announced to the scrubber and return path healthy.
+## Verification (mandatory) — on-router read-back
 
-If the feed cannot confirm the intended end-state, the action is `uncertain`:
-lock the asset, disable automatic actions for it, alert, require admin ack.
+Verification opens a **separate read-only SSH session** and runs the template's
+`verification_json` `show`; it passes iff the expected substring is present **and**
+the reject substring is absent (case-insensitive). v1 verifies against the router,
+**not** a BGP feed:
 
-## Rollback & expiry
+- null-route / blackhole installed: `show ip route {net}` → expect `Null0`;
+- withdraw: `show ip route {net}` → reject `Null0`;
+- neighbor down: `show ip bgp neighbors {ip}` → expect `Administratively shut`;
+- neighbor up: `show ip bgp neighbors {ip}` → expect `BGP state`, reject
+  `Administratively shut`.
 
-Every routing change has a rollback (`withdraw_blackhole_prefix`,
-`flowspec_remove_rule`, `stop_diversion`) that is itself audited and verified.
-Prefer `auto_expiry_seconds` on blackholes so a forgotten mitigation self-clears.
+If the read-back cannot confirm the intended end-state, the action is `uncertain`:
+**lock the device**, disable automatic actions for it, alert, require admin ack.
+
+## Rollback
+
+Every disruptive template is paired with its inverse via `rollback_template_id`
+(`null_route_withdraw`, `blackhole_withdraw`, `bgp_session_enable`). Rollback runs
+through the same SSH path and is itself verified by read-back and audited. There is
+no auto-expiry timer in v1 (that mechanism was de-scoped) — a forgotten mitigation
+is cleared by an operator rollback or by recovery rules, not by a self-clearing
+timer.
 
 ## Gate checklist (every routing action)
 
-- target within `permitted_prefixes` and length limits ✔
-- provider `actions_enabled` and reachable ✔
-- asset not locked, no active cooldown, no running action, no `uncertain` ✔
-- automatic only if global + per-rule enabled; manual high-level only with re-auth
-  + typed confirmation + reason ✔
-- state persisted before/after; verification planned; rollback defined ✔
+- parameters type-checked; line passes the device-CLI allowlist; prefix length
+  within the agreed RTBH limit ✔
+- operating mode is `enforce` (observe renders the would-run plan and executes
+  nothing) ✔
+- target device not locked, no active cooldown, no running action, no `uncertain` ✔
+- automatic only if global enable **and** per-rule enable are set; manual requires
+  the `trigger_manual_reroute` permission (in-house tool — no typed confirmation /
+  re-auth gate) ✔
+- state persisted before/after each step; read-back verification planned; rollback
+  template defined ✔
