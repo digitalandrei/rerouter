@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::detection;
-use crate::telemetry::snmp;
+use crate::telemetry::{flow, snmp};
 
 /// How often the supervisor reconciles the running loops against the DB.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
@@ -42,6 +42,9 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     tokio::spawn(prune_samples(pool.clone()));
     tokio::spawn(discover_prefixes_daily(pool.clone()));
+    // NetFlow/IPFIX flow collector — a SECOND, read-only telemetry source. No-op
+    // unless [flow].enabled; binds its own UDP socket (see docs/flow-telemetry.md).
+    tokio::spawn(flow::collector::run(pool.clone(), cfg.clone()));
     tokio::spawn(supervise(pool, cfg));
     tracing::info!(event_type = "scheduler_started", "scheduler supervisor spawned (per-device SNMP poll loops)");
     Ok(())

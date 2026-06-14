@@ -18,6 +18,7 @@ import { ToneBadge } from "@/components/status-badge";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { OverviewTab } from "./device-detail/overview-tab";
 import { InterfacesTab } from "./device-detail/interfaces-tab";
+import { FlowsTab } from "./device-detail/flows-tab";
 import { BgpSessionsCard } from "./device-detail/bgp-sessions-card";
 import { AnnouncedPrefixesCard } from "./device-detail/announced-prefixes-card";
 import { DeviceSettingsTab } from "./device-detail/device-settings-tab";
@@ -31,7 +32,14 @@ export default function DeviceDetail() {
 
   const [searchParams, setSearchParams] = useSearchParams();
   const raw = searchParams.get("tab");
-  const tab = raw === "settings" && canManage ? "settings" : raw === "interfaces" ? "interfaces" : "overview";
+  const tab =
+    raw === "settings" && canManage
+      ? "settings"
+      : raw === "interfaces"
+        ? "interfaces"
+        : raw === "flows"
+          ? "flows"
+          : "overview";
   const setTab = (next: string) =>
     setSearchParams(
       (prev) => {
@@ -175,6 +183,7 @@ export default function DeviceDetail() {
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="interfaces">Interfaces ({device.interface_count})</TabsTrigger>
+          <TabsTrigger value="flows">Flows</TabsTrigger>
           {canManage && <TabsTrigger value="settings">Settings</TabsTrigger>}
         </TabsList>
 
@@ -195,6 +204,10 @@ export default function DeviceDetail() {
               />
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <TabsContent value="flows" className="mt-4">
+          <FlowsTab deviceId={deviceId} refreshKey={refreshKey} />
         </TabsContent>
 
         {canManage && (

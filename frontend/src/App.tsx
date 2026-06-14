@@ -24,6 +24,7 @@ import Rules from "@/pages/Rules";
 import Templates from "@/pages/Templates";
 import Reroutes from "@/pages/Reroutes";
 import ManualReroute from "@/pages/ManualReroute";
+import Flows from "@/pages/Flows";
 import Alerts from "@/pages/Alerts";
 import Audit from "@/pages/Audit";
 import Settings from "@/pages/Settings";
@@ -74,6 +75,7 @@ export default function App() {
             <Route path="/templates" element={<Templates />} />
             <Route path="/mitigations" element={<Reroutes />} />
             <Route path="/mitigations/manual" element={<ManualReroute />} />
+            <Route path="/flows" element={<Flows />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/settings" element={<Settings />} />

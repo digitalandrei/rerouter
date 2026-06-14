@@ -5,6 +5,7 @@
 //! interface rates, store current + history, and feed the detection engine.
 //! SNMP is read-only — ideal for observe mode.
 
+pub mod flow;
 pub mod snmp;
 
 use chrono::{DateTime, Utc};

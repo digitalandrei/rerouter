@@ -16,6 +16,8 @@ pub struct Config {
     pub reroute: Reroute,
     #[serde(default)]
     pub retention: Retention,
+    #[serde(default)]
+    pub flow: Flow,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +123,48 @@ pub struct Retention {
     pub reroute_logs_days: u32,
 }
 
+/// NetFlow/IPFIX flow collector. A SECOND, read-only telemetry source (see
+/// docs/flow-telemetry.md). OFF by default. Unlike `server.bind` (loopback-only,
+/// enforced in `validate`), the flow listener must receive UDP from the router,
+/// so its bind address is operator-chosen — a deliberate, documented exposure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Flow {
+    pub enabled: bool,
+    /// UDP bind address for the collector (e.g. a management address reachable
+    /// from the exporting router). NOT loopback-restricted.
+    pub bind_addr: String,
+    pub bind_port: u16,
+    /// Only parse datagrams whose source IP resolves to an enrolled device.
+    pub allowlist_enrolled_only: bool,
+    /// Retain ~the last hour of aggregated buckets (mirrors interface_samples).
+    pub retention_minutes: i64,
+    /// Aggregation bucket width in seconds.
+    pub bucket_seconds: u64,
+    /// 5-tuples retained per bucket/interface/direction; the tail is truncated
+    /// (logged, never silent — the count survives in flow_iface_buckets).
+    pub top_k_talkers: usize,
+    /// Fallback sampling rate when an exporter reports none and no per-exporter
+    /// override is set. A sampled-looking exporter that falls through to this is
+    /// flagged low-confidence (blocks flow-driven automatic actions).
+    pub default_sampling_rate: u32,
+}
+
+impl Default for Flow {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0".into(),
+            bind_port: 2055,
+            allowlist_enrolled_only: true,
+            retention_minutes: 70,
+            bucket_seconds: 60,
+            top_k_talkers: 100,
+            default_sampling_rate: 1,
+        }
+    }
+}
+
 // Built-in defaults — these MUST mirror config.example.toml exactly. Used when
 // the config file is missing (fresh installs before the operator customizes
 // anything); `Config::load_or_default` logs a warning in that case.
@@ -196,6 +240,7 @@ impl Default for Config {
             safety: Safety::default(),
             reroute: Reroute::default(),
             retention: Retention::default(),
+            flow: Flow::default(),
         }
     }
 }

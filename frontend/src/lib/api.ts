@@ -177,6 +177,61 @@ export interface Sample {
   rx_power_dbm: number | null;
 }
 
+// --- Flow telemetry (NetFlow/IPFIX) — read-only second source -------------
+
+/** One ranked row from /api/devices/{id}/flows/top. Fields beyond the common
+ *  aggregate vary by dimension (talkers / ports / traffic). Counts are raw
+ *  (sampled); est_* are scaled by the effective sampling rate. */
+export interface FlowTopRow {
+  est_bytes: number;
+  est_pkts: number;
+  raw_bytes: number;
+  raw_pkts: number;
+  sampling_rate: number;
+  estimated: boolean;
+  low_confidence: boolean;
+  direction: "ingress" | "egress";
+  // talkers
+  src_addr?: string;
+  dst_addr?: string;
+  src_port?: number | null;
+  dst_port?: number | null;
+  protocol?: number;
+  // ports
+  port?: number;
+  port_kind?: "src" | "dst";
+  // traffic
+  if_index?: number;
+  interface_id?: number | null;
+}
+
+export type FlowDimension = "talkers" | "ports" | "traffic";
+
+export interface FlowTopResponse {
+  dimension: FlowDimension;
+  minutes: number;
+  interface_filtered: boolean;
+  rows: FlowTopRow[];
+}
+
+export interface FlowExporter {
+  id: number;
+  source_addr: string;
+  observation_domain: number;
+  configured_sampling_rate: number | null;
+  reported_sampling_rate: number | null;
+  snmp_derived_rate: number | null;
+  effective_sampling_rate: number;
+  sampling_source: "config" | "reported" | "snmp_derived" | "default" | "unknown";
+  sampling_confidence: "high" | "low";
+  snmp_xcal_ratio: number | null;
+  last_packet_at: string | null;
+  template_count: number;
+  datagrams_total: number;
+  dropped_no_template: number;
+  dropped_malformed: number;
+}
+
 export interface DeviceTestResult {
   ok: boolean;
   vendor?: string;
@@ -562,6 +617,54 @@ export const api = {
       request<Sample[]>(
         `/api/interfaces/${id}/metrics${minutes !== undefined ? `?minutes=${minutes}` : ""}`,
       ),
+  },
+
+  flows: {
+    top: (
+      deviceId: number,
+      opts: {
+        dimension: FlowDimension;
+        minutes?: number;
+        metric?: "bytes" | "pkts";
+        interfaceId?: number;
+        portKind?: "src" | "dst";
+      },
+    ) => {
+      const p = new URLSearchParams({ dimension: opts.dimension });
+      if (opts.minutes !== undefined) p.set("minutes", String(opts.minutes));
+      if (opts.metric) p.set("metric", opts.metric);
+      if (opts.interfaceId !== undefined) p.set("interface_id", String(opts.interfaceId));
+      if (opts.portKind) p.set("port_kind", opts.portKind);
+      return request<FlowTopResponse>(`/api/devices/${deviceId}/flows/top?${p.toString()}`);
+    },
+    exporters: (deviceId: number) =>
+      request<FlowExporter[]>(`/api/devices/${deviceId}/flow-exporters`),
+    search: (opts: {
+      deviceId?: number;
+      src?: string;
+      dst?: string;
+      port?: number;
+      minutes?: number;
+      metric?: "bytes" | "pkts";
+      limit?: number;
+    }) => {
+      const p = new URLSearchParams();
+      if (opts.deviceId !== undefined) p.set("device_id", String(opts.deviceId));
+      if (opts.src) p.set("src", opts.src);
+      if (opts.dst) p.set("dst", opts.dst);
+      if (opts.port !== undefined) p.set("port", String(opts.port));
+      if (opts.minutes !== undefined) p.set("minutes", String(opts.minutes));
+      if (opts.metric) p.set("metric", opts.metric);
+      if (opts.limit !== undefined) p.set("limit", String(opts.limit));
+      return request<{ minutes: number; rows: FlowTopRow[] }>(
+        `/api/flows/search?${p.toString()}`,
+      );
+    },
+    suggest: (field: "src" | "dst" | "port", q: string, deviceId?: number) => {
+      const p = new URLSearchParams({ field, q });
+      if (deviceId !== undefined) p.set("device_id", String(deviceId));
+      return request<string[]>(`/api/flows/suggest?${p.toString()}`);
+    },
   },
 
   rules: {

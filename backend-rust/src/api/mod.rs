@@ -20,6 +20,7 @@ pub mod locks;
 pub mod settings;
 pub mod devices;
 pub mod interfaces;
+pub mod flows;
 pub mod users;
 
 use anyhow::{Context, Result};
@@ -116,6 +117,11 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/devices/{id}/bgp-networks", get(devices::bgp_networks))
         .route("/api/devices/{id}/discover-prefixes", post(devices::discover_prefixes))
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
+        // flow telemetry (NetFlow/IPFIX) — read-only second source, see flows.rs
+        .route("/api/devices/{id}/flows/top", get(flows::top))
+        .route("/api/devices/{id}/flow-exporters", get(flows::exporters))
+        .route("/api/flows/search", get(flows::search))
+        .route("/api/flows/suggest", get(flows::suggest))
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))
         .route("/api/interfaces/{id}/metrics", get(interfaces::metrics))

@@ -1,0 +1,202 @@
+# Flow Telemetry (NetFlow v9 / IPFIX) — design note
+
+> **Status: implemented (NetFlow v9), read-only.** Collector + storage + API +
+> UI are in the tree; IPFIX (v10) is the planned additive decoder. The primary
+> telemetry source remains **SNMP interface polling**
+> ([telemetry-model.md](telemetry-model.md)); flow telemetry is a *second*,
+> additive source that gives per-tuple visibility SNMP cannot. Code:
+> `backend-rust/src/telemetry/flow/` (`v9.rs` decoder, `collector.rs` listener),
+> `src/api/flows.rs`, migration `20260614000300_flow_collector.sql`,
+> frontend `frontend/src/pages/device-detail/flows-tab.tsx`. OFF by default
+> (`[flow].enabled = false`); the migration is additive and not auto-applied to
+> any running DB.
+
+## Why
+
+SNMP gives **volume** per interface (rx/tx bps & pps) but not **composition**:
+which sources, which ports, which 5-tuples make up that volume. The motivating
+case is a high-pps / low-bitrate flood — e.g. a UDP/53 reflection from peer A —
+that barely moves the bitrate graph but is obvious as "N Mpps to dst port 53 on
+ingress interface X". Flow telemetry is the base for that class of detector.
+
+This note covers a **read-only flow collector**: it ingests NetFlow, aggregates,
+and displays. It is a telemetry source, not an action path. Like all telemetry it
+*feeds* detection but never executes anything — observe mode and every reroute
+gate are unchanged.
+
+## Scope (v1)
+
+- **Ingest** Cisco ASR 1004 export: **NetFlow v9** now. The decoder normalizes to
+  an internal `FlowRecord` so **IPFIX (v10)** is an additive decoder later, not a
+  rewrite (v9 and IPFIX share field semantics; they differ in header, set IDs —
+  template/options `0`/`1` in v9 vs `2`/`3` in IPFIX — and variable-length
+  encoding).
+- **Retain the last ~hour** of aggregated flow data (mirrors the
+  `interface_samples` 70-minute window and its prune job).
+- **Display** per interface: top-10 talkers (5-tuples), top-10 ports, and
+  per-interface/direction totals.
+- **Out of scope (future):** sFlow, per-tuple anomaly baselines, flow-driven
+  automatic reroutes. Flow signals may inform detection rules, but auto-execution
+  stays behind the existing global + per-rule enables and enforce mode.
+
+## Listener & configuration
+
+The collector has its **own config block**, independent of the web/API binding.
+The Rust API binds loopback-only and is never exposed; the flow listener, by
+necessity, must receive UDP from the router, so it binds where the operator
+chooses — this is a deliberate, documented exposure, off by default.
+
+```toml
+[flow]
+enabled        = false          # off by default
+bind_addr      = "0.0.0.0"      # management address that can reach the ASR
+bind_port      = 2055
+# Only accept datagrams whose source IP resolves to an enrolled device. A packet
+# from an unknown source is counted and dropped (never parsed into state).
+allowlist_enrolled_only = true
+retention_minutes = 70
+bucket_seconds    = 60          # aggregation bucket width
+top_k_talkers     = 100         # 5-tuples retained per bucket/interface/direction
+```
+
+Safety rules for the listener (doctrine: parsers "never panic", structured
+errors, low confidence blocks automatic actions):
+
+- **Source-IP allowlist.** Only datagrams from enrolled `devices` (matched by
+  `hostname`/management IP) are parsed. Everything else increments a drop counter
+  and is discarded — no template state, no records.
+- **Never panic on malformed input.** Every decode step returns a structured
+  error; a bad datagram is logged + counted and the loop continues. A
+  single malformed packet must never take down the collector.
+- **Bounded memory.** Template caches and in-flight bucket state are bounded;
+  the long tail of 5-tuples is truncated to `top_k_talkers` *before* write (see
+  truncation note below — it is logged, never silent).
+
+## Interface mapping (free, reuse existing model)
+
+NetFlow records carry input/output SNMP `ifIndex` (`INPUT_SNMP` 10 /
+`OUTPUT_SNMP` 14). We already key `device_interfaces` on `(device_id, if_index)`.
+So:
+
+- exporter **source IP** → `devices` row → `device_id`;
+- record **ifIndex** → `device_interfaces` row → `interface_id`.
+
+Flows land on the *same* interface model the SNMP path and the rule engine
+already use. A flow whose ifIndex is unknown (not yet discovered) is attributed to
+the device with `interface_id = NULL` and still counted at device scope.
+
+## Sampling — resolution & confidence
+
+ASR Flexible NetFlow is typically **sampled**. The exporter *may* advertise the
+rate via an options template (`FLOW_SAMPLER_ID` 48 / `FLOW_SAMPLER_MODE` 49 /
+`FLOW_SAMPLER_RANDOM_INTERVAL` 50; IPFIX `samplingPacketInterval` 305 /
+`samplingPacketSpace` 306), but on Cisco this is **unreliable** — the options
+template may be sent rarely, late, or not at all, and data records may reference a
+`samplerId` we have not yet resolved. So: parse it opportunistically, never depend
+on it.
+
+**Effective-rate precedence** (per exporter, recorded in `flow_exporters`):
+
+1. **`config`** — operator-set override for this exporter. **Authoritative when
+   set** (force), because a device can report a stale/wrong rate after a config
+   change and operator intent must win.
+2. **`reported`** — rate resolved from the exporter's options template.
+3. **`snmp_derived`** — back-calculated by cross-checking against SNMP (below).
+4. **`default`** — global `[flow]` default. If we fall through to here for a
+   sampled-looking exporter, the exporter is flagged **low-confidence**.
+5. **`unknown`** — no rate known yet → **low-confidence**, and flow-derived
+   signals from this exporter must **not** feed automatic actions (doctrine).
+
+Counts are stored as the **raw sampled** values *plus* the
+`effective_sampling_rate` used, so an estimate is always re-derivable if the rate
+is later corrected. The display/detection layer multiplies; any value scaled by a
+rate > 1 is presented as **estimated**, not exact. Estimates are statistically
+sound for large aggregates (an interface total, a port-53 flood) and noisy for the
+long tail (a single sampled packet × rate) — the UI labels accordingly.
+
+### SNMP cross-calibration
+
+We poll `ifHC*` octet/packet counters on the *same* interfaces. Over a bucket
+window we compare flow-estimated vs SNMP-measured volume on the same
+`(device_id, if_index)`:
+
+```text
+observed_rate ≈ snmp_bytes_in_window / flow_sampled_bytes_in_window
+```
+
+This gives (a) a **sanity check** — if the flow estimate and SNMP disagree by
+more than a configured factor, raise a "sampling rate likely wrong" flag on the
+exporter; and (b) an **auto-derived rate** (`snmp_derived`) when nothing else is
+available. It is a calibrator, not a hard source: SNMP and flow count slightly
+different things (e.g. broadcast/multicast, L2 overhead), so a tolerance band
+applies.
+
+## Storage
+
+Pre-aggregate into fixed-width time buckets (`bucket_seconds`, default 60); never
+store raw flows — under the exact DDoS we want to catch, raw 5-tuple cardinality
+is millions/hour. Three purpose-built, individually-bounded bucket tables, because
+a single "top-K talkers" table would **miss a spoofed-source flood** (millions of
+distinct src IPs, each tiny, all to dst/53 — truncating by talker loses them,
+while the port rollup aggregates them all):
+
+- **`flow_iface_buckets`** — per `(bucket, interface, direction)` totals
+  (pkts/bytes/flow_count). Tiny. Drives per-interface totals and SNMP
+  cross-calibration.
+- **`flow_port_buckets`** — per `(bucket, interface, direction, protocol,
+  port_kind, port)`. Bounded (≤ ~128k/bucket, in practice tiny). **This is what
+  catches the port-53 spoofed flood**, since it aggregates across all source IPs.
+- **`flow_talker_buckets`** — per `(bucket, interface, direction)` **top-K
+  5-tuples only**. The long tail beyond `top_k_talkers` is dropped in memory
+  before write; `flow_iface_buckets.flow_count` records how many flows existed so
+  the UI shows "top 100 of N" — the truncation is surfaced, never silent.
+
+Each row stores raw sampled `pkts`/`bytes`, the `effective_sampling_rate` and
+`sampling_confidence` in force, and `flow_count`. Retention: a prune job deletes
+`bucket_ts < now - retention_minutes` from all three, mirroring `prune_samples`.
+`flow_exporters` is durable state (not pruned).
+
+Top-N queries are then `ORDER BY SUM(bytes|pkts) DESC LIMIT 10` over the window,
+grouped by the relevant dimension.
+
+## Background task
+
+A `flow::collector::run(pool, cfg)` task spawns from `scheduler::run()` alongside
+`supervise` and `prune_samples` (only when `[flow].enabled`):
+
+1. UDP recv loop → allowlist check → decode header → dispatch sets.
+2. Template sets update the per-exporter template cache; options templates update
+   the sampler state. Data records decode against the cached template (dropped +
+   counted if the template is not yet known).
+3. Decoded `FlowRecord`s fold into in-memory bucket accumulators keyed by the
+   three dimensions above.
+4. On bucket close, resolve the effective sampling rate, truncate talkers to
+   top-K, and flush to the bucket tables in one transaction.
+5. A sibling prune task trims expired buckets every `PRUNE_INTERVAL`.
+
+Templates are **in-memory** in v1: after a controller restart, data records are
+dropped until each template is re-advertised (seconds-to-minutes). This gap is
+logged; it is a telemetry blind spot, not a safety issue (no action depends on a
+single bucket), and matches "never assume state survived a restart".
+
+## API & UI
+
+- `GET /api/devices/{id}/flows/top?dimension=talkers|ports|traffic&interface_id=&minutes=60`
+  → ranked top-10 for the chosen dimension/window, each row carrying
+  `estimated` + `sampling_confidence` so the UI can badge it.
+- `GET /api/devices/{id}/flow-exporters` → exporter health: effective rate,
+  source, confidence, last packet, dropped/unknown-template counters, SNMP
+  cross-cal delta.
+- UI: a **Flows** panel on the device/interface view — three ranked tables, with
+  an "estimated (sampled N:1)" badge and a low-confidence warning when the rate is
+  unknown or the SNMP cross-check disagrees.
+
+## Detection hook (future)
+
+Flow aggregates expose new signals (e.g. dst-port pps, talker pps, unique-source
+count) that a future detector can threshold — the natural home for the
+"big-pps / low-bps to port 53 from peer A" rule. Wiring those into the rule engine
+is **out of scope here**; this note only lands the read-only collector and its
+storage. Any future flow-driven automatic action stays behind the existing
+enforce-mode + global + per-rule enables, and **low sampling confidence blocks
+it** by the rule above.

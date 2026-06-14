@@ -66,3 +66,22 @@ require_verification = true
 traffic_samples_days = 7
 rule_events_days = 90
 reroute_logs_days = 365
+
+# NetFlow v9 / IPFIX flow collector — a SECOND, read-only telemetry source giving
+# per-tuple composition SNMP cannot (see docs/flow-telemetry.md). OFF by default.
+# Unlike [server].bind (loopback-only), the listener must receive UDP from the
+# router, so bind_addr is operator-chosen — a deliberate, documented exposure.
+[flow]
+enabled = false
+bind_addr = "0.0.0.0"
+bind_port = 2055
+# Only parse datagrams whose source IP resolves to an enrolled device.
+allowlist_enrolled_only = true
+# Retain ~the last hour of aggregated buckets (mirrors interface_samples).
+retention_minutes = 70
+# Aggregation bucket width (seconds) and per-bucket top-K 5-tuples retained.
+bucket_seconds = 60
+top_k_talkers = 100
+# Fallback sampling rate when an exporter reports none and no override is set; a
+# sampled-looking exporter that falls through to this is flagged low-confidence.
+default_sampling_rate = 1
