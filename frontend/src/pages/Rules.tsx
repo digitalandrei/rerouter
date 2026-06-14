@@ -8,7 +8,7 @@
  * preserved. RBAC: edit_rules permission gates toggle and delete (both
  * roles have it — current behaviour kept).
  */
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState } from "react";
 import {
   SlidersHorizontal,
   ToggleLeft,
@@ -27,7 +27,6 @@ import {
   api,
   type Rule,
   type Device,
-  type Interface,
   type Template,
   ApiError,
 } from "@/lib/api";
@@ -35,22 +34,14 @@ import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { Toggle } from "@/components/ui/toggle";
 import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
-import { EditRuleDialog } from "./rules/edit-rule-dialog";
-import {
-  METRICS,
-  metricLabel,
-  isFlowMetric,
-  FLOW_PROTOCOLS,
-  RECOVERY_MODES,
-  thresholdHint,
-} from "./rules/rule-constants";
+import { RuleDialog } from "./rules/rule-dialog";
+import { metricLabel, isFlowMetric } from "./rules/rule-constants";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -294,46 +285,6 @@ const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
-interface RuleForm {
-  name: string;
-  device_id: string;
-  interface_id: string;
-  metric: string;
-  // Flow-metric selector (used only when metric is flow_pps / flow_bps).
-  flow_direction: "ingress" | "egress";
-  flow_protocol: string; // "" = any
-  flow_port: string; // "" = whole interface
-  flow_port_kind: "src" | "dst";
-  operator: ">" | "<";
-  threshold_value: string;
-  window_minutes: string;
-  consecutive_samples: string;
-  recovery_mode: "auto" | "threshold" | "manual";
-  recovery_threshold_value: string;
-  recovery_window_minutes: string; // threshold-mode flow recovery override
-  recovery_consecutive_samples: string; // threshold-mode SNMP recovery override
-  severity: string;
-}
-
-const DEFAULT_FORM: RuleForm = {
-  name: "",
-  device_id: "",
-  interface_id: "",
-  metric: "rx_bps",
-  flow_direction: "ingress",
-  flow_protocol: "",
-  flow_port: "",
-  flow_port_kind: "dst",
-  operator: ">",
-  threshold_value: "",
-  window_minutes: "1",
-  consecutive_samples: "3",
-  recovery_mode: "auto",
-  recovery_threshold_value: "",
-  recovery_window_minutes: "",
-  recovery_consecutive_samples: "",
-  severity: "warning",
-};
 
 
 /** Human-readable condition string: "rx_bps > 8000000000" */
@@ -446,12 +397,8 @@ export default function Rules() {
 
   const [rules, setRules] = useState<Rule[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
-  const [deviceInterfaces, setDeviceInterfaces] = useState<Interface[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState<RuleForm>(DEFAULT_FORM);
-  const [addError, setAddError] = useState<string | null>(null);
-  const [addBusy, setAddBusy] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
   const [manageRule, setManageRule] = useState<Rule | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
   const [editRule, setEditRule] = useState<Rule | null>(null);
@@ -485,85 +432,6 @@ export default function Rules() {
     }, 20000);
     return () => clearInterval(t);
   }, []);
-
-  function setField(field: keyof RuleForm, value: string) {
-    setForm((f) => {
-      const next = { ...f, [field]: value };
-      if (field === "device_id") {
-        next.interface_id = "";
-      }
-      return next;
-    });
-    if (field === "device_id" && value) {
-      api.devices
-        .interfaces(parseInt(value, 10))
-        .then(setDeviceInterfaces)
-        .catch(() => setDeviceInterfaces([]));
-    }
-  }
-
-  async function handleAdd(e: FormEvent) {
-    e.preventDefault();
-    setAddError(null);
-    if (!form.interface_id) {
-      setAddError("Select a device and interface.");
-      return;
-    }
-    setAddBusy(true);
-    try {
-      const isFlow = isFlowMetric(form.metric);
-      const flow = isFlow
-        ? {
-            flow_direction: "ingress" as const, // locked to ingress for now
-            flow_protocol: form.flow_protocol ? parseInt(form.flow_protocol, 10) : null,
-            flow_port: form.flow_port ? parseInt(form.flow_port, 10) : null,
-            flow_port_kind: form.flow_port ? form.flow_port_kind : null,
-          }
-        : {};
-      // Persistence is per family: flows use the time window, SNMP uses
-      // consecutive samples. The unused control is sent as 0 (disabled).
-      const duration_seconds = isFlow
-        ? Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60))
-        : 0;
-      const consecutive_samples = isFlow ? 0 : Math.max(1, parseInt(form.consecutive_samples, 10) || 1);
-      await api.rules.create({
-        name: form.name.trim(),
-        target_kind: "interface",
-        interface_id: parseInt(form.interface_id, 10),
-        device_id: parseInt(form.device_id, 10),
-        metric: form.metric,
-        ...flow,
-        operator: form.operator,
-        threshold_value: parseFloat(form.threshold_value),
-        duration_seconds,
-        consecutive_samples,
-        recovery_mode: form.recovery_mode,
-        recovery_threshold_value:
-          form.recovery_mode === "threshold" && form.recovery_threshold_value
-            ? parseFloat(form.recovery_threshold_value)
-            : null,
-        recovery_window_seconds:
-          form.recovery_mode === "threshold" && isFlow && form.recovery_window_minutes
-            ? Math.max(0, Math.round(parseFloat(form.recovery_window_minutes) * 60))
-            : null,
-        recovery_consecutive_samples:
-          form.recovery_mode === "threshold" && !isFlow && form.recovery_consecutive_samples
-            ? Math.max(1, parseInt(form.recovery_consecutive_samples, 10))
-            : null,
-        severity: form.severity,
-        enabled: true,
-        automatic_reroute_enabled: false,
-        reroute_template_id: null,
-      });
-      setForm(DEFAULT_FORM);
-      setShowAdd(false);
-      loadRules();
-    } catch (err) {
-      setAddError(err instanceof ApiError ? err.message : "Failed to create rule");
-    } finally {
-      setAddBusy(false);
-    }
-  }
 
   async function clearRule(rule: Rule) {
     try {
@@ -614,293 +482,11 @@ export default function Rules() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Threshold rules</h1>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setShowAdd((v) => !v)}
-        >
-          {showAdd ? "Cancel" : "Add rule"}
+        <Button variant="outline" size="sm" onClick={() => setAddOpen(true)} disabled={!canEdit}>
+          Add rule
         </Button>
       </div>
 
-      {showAdd && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">New threshold rule</CardTitle>
-            <CardDescription>
-              Select a device and interface, then configure the threshold.
-              Automatic reroutes are off by default (doctrine §8).
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleAdd} className="space-y-4">
-              <label className="block space-y-1 text-sm font-medium">
-                Rule name
-                <input
-                  required
-                  className={inputClass}
-                  value={form.name}
-                  onChange={(e) => setField("name", e.target.value)}
-                  placeholder="High Rx utilization on core uplink"
-                />
-              </label>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="block space-y-1 text-sm font-medium">
-                  Device
-                  <select
-                    required
-                    className={inputClass}
-                    value={form.device_id}
-                    onChange={(e) => setField("device_id", e.target.value)}
-                  >
-                    <option value="">Select device…</option>
-                    {devices.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({d.hostname})
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  Interface
-                  <select
-                    required
-                    className={inputClass}
-                    value={form.interface_id}
-                    onChange={(e) => setField("interface_id", e.target.value)}
-                    disabled={!form.device_id}
-                  >
-                    <option value="">
-                      {form.device_id
-                        ? "Select interface…"
-                        : "Select device first"}
-                    </option>
-                    {deviceInterfaces.map((iface) => (
-                      <option key={iface.id} value={iface.id}>
-                        {iface.if_name}
-                        {iface.if_alias ? ` — ${iface.if_alias}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  Metric
-                  <select
-                    className={inputClass}
-                    value={form.metric}
-                    onChange={(e) => setField("metric", e.target.value)}
-                  >
-                    {METRICS.map((m) => (
-                      <option key={m.value} value={m.value}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {isFlowMetric(form.metric) && (
-                  <>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Flow direction
-                      <select
-                        className={`${inputClass} opacity-60`}
-                        value="ingress"
-                        disabled
-                      >
-                        <option value="ingress">ingress</option>
-                      </select>
-                      <span className="text-[11px] font-normal text-muted-foreground">
-                        ingress only for now
-                      </span>
-                    </label>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Protocol
-                      <select
-                        className={inputClass}
-                        value={form.flow_protocol}
-                        onChange={(e) => setField("flow_protocol", e.target.value)}
-                      >
-                        {FLOW_PROTOCOLS.map((p) => (
-                          <option key={p.value} value={p.value}>
-                            {p.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Port (optional)
-                      <input
-                        type="number"
-                        min={0}
-                        max={65535}
-                        className={inputClass}
-                        value={form.flow_port}
-                        onChange={(e) => setField("flow_port", e.target.value)}
-                        placeholder="e.g. 53 — blank = whole interface"
-                      />
-                    </label>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Port matches
-                      <select
-                        className={inputClass}
-                        value={form.flow_port_kind}
-                        onChange={(e) => setField("flow_port_kind", e.target.value)}
-                        disabled={!form.flow_port}
-                      >
-                        <option value="dst">destination port</option>
-                        <option value="src">source port</option>
-                      </select>
-                    </label>
-                  </>
-                )}
-                <label className="block space-y-1 text-sm font-medium">
-                  Operator
-                  <select
-                    className={inputClass}
-                    value={form.operator}
-                    onChange={(e) =>
-                      setField("operator", e.target.value as ">" | "<")
-                    }
-                  >
-                    <option value=">">above (&gt;)</option>
-                    <option value="<">below (&lt;)</option>
-                  </select>
-                </label>
-                <label className="block space-y-1 text-sm font-medium">
-                  Threshold value
-                  <input
-                    type="number"
-                    step="any"
-                    required
-                    className={inputClass}
-                    value={form.threshold_value}
-                    onChange={(e) => setField("threshold_value", e.target.value)}
-                    placeholder={thresholdHint(form.metric)}
-                  />
-                </label>
-                {isFlowMetric(form.metric) ? (
-                  <label className="block space-y-1 text-sm font-medium">
-                    Sliding window (minutes)
-                    <input
-                      type="number"
-                      min={0}
-                      step="0.5"
-                      required
-                      className={inputClass}
-                      value={form.window_minutes}
-                      onChange={(e) => setField("window_minutes", e.target.value)}
-                    />
-                    <span className="text-[11px] font-normal text-muted-foreground">
-                      flows are bucketed per minute — persist by time
-                    </span>
-                  </label>
-                ) : (
-                  <label className="block space-y-1 text-sm font-medium">
-                    Consecutive samples (poll cycles)
-                    <input
-                      type="number"
-                      min={1}
-                      required
-                      className={inputClass}
-                      value={form.consecutive_samples}
-                      onChange={(e) => setField("consecutive_samples", e.target.value)}
-                    />
-                    <span className="text-[11px] font-normal text-muted-foreground">
-                      fire after N consecutive polls past the threshold
-                    </span>
-                  </label>
-                )}
-                <label className="block space-y-1 text-sm font-medium">
-                  Recovery
-                  <select
-                    className={inputClass}
-                    value={form.recovery_mode}
-                    onChange={(e) => setField("recovery_mode", e.target.value)}
-                  >
-                    {RECOVERY_MODES.map((m) => (
-                      <option key={m.value} value={m.value}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {form.recovery_mode === "auto" && (
-                  <p className="sm:col-span-2 text-[11px] text-muted-foreground">
-                    {isFlowMetric(form.metric)
-                      ? "Clears once the metric stays back under the threshold for the same sliding window used to fire."
-                      : "Clears after the same number of consecutive samples back under the threshold that fired it."}
-                  </p>
-                )}
-                {form.recovery_mode === "manual" && (
-                  <p className="sm:col-span-2 text-[11px] text-muted-foreground">
-                    Stays firing until an operator clears it (the “Clear” button on the rule).
-                  </p>
-                )}
-                {form.recovery_mode === "threshold" && (
-                  <>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Recovery threshold
-                      <input
-                        type="number"
-                        step="any"
-                        className={inputClass}
-                        value={form.recovery_threshold_value}
-                        onChange={(e) => setField("recovery_threshold_value", e.target.value)}
-                        placeholder="crosses back past this (blank = fire threshold)"
-                      />
-                    </label>
-                    {isFlowMetric(form.metric) ? (
-                      <label className="block space-y-1 text-sm font-medium">
-                        Recovery window (minutes)
-                        <input
-                          type="number"
-                          min={0}
-                          step="0.5"
-                          className={inputClass}
-                          value={form.recovery_window_minutes}
-                          onChange={(e) => setField("recovery_window_minutes", e.target.value)}
-                          placeholder="blank = same as firing window"
-                        />
-                      </label>
-                    ) : (
-                      <label className="block space-y-1 text-sm font-medium">
-                        Recovery samples
-                        <input
-                          type="number"
-                          min={1}
-                          className={inputClass}
-                          value={form.recovery_consecutive_samples}
-                          onChange={(e) => setField("recovery_consecutive_samples", e.target.value)}
-                          placeholder="blank = same as firing samples"
-                        />
-                      </label>
-                    )}
-                  </>
-                )}
-                <label className="block space-y-1 text-sm font-medium">
-                  Severity
-                  <select
-                    className={inputClass}
-                    value={form.severity}
-                    onChange={(e) => setField("severity", e.target.value)}
-                  >
-                    <option value="info">info</option>
-                    <option value="warning">warning</option>
-                    <option value="critical">critical</option>
-                  </select>
-                </label>
-              </div>
-              {addError && (
-                <p className="text-sm text-destructive" role="alert">
-                  {addError}
-                </p>
-              )}
-              <Button type="submit" disabled={addBusy}>
-                {addBusy ? "Creating…" : "Create rule"}
-              </Button>
-            </form>
-          </CardContent>
-        </Card>
-      )}
 
       <Card>
         <CardHeader>
@@ -1100,9 +686,18 @@ export default function Rules() {
         />
       )}
 
+      {addOpen && (
+        <RuleDialog
+          devices={devices}
+          onClose={() => setAddOpen(false)}
+          onSaved={() => loadRules()}
+        />
+      )}
+
       {editRule && (
-        <EditRuleDialog
+        <RuleDialog
           rule={editRule}
+          devices={devices}
           onClose={() => setEditRule(null)}
           onSaved={(updated) =>
             setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r)))
