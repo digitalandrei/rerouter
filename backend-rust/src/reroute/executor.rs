@@ -96,6 +96,39 @@ pub async fn execute(
         };
     }
 
+    // Global automatic master switch — gates AUTOMATIC triggers ONLY (manual and
+    // rollback have their own upstream permission checks and must not be disabled
+    // by this switch). Doctrine: automatic execution needs enforce mode AND this
+    // global enable AND the per-rule enable. The runtime value lives in
+    // system_settings; config is only the startup fallback.
+    if req.trigger_type == "automatic"
+        && !crate::api::settings::bool_setting(
+            pool,
+            "automatic_actions_enabled",
+            cfg.safety.automatic_actions_enabled,
+        )
+        .await
+    {
+        return blocked(
+            &req,
+            device_name,
+            "automatic actions are globally disabled (automatic_actions_enabled = false)".into(),
+        );
+    }
+
+    // Verify-or-refuse: when verification is required, an action whose template
+    // has NO verification step can never be confirmed. Never auto-run such a
+    // template; for manual/rollback it still runs but the state machine forces an
+    // `uncertain` outcome instead of reporting success (see run_state_machine).
+    if cfg.reroute.require_verification && plan.verify.is_none() && req.trigger_type == "automatic"
+    {
+        return blocked(
+            &req,
+            device_name,
+            "template has no verification step and reroute.require_verification is enabled".into(),
+        );
+    }
+
     // Safety gates (device-scoped).
     if crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await {
         return blocked(
@@ -114,20 +147,10 @@ pub async fn execute(
             "device is locked (a prior action needs admin acknowledgement)".into(),
         );
     }
-    if running_on_device(pool, req.device_id).await {
-        return blocked(
-            &req,
-            device_name,
-            "another reroute is already running on this device".into(),
-        );
-    }
-    if has_uncertain(pool, req.device_id).await {
-        return blocked(
-            &req,
-            device_name,
-            "an unresolved uncertain action exists on this device".into(),
-        );
-    }
+    // NOTE: the "already running on this device" and "unresolved uncertain"
+    // guards are re-checked atomically with the INSERT under a per-device
+    // advisory lock below (see reserve_reroute_slot), so two concurrent triggers
+    // cannot both pass them and double-apply config to one device.
     if let Ok(Some(until)) = cooldown::active_until(pool, "device", &device_ref).await {
         return blocked(
             &req,
@@ -163,10 +186,43 @@ pub async fn execute(
         }
     }
 
-    // State machine.
-    let reroute_id = match insert_reroute(pool, &req, &plan).await {
+    // Reserve a slot under a per-device advisory lock: the already-running /
+    // uncertain re-checks and the INSERT happen atomically, so two concurrent
+    // triggers cannot both pass the guard and push config to the same device.
+    let lock_name = format!("reroute_dev_{}", req.device_id);
+    let mut guard = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return blocked(
+                &req,
+                device_name,
+                format!("could not acquire device guard: {e}"),
+            )
+        }
+    };
+    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
+        .bind(&lock_name)
+        .fetch_one(&mut *guard)
+        .await
+        .ok()
+        .flatten();
+    if got != Some(1) {
+        return blocked(
+            &req,
+            device_name,
+            "could not acquire the per-device reroute guard (another action is being set up)"
+                .into(),
+        );
+    }
+    let reserved = reserve_reroute_slot(pool, &req, &plan).await;
+    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+        .bind(&lock_name)
+        .execute(&mut *guard)
+        .await;
+    drop(guard);
+    let reroute_id = match reserved {
         Ok(id) => id,
-        Err(e) => return blocked(&req, device_name, format!("could not persist reroute: {e}")),
+        Err(reason) => return blocked(&req, device_name, reason),
     };
     audit(
         pool,
@@ -189,7 +245,14 @@ pub async fn execute(
     )
     .await;
 
-    let final_state = run_state_machine(pool, &req, reroute_id, &plan).await;
+    let final_state = run_state_machine(
+        pool,
+        &req,
+        reroute_id,
+        &plan,
+        cfg.reroute.require_verification,
+    )
+    .await;
 
     // Post-action cooldowns: per-device always, per-rule when rule-triggered.
     let _ = cooldown::record(
@@ -238,6 +301,7 @@ async fn run_state_machine(
     req: &ActionRequest,
     reroute_id: u64,
     plan: &RenderedPlan,
+    require_verification: bool,
 ) -> String {
     // -> running
     let _ = sqlx::query(
@@ -290,13 +354,9 @@ async fn run_state_machine(
         Verdict::Pass => "succeeded",
         Verdict::Fail => "failed",
         Verdict::Uncertain => "uncertain",
-        Verdict::None => {
-            if applied_ok {
-                "succeeded"
-            } else {
-                "failed"
-            }
-        }
+        // Template had no verify step. If verification is required we must NOT
+        // claim success — mark uncertain (which locks the device) instead.
+        Verdict::None => final_state_without_verification(applied_ok, require_verification),
     };
 
     finalize(pool, req, reroute_id, final_state, applied_ok, verdict).await;
@@ -308,6 +368,39 @@ enum Verdict {
     Fail,
     Uncertain,
     None,
+}
+
+/// Pure decision for the no-verify-step case: when verification is required we
+/// must NEVER report success (doctrine: "verify, don't assume") — mark the action
+/// `uncertain` (which locks the device) instead. Unit-tested below.
+fn final_state_without_verification(applied_ok: bool, require_verification: bool) -> &'static str {
+    if !applied_ok {
+        "failed"
+    } else if require_verification {
+        "uncertain"
+    } else {
+        "succeeded"
+    }
+}
+
+/// Reserve a reroute row for this device while the caller holds the per-device
+/// advisory lock: re-check the device-scoped guards (already-running / uncertain)
+/// and INSERT atomically. `Err(reason)` means blocked. Pairing the checks with
+/// the INSERT under one lock is what closes the concurrent double-apply race.
+async fn reserve_reroute_slot(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    plan: &RenderedPlan,
+) -> Result<u64, String> {
+    if running_on_device(pool, req.device_id).await {
+        return Err("another reroute is already running on this device".into());
+    }
+    if has_uncertain(pool, req.device_id).await {
+        return Err("an unresolved uncertain action exists on this device".into());
+    }
+    insert_reroute(pool, req, plan)
+        .await
+        .map_err(|e| format!("could not persist reroute: {e}"))
 }
 
 /// Run the verification `show` read and judge it (substring expect/reject).
@@ -650,5 +743,28 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
         would_run: None,
         device_id: req.device_id,
         device_name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_state_without_verification;
+
+    #[test]
+    fn no_verify_step_is_uncertain_when_verification_required() {
+        // Commands applied but the template carries no verify step: with
+        // verification required we must not claim success (doctrine).
+        assert_eq!(final_state_without_verification(true, true), "uncertain");
+    }
+
+    #[test]
+    fn no_verify_step_is_success_when_verification_not_required() {
+        assert_eq!(final_state_without_verification(true, false), "succeeded");
+    }
+
+    #[test]
+    fn failed_apply_is_failed_regardless_of_verification_flag() {
+        assert_eq!(final_state_without_verification(false, true), "failed");
+        assert_eq!(final_state_without_verification(false, false), "failed");
     }
 }

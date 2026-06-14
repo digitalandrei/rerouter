@@ -189,12 +189,40 @@ export default function Settings() {
         <CardHeader>
           <CardTitle className="text-lg">Automatic reroutes</CardTitle>
           <CardDescription>
-            There is no global automatic switch — each rule decides. A rule with
-            actions and its <strong>Auto</strong> toggle on runs them when it
-            fires, but only in <strong>enforce</strong> mode and subject to
-            device locks &amp; cooldowns. In observe mode nothing runs.
+            Global master switch for <strong>automatic</strong> reroutes (default
+            OFF, admin-only and audited). Automatic execution requires{" "}
+            <strong>all</strong> of: enforce mode, this switch ON, and the firing
+            rule's own <strong>Auto</strong> toggle — plus the executor's device
+            locks &amp; cooldowns. Manual reroutes are unaffected. In observe mode
+            nothing runs.
           </CardDescription>
         </CardHeader>
+        <CardContent className="flex items-center gap-3">
+          <Badge
+            variant={
+              settings?.automatic_actions_enabled ? "destructive" : "outline"
+            }
+          >
+            {settings?.automatic_actions_enabled ? "ENABLED" : "disabled"}
+          </Badge>
+          <Button
+            variant={
+              settings?.automatic_actions_enabled ? "outline" : "destructive"
+            }
+            size="sm"
+            onClick={() => {
+              const next = !settings?.automatic_actions_enabled;
+              void api.settings
+                .put({ automatic_actions_enabled: next })
+                .then(setSettings);
+            }}
+            disabled={loading || settings === null}
+          >
+            {settings?.automatic_actions_enabled
+              ? "Disable automatic reroutes"
+              : "Enable automatic reroutes (audited)"}
+          </Button>
+        </CardContent>
       </Card>
 
       <Card>

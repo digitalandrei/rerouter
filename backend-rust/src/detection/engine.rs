@@ -127,6 +127,13 @@ struct RuleStateRow {
 /// Evaluate every enabled interface rule on `device_id` against the latest
 /// metrics. Called by the scheduler right after a poll stores fresh samples.
 /// Per-rule failures are logged and skipped; one bad rule never stops the rest.
+///
+/// Rules are evaluated in PRIORITY order (severity: critical > warning > info,
+/// then oldest rule first), so when two rules fire on the same device the
+/// higher-priority one acts first. Auto-execution is mutually exclusive per
+/// device: while a reroute is in flight the executor's per-device reserve guard
+/// blocks any other action on that device; once it finalizes the device frees up
+/// and the next still-firing rule can act on a later pass.
 pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<usize> {
     let rules = sqlx::query_as::<_, InterfaceRule>(
         "SELECT id, name, interface_id, device_id, metric, \
@@ -137,7 +144,10 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
                 recovery_consecutive_samples, severity, \
                 automatic_reroute_enabled \
          FROM rules \
-         WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ?",
+         WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ? \
+         ORDER BY CASE severity \
+             WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 WHEN 'info' THEN 2 ELSE 3 END, \
+             id",
     )
     .bind(device_id)
     .fetch_all(pool)
@@ -455,6 +465,20 @@ async fn flow_observation(
     }))
 }
 
+/// Pure decision: should a fired rule's actions auto-execute? Requires enforce
+/// mode AND the global automatic master switch AND the rule's own auto switch,
+/// and NEVER on a low-confidence (unverified-sampling) reading. This is the
+/// doctrine "global and per-rule" gate; the executor re-checks it as defence in
+/// depth. Unit-tested below.
+fn should_auto_execute(
+    mode_is_enforce: bool,
+    global_automatic_enabled: bool,
+    rule_automatic_enabled: bool,
+    low_confidence: bool,
+) -> bool {
+    mode_is_enforce && global_automatic_enabled && rule_automatic_enabled && !low_confidence
+}
+
 /// On the firing edge: record the rule_event and enqueue the alert. In observe
 /// mode (and always, since execution is gated elsewhere) the alert carries the
 /// would-run plan instead of any reroute.
@@ -505,12 +529,21 @@ async fn on_fire(
         payload["sampling_low_confidence"] = json!(low_confidence);
     }
 
-    // "The rule decides": in enforce mode, a rule with auto enabled runs its
-    // actions now (gated further by the executor's locks/cooldowns). Otherwise —
-    // observe mode, or a manual-only rule — we only RENDER the would-run plan.
-    // SAFETY: low flow-sampling confidence NEVER auto-executes (doctrine: low
-    // parser confidence blocks automatic actions) — it still alerts + renders.
-    if low_confidence && mode == "enforce" && rule.automatic_reroute_enabled {
+    // "The rule decides", but only within the GLOBAL gates. Automatic execution
+    // requires enforce mode AND the global master switch (automatic_actions_enabled)
+    // AND the rule's own auto switch, and never on a low-confidence (unverified
+    // sampling) reading. Otherwise — observe mode, global switch off, a manual-only
+    // rule, or low confidence — we only RENDER the would-run plan. The runtime
+    // global value lives in system_settings; config is the startup fallback.
+    let global_auto = crate::api::settings::bool_setting(
+        pool,
+        "automatic_actions_enabled",
+        cfg.safety.automatic_actions_enabled,
+    )
+    .await;
+    // Surface low-confidence suppression only when it is the deciding blocker
+    // (everything else that would permit auto-execution is satisfied).
+    if low_confidence && mode == "enforce" && global_auto && rule.automatic_reroute_enabled {
         payload["auto_suppressed_low_confidence"] = json!(true);
         tracing::warn!(
             event_type = "rule_auto_suppressed",
@@ -518,7 +551,12 @@ async fn on_fire(
             "flow rule fired but auto-action suppressed: low sampling confidence"
         );
     }
-    let auto = mode == "enforce" && rule.automatic_reroute_enabled && !low_confidence;
+    let auto = should_auto_execute(
+        mode == "enforce",
+        global_auto,
+        rule.automatic_reroute_enabled,
+        low_confidence,
+    );
     if auto {
         let executed = auto_execute_actions(pool, cfg, rule).await;
         if !executed.is_empty() {
@@ -887,4 +925,37 @@ pub async fn clear_rule_manual(pool: &MySqlPool, cfg: &Config, rule_id: u64) -> 
     );
     run_recovery_rollback(pool, cfg, rule_id, &name, auto_enabled).await;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_execute;
+
+    // Args: (enforce_mode, global_switch, rule_switch, low_confidence) -> auto?
+    // These mirror the doctrine acceptance gates for the auto-execution decision.
+
+    #[test]
+    fn observe_mode_never_auto_executes() {
+        assert!(!should_auto_execute(false, true, true, false));
+    }
+
+    #[test]
+    fn enforce_with_global_switch_off_never_auto_executes() {
+        assert!(!should_auto_execute(true, false, true, false));
+    }
+
+    #[test]
+    fn enforce_global_on_but_rule_off_does_not_auto_execute() {
+        assert!(!should_auto_execute(true, true, false, false));
+    }
+
+    #[test]
+    fn low_confidence_suppresses_even_when_all_switches_on() {
+        assert!(!should_auto_execute(true, true, true, true));
+    }
+
+    #[test]
+    fn all_gates_satisfied_auto_executes() {
+        assert!(should_auto_execute(true, true, true, false));
+    }
 }
