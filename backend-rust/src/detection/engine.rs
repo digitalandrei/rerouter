@@ -393,6 +393,20 @@ async fn flow_observation(
     let bucket_secs = cfg.flow.bucket_seconds.max(1) as f64;
     let direction = rule.flow_direction.as_deref().unwrap_or("ingress");
 
+    // Match flow buckets by (device_id, if_index), NOT by the bucket's
+    // interface_id FK. if_index/device_id are always populated on a bucket;
+    // interface_id can be NULL when the exporter's ifIndex wasn't mapped to an
+    // enrolled row, which would make a flow condition silently never match. We
+    // resolve the rule's interface to its (device_id, if_index) and scope on that.
+    let resolved: Option<(u64, u32)> =
+        sqlx::query_as("SELECT device_id, if_index FROM device_interfaces WHERE id = ?")
+            .bind(rule.interface_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((dev_id, if_index)) = resolved else {
+        return Ok(None); // interface no longer exists
+    };
+
     // (est_pkts, est_bytes, low_conf flag, latest bucket_ts) — all NULL if the
     // selector matched no rows.
     type Agg = (Option<u64>, Option<u64>, Option<u64>, Option<Ts>);
@@ -404,19 +418,21 @@ async fn flow_observation(
         let port_kind = rule.flow_port_kind.as_deref().unwrap_or("dst");
         sqlx::query_as(&format!(
             "SELECT {agg}, MAX(bucket_ts) FROM flow_port_buckets \
-             WHERE interface_id = ? AND direction = ? AND port_kind = ? AND port = ? \
+             WHERE device_id = ? AND if_index = ? AND direction = ? AND port_kind = ? AND port = ? \
                AND (? IS NULL OR protocol = ?) \
                AND bucket_ts = (SELECT MAX(bucket_ts) FROM flow_port_buckets \
-                  WHERE interface_id = ? AND direction = ? AND port_kind = ? AND port = ? \
+                  WHERE device_id = ? AND if_index = ? AND direction = ? AND port_kind = ? AND port = ? \
                     AND (? IS NULL OR protocol = ?))"
         ))
-        .bind(rule.interface_id)
+        .bind(dev_id)
+        .bind(if_index)
         .bind(direction)
         .bind(port_kind)
         .bind(port)
         .bind(rule.flow_protocol)
         .bind(rule.flow_protocol)
-        .bind(rule.interface_id)
+        .bind(dev_id)
+        .bind(if_index)
         .bind(direction)
         .bind(port_kind)
         .bind(port)
@@ -427,13 +443,15 @@ async fn flow_observation(
     } else {
         sqlx::query_as(&format!(
             "SELECT {agg}, MAX(bucket_ts) FROM flow_iface_buckets \
-             WHERE interface_id = ? AND direction = ? \
+             WHERE device_id = ? AND if_index = ? AND direction = ? \
                AND bucket_ts = (SELECT MAX(bucket_ts) FROM flow_iface_buckets \
-                  WHERE interface_id = ? AND direction = ?)"
+                  WHERE device_id = ? AND if_index = ? AND direction = ?)"
         ))
-        .bind(rule.interface_id)
+        .bind(dev_id)
+        .bind(if_index)
         .bind(direction)
-        .bind(rule.interface_id)
+        .bind(dev_id)
+        .bind(if_index)
         .bind(direction)
         .fetch_one(pool)
         .await?
