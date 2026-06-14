@@ -310,6 +310,7 @@ interface RuleForm {
   consecutive_samples: string;
   recovery_mode: "auto" | "threshold" | "manual";
   recovery_threshold_value: string;
+  recovery_window_seconds: string;
   severity: string;
 }
 
@@ -328,6 +329,7 @@ const DEFAULT_FORM: RuleForm = {
   consecutive_samples: "3",
   recovery_mode: "auto",
   recovery_threshold_value: "",
+  recovery_window_seconds: "",
   severity: "warning",
 };
 
@@ -373,6 +375,40 @@ function breaches(op: string, v: number, t: number): boolean {
     default:
       return false;
   }
+}
+
+/** The active persistence control for the rule's metric family. */
+function persistenceLabel(rule: Rule): string {
+  if (isFlowMetric(rule.metric)) {
+    if (rule.duration_seconds <= 0) return "immediate";
+    const m = rule.duration_seconds / 60;
+    return `${m.toLocaleString(undefined, { maximumFractionDigits: 1 })} min window`;
+  }
+  return rule.consecutive_samples > 0 ? `${rule.consecutive_samples} samples` : "immediate";
+}
+
+/** Live progression toward firing: consecutive samples (SNMP) or minutes held
+ *  (flows). A single sample crossing back resets this to zero, server-side. */
+function RuleProgress({ rule }: { rule: Rule }) {
+  const state = rule.current_state;
+  if (state !== "matching" && state !== "firing") return null;
+  const cls = state === "firing" ? "text-red-600 dark:text-red-400" : "text-amber-600 dark:text-amber-400";
+
+  let label: string;
+  if (isFlowMetric(rule.metric)) {
+    const heldMin = rule.first_matched_at
+      ? (Date.now() - new Date(rule.first_matched_at).getTime()) / 60000
+      : 0;
+    const target = rule.duration_seconds / 60;
+    label =
+      state === "firing"
+        ? `firing · ${heldMin.toFixed(1)} min`
+        : `held ${heldMin.toFixed(1)} / ${target.toFixed(1)} min`;
+  } else {
+    const n = rule.consecutive_match_count ?? 0;
+    label = state === "firing" ? `firing · ${n} samples` : `${n} / ${rule.consecutive_samples} samples`;
+  }
+  return <span className={`text-[11px] font-medium ${cls}`}>{label}</span>;
 }
 
 /** Colored live status: current value, above/below the threshold, breach = red. */
@@ -503,6 +539,10 @@ export default function Rules() {
         recovery_threshold_value:
           form.recovery_mode === "threshold" && form.recovery_threshold_value
             ? parseFloat(form.recovery_threshold_value)
+            : null,
+        recovery_window_seconds:
+          form.recovery_mode !== "manual" && form.recovery_window_seconds
+            ? Math.max(0, parseInt(form.recovery_window_seconds, 10))
             : null,
         severity: form.severity,
         enabled: true,
@@ -777,6 +817,19 @@ export default function Rules() {
                     ))}
                   </select>
                 </label>
+                {form.recovery_mode !== "manual" && (
+                  <label className="block space-y-1 text-sm font-medium">
+                    Settle window (seconds)
+                    <input
+                      type="number"
+                      min={0}
+                      className={inputClass}
+                      value={form.recovery_window_seconds}
+                      onChange={(e) => setField("recovery_window_seconds", e.target.value)}
+                      placeholder="blank = global default"
+                    />
+                  </label>
+                )}
                 {form.recovery_mode === "threshold" && (
                   <label className="block space-y-1 text-sm font-medium">
                     Recovery threshold
@@ -846,7 +899,7 @@ export default function Rules() {
                   </TableHead>
                   <TableHead>Target</TableHead>
                   <TableHead>Condition</TableHead>
-                  <TableHead>Duration</TableHead>
+                  <TableHead>Persistence</TableHead>
                   <TableHead>Severity</TableHead>
                   <TableHead>Enabled</TableHead>
                   <TableHead>Mitigation</TableHead>
@@ -887,12 +940,12 @@ export default function Rules() {
                       </div>
                     </TableCell>
 
-                    {/* Sliding window */}
+                    {/* Persistence (per family) + live progression toward firing */}
                     <TableCell className="text-xs text-muted-foreground">
-                      {rule.duration_seconds >= 60
-                        ? `${(rule.duration_seconds / 60).toLocaleString(undefined, { maximumFractionDigits: 1 })} min`
-                        : `${rule.duration_seconds}s`}{" "}
-                      / {rule.consecutive_samples} cycles
+                      <div className="flex flex-col gap-1">
+                        <span>{persistenceLabel(rule)}</span>
+                        <RuleProgress rule={rule} />
+                      </div>
                     </TableCell>
 
                     {/* Severity badge */}

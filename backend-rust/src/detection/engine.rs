@@ -66,6 +66,9 @@ struct InterfaceRule {
     recovery_mode: String,
     /// Recovery threshold for `threshold` mode (defaults to threshold_value).
     recovery_threshold_value: Option<f64>,
+    /// Settle window (seconds) for auto/threshold recovery; NULL = global
+    /// detection.hysteresis_seconds.
+    recovery_window_seconds: Option<u32>,
     severity: String,
     /// Per-rule switch: in enforce mode, run the rule's actions automatically on
     /// the firing edge. "The rule decides" — this is the only auto gate besides
@@ -129,7 +132,7 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
                 flow_direction, flow_protocol, flow_port, flow_port_kind, \
                 operator, threshold_value, \
                 duration_seconds, consecutive_samples, \
-                recovery_mode, recovery_threshold_value, severity, \
+                recovery_mode, recovery_threshold_value, recovery_window_seconds, severity, \
                 automatic_reroute_enabled \
          FROM rules \
          WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ?",
@@ -221,8 +224,12 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
     }
 
     // Firing condition not matched this tick. How the rule clears depends on its
-    // recovery_mode (docs/detection-engine.md).
-    let hysteresis = cfg.detection.hysteresis_seconds as i64;
+    // recovery_mode (docs/detection-engine.md). The settle window is per-rule,
+    // falling back to the global detection.hysteresis_seconds.
+    let hysteresis = rule
+        .recovery_window_seconds
+        .map(|s| s as i64)
+        .unwrap_or(cfg.detection.hysteresis_seconds as i64);
     if prev_state == "firing" {
         match rule.recovery_mode.as_str() {
             // Operator must clear it; never auto-recovers.
@@ -658,6 +665,13 @@ async fn set_recovery_first(pool: &MySqlPool, rule_id: u64, at: Option<Ts>) -> R
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Reset a rule's evaluation state to clear (zeroing streaks + recovery), without
+/// recording an event. Called when a rule is edited so its old match/firing
+/// progress doesn't carry over against the new condition.
+pub async fn reset_rule_state(pool: &MySqlPool, rule_id: u64) -> Result<()> {
+    clear_state(pool, rule_id, 0.0).await
 }
 
 /// Operator-initiated clear of a firing rule (recovery_mode = manual, or any rule

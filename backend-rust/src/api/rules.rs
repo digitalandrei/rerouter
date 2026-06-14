@@ -53,6 +53,7 @@ struct RuleRow {
     consecutive_samples: u32,
     recovery_mode: String,
     recovery_threshold_value: Option<f64>,
+    recovery_window_seconds: Option<u32>,
     severity: String,
     enabled: bool,
     automatic_reroute_enabled: bool,
@@ -63,6 +64,9 @@ struct RuleRow {
     current_state: Option<String>,
     last_metric_value: Option<f64>,
     last_evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Live progression toward firing (from rule_states).
+    consecutive_match_count: Option<u32>,
+    first_matched_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Rule columns + resolved target names + the latest evaluation snapshot
@@ -70,10 +74,11 @@ struct RuleRow {
 const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
      r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind, \
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
-     r.recovery_mode, r.recovery_threshold_value, r.severity, r.enabled, \
+     r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
-     rs.current_state, rs.last_metric_value, rs.last_evaluated_at \
+     rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
+     rs.consecutive_match_count, rs.first_matched_at \
      FROM rules r \
      LEFT JOIN device_interfaces i ON i.id = r.interface_id \
      LEFT JOIN devices d ON d.id = r.device_id \
@@ -97,6 +102,7 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "consecutive_samples": r.consecutive_samples,
         "recovery_mode": r.recovery_mode,
         "recovery_threshold_value": r.recovery_threshold_value,
+        "recovery_window_seconds": r.recovery_window_seconds,
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
@@ -106,6 +112,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "current_state": r.current_state,
         "current_value": r.last_metric_value,
         "last_evaluated_at": r.last_evaluated_at.map(|t| t.to_rfc3339()),
+        "consecutive_match_count": r.consecutive_match_count,
+        "first_matched_at": r.first_matched_at.map(|t| t.to_rfc3339()),
         "action_count": actions.len(),
         "actions": actions,
     })
@@ -200,6 +208,8 @@ pub struct RuleBody {
     recovery_mode: String,
     #[serde(default)]
     recovery_threshold_value: Option<f64>,
+    #[serde(default)]
+    recovery_window_seconds: Option<u32>,
     #[serde(default = "default_severity")]
     severity: String,
     #[serde(default = "default_true")]
@@ -309,9 +319,10 @@ pub async fn create(
             flow_direction, flow_protocol, flow_port, flow_port_kind, \
             operator, threshold_value, \
             duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
+            recovery_window_seconds, \
             severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(body.interface_id)
@@ -327,6 +338,7 @@ pub async fn create(
     .bind(body.consecutive_samples)
     .bind(&body.recovery_mode)
     .bind(recovery_threshold_value)
+    .bind(body.recovery_window_seconds)
     .bind(&body.severity)
     .bind(body.enabled)
     .bind(body.automatic_reroute_enabled)
@@ -372,6 +384,7 @@ pub struct RuleUpdate {
     consecutive_samples: Option<u32>,
     recovery_mode: Option<String>,
     recovery_threshold_value: Option<Option<f64>>,
+    recovery_window_seconds: Option<Option<u32>>,
     severity: Option<String>,
     enabled: Option<bool>,
     automatic_reroute_enabled: Option<bool>,
@@ -463,6 +476,9 @@ pub async fn update(
     if body.recovery_threshold_value.is_some() {
         sets.push("recovery_threshold_value = ?");
     }
+    if body.recovery_window_seconds.is_some() {
+        sets.push("recovery_window_seconds = ?");
+    }
     if body.severity.is_some() {
         sets.push("severity = ?");
     }
@@ -515,6 +531,9 @@ pub async fn update(
     if let Some(v) = &body.recovery_threshold_value {
         q = q.bind(*v);
     }
+    if let Some(v) = &body.recovery_window_seconds {
+        q = q.bind(*v);
+    }
     if let Some(v) = &body.severity {
         q = q.bind(v);
     }
@@ -533,6 +552,26 @@ pub async fn update(
     if q.execute(&state.pool).await.is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
+
+    // Editing the CONDITION invalidates any in-progress match/firing streak — reset
+    // evaluation state so the rule re-evaluates fresh (a pure enable/name change
+    // doesn't). The rule then starts counting from zero against the new condition.
+    let condition_changed = body.metric.is_some()
+        || body.operator.is_some()
+        || body.threshold_value.is_some()
+        || body.duration_seconds.is_some()
+        || body.consecutive_samples.is_some()
+        || body.recovery_mode.is_some()
+        || body.recovery_threshold_value.is_some()
+        || body.recovery_window_seconds.is_some()
+        || body.flow_direction.is_some()
+        || body.flow_protocol.is_some()
+        || body.flow_port.is_some()
+        || body.flow_port_kind.is_some();
+    if condition_changed {
+        let _ = crate::detection::engine::reset_rule_state(&state.pool, id).await;
+    }
+
     match fetch_rule(&state.pool, id).await {
         Ok(Some(v)) => (StatusCode::OK, Json(v)),
         _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),

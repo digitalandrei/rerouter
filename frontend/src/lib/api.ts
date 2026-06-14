@@ -325,6 +325,7 @@ export interface Rule {
   consecutive_samples: number;
   recovery_mode?: "auto" | "threshold" | "manual";
   recovery_threshold_value?: number | null;
+  recovery_window_seconds?: number | null;
   severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;
@@ -337,6 +338,9 @@ export interface Rule {
   current_state?: "clear" | "matching" | "firing" | null;
   current_value?: number | null;
   last_evaluated_at?: string | null;
+  // Live progression toward firing (from rule_states).
+  consecutive_match_count?: number | null;
+  first_matched_at?: string | null;
 }
 
 export interface Alert {
