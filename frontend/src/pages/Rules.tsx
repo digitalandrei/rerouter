@@ -36,7 +36,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 import { Toggle } from "@/components/ui/toggle";
 import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
 import { EditRuleDialog } from "./rules/edit-rule-dialog";
-import { METRICS, metricLabel } from "./rules/rule-constants";
+import { METRICS, metricLabel, isFlowMetric, FLOW_PROTOCOLS } from "./rules/rule-constants";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -292,6 +292,11 @@ interface RuleForm {
   device_id: string;
   interface_id: string;
   metric: string;
+  // Flow-metric selector (used only when metric is flow_pps / flow_bps).
+  flow_direction: "ingress" | "egress";
+  flow_protocol: string; // "" = any
+  flow_port: string; // "" = whole interface
+  flow_port_kind: "src" | "dst";
   operator: ">" | "<";
   threshold_value: string;
   window_minutes: string;
@@ -304,6 +309,10 @@ const DEFAULT_FORM: RuleForm = {
   device_id: "",
   interface_id: "",
   metric: "rx_bps",
+  flow_direction: "ingress",
+  flow_protocol: "",
+  flow_port: "",
+  flow_port_kind: "dst",
   operator: ">",
   threshold_value: "",
   window_minutes: "1",
@@ -453,12 +462,21 @@ export default function Rules() {
     }
     setAddBusy(true);
     try {
+      const flow = isFlowMetric(form.metric)
+        ? {
+            flow_direction: form.flow_direction,
+            flow_protocol: form.flow_protocol ? parseInt(form.flow_protocol, 10) : null,
+            flow_port: form.flow_port ? parseInt(form.flow_port, 10) : null,
+            flow_port_kind: form.flow_port ? form.flow_port_kind : null,
+          }
+        : {};
       await api.rules.create({
         name: form.name.trim(),
         target_kind: "interface",
         interface_id: parseInt(form.interface_id, 10),
         device_id: parseInt(form.device_id, 10),
         metric: form.metric,
+        ...flow,
         operator: form.operator,
         threshold_value: parseFloat(form.threshold_value),
         duration_seconds: Math.max(0, Math.round(parseFloat(form.window_minutes || "0") * 60)),
@@ -600,6 +618,59 @@ export default function Rules() {
                     ))}
                   </select>
                 </label>
+                {isFlowMetric(form.metric) && (
+                  <>
+                    <label className="block space-y-1 text-sm font-medium">
+                      Flow direction
+                      <select
+                        className={inputClass}
+                        value={form.flow_direction}
+                        onChange={(e) => setField("flow_direction", e.target.value)}
+                      >
+                        <option value="ingress">ingress</option>
+                        <option value="egress">egress</option>
+                      </select>
+                    </label>
+                    <label className="block space-y-1 text-sm font-medium">
+                      Protocol
+                      <select
+                        className={inputClass}
+                        value={form.flow_protocol}
+                        onChange={(e) => setField("flow_protocol", e.target.value)}
+                      >
+                        {FLOW_PROTOCOLS.map((p) => (
+                          <option key={p.value} value={p.value}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block space-y-1 text-sm font-medium">
+                      Port (optional)
+                      <input
+                        type="number"
+                        min={0}
+                        max={65535}
+                        className={inputClass}
+                        value={form.flow_port}
+                        onChange={(e) => setField("flow_port", e.target.value)}
+                        placeholder="e.g. 53 — blank = whole interface"
+                      />
+                    </label>
+                    <label className="block space-y-1 text-sm font-medium">
+                      Port matches
+                      <select
+                        className={inputClass}
+                        value={form.flow_port_kind}
+                        onChange={(e) => setField("flow_port_kind", e.target.value)}
+                        disabled={!form.flow_port}
+                      >
+                        <option value="dst">destination port</option>
+                        <option value="src">source port</option>
+                      </select>
+                    </label>
+                  </>
+                )}
                 <label className="block space-y-1 text-sm font-medium">
                   Operator
                   <select

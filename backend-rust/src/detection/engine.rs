@@ -28,6 +28,23 @@ type Ts = DateTime<Utc>;
 use super::condition::Op;
 use crate::config::Config;
 
+/// Flow-derived rule metrics (evaluated against the latest closed flow bucket
+/// rather than interface_metrics_current). See docs/flow-telemetry.md.
+const FLOW_METRICS: &[&str] = &["flow_pps", "flow_bps"];
+
+fn is_flow_metric(metric: &str) -> bool {
+    FLOW_METRICS.contains(&metric)
+}
+
+/// One metric reading feeding the rule state machine, from either telemetry
+/// source. `low_confidence` (flow sampling not verified) blocks automatic
+/// actions but never blocks alerting.
+struct Observation {
+    value: f64,
+    sampled_at: Option<Ts>,
+    low_confidence: bool,
+}
+
 /// One enabled interface rule with the bits the evaluator needs.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct InterfaceRule {
@@ -36,6 +53,11 @@ struct InterfaceRule {
     interface_id: u64,
     device_id: Option<u64>,
     metric: String,
+    /// Flow-metric selector (NULL for SNMP interface metrics).
+    flow_direction: Option<String>,
+    flow_protocol: Option<u16>,
+    flow_port: Option<u16>,
+    flow_port_kind: Option<String>,
     operator: String,
     threshold_value: f64,
     duration_seconds: u32,
@@ -98,7 +120,9 @@ struct RuleStateRow {
 /// Per-rule failures are logged and skipped; one bad rule never stops the rest.
 pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<usize> {
     let rules = sqlx::query_as::<_, InterfaceRule>(
-        "SELECT id, name, interface_id, device_id, metric, operator, threshold_value, \
+        "SELECT id, name, interface_id, device_id, metric, \
+                flow_direction, flow_protocol, flow_port, flow_port_kind, \
+                operator, threshold_value, \
                 duration_seconds, consecutive_samples, severity, \
                 automatic_reroute_enabled \
          FROM rules \
@@ -128,34 +152,16 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         return Ok(false); // unknown operator: never matches.
     };
 
-    let metrics = sqlx::query_as::<_, CurrentMetrics>(
-        "SELECT sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
-                rx_util_percent, tx_util_percent, oper_status \
-         FROM interface_metrics_current WHERE interface_id = ?",
-    )
-    .bind(rule.interface_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(metrics) = metrics else { return Ok(false) }; // no sample yet.
-
-    // Ignore stale/invalid samples — they must not advance a rule's state.
-    if !metrics.valid_sample {
-        return Ok(false);
-    }
-    let stale_after = cfg.telemetry.stale_after_seconds as i64;
-    if let Some(ts) = metrics.sampled_at {
-        let age = (Utc::now() - ts).num_seconds();
-        if age > stale_after {
-            return Ok(false);
-        }
+    // Source the reading from flow buckets or interface metrics. Either path
+    // returns None for no/stale/invalid sample (which must not advance state).
+    let obs = if is_flow_metric(&rule.metric) {
+        flow_observation(pool, cfg, rule).await?
     } else {
-        return Ok(false);
-    }
-
-    let Some(value) = metrics.value(&rule.metric) else {
-        return Ok(false); // unknown metric.
+        interface_observation(pool, cfg, rule).await?
     };
+    let Some(obs) = obs else { return Ok(false) };
+    let value = obs.value;
+    let sampled_at = obs.sampled_at;
     let matched = op.compare(value, rule.threshold_value);
 
     // Load prior state.
@@ -170,7 +176,6 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
 
     let prev_state = prev.current_state.as_deref().unwrap_or("clear");
     let now = Utc::now();
-    let sampled_at = metrics.sampled_at;
 
     if matched {
         let consecutive = prev.consecutive_match_count.saturating_add(1);
@@ -185,7 +190,7 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         if should_fire && prev_state != "firing" {
             // Rising edge: fire.
             upsert_state(pool, rule.id, "firing", Some(first_matched), sampled_at, consecutive, value).await?;
-            on_fire(pool, cfg, rule, value, sampled_at).await?;
+            on_fire(pool, cfg, rule, value, sampled_at, obs.low_confidence).await?;
             return Ok(true);
         } else if should_fire {
             // Already firing: keep firing, refresh activity (no new alert).
@@ -229,6 +234,103 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
     Ok(false)
 }
 
+/// Read an SNMP interface metric from `interface_metrics_current`. None for a
+/// missing / invalid / stale sample, or an unknown metric name.
+async fn interface_observation(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: &InterfaceRule,
+) -> Result<Option<Observation>> {
+    let metrics = sqlx::query_as::<_, CurrentMetrics>(
+        "SELECT sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
+                rx_util_percent, tx_util_percent, oper_status \
+         FROM interface_metrics_current WHERE interface_id = ?",
+    )
+    .bind(rule.interface_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(metrics) = metrics else { return Ok(None) };
+    if !metrics.valid_sample {
+        return Ok(None);
+    }
+    let stale_after = cfg.telemetry.stale_after_seconds as i64;
+    match metrics.sampled_at {
+        Some(ts) if (Utc::now() - ts).num_seconds() <= stale_after => {}
+        _ => return Ok(None),
+    }
+    let Some(value) = metrics.value(&rule.metric) else { return Ok(None) };
+    Ok(Some(Observation { value, sampled_at: metrics.sampled_at, low_confidence: false }))
+}
+
+/// Read a flow-derived metric (flow_pps / flow_bps) from the latest CLOSED flow
+/// bucket matching the rule's (interface, direction[, protocol][, port])
+/// selector. Counts are sampling-scaled (estimated). None when there is no flow
+/// data for the selector or the newest bucket is stale. `low_confidence` is set
+/// when the sampling rate behind the estimate is unverified.
+async fn flow_observation(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: &InterfaceRule,
+) -> Result<Option<Observation>> {
+    let bucket_secs = cfg.flow.bucket_seconds.max(1) as f64;
+    let direction = rule.flow_direction.as_deref().unwrap_or("ingress");
+
+    // (est_pkts, est_bytes, low_conf flag, latest bucket_ts) — all NULL if the
+    // selector matched no rows.
+    type Agg = (Option<u64>, Option<u64>, Option<u64>, Option<Ts>);
+    let agg = "CAST(SUM(pkts * effective_sampling_rate) AS UNSIGNED), \
+               CAST(SUM(bytes * effective_sampling_rate) AS UNSIGNED), \
+               CAST(MAX(sampling_confidence = 'low') AS UNSIGNED)";
+
+    let row: Agg = if let Some(port) = rule.flow_port {
+        let port_kind = rule.flow_port_kind.as_deref().unwrap_or("dst");
+        sqlx::query_as(&format!(
+            "SELECT {agg}, MAX(bucket_ts) FROM flow_port_buckets \
+             WHERE interface_id = ? AND direction = ? AND port_kind = ? AND port = ? \
+               AND (? IS NULL OR protocol = ?) \
+               AND bucket_ts = (SELECT MAX(bucket_ts) FROM flow_port_buckets \
+                  WHERE interface_id = ? AND direction = ? AND port_kind = ? AND port = ? \
+                    AND (? IS NULL OR protocol = ?))"
+        ))
+        .bind(rule.interface_id).bind(direction).bind(port_kind).bind(port)
+        .bind(rule.flow_protocol).bind(rule.flow_protocol)
+        .bind(rule.interface_id).bind(direction).bind(port_kind).bind(port)
+        .bind(rule.flow_protocol).bind(rule.flow_protocol)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "SELECT {agg}, MAX(bucket_ts) FROM flow_iface_buckets \
+             WHERE interface_id = ? AND direction = ? \
+               AND bucket_ts = (SELECT MAX(bucket_ts) FROM flow_iface_buckets \
+                  WHERE interface_id = ? AND direction = ?)"
+        ))
+        .bind(rule.interface_id).bind(direction)
+        .bind(rule.interface_id).bind(direction)
+        .fetch_one(pool)
+        .await?
+    };
+
+    let (est_pkts, est_bytes, low_conf, bucket_ts) = row;
+    let Some(bucket_ts) = bucket_ts else { return Ok(None) }; // no flow data for the selector.
+
+    // Flow buckets lag (bucket close + flush), so allow a wider staleness window
+    // than the SNMP path — a few bucket widths.
+    let flow_stale = (cfg.flow.bucket_seconds as i64 * 3).max(cfg.telemetry.stale_after_seconds as i64);
+    if (Utc::now() - bucket_ts).num_seconds() > flow_stale {
+        return Ok(None);
+    }
+
+    let value = match rule.metric.as_str() {
+        "flow_pps" => est_pkts.unwrap_or(0) as f64 / bucket_secs,
+        "flow_bps" => est_bytes.unwrap_or(0) as f64 * 8.0 / bucket_secs,
+        _ => return Ok(None),
+    };
+    // Unknown confidence is treated as low (cautious): never auto-act on it.
+    Ok(Some(Observation { value, sampled_at: Some(bucket_ts), low_confidence: low_conf.unwrap_or(1) != 0 }))
+}
+
 /// On the firing edge: record the rule_event and enqueue the alert. In observe
 /// mode (and always, since execution is gated elsewhere) the alert carries the
 /// would-run plan instead of any reroute.
@@ -238,6 +340,7 @@ async fn on_fire(
     rule: &InterfaceRule,
     value: f64,
     sampled_at: Option<Ts>,
+    low_confidence: bool,
 ) -> Result<()> {
     record_event(pool, rule, "fired", value, sampled_at).await?;
 
@@ -266,10 +369,28 @@ async fn on_fire(
         "severity": rule.severity,
     });
 
+    // For a flow rule, surface the selector + that the value is a sampled estimate.
+    if is_flow_metric(&rule.metric) {
+        payload["flow_selector"] = json!({
+            "flow_direction": rule.flow_direction,
+            "flow_protocol": rule.flow_protocol,
+            "flow_port": rule.flow_port,
+            "flow_port_kind": rule.flow_port_kind,
+        });
+        payload["flow_estimated"] = json!(true);
+        payload["sampling_low_confidence"] = json!(low_confidence);
+    }
+
     // "The rule decides": in enforce mode, a rule with auto enabled runs its
     // actions now (gated further by the executor's locks/cooldowns). Otherwise —
     // observe mode, or a manual-only rule — we only RENDER the would-run plan.
-    let auto = mode == "enforce" && rule.automatic_reroute_enabled;
+    // SAFETY: low flow-sampling confidence NEVER auto-executes (doctrine: low
+    // parser confidence blocks automatic actions) — it still alerts + renders.
+    if low_confidence && mode == "enforce" && rule.automatic_reroute_enabled {
+        payload["auto_suppressed_low_confidence"] = json!(true);
+        tracing::warn!(event_type = "rule_auto_suppressed", rule_id = rule.id, "flow rule fired but auto-action suppressed: low sampling confidence");
+    }
+    let auto = mode == "enforce" && rule.automatic_reroute_enabled && !low_confidence;
     if auto {
         let executed = auto_execute_actions(pool, cfg, rule).await;
         if !executed.is_empty() {

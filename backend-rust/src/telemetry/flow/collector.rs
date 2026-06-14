@@ -52,13 +52,16 @@ impl Counts {
 
 type IfaceKey = (u32, Direction);
 type PortKey = (u32, Direction, u8, PortKind, u16);
+// PortKind is reused as the src/dst discriminator for the AS dimension.
+type AsKey = (u32, Direction, PortKind, u32);
 type TalkerKey = (u32, Direction, IpAddr, IpAddr, Option<u16>, Option<u16>, u8);
 
-/// One bucket's aggregation across the three reporting dimensions.
+/// One bucket's aggregation across the reporting dimensions.
 #[derive(Debug, Default)]
 struct Accum {
     iface: HashMap<IfaceKey, Counts>,
     port: HashMap<PortKey, Counts>,
+    as_: HashMap<AsKey, Counts>,
     talker: HashMap<TalkerKey, Counts>,
 }
 
@@ -87,6 +90,15 @@ impl Accum {
                     .or_default()
                     .add(fr.pkts, fr.bytes);
             }
+        }
+
+        // AS dimension — only when the exporter collects AS and it's a real ASN
+        // (0 = unknown / no BGP route).
+        if let Some(asn) = fr.src_as.filter(|a| *a != 0) {
+            self.as_.entry((ifindex, dir, PortKind::Src, asn)).or_default().add(fr.pkts, fr.bytes);
+        }
+        if let Some(asn) = fr.dst_as.filter(|a| *a != 0) {
+            self.as_.entry((ifindex, dir, PortKind::Dst, asn)).or_default().add(fr.pkts, fr.bytes);
         }
 
         self.talker
@@ -517,6 +529,21 @@ async fn write_bucket(
         .execute(&mut *tx).await?;
     }
 
+    // AS rollups (only present when the exporter collects SRC_AS/DST_AS).
+    for ((if_index, dir, kind, asn), c) in &acc.as_ {
+        let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
+        sqlx::query(
+            "INSERT INTO flow_as_buckets \
+                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, as_kind, asn, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE pkts = pkts + VALUES(pkts), bytes = bytes + VALUES(bytes), flow_count = flow_count + VALUES(flow_count)",
+        )
+        .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
+        .bind(bucket_ts).bind(kind.as_str()).bind(*asn)
+        .bind(c.pkts).bind(c.bytes).bind(c.flows).bind(rate).bind(conf)
+        .execute(&mut *tx).await?;
+    }
+
     // Top-K talkers. Sort by bytes desc; the tail is dropped (the count of all
     // talkers survives in flow_iface_buckets.flow_count).
     let mut talkers: Vec<(&TalkerKey, &Counts)> = acc.talker.iter().collect();
@@ -615,7 +642,7 @@ async fn cross_calibrate(
 async fn prune_loop(pool: MySqlPool, cfg: Arc<Config>) {
     let minutes = cfg.flow.retention_minutes.max(1);
     loop {
-        for table in ["flow_iface_buckets", "flow_port_buckets", "flow_talker_buckets"] {
+        for table in ["flow_iface_buckets", "flow_port_buckets", "flow_as_buckets", "flow_talker_buckets"] {
             let sql = format!("DELETE FROM {table} WHERE bucket_ts < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)");
             match sqlx::query(&sql).bind(minutes).execute(&pool).await {
                 Ok(r) if r.rows_affected() > 0 => {

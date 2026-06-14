@@ -36,6 +36,8 @@ const F_INPUT_SNMP: u16 = 10;
 const F_L4_DST_PORT: u16 = 11;
 const F_IPV4_DST_ADDR: u16 = 12;
 const F_OUTPUT_SNMP: u16 = 14;
+const F_SRC_AS: u16 = 16;
+const F_DST_AS: u16 = 17;
 const F_OUT_BYTES: u16 = 23;
 const F_OUT_PKTS: u16 = 24;
 const F_IPV6_SRC_ADDR: u16 = 27;
@@ -314,6 +316,8 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
     let mut protocol: u8 = 0;
     let mut in_if: Option<u32> = None;
     let mut out_if: Option<u32> = None;
+    let mut src_as: Option<u32> = None;
+    let mut dst_as: Option<u32> = None;
     let mut direction: Option<u8> = None;
     let mut in_bytes: u64 = 0;
     let mut out_bytes: u64 = 0;
@@ -339,6 +343,8 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
             F_L4_DST_PORT => dst_port = Some(be_uint(f) as u16),
             F_INPUT_SNMP => in_if = Some(be_uint(f) as u32),
             F_OUTPUT_SNMP => out_if = Some(be_uint(f) as u32),
+            F_SRC_AS => src_as = Some(be_uint(f) as u32),
+            F_DST_AS => dst_as = Some(be_uint(f) as u32),
             F_DIRECTION => direction = Some(be_uint(f) as u8),
             F_IPV4_SRC_ADDR if flen == 4 => src_v4 = Some(Ipv4Addr::new(f[0], f[1], f[2], f[3])),
             F_IPV4_DST_ADDR if flen == 4 => dst_v4 = Some(Ipv4Addr::new(f[0], f[1], f[2], f[3])),
@@ -363,6 +369,8 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
         protocol,
         in_if_index: in_if,
         out_if_index: out_if,
+        src_as,
+        dst_as,
         direction,
         // Cisco exports per-direction counters; a record carries one direction's
         // (in OR out). Sum so we don't lose the populated side.

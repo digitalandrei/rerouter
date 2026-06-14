@@ -40,6 +40,7 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
   const [metric, setMetric] = useState<"bytes" | "pkts">("bytes");
   const [traffic, setTraffic] = useState<FlowTopResponse | null>(null);
   const [ports, setPorts] = useState<FlowTopResponse | null>(null);
+  const [asStats, setAsStats] = useState<FlowTopResponse | null>(null);
   const [talkers, setTalkers] = useState<FlowTopResponse | null>(null);
   const [exporters, setExporters] = useState<FlowExporter[]>([]);
   const [loading, setLoading] = useState(true);
@@ -50,12 +51,14 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
     Promise.all([
       api.flows.top(deviceId, { dimension: "traffic", minutes: WINDOW_MINUTES, metric }),
       api.flows.top(deviceId, { dimension: "ports", minutes: WINDOW_MINUTES, metric, portKind: "dst" }),
+      api.flows.top(deviceId, { dimension: "as", minutes: WINDOW_MINUTES, metric, asKind: "src" }),
       api.flows.top(deviceId, { dimension: "talkers", minutes: WINDOW_MINUTES, metric }),
       api.flows.exporters(deviceId),
     ])
-      .then(([t, p, k, e]) => {
+      .then(([t, p, a, k, e]) => {
         setTraffic(t);
         setPorts(p);
+        setAsStats(a);
         setTalkers(k);
         setExporters(e);
         setError(null);
@@ -76,7 +79,11 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
       : fmtPps(row.est_pkts / windowSecs);
 
   const hasAnyData =
-    (traffic?.rows.length ?? 0) + (ports?.rows.length ?? 0) + (talkers?.rows.length ?? 0) > 0;
+    (traffic?.rows.length ?? 0) +
+      (ports?.rows.length ?? 0) +
+      (asStats?.rows.length ?? 0) +
+      (talkers?.rows.length ?? 0) >
+    0;
 
   return (
     <div className="space-y-4">
@@ -126,7 +133,6 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
               headers={
                 <>
                   <TableHead className="pl-6">Interface</TableHead>
-                  <TableHead>Dir</TableHead>
                   <TableHead className="text-right">{rateHead}</TableHead>
                   <TableHead className="pr-6">Sampling</TableHead>
                 </>
@@ -134,9 +140,6 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
               renderRow={(row, i) => (
                 <TableRow key={i}>
                   <TableCell className="pl-6 font-medium">if{row.if_index}</TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">{row.direction}</Badge>
-                  </TableCell>
                   <TableCell className="text-right font-mono text-xs">{rate(row)}</TableCell>
                   <RowFlags row={row} />
                 </TableRow>
@@ -150,7 +153,6 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
                 <>
                   <TableHead className="pl-6">Port</TableHead>
                   <TableHead>Proto</TableHead>
-                  <TableHead>Dir</TableHead>
                   <TableHead className="text-right">{rateHead}</TableHead>
                   <TableHead className="pr-6">Sampling</TableHead>
                 </>
@@ -159,9 +161,25 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
                 <TableRow key={i}>
                   <TableCell className="pl-6 font-medium">{row.port}</TableCell>
                   <TableCell>{protoName(row.protocol)}</TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">{row.direction}</Badge>
-                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">{rate(row)}</TableCell>
+                  <RowFlags row={row} />
+                </TableRow>
+              )}
+            />
+
+            <TopCard
+              title="Top source AS"
+              response={asStats}
+              headers={
+                <>
+                  <TableHead className="pl-6">AS number</TableHead>
+                  <TableHead className="text-right">{rateHead}</TableHead>
+                  <TableHead className="pr-6">Sampling</TableHead>
+                </>
+              }
+              renderRow={(row, i) => (
+                <TableRow key={i}>
+                  <TableCell className="pl-6 font-mono">AS{row.asn}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{rate(row)}</TableCell>
                   <RowFlags row={row} />
                 </TableRow>

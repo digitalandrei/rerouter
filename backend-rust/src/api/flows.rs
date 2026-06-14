@@ -50,7 +50,7 @@ fn talker_json(r: TalkerAggRow) -> Value {
 
 #[derive(Debug, Deserialize)]
 pub struct TopQuery {
-    /// talkers | ports | traffic. Defaults to traffic.
+    /// talkers | ports | as | traffic. Defaults to traffic.
     dimension: Option<String>,
     /// Restrict to one interface (device_interfaces.id).
     interface_id: Option<u64>,
@@ -61,6 +61,8 @@ pub struct TopQuery {
     metric: Option<String>,
     /// For dimension=ports: src | dst (default dst).
     port_kind: Option<String>,
+    /// For dimension=as: src | dst (default src — "top speakers").
+    as_kind: Option<String>,
 }
 
 async fn device_exists(pool: &sqlx::MySqlPool, id: u64) -> bool {
@@ -101,8 +103,15 @@ pub async fn top(
             };
             top_ports(&state.pool, device_id, q.interface_id, minutes, order, kind).await
         }
+        "as" => {
+            let kind = match q.as_kind.as_deref() {
+                Some("dst") => "dst",
+                _ => "src",
+            };
+            top_as(&state.pool, device_id, q.interface_id, minutes, order, kind).await
+        }
         "traffic" => top_traffic(&state.pool, device_id, q.interface_id, minutes, order).await,
-        _ => return err(StatusCode::BAD_REQUEST, "dimension must be talkers, ports, or traffic"),
+        _ => return err(StatusCode::BAD_REQUEST, "dimension must be talkers, ports, as, or traffic"),
     };
 
     match rows {
@@ -217,6 +226,41 @@ async fn top_ports(
         .collect())
 }
 
+async fn top_as(
+    pool: &sqlx::MySqlPool,
+    device_id: u64,
+    interface_id: Option<u64>,
+    minutes: i64,
+    order: &str,
+    as_kind: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut where_ = window_clause("flow_as_buckets", interface_id.is_some());
+    where_.push_str(" AND as_kind = ?");
+    let sql = format!(
+        "SELECT asn, direction, {agg} {where_} \
+         GROUP BY asn, direction ORDER BY {order} DESC LIMIT 10",
+        agg = agg_select(),
+    );
+    let mut query = sqlx::query_as::<_, (u32, String, u64, u64, u64, u64, u64, u64)>(&sql)
+        .bind(device_id)
+        .bind(minutes);
+    if let Some(i) = interface_id {
+        query = query.bind(i);
+    }
+    query = query.bind(as_kind);
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(asn, direction, eb, ep, rb, rp, mr, lc)| {
+            let mut v = agg_json(eb, ep, rb, rp, mr, lc);
+            v["asn"] = json!(asn);
+            v["as_kind"] = json!(as_kind);
+            v["direction"] = json!(direction);
+            v
+        })
+        .collect())
+}
+
 async fn top_talkers(
     pool: &sqlx::MySqlPool,
     device_id: u64,
@@ -249,6 +293,8 @@ pub struct SearchQuery {
     dst: Option<String>,
     /// Exact match on a port appearing as EITHER the source or destination port.
     port: Option<u16>,
+    /// Exact match on the IP protocol number (6=TCP, 17=UDP, …).
+    protocol: Option<u16>,
     minutes: Option<i64>,
     metric: Option<String>,
     limit: Option<i64>,
@@ -290,6 +336,9 @@ pub async fn search(
     }
     if let Some(p) = q.port {
         qb.push(" AND (src_port = ").push_bind(p).push(" OR dst_port = ").push_bind(p).push(")");
+    }
+    if let Some(proto) = q.protocol {
+        qb.push(" AND protocol = ").push_bind(proto);
     }
     qb.push(" GROUP BY src_addr, dst_addr, src_port, dst_port, protocol, direction ORDER BY ");
     qb.push(order);

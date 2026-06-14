@@ -68,6 +68,10 @@ pub struct FlowRecord {
     pub protocol: u8,
     pub in_if_index: Option<u32>,
     pub out_if_index: Option<u32>,
+    /// Source / destination AS (SRC_AS 16 / DST_AS 17) — None unless the exporter
+    /// collects them (Cisco FNF `collect routing source/destination as`).
+    pub src_as: Option<u32>,
+    pub dst_as: Option<u32>,
     /// NetFlow DIRECTION (61) if the template carried it.
     pub direction: Option<u8>,
     pub bytes: u64,

@@ -200,12 +200,15 @@ export interface FlowTopRow {
   // ports
   port?: number;
   port_kind?: "src" | "dst";
+  // as
+  asn?: number;
+  as_kind?: "src" | "dst";
   // traffic
   if_index?: number;
   interface_id?: number | null;
 }
 
-export type FlowDimension = "talkers" | "ports" | "traffic";
+export type FlowDimension = "talkers" | "ports" | "as" | "traffic";
 
 export interface FlowTopResponse {
   dimension: FlowDimension;
@@ -311,6 +314,11 @@ export interface Rule {
   interface_id: number | null;
   device_id: number | null;
   metric: string;
+  // Flow-metric selector (null for SNMP interface metrics).
+  flow_direction?: "ingress" | "egress" | null;
+  flow_protocol?: number | null;
+  flow_port?: number | null;
+  flow_port_kind?: "src" | "dst" | null;
   operator: ">" | "<";
   threshold_value: number;
   duration_seconds: number;
@@ -628,6 +636,7 @@ export const api = {
         metric?: "bytes" | "pkts";
         interfaceId?: number;
         portKind?: "src" | "dst";
+        asKind?: "src" | "dst";
       },
     ) => {
       const p = new URLSearchParams({ dimension: opts.dimension });
@@ -635,6 +644,7 @@ export const api = {
       if (opts.metric) p.set("metric", opts.metric);
       if (opts.interfaceId !== undefined) p.set("interface_id", String(opts.interfaceId));
       if (opts.portKind) p.set("port_kind", opts.portKind);
+      if (opts.asKind) p.set("as_kind", opts.asKind);
       return request<FlowTopResponse>(`/api/devices/${deviceId}/flows/top?${p.toString()}`);
     },
     exporters: (deviceId: number) =>
@@ -644,6 +654,7 @@ export const api = {
       src?: string;
       dst?: string;
       port?: number;
+      protocol?: number;
       minutes?: number;
       metric?: "bytes" | "pkts";
       limit?: number;
@@ -653,6 +664,7 @@ export const api = {
       if (opts.src) p.set("src", opts.src);
       if (opts.dst) p.set("dst", opts.dst);
       if (opts.port !== undefined) p.set("port", String(opts.port));
+      if (opts.protocol !== undefined) p.set("protocol", String(opts.protocol));
       if (opts.minutes !== undefined) p.set("minutes", String(opts.minutes));
       if (opts.metric) p.set("metric", opts.metric);
       if (opts.limit !== undefined) p.set("limit", String(opts.limit));

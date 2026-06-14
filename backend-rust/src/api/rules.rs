@@ -28,6 +28,14 @@ const INTERFACE_METRICS: &[&str] = &[
     "oper_status",
 ];
 
+/// Flow-derived metrics: evaluated against the latest closed flow bucket for the
+/// rule's (interface, direction[, protocol][, port]) selector (docs/flow-telemetry.md).
+const FLOW_METRICS: &[&str] = &["flow_pps", "flow_bps"];
+
+fn is_flow_metric(m: &str) -> bool {
+    FLOW_METRICS.contains(&m)
+}
+
 #[derive(sqlx::FromRow)]
 struct RuleRow {
     id: u64,
@@ -35,6 +43,10 @@ struct RuleRow {
     interface_id: Option<u64>,
     device_id: Option<u64>,
     metric: String,
+    flow_direction: Option<String>,
+    flow_protocol: Option<u16>,
+    flow_port: Option<u16>,
+    flow_port_kind: Option<String>,
     operator: String,
     threshold_value: f64,
     duration_seconds: u32,
@@ -54,6 +66,7 @@ struct RuleRow {
 /// Rule columns + resolved target names + the latest evaluation snapshot
 /// (rule_states). Note the table aliases (`r`/`i`/`d`/`rs`).
 const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
+     r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind, \
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
@@ -71,6 +84,10 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
         "interface_id": r.interface_id,
         "device_id": r.device_id,
         "metric": r.metric,
+        "flow_direction": r.flow_direction,
+        "flow_protocol": r.flow_protocol,
+        "flow_port": r.flow_port,
+        "flow_port_kind": r.flow_port_kind,
         "operator": r.operator,
         "threshold_value": r.threshold_value,
         "duration_seconds": r.duration_seconds,
@@ -159,6 +176,15 @@ pub struct RuleBody {
     name: String,
     interface_id: Option<u64>,
     metric: String,
+    // Flow-metric selector (ignored / forced NULL for SNMP interface metrics).
+    #[serde(default)]
+    flow_direction: Option<String>,
+    #[serde(default)]
+    flow_protocol: Option<u16>,
+    #[serde(default)]
+    flow_port: Option<u16>,
+    #[serde(default)]
+    flow_port_kind: Option<String>,
     operator: String,
     threshold_value: f64,
     #[serde(default = "default_duration")]
@@ -201,10 +227,20 @@ async fn validate(pool: &sqlx::MySqlPool, body: &RuleBody) -> Result<Option<u64>
     let Some(iface_id) = body.interface_id else {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "interface_id is required".into()));
     };
-    if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
+    if is_flow_metric(&body.metric) {
+        // Flow rule: a direction is required; protocol/port are optional selectors.
+        if !matches!(body.flow_direction.as_deref(), Some("ingress") | Some("egress")) {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "flow_direction must be ingress or egress".into()));
+        }
+        if let Some(pk) = body.flow_port_kind.as_deref() {
+            if !matches!(pk, "src" | "dst") {
+                return Err((StatusCode::UNPROCESSABLE_ENTITY, "flow_port_kind must be src or dst".into()));
+            }
+        }
+    } else if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("metric must be one of: {}", INTERFACE_METRICS.join(", ")),
+            format!("metric must be one of: {}, or flow_pps / flow_bps", INTERFACE_METRICS.join(", ")),
         ));
     }
     // Resolve the owning device; also validates the interface exists.
@@ -230,16 +266,34 @@ pub async fn create(
         Err((code, msg)) => return err(code, &msg),
     };
 
+    // Flow selectors only apply to flow metrics; force NULL otherwise. A flow_port
+    // without an explicit kind defaults to destination port.
+    let (flow_direction, flow_protocol, flow_port, flow_port_kind) = if is_flow_metric(&body.metric) {
+        let kind = body
+            .flow_port_kind
+            .clone()
+            .or_else(|| body.flow_port.map(|_| "dst".to_string()));
+        (body.flow_direction.clone(), body.flow_protocol, body.flow_port, kind)
+    } else {
+        (None, None, None, None)
+    };
+
     let res = sqlx::query(
-        "INSERT INTO rules (name, interface_id, device_id, metric, operator, threshold_value, \
+        "INSERT INTO rules (name, interface_id, device_id, metric, \
+            flow_direction, flow_protocol, flow_port, flow_port_kind, \
+            operator, threshold_value, \
             duration_seconds, consecutive_samples, severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(body.interface_id)
     .bind(device_id)
     .bind(&body.metric)
+    .bind(flow_direction)
+    .bind(flow_protocol)
+    .bind(flow_port)
+    .bind(flow_port_kind)
     .bind(&body.operator)
     .bind(body.threshold_value)
     .bind(body.duration_seconds)
@@ -279,6 +333,10 @@ pub async fn show(
 pub struct RuleUpdate {
     name: Option<String>,
     metric: Option<String>,
+    flow_direction: Option<String>,
+    flow_protocol: Option<u16>,
+    flow_port: Option<u16>,
+    flow_port_kind: Option<String>,
     operator: Option<String>,
     threshold_value: Option<f64>,
     duration_seconds: Option<u32>,
@@ -311,8 +369,24 @@ pub async fn update(
         }
     }
     if let Some(metric) = &body.metric {
-        if existing.interface_id.is_some() && !INTERFACE_METRICS.contains(&metric.as_str()) {
+        if is_flow_metric(metric) {
+            // Changing into a flow metric requires the rule to already be a flow
+            // rule (has a selector). Recreate the rule to change metric family.
+            if existing.flow_direction.is_none() {
+                return err(StatusCode::UNPROCESSABLE_ENTITY, "recreate the rule to switch to a flow metric");
+            }
+        } else if existing.interface_id.is_some() && !INTERFACE_METRICS.contains(&metric.as_str()) {
             return err(StatusCode::UNPROCESSABLE_ENTITY, "unsupported interface metric");
+        }
+    }
+    if let Some(pk) = &body.flow_port_kind {
+        if !matches!(pk.as_str(), "src" | "dst") {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "flow_port_kind must be src or dst");
+        }
+    }
+    if let Some(dir) = &body.flow_direction {
+        if !matches!(dir.as_str(), "ingress" | "egress") {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "flow_direction must be ingress or egress");
         }
     }
 
@@ -322,6 +396,18 @@ pub async fn update(
     }
     if body.metric.is_some() {
         sets.push("metric = ?");
+    }
+    if body.flow_direction.is_some() {
+        sets.push("flow_direction = ?");
+    }
+    if body.flow_protocol.is_some() {
+        sets.push("flow_protocol = ?");
+    }
+    if body.flow_port.is_some() {
+        sets.push("flow_port = ?");
+    }
+    if body.flow_port_kind.is_some() {
+        sets.push("flow_port_kind = ?");
     }
     if body.operator.is_some() {
         sets.push("operator = ?");
@@ -355,6 +441,18 @@ pub async fn update(
         q = q.bind(v);
     }
     if let Some(v) = &body.metric {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.flow_direction {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.flow_protocol {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.flow_port {
+        q = q.bind(v);
+    }
+    if let Some(v) = &body.flow_port_kind {
         q = q.bind(v);
     }
     if let Some(v) = &body.operator {

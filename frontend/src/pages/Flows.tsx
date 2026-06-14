@@ -115,6 +115,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
   const [src, setSrc] = useState("");
   const [dst, setDst] = useState("");
   const [port, setPort] = useState("");
+  const [proto, setProto] = useState(""); // "" = any; else IP protocol number
   const [metric, setMetric] = useState<"bytes" | "pkts">("bytes");
   const [rows, setRows] = useState<FlowTopRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -140,6 +141,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
     const n = parseInt(port, 10);
     return Number.isFinite(n) && String(n) === port.trim() ? n : undefined;
   }, [port]);
+  const protoNum = useMemo(() => (proto === "" ? undefined : parseInt(proto, 10)), [proto]);
 
   // Lazy search: debounced on any filter change, with a sequence guard so a
   // slower earlier response can't overwrite a newer one.
@@ -153,6 +155,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
           src: src.trim() || undefined,
           dst: dst.trim() || undefined,
           port: portNum,
+          protocol: protoNum,
           metric,
           limit: 100,
         })
@@ -171,7 +174,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
         });
     }, 350);
     return () => clearTimeout(t);
-  }, [deviceId, src, dst, portNum, metric]);
+  }, [deviceId, src, dst, portNum, protoNum, metric]);
 
   const windowSecs = WINDOW_MINUTES * 60;
   const rate = (r: FlowTopRow) =>
@@ -182,7 +185,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
   return (
     <div className="space-y-4">
       <Card>
-        <CardContent className="grid grid-cols-1 gap-4 py-4 md:grid-cols-5">
+        <CardContent className="grid grid-cols-1 gap-4 py-4 md:grid-cols-6">
           <div className="space-y-1">
             <Label>Device</Label>
             <DeviceSelect devices={devices} value={deviceId} onChange={setDeviceId} allowAll />
@@ -215,6 +218,20 @@ function SearchTab({ devices }: { devices: Device[] }) {
               inputMode="numeric"
             />
             {portInvalid && <p className="text-xs text-destructive">Enter a numeric port</p>}
+          </div>
+          <div className="space-y-1">
+            <Label>Protocol</Label>
+            <select
+              className="h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              value={proto}
+              onChange={(e) => setProto(e.target.value)}
+            >
+              <option value="">Any</option>
+              <option value="6">TCP</option>
+              <option value="17">UDP</option>
+              <option value="1">ICMP</option>
+              <option value="132">SCTP</option>
+            </select>
           </div>
           <div className="space-y-1">
             <Label>Rank by</Label>
@@ -255,7 +272,6 @@ function SearchTab({ devices }: { devices: Device[] }) {
                   <TableHead className="pl-6">Source</TableHead>
                   <TableHead>Destination</TableHead>
                   <TableHead>Proto</TableHead>
-                  <TableHead>Dir</TableHead>
                   <TableHead className="text-right">{metric === "bytes" ? "Rate" : "Packets/s"}</TableHead>
                   <TableHead className="pr-6">Sampling</TableHead>
                 </TableRow>
@@ -272,9 +288,6 @@ function SearchTab({ devices }: { devices: Device[] }) {
                       {r.dst_port != null && `:${r.dst_port}`}
                     </TableCell>
                     <TableCell>{protoName(r.protocol)}</TableCell>
-                    <TableCell>
-                      <Badge variant="secondary">{r.direction}</Badge>
-                    </TableCell>
                     <TableCell className="text-right font-mono text-xs">{rate(r)}</TableCell>
                     <TableCell className="pr-6">
                       <div className="flex items-center gap-1">
