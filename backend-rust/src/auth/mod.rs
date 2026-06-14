@@ -248,6 +248,7 @@ async fn totp_challenge(
     let pool = &state.pool;
     let ip = client_ip(&headers, Some(&socket));
     let ua = user_agent(&headers);
+    let cfg = &state.config.auth;
 
     // Load the pre-2FA session from the cookie.
     let Some(cookie) = jar.get(sessions::SESSION_COOKIE) else {
@@ -273,16 +274,17 @@ async fn totp_challenge(
     };
     let user_id = session.user_id;
 
-    // Load the user's email + (encrypted) secret + confirmation state.
-    let Some((email, secret_hex, confirmed_at)) = sqlx::query_as::<
+    // Load the user's email + (encrypted) secret + confirmation + lock state.
+    let Some((email, secret_hex, confirmed_at, locked_until)) = sqlx::query_as::<
         _,
         (
             String,
             Option<String>,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
         ),
     >(
-        "SELECT email, two_factor_secret, two_factor_confirmed_at FROM users WHERE id = ?",
+        "SELECT email, two_factor_secret, two_factor_confirmed_at, locked_until FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -297,6 +299,31 @@ async fn totp_challenge(
             ),
         );
     };
+
+    // Throttle the 2FA step too: a correct password must not buy unlimited TOTP
+    // guesses. Failures below bump the SAME per-user counter as the password step
+    // and lock the account at the threshold; a locked account is refused here as
+    // well, so brute-forcing the 6-digit code locks out like a bad password does.
+    if let Some(until) = locked_until {
+        if until > chrono::Utc::now() {
+            audit(
+                pool,
+                Some(user_id),
+                "2fa_failed",
+                &ip,
+                &ua,
+                "account locked",
+            )
+            .await;
+            return (
+                jar,
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "account_locked" })),
+                ),
+            );
+        }
+    }
 
     let first_confirmation = confirmed_at.is_none();
 
@@ -326,6 +353,15 @@ async fn totp_challenge(
             &ip,
             &ua,
             "invalid totp/recovery code",
+        )
+        .await;
+        bump_failure_and_maybe_lock(
+            pool,
+            user_id,
+            cfg.lockout_threshold,
+            cfg.lockout_minutes as i64,
+            &ip,
+            &ua,
         )
         .await;
         return (
@@ -371,6 +407,7 @@ async fn totp_challenge(
         if let Ok(json_hashes) = serde_json::to_string(&hashes) {
             let _ = sqlx::query(
                 "UPDATE users SET two_factor_confirmed_at = UTC_TIMESTAMP(), two_factor_recovery_codes = ?, \
+                 failed_login_attempts = 0, locked_until = NULL, \
                  last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
             )
             .bind(json_hashes)
@@ -391,7 +428,8 @@ async fn totp_challenge(
         .await;
     } else {
         let _ = sqlx::query(
-            "UPDATE users SET last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
+            "UPDATE users SET failed_login_attempts = 0, locked_until = NULL, \
+             last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
         )
         .bind(&ip)
         .bind(user_id)
@@ -491,8 +529,26 @@ fn decrypt_secret(secret_hex: &str) -> Option<String> {
     crate::crypto::open_str(&blob).ok()
 }
 
-/// Increment failed_login_attempts; lock the account when the threshold is hit.
+/// Password-step failure: audit the bad password, then bump the shared lockout
+/// counter.
 async fn register_failure(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    threshold: u32,
+    lock_minutes: i64,
+    ip: &str,
+    ua: &str,
+) {
+    audit(pool, Some(user_id), "login_failed", ip, ua, "bad password").await;
+    bump_failure_and_maybe_lock(pool, user_id, threshold, lock_minutes, ip, ua).await;
+}
+
+/// Increment failed_login_attempts and lock the account once it reaches
+/// `threshold`. Shared by the password step AND the TOTP step so a 6-digit code
+/// can't be brute-forced behind a known password. The per-attempt audit event
+/// (login_failed / 2fa_failed) is logged by the caller; this adds only the
+/// account_locked audit + alert on the locking edge.
+async fn bump_failure_and_maybe_lock(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     threshold: u32,
@@ -515,8 +571,6 @@ async fn register_failure(
         .flatten()
         .unwrap_or(0);
 
-    audit(pool, Some(user_id), "login_failed", ip, ua, "bad password").await;
-
     if current >= threshold {
         let _ = sqlx::query(
             "UPDATE users SET locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? MINUTE) WHERE id = ?",
@@ -531,33 +585,39 @@ async fn register_failure(
             "account_locked",
             ip,
             ua,
-            "failed login threshold exceeded",
+            "failed auth threshold exceeded",
         )
         .await;
         let _ = enqueue_security_alert(
             pool,
             "account_locked",
             user_id,
-            "account locked after repeated failed logins",
+            "account locked after repeated failed auth attempts",
         )
         .await;
     }
 }
 
-/// Constant-ish-time single-use recovery-code check. Codes are stored as a JSON
-/// array of Argon2id hashes; on a match, remove that hash (single-use).
+/// Single-use recovery-code check, made race-safe. Codes are stored as a JSON
+/// array of Argon2id hashes; consuming one is a read → match → write-back of that
+/// array, which MUST be atomic or two concurrent requests could both spend the
+/// same code. We serialize per user with a transaction + `SELECT ... FOR UPDATE`:
+/// the second caller blocks until the first commits, then sees the code already
+/// removed and fails to match.
 async fn consume_recovery_code(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     code: &str,
 ) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
     let Some(json_hashes): Option<String> =
-        sqlx::query_scalar("SELECT two_factor_recovery_codes FROM users WHERE id = ?")
+        sqlx::query_scalar("SELECT two_factor_recovery_codes FROM users WHERE id = ? FOR UPDATE")
             .bind(user_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten()
     else {
+        tx.rollback().await?;
         return Ok(false);
     };
     let mut hashes: Vec<String> = serde_json::from_str(&json_hashes).unwrap_or_default();
@@ -569,14 +629,18 @@ async fn consume_recovery_code(
             break;
         }
     }
-    let Some(i) = matched else { return Ok(false) };
+    let Some(i) = matched else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
     hashes.remove(i);
     let updated = serde_json::to_string(&hashes)?;
     sqlx::query("UPDATE users SET two_factor_recovery_codes = ? WHERE id = ?")
         .bind(updated)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(true)
 }
 
