@@ -206,6 +206,7 @@ export interface FlowTopRow {
   // traffic
   if_index?: number;
   interface_id?: number | null;
+  if_name?: string;
 }
 
 export type FlowDimension = "talkers" | "ports" | "as" | "traffic";
@@ -307,6 +308,9 @@ export interface RuleAction {
   position: number;
 }
 
+/** Comparison operators accepted by the rules API (backend rules.rs validation). */
+export type RuleOperator = ">" | "<" | ">=" | "<=" | "==" | "!=";
+
 export interface Rule {
   id: number;
   name: string;
@@ -319,7 +323,7 @@ export interface Rule {
   flow_protocol?: number | null;
   flow_port?: number | null;
   flow_port_kind?: "src" | "dst" | null;
-  operator: ">" | "<";
+  operator: RuleOperator;
   threshold_value: number;
   duration_seconds: number;
   consecutive_samples: number;

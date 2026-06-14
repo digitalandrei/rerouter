@@ -193,12 +193,30 @@ async fn top_traffic(
         query = query.bind(i);
     }
     let rows = query.fetch_all(pool).await?;
+
+    // Resolve interface_id -> a human label (if_name, falling back to if_descr)
+    // so the UI can show "TenGigabitEthernet1/1" instead of a raw ifIndex.
+    let names: std::collections::HashMap<u64, String> =
+        sqlx::query_as::<_, (u64, Option<String>, Option<String>)>(
+            "SELECT id, if_name, if_descr FROM device_interfaces WHERE device_id = ?",
+        )
+        .bind(device_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, name, descr)| name.or(descr).map(|n| (id, n)))
+        .collect();
+
     Ok(rows
         .into_iter()
         .map(|(if_index, iface_id, direction, eb, ep, rb, rp, mr, lc)| {
             let mut v = agg_json(eb, ep, rb, rp, mr, lc);
             v["if_index"] = json!(if_index);
             v["interface_id"] = json!(iface_id);
+            if let Some(name) = iface_id.and_then(|id| names.get(&id)) {
+                v["if_name"] = json!(name);
+            }
             v["direction"] = json!(direction);
             v
         })

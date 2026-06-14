@@ -8,7 +8,7 @@
  */
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
-import { api, type Rule, type Device, type Interface, ApiError } from "@/lib/api";
+import { api, type Rule, type RuleOperator, type Device, type Interface, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -21,6 +21,7 @@ import { InfoHint } from "@/components/info-hint";
 import {
   METRICS,
   SEVERITIES,
+  OPERATORS,
   RECOVERY_MODES,
   FLOW_PROTOCOLS,
   isFlowMetric,
@@ -50,7 +51,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
     flow_protocol: rule?.flow_protocol != null ? String(rule.flow_protocol) : "",
     flow_port: rule?.flow_port != null ? String(rule.flow_port) : "",
     flow_port_kind: (rule?.flow_port_kind ?? "dst") as "src" | "dst",
-    operator: (rule?.operator ?? ">") as ">" | "<",
+    operator: (rule?.operator ?? ">") as RuleOperator,
     threshold_value: rule != null ? String(rule.threshold_value) : "",
     window_minutes: rule != null ? String(rule.duration_seconds / 60) : "1",
     consecutive_samples: String(rule?.consecutive_samples || 3),
@@ -275,9 +276,16 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
 
             <label className="block space-y-1 text-sm font-medium">
               Condition
-              <select className={inputClass} value={form.operator} onChange={(e) => set("operator", e.target.value as ">" | "<")}>
-                <option value=">">above (&gt;)</option>
-                <option value="<">below (&lt;)</option>
+              <select
+                className={inputClass}
+                value={form.operator}
+                onChange={(e) => set("operator", e.target.value as RuleOperator)}
+              >
+                {OPERATORS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="block space-y-1 text-sm font-medium">

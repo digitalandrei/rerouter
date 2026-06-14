@@ -139,7 +139,14 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
               }
               renderRow={(row, i) => (
                 <TableRow key={i}>
-                  <TableCell className="pl-6 font-medium">if{row.if_index}</TableCell>
+                  <TableCell className="pl-6 font-medium">
+                    {row.if_name ?? `if${row.if_index}`}
+                    {row.if_name != null && (
+                      <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                        if{row.if_index}
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-right font-mono text-xs">{rate(row)}</TableCell>
                   <RowFlags row={row} />
                 </TableRow>

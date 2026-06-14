@@ -12,6 +12,16 @@ export const METRICS = [
 
 export const SEVERITIES = ["info", "warning", "critical"];
 
+/** Comparison operators — must match the backend rules API (rules.rs). */
+export const OPERATORS: { value: string; label: string }[] = [
+  { value: ">", label: "above (>)" },
+  { value: ">=", label: "at or above (>=)" },
+  { value: "<", label: "below (<)" },
+  { value: "<=", label: "at or below (<=)" },
+  { value: "==", label: "equals (==)" },
+  { value: "!=", label: "not equal (!=)" },
+];
+
 /** Flow metrics are evaluated against flow buckets and carry a selector. */
 export function isFlowMetric(value: string): boolean {
   return value === "flow_pps" || value === "flow_bps";

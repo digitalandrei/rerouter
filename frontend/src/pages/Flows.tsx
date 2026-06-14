@@ -7,7 +7,7 @@
  * Flows are a second, read-only telemetry source (docs/flow-telemetry.md). A
  * later iteration will wire these signals (pps & bps) into rule conditions.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Waves } from "lucide-react";
 import { api, type Device, type FlowTopRow, ApiError } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -15,6 +15,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -120,6 +126,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
   const [rows, setRows] = useState<FlowTopRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<FlowTopRow | null>(null);
   const seqRef = useRef(0);
 
   // Suggestion fetchers, memoized on the selected device so the autocomplete's
@@ -278,7 +285,12 @@ function SearchTab({ devices }: { devices: Device[] }) {
               </TableHeader>
               <TableBody>
                 {rows.map((r, i) => (
-                  <TableRow key={i}>
+                  <TableRow
+                    key={i}
+                    className="cursor-pointer"
+                    onClick={() => setSelected(r)}
+                    title="View flow details"
+                  >
                     <TableCell className="pl-6 font-mono text-xs">
                       {r.src_addr}
                       {r.src_port != null && `:${r.src_port}`}
@@ -309,6 +321,74 @@ function SearchTab({ devices }: { devices: Device[] }) {
           )}
         </CardContent>
       </Card>
+
+      <FlowDetailDialog
+        row={selected}
+        windowMinutes={WINDOW_MINUTES}
+        onClose={() => setSelected(null)}
+      />
     </div>
+  );
+}
+
+/** Read-only detail view for one searched flow (uses the row we already have). */
+function FlowDetailDialog({
+  row,
+  windowMinutes,
+  onClose,
+}: {
+  row: FlowTopRow | null;
+  windowMinutes: number;
+  onClose: () => void;
+}) {
+  if (row == null) return null;
+  const windowSecs = windowMinutes * 60;
+  return (
+    <Dialog open={row != null} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Flow detail</DialogTitle>
+        </DialogHeader>
+        <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-2 text-sm">
+          <DetailRow label="Source">
+            <span className="font-mono text-xs">
+              {row.src_addr}
+              {row.src_port != null && `:${row.src_port}`}
+            </span>
+          </DetailRow>
+          <DetailRow label="Destination">
+            <span className="font-mono text-xs">
+              {row.dst_addr}
+              {row.dst_port != null && `:${row.dst_port}`}
+            </span>
+          </DetailRow>
+          <DetailRow label="Protocol">{protoName(row.protocol)}</DetailRow>
+          <DetailRow label="Direction">{row.direction}</DetailRow>
+          <DetailRow label="Rate">{fmtBps((row.est_bytes * 8) / windowSecs)}</DetailRow>
+          <DetailRow label="Packets/s">{fmtPps(row.est_pkts / windowSecs)}</DetailRow>
+          <DetailRow label={`Bytes (last ${windowMinutes}m)`}>
+            {row.est_bytes.toLocaleString()} est · {row.raw_bytes.toLocaleString()} sampled
+          </DetailRow>
+          <DetailRow label={`Packets (last ${windowMinutes}m)`}>
+            {row.est_pkts.toLocaleString()} est · {row.raw_pkts.toLocaleString()} sampled
+          </DetailRow>
+          <DetailRow label="Sampling">
+            <span className="inline-flex items-center gap-1">
+              {row.estimated ? `${row.sampling_rate}:1 (scaled estimate)` : "1:1 (unsampled)"}
+              {row.low_confidence && <Badge variant="destructive">low conf</Badge>}
+            </span>
+          </DetailRow>
+        </dl>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd>{children}</dd>
+    </>
   );
 }
