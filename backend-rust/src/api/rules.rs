@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{err, AppState};
-use crate::auth::rbac::{markers, RequirePermission};
+use crate::auth::rbac::{self, markers, RequirePermission};
 
 type JsonResp = (StatusCode, Json<Value>);
 
@@ -682,22 +682,50 @@ pub async fn remove(
 }
 
 /// POST /api/rules/{id}/clear — operator-initiated clear of a firing rule (the
-/// recovery path for recovery_mode = manual, or an admin override). Observe-safe:
-/// it only resets detection state + records a `cleared` event; it executes nothing.
+/// recovery path for recovery_mode = manual, or an admin override). Resets the
+/// rule's detection state and records a `cleared` event.
+///
+/// NOT always side-effect-free: in ENFORCE mode, clearing a firing rule whose
+/// Auto switch is on ALSO runs the rollback of its actions (a real config push,
+/// the inverse of auto-recovery). That case therefore requires
+/// `trigger_manual_reroute` on top of `edit_rules`. In observe mode, or for a
+/// manual-only rule, nothing executes and `edit_rules` alone suffices.
 pub async fn clear(
-    _g: RequirePermission<markers::EditRules>,
+    g: RequirePermission<markers::EditRules>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM rules WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
-    if exists.is_none() {
+    let pool = &state.pool;
+    // Existence + (is it firing?, is Auto on?) in one query.
+    let row: Option<(Option<String>, bool)> = sqlx::query_as(
+        "SELECT rs.current_state, r.automatic_reroute_enabled \
+         FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    let Some((current_state, auto_enabled)) = row else {
         return err(StatusCode::NOT_FOUND, "rule not found");
+    };
+
+    // If clearing would actually roll back actions (firing + Auto + enforce), it
+    // is a reroute-triggering operation and needs the reroute permission too.
+    let would_roll_back = current_state.as_deref() == Some("firing")
+        && auto_enabled
+        && crate::api::settings::operating_mode(pool, &state.config).await == "enforce";
+    if would_roll_back {
+        match rbac::has_permission(pool, &g.session, rbac::Permission::TriggerManualReroute).await {
+            Ok(true) => {}
+            Ok(false) => return err(
+                StatusCode::FORBIDDEN,
+                "clearing this rule would roll back its actions; trigger_manual_reroute required",
+            ),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "authz check failed"),
+        }
     }
-    match crate::detection::engine::clear_rule_manual(&state.pool, &state.config, id).await {
+
+    match crate::detection::engine::clear_rule_manual(pool, &state.config, id).await {
         Ok(cleared) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "cleared": cleared })),

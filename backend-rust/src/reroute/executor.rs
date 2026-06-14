@@ -303,7 +303,15 @@ async fn run_state_machine(
     plan: &RenderedPlan,
     require_verification: bool,
 ) -> String {
-    // -> running
+    // -> pending: committed to act, persisted BEFORE any side effect. Crash
+    // recovery treats pending/running/verifying as in-flight (=> uncertain), so
+    // a crash from here on locks the device rather than being assumed harmless.
+    let _ = sqlx::query("UPDATE reroutes SET state = 'pending' WHERE id = ?")
+        .bind(reroute_id)
+        .execute(pool)
+        .await;
+
+    // -> running: the SSH session is about to push config (the side effect).
     let _ = sqlx::query(
         "UPDATE reroutes SET state = 'running', started_at = UTC_TIMESTAMP() WHERE id = ?",
     )

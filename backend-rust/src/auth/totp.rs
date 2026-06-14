@@ -7,8 +7,19 @@ use anyhow::{anyhow, Result};
 use rand::distr::{Alphanumeric, SampleString};
 use totp_rs::{Algorithm, Secret, TOTP};
 
-pub const ISSUER: &str = "Rerouter";
+/// Default TOTP issuer label when TWO_FACTOR_ISSUER is unset.
+pub const DEFAULT_ISSUER: &str = "Rerouter";
 pub const RECOVERY_CODE_COUNT: usize = 8;
+
+/// The issuer label shown in authenticator apps: TWO_FACTOR_ISSUER from the
+/// environment (documented in deployment.md / config.example.toml), falling back
+/// to [`DEFAULT_ISSUER`]. Read per call so ops can change it without a rebuild.
+fn issuer() -> String {
+    std::env::var("TWO_FACTOR_ISSUER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ISSUER.to_string())
+}
 
 fn instance(secret: Secret, account_email: &str) -> Result<TOTP> {
     TOTP::new(
@@ -19,7 +30,7 @@ fn instance(secret: Secret, account_email: &str) -> Result<TOTP> {
         secret
             .to_bytes()
             .map_err(|e| anyhow!("decoding totp secret: {e:?}"))?,
-        Some(ISSUER.to_string()),
+        Some(issuer()),
         account_email.to_string(),
     )
     .map_err(|e| anyhow!("building totp: {e}"))
