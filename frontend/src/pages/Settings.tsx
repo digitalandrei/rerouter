@@ -15,6 +15,8 @@ import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import {
   Card,
   CardContent,
@@ -124,6 +126,15 @@ function RtbhCard() {
 export default function Settings() {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
+  // Confirmation gate for the dangerous direction of a safety switch (the
+  // control looks uniform now, so the deliberate/audited friction lives here).
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    destructive: boolean;
+    run: () => Promise<void>;
+  } | null>(null);
 
   function loadSettings() {
     setLoading(true);
@@ -155,33 +166,31 @@ export default function Settings() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
-          <Badge
-            variant={
-              settings?.operating_mode === "enforce" ? "destructive" : "outline"
-            }
-          >
-            {settings?.operating_mode === "enforce"
-              ? "ENFORCE"
-              : "observe (read-only / alert-only)"}
-          </Badge>
-          <Button
-            variant={
-              settings?.operating_mode === "enforce" ? "outline" : "destructive"
-            }
-            size="sm"
-            onClick={() => {
-              const next =
-                settings?.operating_mode === "enforce" ? "observe" : "enforce";
-              void api.settings
-                .put({ operating_mode: next })
-                .then(setSettings);
-            }}
+          <Switch
+            checked={settings?.operating_mode === "enforce"}
             disabled={loading || settings === null}
-          >
+            aria-label="Toggle enforce mode"
+            onCheckedChange={(v) => {
+              if (v) {
+                setConfirm({
+                  title: "Switch to enforce mode?",
+                  description:
+                    "Enforce mode lets reroutes actually execute (still gated by every other safety rule). This flip is admin-only and audited.",
+                  confirmLabel: "Switch to enforce",
+                  destructive: true,
+                  run: () =>
+                    api.settings.put({ operating_mode: "enforce" }).then(setSettings),
+                });
+              } else {
+                void api.settings.put({ operating_mode: "observe" }).then(setSettings);
+              }
+            }}
+          />
+          <span className="text-sm font-medium">
             {settings?.operating_mode === "enforce"
-              ? "Switch to observe"
-              : "Switch to enforce (audited)"}
-          </Button>
+              ? "Enforce — reroutes can execute"
+              : "Observe — read-only / alert-only"}
+          </span>
         </CardContent>
       </Card>
 
@@ -198,30 +207,35 @@ export default function Settings() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
-          <Badge
-            variant={
-              settings?.automatic_actions_enabled ? "destructive" : "outline"
-            }
-          >
-            {settings?.automatic_actions_enabled ? "ENABLED" : "disabled"}
-          </Badge>
-          <Button
-            variant={
-              settings?.automatic_actions_enabled ? "outline" : "destructive"
-            }
-            size="sm"
-            onClick={() => {
-              const next = !settings?.automatic_actions_enabled;
-              void api.settings
-                .put({ automatic_actions_enabled: next })
-                .then(setSettings);
-            }}
+          <Switch
+            checked={!!settings?.automatic_actions_enabled}
             disabled={loading || settings === null}
-          >
+            aria-label="Toggle automatic reroutes"
+            onCheckedChange={(v) => {
+              if (v) {
+                setConfirm({
+                  title: "Enable automatic reroutes globally?",
+                  description:
+                    "With enforce mode on and a rule's own Auto toggle on, a firing rule will execute its reroute with no operator. Admin-only and audited.",
+                  confirmLabel: "Enable automatic reroutes",
+                  destructive: true,
+                  run: () =>
+                    api.settings
+                      .put({ automatic_actions_enabled: true })
+                      .then(setSettings),
+                });
+              } else {
+                void api.settings
+                  .put({ automatic_actions_enabled: false })
+                  .then(setSettings);
+              }
+            }}
+          />
+          <span className="text-sm font-medium">
             {settings?.automatic_actions_enabled
-              ? "Disable automatic reroutes"
-              : "Enable automatic reroutes (audited)"}
-          </Button>
+              ? "Automatic reroutes enabled"
+              : "Automatic reroutes disabled"}
+          </span>
         </CardContent>
       </Card>
 
@@ -233,33 +247,50 @@ export default function Settings() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
-          <Badge variant={settings?.global_lock ? "destructive" : "outline"}>
-            {settings?.global_lock ? "LOCKED" : "clear"}
-          </Badge>
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() =>
-              void api.settings.put({ global_lock: true }).then(setSettings)
-            }
-            disabled={loading || settings?.global_lock === true}
-          >
-            Set lock
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              void api.settings.put({ global_lock: false }).then(setSettings)
-            }
-            disabled={loading || settings?.global_lock !== true}
-          >
-            Clear lock
-          </Button>
+          <Switch
+            checked={!!settings?.global_lock}
+            disabled={loading || settings === null}
+            aria-label="Toggle maintenance lock"
+            onCheckedChange={(v) => {
+              if (v) {
+                void api.settings.put({ global_lock: true }).then(setSettings);
+              } else {
+                setConfirm({
+                  title: "Clear the maintenance lock?",
+                  description:
+                    "Clearing the lock re-allows reroute actions to run.",
+                  confirmLabel: "Clear lock",
+                  destructive: false,
+                  run: () =>
+                    api.settings.put({ global_lock: false }).then(setSettings),
+                });
+              }
+            }}
+          />
+          <span className="text-sm font-medium">
+            {settings?.global_lock
+              ? "Maintenance lock engaged — all reroutes blocked"
+              : "No maintenance lock"}
+          </span>
         </CardContent>
       </Card>
 
       <RtbhCard />
+
+      {confirm && (
+        <ConfirmDialog
+          open
+          onOpenChange={(v) => !v && setConfirm(null)}
+          title={confirm.title}
+          description={confirm.description}
+          confirmLabel={confirm.confirmLabel}
+          destructive={confirm.destructive}
+          onConfirm={async () => {
+            await confirm.run();
+            setConfirm(null);
+          }}
+        />
+      )}
     </div>
   );
 }

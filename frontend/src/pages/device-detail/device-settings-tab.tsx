@@ -3,6 +3,7 @@ import { Activity, Copy, KeyRound, ShieldCheck, TerminalSquare } from "lucide-re
 import { toast } from "sonner";
 import { api, type Device, type CapabilityCheck, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ToneBadge } from "@/components/status-badge";
@@ -252,10 +253,15 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
             </label>
           </div>
 
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input type="checkbox" checked={form.enabled} onChange={(e) => setField("enabled", e.target.checked)} className="h-4 w-4 rounded border border-input" />
-            Enabled (polling active)
-          </label>
+          <div className="flex items-center gap-3 text-sm font-medium">
+            <Switch
+              id="device-enabled"
+              checked={form.enabled}
+              onCheckedChange={(v) => setField("enabled", v)}
+              aria-label="Toggle polling"
+            />
+            <label htmlFor="device-enabled">Enabled (polling active)</label>
+          </div>
 
           <label className="block space-y-1 text-sm font-medium">
             SNMP community string

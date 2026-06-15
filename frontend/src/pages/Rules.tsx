@@ -11,8 +11,6 @@
 import { useEffect, useState } from "react";
 import {
   SlidersHorizontal,
-  ToggleLeft,
-  ToggleRight,
   Pencil,
   Trash2,
   ArrowUp,
@@ -32,8 +30,8 @@ import {
 } from "@/lib/api";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
-import { Toggle } from "@/components/ui/toggle";
-import { SeverityBadge, ToneBadge, toneClass } from "@/components/status-badge";
+import { Switch } from "@/components/ui/switch";
+import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
 import { useAuth } from "@/lib/auth";
@@ -172,15 +170,17 @@ function RuleActionsDialog({
               mode nothing runs. Off = the operator runs them manually.
             </div>
           </div>
-          <Button
-            size="sm"
-            variant={current.automatic_reroute_enabled ? "destructive" : "outline"}
-            onClick={() => void toggleAuto()}
+          <Switch
+            checked={current.automatic_reroute_enabled}
+            onCheckedChange={() => void toggleAuto()}
             disabled={actions.length === 0}
-            title={actions.length === 0 ? "Attach an action first" : undefined}
-          >
-            {current.automatic_reroute_enabled ? "Auto: ON" : "Auto: OFF"}
-          </Button>
+            aria-label="Toggle automatic execution"
+            title={
+              actions.length === 0
+                ? "Attach an action first"
+                : "Run these actions automatically when the rule fires (enforce mode only)"
+            }
+          />
         </div>
 
         {/* Existing actions */}
@@ -572,25 +572,23 @@ export default function Rules() {
                       <SeverityBadge severity={rule.severity} />
                     </TableCell>
 
-                    {/* Enabled — Toggle with text, green when on / red when off */}
+                    {/* Enabled — green/check on, red/X off (disabled when read-only) */}
                     <TableCell onClick={(e) => e.stopPropagation()}>
-                      {canEdit ? (
-                        <Toggle
-                          variant="outline"
-                          size="sm"
-                          pressed={rule.enabled}
-                          onPressedChange={() => void toggleRule(rule)}
-                          aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
-                          className="data-[state=on]:border-emerald-300 data-[state=on]:bg-emerald-100 data-[state=on]:text-emerald-700 data-[state=off]:text-red-600 dark:data-[state=on]:bg-emerald-950/60 dark:data-[state=on]:text-emerald-300 dark:data-[state=off]:text-red-400"
-                        >
-                          {rule.enabled ? <ToggleRight className="size-4" /> : <ToggleLeft className="size-4" />}
-                          {rule.enabled ? "Enabled" : "Disabled"}
-                        </Toggle>
-                      ) : (
-                        <ToneBadge tone={rule.enabled ? "good" : "bad"}>
-                          {rule.enabled ? "enabled" : "disabled"}
-                        </ToneBadge>
-                      )}
+                      <Switch
+                        checked={rule.enabled}
+                        onCheckedChange={() => void toggleRule(rule)}
+                        disabled={!canEdit}
+                        aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
+                        title={
+                          canEdit
+                            ? rule.enabled
+                              ? "Enabled — click to disable"
+                              : "Disabled — click to enable"
+                            : rule.enabled
+                              ? "Enabled"
+                              : "Disabled"
+                        }
+                      />
                     </TableCell>
 
                     {/* Mitigation — attached reroute actions + auto/manual */}
