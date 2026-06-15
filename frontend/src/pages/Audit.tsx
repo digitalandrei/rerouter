@@ -10,6 +10,14 @@
 import { useEffect, useState } from "react";
 import { api, type AuditEntry } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 export default function Audit() {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
@@ -32,34 +40,34 @@ export default function Audit() {
               export placeholder.
             </p>
           ) : (
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b text-muted-foreground">
-                  <th className="py-2 pr-4 font-medium">When</th>
-                  <th className="py-2 pr-4 font-medium">Actor</th>
-                  <th className="py-2 pr-4 font-medium">Action</th>
-                  <th className="py-2 pr-4 font-medium">Subject</th>
-                  <th className="py-2 font-medium">IP</th>
-                </tr>
-              </thead>
-              <tbody>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>When</TableHead>
+                  <TableHead>Actor</TableHead>
+                  <TableHead>Action</TableHead>
+                  <TableHead>Subject</TableHead>
+                  <TableHead>IP</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {entries.map((entry) => (
-                  <tr key={entry.id} className="border-b last:border-0">
-                    <td className="py-2 pr-4 text-xs text-muted-foreground">
+                  <TableRow key={entry.id}>
+                    <TableCell className="text-xs text-muted-foreground">
                       {entry.created_at}
-                    </td>
-                    <td className="py-2 pr-4">{entry.actor}</td>
-                    <td className="py-2 pr-4">
+                    </TableCell>
+                    <TableCell>{entry.actor}</TableCell>
+                    <TableCell>
                       <code className="text-xs">{entry.action}</code>
-                    </td>
-                    <td className="py-2 pr-4">{entry.subject}</td>
-                    <td className="py-2">
+                    </TableCell>
+                    <TableCell>{entry.subject}</TableCell>
+                    <TableCell>
                       <code className="text-xs">{entry.ip}</code>
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           )}
         </CardContent>
       </Card>

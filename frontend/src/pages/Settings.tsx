@@ -154,7 +154,7 @@ export default function Settings() {
             and audited (doctrine §8, gate 0).
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex items-center gap-3">
+        <CardContent className="flex flex-wrap items-center gap-3">
           <Badge
             variant={
               settings?.operating_mode === "enforce" ? "destructive" : "outline"
@@ -197,7 +197,7 @@ export default function Settings() {
             nothing runs.
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex items-center gap-3">
+        <CardContent className="flex flex-wrap items-center gap-3">
           <Badge
             variant={
               settings?.automatic_actions_enabled ? "destructive" : "outline"
@@ -232,7 +232,7 @@ export default function Settings() {
             While locked, no reroute actions run at all (manage_locks).
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex items-center gap-3">
+        <CardContent className="flex flex-wrap items-center gap-3">
           <Badge variant={settings?.global_lock ? "destructive" : "outline"}>
             {settings?.global_lock ? "LOCKED" : "clear"}
           </Badge>
