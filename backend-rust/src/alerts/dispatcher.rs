@@ -59,10 +59,13 @@ pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
     );
     loop {
         // Re-evaluate SMTP each cycle so configuring it later starts delivery
-        // without a restart. When unconfigured we leave alerts queued.
+        // without a restart. We drain when EITHER email is configured OR at least
+        // one Teams webhook exists; otherwise alerts stay queued (so the original
+        // "retry email once SMTP comes up" guarantee holds when Teams isn't used).
         let mailer = mailer_from();
-        if let Some(mailer) = mailer {
-            if let Err(e) = drain_once(&pool, &mailer).await {
+        let have_webhooks = any_enabled_webhook(&pool).await;
+        if mailer.is_some() || have_webhooks {
+            if let Err(e) = drain_once(&pool, mailer.as_ref()).await {
                 tracing::warn!(event_type = "alert_drain_failed", error = %e, "alert drain pass failed");
             }
         }
@@ -70,8 +73,9 @@ pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
     }
 }
 
-/// Process one batch of undelivered alerts.
-async fn drain_once(pool: &MySqlPool, mailer: &super::mailer::Mailer) -> Result<()> {
+/// Process one batch of undelivered alerts. `mailer` is None when SMTP is
+/// unconfigured (the Teams channel may still deliver).
+async fn drain_once(pool: &MySqlPool, mailer: Option<&super::mailer::Mailer>) -> Result<()> {
     let pending = sqlx::query_as::<_, PendingAlert>(
         "SELECT a.id, a.event_type, a.severity, a.occurrence_count, a.payload_json, a.created_at \
          FROM alerts a \
@@ -90,35 +94,25 @@ async fn drain_once(pool: &MySqlPool, mailer: &super::mailer::Mailer) -> Result<
     Ok(())
 }
 
+/// True if at least one enabled Teams webhook endpoint exists.
+async fn any_enabled_webhook(pool: &MySqlPool) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM webhook_endpoints WHERE enabled = 1")
+        .fetch_one(pool)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
 /// Resolve recipients, apply dedup + rate limit, send, and record deliveries for
 /// one alert. Always records at least one delivery row (even if there are no
 /// recipients) so the alert is not re-scanned forever.
 async fn dispatch_alert(
     pool: &MySqlPool,
-    mailer: &super::mailer::Mailer,
+    mailer: Option<&super::mailer::Mailer>,
     alert: &PendingAlert,
 ) -> Result<()> {
     let always_immediate = super::ALWAYS_IMMEDIATE.contains(&alert.event_type.as_str());
     let is_critical = alert.severity == "critical";
-
-    let recipients = resolve_recipients(pool, alert, is_critical).await?;
-    if recipients.is_empty() {
-        // No one subscribed: record a single no-recipient marker so the cursor
-        // advances. Uses recipient_id = NULL-equivalent is not allowed (FK), so
-        // we skip the delivery row and instead log; to avoid infinite rescan we
-        // insert a self-referencing sentinel is impossible — log + return, and
-        // rely on the alert simply having no audience. To keep the cursor moving
-        // we DELETE-guard by recording nothing only when truly no recipients
-        // exist in the system; otherwise the EXISTS check would loop. We instead
-        // mark via a system recipient row.
-        ensure_processed_without_recipient(pool, alert).await?;
-        tracing::info!(
-            event_type = "alert_no_recipients",
-            alert_id = alert.id,
-            "alert had no subscribed recipients"
-        );
-        return Ok(());
-    }
 
     let subject = body::subject(
         alert.event_type.as_str(),
@@ -133,47 +127,61 @@ async fn dispatch_alert(
         payload(alert),
     );
 
-    for r in recipients {
-        // De-dup: a prior delivery for the same dedup_key within the window
-        // collapses this one (unless always-immediate).
-        if !always_immediate && recently_delivered(pool, alert, &r).await? {
-            record_delivery(
-                pool,
-                alert.id,
-                r.id,
-                "queued",
-                Some("suppressed: deduplicated within window"),
-            )
-            .await?;
-            continue;
-        }
-        // Rate limit: too many in the last hour -> queue (digest fallback)
-        // instead of sending (unless always-immediate).
-        if !always_immediate && over_rate_limit(pool, r.id).await? {
-            record_delivery(
-                pool,
-                alert.id,
-                r.id,
-                "queued",
-                Some("rate limited: deferred to digest"),
-            )
-            .await?;
-            continue;
-        }
+    // Whether this alert had ANY audience on any channel (suppressed/queued rows
+    // still count — they record a delivery row so the cursor advances).
+    let mut had_audience = false;
 
-        match mailer.send(&r.email, &subject, text.clone()).await {
-            Ok(()) => record_delivery(pool, alert.id, r.id, "sent", None).await?,
-            Err(e) => {
-                record_delivery(
-                    pool,
-                    alert.id,
-                    r.id,
-                    "failed",
-                    Some(&truncate(&e.to_string(), 1000)),
-                )
-                .await?
+    // --- Email channel (only when SMTP is configured this cycle) ---------------
+    if let Some(mailer) = mailer {
+        let recipients = resolve_recipients(pool, alert, is_critical).await?;
+        if !recipients.is_empty() {
+            had_audience = true;
+        }
+        for r in recipients {
+            if !always_immediate && recently_delivered(pool, alert, &r).await? {
+                record_delivery(pool, alert.id, r.id, "queued", Some("suppressed: deduplicated within window")).await?;
+                continue;
+            }
+            if !always_immediate && over_rate_limit(pool, r.id).await? {
+                record_delivery(pool, alert.id, r.id, "queued", Some("rate limited: deferred to digest")).await?;
+                continue;
+            }
+            match mailer.send(&r.email, &subject, text.clone()).await {
+                Ok(()) => record_delivery(pool, alert.id, r.id, "sent", None).await?,
+                Err(e) => {
+                    record_delivery(pool, alert.id, r.id, "failed", Some(&truncate(&e.to_string(), 1000))).await?
+                }
             }
         }
+    }
+
+    // --- Teams channel ---------------------------------------------------------
+    let endpoints = super::webhook::load_subscribed(pool, &alert.event_type).await?;
+    if !endpoints.is_empty() {
+        had_audience = true;
+    }
+    for e in endpoints {
+        if !always_immediate && webhook_recently_delivered(pool, alert, e.id).await? {
+            record_webhook_delivery(pool, alert.id, e.id, "queued", Some("suppressed: deduplicated within window")).await?;
+            continue;
+        }
+        if !always_immediate && webhook_over_rate_limit(pool, e.id).await? {
+            record_webhook_delivery(pool, alert.id, e.id, "queued", Some("rate limited")).await?;
+            continue;
+        }
+        match super::webhook::post_teams(&e.url, &subject, alert.severity.as_str(), &text).await {
+            Ok(()) => record_webhook_delivery(pool, alert.id, e.id, "sent", None).await?,
+            Err(err) => {
+                record_webhook_delivery(pool, alert.id, e.id, "failed", Some(&truncate(&err.to_string(), 1000))).await?
+            }
+        }
+    }
+
+    // No audience on any channel. Only mark processed (sentinel) when email was
+    // actually available — otherwise leave queued so email retries once SMTP is up.
+    if !had_audience && mailer.is_some() {
+        ensure_processed_without_recipient(pool, alert).await?;
+        tracing::info!(event_type = "alert_no_recipients", alert_id = alert.id, "alert had no subscribed recipients");
     }
     Ok(())
 }
@@ -248,6 +256,67 @@ async fn over_rate_limit(pool: &MySqlPool, recipient_id: u64) -> Result<bool> {
     .fetch_one(pool)
     .await?;
     Ok(count >= RATE_LIMIT_PER_HOUR as i64)
+}
+
+/// Teams equivalent of `recently_delivered`, keyed on the endpoint.
+async fn webhook_recently_delivered(
+    pool: &MySqlPool,
+    alert: &PendingAlert,
+    endpoint_id: u64,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alert_deliveries d \
+         JOIN alerts a ON a.id = d.alert_id \
+         WHERE d.endpoint_id = ? AND d.channel = 'teams' AND d.status = 'sent' \
+           AND a.dedup_key = (SELECT dedup_key FROM alerts WHERE id = ?) \
+           AND d.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(endpoint_id)
+    .bind(alert.id)
+    .bind(DEDUP_WINDOW_SECS as i64)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+/// Teams equivalent of `over_rate_limit`, keyed on the endpoint.
+async fn webhook_over_rate_limit(pool: &MySqlPool, endpoint_id: u64) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alert_deliveries \
+         WHERE endpoint_id = ? AND channel = 'teams' AND status = 'sent' \
+           AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)",
+    )
+    .bind(endpoint_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count >= RATE_LIMIT_PER_HOUR as i64)
+}
+
+/// Insert a Teams alert_deliveries row (recipient_id NULL, channel 'teams').
+async fn record_webhook_delivery(
+    pool: &MySqlPool,
+    alert_id: u64,
+    endpoint_id: u64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let sent_at_sql = if status == "sent" {
+        "UTC_TIMESTAMP()"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "INSERT INTO alert_deliveries (alert_id, endpoint_id, channel, status, error, sent_at) \
+         VALUES (?, ?, 'teams', ?, ?, {sent_at_sql})"
+    );
+    sqlx::query(&sql)
+        .bind(alert_id)
+        .bind(endpoint_id)
+        .bind(status)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Insert an alert_deliveries row. `sent` stamps sent_at.

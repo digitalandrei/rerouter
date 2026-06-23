@@ -16,16 +16,30 @@ policy; an `enabled` flag; and an `automatic_reroute_enabled` flag (default
 live in the `rule_actions` table (see "Actions" below). (The legacy
 `rules.reroute_template_id` column is unused.)
 
-Metrics come from SNMP interface polling, so the set is exactly the seven
-derived/raw interface signals — there are no SYN, per-source, or connection-rate
-metrics (SNMP cannot produce them):
+Metrics come from SNMP interface polling — there are no SYN, per-source, or
+connection-rate metrics (SNMP cannot produce them):
 
 ```text
-rx_bps  tx_bps  rx_pps  tx_pps  rx_util_percent  tx_util_percent  oper_status
+rx_bps  tx_bps  rx_pps  tx_pps  rx_util_percent  tx_util_percent
+in_err_rate  out_err_rate  oper_status
 ```
 
 `oper_status` resolves to `1` when the link is `up`, else `0`, so a rule like
-`oper_status < 1` fires on link-down.
+`oper_status < 1` fires on link-down. `in_err_rate` / `out_err_rate` are
+errors/sec derived from the cumulative `ifInErrors`/`ifOutErrors` deltas (0 on a
+counter wrap), so a rule like `in_err_rate > 100` fires on an error storm.
+
+### Aggregation (summed rules)
+
+A rule's `metric_aggregation` is `single` (the default — one interface) or `sum`.
+A `sum` rule has no single owning interface/device; it lists member interfaces in
+`rule_interfaces` (which may span **multiple devices**) and thresholds the **sum**
+of a rate metric (`rx_bps`/`tx_bps`/`rx_pps`/`tx_pps`/`in_err_rate`/`out_err_rate`
+— summing a percentage or status is meaningless and rejected) across them. Summed
+rules are evaluated in a single global pass (`evaluate_aggregate_rules`), not in
+the per-device loop. **Conservative sampling:** if ANY member lacks a fresh, valid
+sample, the whole observation is skipped — a summed rule never fires on partial
+data (doctrine "low confidence blocks").
 
 Operators: `>`, `>=`, `<`, `<=`, `==`, `!=`. (The two-argument forms `between` /
 `outside` and the `changed` / `stale` operators are parsed but not evaluated — the

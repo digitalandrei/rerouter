@@ -779,11 +779,12 @@ struct BgpPeerRow {
     peer_state: Option<String>,
     peer_admin_status: Option<String>,
     label: Option<String>,
+    out_prefix_list: Option<String>,
     last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const BGP_PEER_COLS: &str = "id, device_id, peer_remote_addr, peer_remote_as, local_as, \
-     peer_state, peer_admin_status, label, last_polled_at";
+     peer_state, peer_admin_status, label, out_prefix_list, last_polled_at";
 
 fn bgp_peer_json(r: &BgpPeerRow) -> Value {
     json!({
@@ -795,6 +796,7 @@ fn bgp_peer_json(r: &BgpPeerRow) -> Value {
         "peer_state": r.peer_state,
         "peer_admin_status": r.peer_admin_status,
         "label": r.label,
+        "out_prefix_list": r.out_prefix_list,
         "last_polled_at": r.last_polled_at.map(fmt_ts),
     })
 }

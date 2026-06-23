@@ -267,7 +267,16 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("template plan has no apply commands"))?;
 
-    let mut commands = Vec::with_capacity(apply.len() + 2);
+    // Optional exec commands that run AFTER the config block closes (privileged
+    // EXEC, e.g. `clear ip bgp <peer> soft out`). They are never wrapped in
+    // `configure terminal` / `end`.
+    let exec_after = plan
+        .get("exec_after")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut commands = Vec::with_capacity(apply.len() + exec_after.len() + 2);
     if config_mode {
         commands.push("configure terminal".to_string());
     }
@@ -280,13 +289,21 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
     if config_mode {
         commands.push("end".to_string());
     }
+    for c in &exec_after {
+        let raw = c
+            .as_str()
+            .ok_or_else(|| anyhow!("plan exec_after command is not a string"))?;
+        commands.push(substitute(raw, &subst)?);
+    }
 
+    // expect/reject may reference template params (e.g. `{prefix_net}`); substitute
+    // them too. A static substring (no braces) passes through unchanged.
     let verify = match t.verification.as_object() {
         Some(v) => match v.get("command").and_then(Value::as_str) {
             Some(cmd) => Some(VerifyStep {
                 command: substitute(cmd, &subst)?,
-                expect: v.get("expect").and_then(Value::as_str).map(str::to_string),
-                reject: v.get("reject").and_then(Value::as_str).map(str::to_string),
+                expect: subst_opt(v.get("expect"), &subst)?,
+                reject: subst_opt(v.get("reject"), &subst)?,
             }),
             None => None,
         },
@@ -323,6 +340,15 @@ fn substitute(template: &str, subst: &Map<String, Value>) -> Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Substitute `{name}` tokens in an optional verification substring (expect /
+/// reject). `None` (no such key / not a string) passes through as `None`.
+fn subst_opt(v: Option<&Value>, subst: &Map<String, Value>) -> Result<Option<String>> {
+    match v.and_then(Value::as_str) {
+        Some(s) => Ok(Some(substitute(s, subst)?)),
+        None => Ok(None),
+    }
 }
 
 /// Parse `a.b.c.d/len` -> (network, netmask, normalized `net/len`). IPv4 only.
@@ -401,6 +427,86 @@ mod tests {
             &json!({"parent": "192.0.2.0/24", "target": "192.0.0.0/16"})
         )
         .is_err());
+    }
+
+    fn tmpl(schema: Value, plan: Value, verification: Value) -> Template {
+        Template {
+            id: 1,
+            name: "t".into(),
+            display_name: None,
+            description: None,
+            provider_type: "device_cli".into(),
+            mode: "ios_ssh".into(),
+            automatic_allowed: false,
+            parameter_schema: schema,
+            plan,
+            verification,
+            rollback_template_id: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn exec_after_runs_after_config_block() {
+        let t = tmpl(
+            json!({
+                "neighbor_ip": {"type": "ip", "required": true},
+                "prefix": {"type": "cidr", "required": true},
+                "prefix_list_name": {"type": "string", "required": true},
+            }),
+            json!({
+                "transport": "ios_ssh", "config_mode": true,
+                "apply": ["ip prefix-list {prefix_list_name} permit {prefix}"],
+                "exec_after": ["clear ip bgp {neighbor_ip} soft out"],
+            }),
+            json!({"command": "show ip bgp neighbors {neighbor_ip} advertised-routes", "expect": "{prefix_net}"}),
+        );
+        let rp = render(
+            &t,
+            &json!({"neighbor_ip": "10.0.0.1", "prefix": "192.0.2.0/24", "prefix_list_name": "PL-UPSTREAM-A"}),
+        )
+        .unwrap();
+        assert_eq!(
+            rp.commands,
+            vec![
+                "configure terminal",
+                "ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
+                "end",
+                "clear ip bgp 10.0.0.1 soft out",
+            ]
+        );
+        // expect substring is substituted to the prefix network.
+        assert_eq!(rp.verify.unwrap().expect.as_deref(), Some("192.0.2.0"));
+    }
+
+    #[test]
+    fn mss_default_and_verify_substitution() {
+        let t = tmpl(
+            json!({
+                "interface": {"type": "string", "required": true, "source": "interface_name"},
+                "mss": {"type": "int", "required": true, "default": "1436"},
+            }),
+            json!({
+                "transport": "ios_ssh", "config_mode": true,
+                "apply": ["interface {interface}", "ip tcp adjust-mss {mss}"],
+            }),
+            json!({"command": "show running-config interface {interface}", "expect": "ip tcp adjust-mss {mss}"}),
+        );
+        // mss omitted -> uses the schema default 1436.
+        let rp = render(&t, &json!({"interface": "GigabitEthernet0/0"})).unwrap();
+        assert_eq!(
+            rp.commands,
+            vec![
+                "configure terminal",
+                "interface GigabitEthernet0/0",
+                "ip tcp adjust-mss 1436",
+                "end",
+            ]
+        );
+        assert_eq!(
+            rp.verify.unwrap().expect.as_deref(),
+            Some("ip tcp adjust-mss 1436")
+        );
     }
 
     #[test]

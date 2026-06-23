@@ -24,6 +24,7 @@ import {
   OPERATORS,
   RECOVERY_MODES,
   FLOW_PROTOCOLS,
+  SUMMABLE_METRICS,
   isFlowMetric,
   thresholdHint,
 } from "./rule-constants";
@@ -65,10 +66,16 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
     severity: rule?.severity ?? "warning",
   });
   const [deviceInterfaces, setDeviceInterfaces] = useState<Interface[]>([]);
+  // Aggregation (`sum`) is create-only. Members are interfaces that may span devices.
+  const [aggregation, setAggregation] = useState<"single" | "sum">(
+    rule?.metric_aggregation ?? "single",
+  );
+  const [members, setMembers] = useState<number[]>(rule?.member_interface_ids ?? []);
+  const [allInterfaces, setAllInterfaces] = useState<{ device: Device; ifaces: Interface[] }[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // In create mode, load the chosen device's interfaces.
+  // In create mode, load the chosen device's interfaces (single-target rules).
   useEffect(() => {
     if (!isCreate || !form.device_id) {
       setDeviceInterfaces([]);
@@ -80,6 +87,37 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
       .catch(() => setDeviceInterfaces([]));
   }, [isCreate, form.device_id]);
 
+  // For a summed rule (create), load every device's interfaces so members can be
+  // picked across devices.
+  useEffect(() => {
+    if (!isCreate || aggregation !== "sum") return;
+    let cancelled = false;
+    Promise.all(
+      devices.map((d) =>
+        api.devices
+          .interfaces(d.id)
+          .then((ifaces) => ({ device: d, ifaces }))
+          .catch(() => ({ device: d, ifaces: [] as Interface[] })),
+      ),
+    ).then((groups) => {
+      if (!cancelled) setAllInterfaces(groups);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isCreate, aggregation, devices]);
+
+  // When switching to sum, coerce the metric to a summable one.
+  useEffect(() => {
+    if (aggregation === "sum" && !SUMMABLE_METRICS.includes(form.metric)) {
+      setForm((f) => ({ ...f, metric: "rx_bps" }));
+    }
+  }, [aggregation, form.metric]);
+
+  function toggleMember(id: number) {
+    setMembers((m) => (m.includes(id) ? m.filter((x) => x !== id) : [...m, id]));
+  }
+
   function set<K extends keyof typeof form>(field: K, value: (typeof form)[K]) {
     setForm((f) => {
       const next = { ...f, [field]: value };
@@ -88,14 +126,24 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
     });
   }
 
-  // In edit mode the metric family is fixed (recreate to switch families).
-  const metricOptions = isCreate ? METRICS : METRICS.filter((m) => isFlowMetric(m.value) === isFlowMetric(rule!.metric));
-  const isFlow = isFlowMetric(form.metric);
+  const isSum = isCreate ? aggregation === "sum" : rule!.metric_aggregation === "sum";
+  // Metric options: summed rules use summable rates only; otherwise the family is
+  // fixed in edit mode (recreate to switch families).
+  const metricOptions = isSum
+    ? METRICS.filter((m) => SUMMABLE_METRICS.includes(m.value))
+    : isCreate
+      ? METRICS
+      : METRICS.filter((m) => isFlowMetric(m.value) === isFlowMetric(rule!.metric));
+  const isFlow = !isSum && isFlowMetric(form.metric);
 
   async function save(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (isCreate && !form.interface_id) {
+    if (isCreate && isSum && members.length === 0) {
+      setError("Select at least one interface to sum.");
+      return;
+    }
+    if (isCreate && !isSum && !form.interface_id) {
       setError("Select a device and interface.");
       return;
     }
@@ -141,15 +189,29 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
 
     try {
       const saved = isCreate
-        ? await api.rules.create({
-            ...common,
-            target_kind: "interface",
-            interface_id: parseInt(form.interface_id, 10),
-            device_id: parseInt(form.device_id, 10),
-            enabled: true,
-            automatic_reroute_enabled: false,
-            reroute_template_id: null,
-          })
+        ? await api.rules.create(
+            isSum
+              ? {
+                  ...common,
+                  target_kind: "interface_group",
+                  metric_aggregation: "sum",
+                  interface_ids: members,
+                  interface_id: null,
+                  device_id: null,
+                  enabled: true,
+                  automatic_reroute_enabled: false,
+                  reroute_template_id: null,
+                }
+              : {
+                  ...common,
+                  target_kind: "interface",
+                  interface_id: parseInt(form.interface_id, 10),
+                  device_id: parseInt(form.device_id, 10),
+                  enabled: true,
+                  automatic_reroute_enabled: false,
+                  reroute_template_id: null,
+                },
+          )
         : await api.rules.update(rule!.id, common);
       toast.success(`${isCreate ? "Created" : "Updated"} rule "${saved.name}"`);
       onSaved(saved);
@@ -173,8 +235,26 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
             <input required className={inputClass} value={form.name} onChange={(e) => set("name", e.target.value)} />
           </label>
 
+          {/* Aggregation toggle (create only): one interface, or the sum across many. */}
+          {isCreate && (
+            <label className="block space-y-1 text-sm font-medium">
+              <span className="inline-flex items-center gap-1">
+                Target{" "}
+                <InfoHint text="Single = one interface. Summed = threshold the total of a rate metric across several interfaces, which may be on different devices." />
+              </span>
+              <select
+                className={inputClass}
+                value={aggregation}
+                onChange={(e) => setAggregation(e.target.value as "single" | "sum")}
+              >
+                <option value="single">Single interface</option>
+                <option value="sum">Summed across interfaces (multi-device)</option>
+              </select>
+            </label>
+          )}
+
           {/* Target — selectable on create, read-only on edit. */}
-          {isCreate ? (
+          {isCreate && !isSum && (
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block space-y-1 text-sm font-medium">
                 Device
@@ -206,10 +286,45 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
                 </select>
               </label>
             </div>
-          ) : (
+          )}
+
+          {/* Summed members — checkboxes grouped by device. */}
+          {isCreate && isSum && (
+            <div className="space-y-1 text-sm font-medium">
+              <span>Interfaces to sum ({members.length} selected)</span>
+              <div className="max-h-48 overflow-y-auto rounded-md border border-input p-2">
+                {allInterfaces.length === 0 && (
+                  <p className="text-xs font-normal text-muted-foreground">Loading interfaces…</p>
+                )}
+                {allInterfaces.map(({ device, ifaces }) => (
+                  <div key={device.id} className="mb-2">
+                    <p className="text-xs font-semibold text-muted-foreground">{device.name}</p>
+                    {ifaces.map((iface) => (
+                      <label key={iface.id} className="flex items-center gap-2 py-0.5 text-sm font-normal">
+                        <input
+                          type="checkbox"
+                          checked={members.includes(iface.id)}
+                          onChange={() => toggleMember(iface.id)}
+                        />
+                        {iface.if_name}
+                        {iface.if_alias ? ` — ${iface.if_alias}` : ""}
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {!isCreate && (
             <p className="text-xs text-muted-foreground">
-              Target: <span className="font-medium">{rule!.interface_name ?? `interface #${rule!.interface_id}`}</span>
-              {rule!.device_name ? ` on ${rule!.device_name}` : ""} · recreate the rule to retarget.
+              Target:{" "}
+              <span className="font-medium">
+                {isSum
+                  ? `${rule!.member_interface_ids?.length ?? 0} interfaces (summed)`
+                  : rule!.interface_name ?? `interface #${rule!.interface_id}`}
+              </span>
+              {!isSum && rule!.device_name ? ` on ${rule!.device_name}` : ""} · recreate the rule to retarget.
             </p>
           )}
 

@@ -90,7 +90,64 @@ bgp_session_enable    router bgp {local_asn} ; no neighbor {neighbor_ip} shutdow
 bgp_session_disable   router bgp {local_asn} ; neighbor {neighbor_ip} shutdown
                       verify: show ip bgp neighbors {neighbor_ip}
                               -> expect "Administratively shut"
+
+bgp_advertise_add     ip prefix-list {prefix_list_name} permit {prefix}
+                      exec_after: clear ip bgp {neighbor_ip} soft out
+                      Advertise a prefix toward ONE upstream peer by adding it to
+                      that peer's outbound route-map prefix-list, then soft-clear
+                      outbound. The prefix-list name is discovered per peer
+                      (neighbor `route-map NAME out` -> route-map
+                      `match ip address prefix-list PL`) and offered by the
+                      `peer_out_prefix_list` picker.
+                      verify: show ip bgp neighbors {neighbor_ip} advertised-routes
+                              -> expect "{prefix_net}"
+                      rollback: bgp_advertise_remove
+
+bgp_advertise_remove  no ip prefix-list {prefix_list_name} permit {prefix}
+                      exec_after: clear ip bgp {neighbor_ip} soft out
+                      verify: show ip bgp neighbors {neighbor_ip} advertised-routes
+                              -> reject "{prefix_net}"
+
+iface_tcp_adjust_mss  interface {interface} ; ip tcp adjust-mss {mss}
+                      MSS clamp (default 1436) applied when a rule activates.
+                      verify: show running-config interface {interface}
+                              -> expect "ip tcp adjust-mss {mss}"
+                      rollback: iface_tcp_adjust_mss_remove
+
+iface_tcp_adjust_mss_remove
+                      interface {interface} ; no ip tcp adjust-mss
+                      verify: show running-config interface {interface}
+                              -> reject "adjust-mss"
+
+iface_shutdown        interface {interface} ; shutdown    (DISRUPTIVE)
+                      verify: show interfaces {interface}
+                              -> expect "administratively down"
+                      rollback: iface_no_shutdown
+                      Blocked on interfaces flagged `protected` (see below).
+
+iface_no_shutdown     interface {interface} ; no shutdown
+                      verify: show interfaces {interface}
+                              -> reject "administratively down"
 ```
+
+`plan_json` supports an optional `exec_after` array — privileged EXEC commands
+(e.g. `clear ip bgp <peer> soft out`) that run AFTER the `configure terminal` …
+`end` block closes, never inside it. Verification `expect`/`reject` substrings may
+reference `{params}` (e.g. `{prefix_net}`), substituted at render time.
+
+A **combination** (remove-from-saturated-upstream + advertise-on-others + MSS
+clamp) is expressed as several ordered `rule_actions` on one rule — each its own
+verification and rollback — not a single composite template.
+
+**Protected-interface guard.** `device_interfaces.protected` flags the device's
+management / transit / SSH path. Before executing a template that targets an
+interface (any param with `source: "interface_name"` — `iface_shutdown`,
+`iface_tcp_adjust_mss*`), the executor resolves the interface and **blocks** if it
+is protected, returning a `blocked_reason` and pushing nothing. This prevents the
+controller from cutting or black-holing its own path to the device. Set the flag
+via `PATCH /api/interfaces/{id}/protected` (`manage_devices`). Every disruptive
+command shape above is also gated by the fail-closed `ssh::command_allowed`
+allowlist.
 
 Disruptive templates are paired with their inverse via `rollback_template_id`.
 The old `cloudflare_under_attack` / `flowspec_drop` / `divert_to_scrubber`

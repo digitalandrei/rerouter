@@ -8,6 +8,7 @@
 pub mod body;
 pub mod dispatcher;
 pub mod mailer;
+pub mod webhook;
 
 use sqlx::MySqlPool;
 

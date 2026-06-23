@@ -1,9 +1,13 @@
-# Email Alerts
+# Alerts (Email + Microsoft Teams)
 
-Rerouter sends email alerts so operators learn about attacks and reroutes even
-when they aren't watching the dashboard. Email is sent by the **controller**
-itself via SMTP (lettre, rustls), processed by an internal async alert-dispatcher
-task so alerting never blocks API requests, detection, or reroutes.
+Rerouter sends alerts so operators learn about attacks and reroutes even when
+they aren't watching the dashboard. Alerts are delivered by the **controller**
+itself over two channels — **email** (SMTP via lettre, rustls) and **Microsoft
+Teams** (incoming webhook, HTTP POST of a MessageCard via reqwest) — processed by
+one internal async alert-dispatcher task so alerting never blocks API requests,
+detection, or reroutes. Each `alerts` row is fanned out to whichever channels are
+subscribed to its event type; deliveries are recorded per channel in
+`alert_deliveries` (`channel` ∈ {`email`, `teams`}).
 
 ## Triggers
 
@@ -71,19 +75,37 @@ Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 - Critical alerts (`uncertain`, `failed`, security events) always fan out to the
   admin tier (`admin` / `superadmin`).
 
+## Teams webhook channel
+
+- A Teams endpoint is an **incoming-webhook URL** stored **encrypted at rest**
+  (AES-256-GCM, `crypto::seal`) in `webhook_endpoints` — only ciphertext is
+  persisted, and the URL is never returned to the client or logged.
+- Per-event routing lives in `webhook_subscriptions` (NULL `event_type` = all
+  events), mirroring `alert_subscriptions`. The same 10-minute de-dup and 20/hr
+  rate limit apply, keyed on the endpoint; `ALWAYS_IMMEDIATE` events bypass both.
+- The dispatcher drains when **either** SMTP is configured **or** at least one
+  enabled webhook exists. If SMTP is down but a webhook is configured, Teams still
+  delivers; an alert with no audience on either channel stays queued (so email
+  retries once SMTP comes up) unless SMTP was up and simply had no recipients.
+- No alert payload (email or Teams) ever contains a secret.
+
 ## Configuration
 
 - SMTP settings are env vars consumed by the controller
   (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`) — see
   [../deploy/env/rerouter.example.env](../deploy/env/rerouter.example.env).
-- Alert routing, thresholds, and per-recipient toggles are stored in the DB and
-  managed from `/alerts` in the UI.
+- Email recipients and Teams webhooks (with per-event routing and a test-send)
+  are managed from the **Notifications** section of `/settings`
+  (`manage_alerts`), backed by `/api/notifications/*`. Webhook URLs are
+  write-only (encrypted, never shown again).
 
 ## Tables
 
-`alerts`, `alert_recipients`, `alert_subscriptions`, `alert_deliveries` — see
-[database.md](database.md). Delivery records (sent/failed/bounced) are retained for
-audit and troubleshooting.
+`alerts`, `alert_recipients`, `alert_subscriptions`, `alert_deliveries` (now
+channel-aware, with a nullable `recipient_id` + an `endpoint_id`),
+`webhook_endpoints`, `webhook_subscriptions` — see [database.md](database.md).
+Delivery records (sent/failed/bounced/queued) are retained for audit and
+troubleshooting.
 
 ## Content
 

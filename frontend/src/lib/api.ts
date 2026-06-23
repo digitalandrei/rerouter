@@ -154,6 +154,8 @@ export interface Interface {
   if_speed_bps: number | null;
   admin_status: string;
   oper_status: string;
+  /** Management/transit path: disruptive shutdown/MSS actions are blocked on it. */
+  protected: boolean;
   metrics: InterfaceMetrics | null;
 }
 
@@ -301,6 +303,8 @@ export interface BgpPeer {
   peer_state: string | null;
   peer_admin_status: string | null;
   label: string | null;
+  /** Outbound route-map's prefix-list, discovered over SSH (bgp_advertise_*). */
+  out_prefix_list: string | null;
   last_polled_at: string | null;
 }
 
@@ -323,6 +327,22 @@ export interface RtbhCommunity {
 // Rules and Alerts
 // ---------------------------------------------------------------------------
 
+/** An email alert recipient. `event_types` is ["*"] for "all events". */
+export interface NotificationRecipient {
+  id: number;
+  email: string;
+  verified: boolean;
+  event_types: string[];
+}
+
+/** A Teams incoming-webhook endpoint (URL is never returned to the client). */
+export interface WebhookEndpoint {
+  id: number;
+  name: string;
+  enabled: boolean;
+  event_types: string[];
+}
+
 export interface RuleAction {
   id: number;
   reroute_template_id: number;
@@ -341,10 +361,14 @@ export type RuleOperator = ">" | "<" | ">=" | "<=" | "==" | "!=";
 export interface Rule {
   id: number;
   name: string;
-  target_kind: "interface";
+  target_kind: "interface" | "interface_group";
   interface_id: number | null;
   device_id: number | null;
   metric: string;
+  /** 'single' (per-interface) or 'sum' (summed across member_interface_ids). */
+  metric_aggregation?: "single" | "sum";
+  /** Member interface ids for a summed rule (may span devices). */
+  member_interface_ids?: number[];
   // Flow-metric selector (null for SNMP interface metrics).
   flow_direction?: "ingress" | "egress" | null;
   flow_protocol?: number | null;
@@ -673,6 +697,11 @@ export const api = {
       request<Sample[]>(
         `/api/interfaces/${id}/metrics${minutes !== undefined ? `?minutes=${minutes}` : ""}`,
       ),
+    setProtected: (id: number, protectedFlag: boolean) =>
+      request<{ ok: boolean; protected: boolean }>(
+        `/api/interfaces/${id}/protected`,
+        { method: "PATCH", body: JSON.stringify({ protected: protectedFlag }) },
+      ),
   },
 
   flows: {
@@ -751,7 +780,7 @@ export const api = {
   rules: {
     list: () => request<Rule[]>("/api/rules"),
     get: (id: number) => request<Rule>(`/api/rules/${id}`),
-    create: (rule: Omit<Rule, "id">) =>
+    create: (rule: Omit<Rule, "id"> & { interface_ids?: number[] }) =>
       request<Rule>("/api/rules", { method: "POST", body: rule }),
     update: (id: number, rule: Partial<Rule>) =>
       request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
@@ -841,6 +870,39 @@ export const api = {
 
   audit: {
     list: () => request<AuditEntry[]>("/api/audit"),
+  },
+
+  notifications: {
+    eventTypes: () => request<string[]>("/api/notifications/event-types"),
+    recipients: () =>
+      request<NotificationRecipient[]>("/api/notifications/recipients"),
+    addRecipient: (body: { email: string; event_types: string[] }) =>
+      request<{ id: number }>("/api/notifications/recipients", {
+        method: "POST",
+        body,
+      }),
+    removeRecipient: (id: number) =>
+      request<{ ok: boolean }>(`/api/notifications/recipients/${id}`, {
+        method: "DELETE",
+      }),
+    testRecipient: (id: number) =>
+      request<{ ok: boolean }>(`/api/notifications/recipients/${id}/test`, {
+        method: "POST",
+      }),
+    webhooks: () => request<WebhookEndpoint[]>("/api/notifications/webhooks"),
+    addWebhook: (body: { name: string; url: string; event_types: string[] }) =>
+      request<{ id: number }>("/api/notifications/webhooks", {
+        method: "POST",
+        body,
+      }),
+    removeWebhook: (id: number) =>
+      request<{ ok: boolean }>(`/api/notifications/webhooks/${id}`, {
+        method: "DELETE",
+      }),
+    testWebhook: (id: number) =>
+      request<{ ok: boolean }>(`/api/notifications/webhooks/${id}/test`, {
+        method: "POST",
+      }),
   },
 
   locks: {

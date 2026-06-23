@@ -16,6 +16,7 @@ pub mod flows;
 pub mod health;
 pub mod interfaces;
 pub mod locks;
+pub mod notifications;
 pub mod reroutes;
 pub mod rtbh;
 pub mod rules;
@@ -153,6 +154,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // interfaces
         .route("/api/interfaces/{id}", get(interfaces::show))
         .route("/api/interfaces/{id}/metrics", get(interfaces::metrics))
+        .route(
+            "/api/interfaces/{id}/protected",
+            patch(interfaces::set_protected),
+        )
         // rules
         .route("/api/rules", get(rules::list).post(rules::create))
         .route(
@@ -185,6 +190,35 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         // alerts + audit
         .route("/api/alerts", get(alerts::list))
         .route("/api/audit", get(audit::list))
+        // notification settings: email recipients + Teams webhooks (manage_alerts)
+        .route(
+            "/api/notifications/event-types",
+            get(notifications::event_types),
+        )
+        .route(
+            "/api/notifications/recipients",
+            get(notifications::list_recipients).post(notifications::add_recipient),
+        )
+        .route(
+            "/api/notifications/recipients/{id}",
+            axum::routing::delete(notifications::remove_recipient),
+        )
+        .route(
+            "/api/notifications/recipients/{id}/test",
+            post(notifications::test_recipient),
+        )
+        .route(
+            "/api/notifications/webhooks",
+            get(notifications::list_webhooks).post(notifications::add_webhook),
+        )
+        .route(
+            "/api/notifications/webhooks/{id}",
+            axum::routing::delete(notifications::remove_webhook),
+        )
+        .route(
+            "/api/notifications/webhooks/{id}/test",
+            post(notifications::test_webhook),
+        )
         // safety locks + global settings
         .route("/api/locks", get(locks::list))
         .route(

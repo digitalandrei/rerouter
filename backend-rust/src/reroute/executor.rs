@@ -96,6 +96,17 @@ pub async fn execute(
         };
     }
 
+    // Protected-interface guard — refuse a disruptive interface action
+    // (shutdown / MSS clamp) on the device's management/transit path, so the
+    // controller cannot black-hole or cut its own path to the device. Applies to
+    // manual, automatic, and rollback triggers alike. (Observe mode and dry-run
+    // returned above, so this only blocks real executions.)
+    if let Some(reason) =
+        protected_interface_block(pool, req.device_id, &req.template, &req.params).await
+    {
+        return blocked(&req, device_name, reason);
+    }
+
     // Global automatic master switch — gates AUTOMATIC triggers ONLY (manual and
     // rollback have their own upstream permission checks and must not be disabled
     // by this switch). Doctrine: automatic execution needs enforce mode AND this
@@ -704,6 +715,52 @@ async fn device_name(pool: &MySqlPool, device_id: u64) -> Option<String> {
         .await
         .ok()
         .flatten()
+}
+
+/// Block disruptive interface actions targeting a `protected` interface (the
+/// device's management / transit / SSH path). Returns `Some(reason)` to block,
+/// `None` to proceed. A template "targets an interface" when its parameter schema
+/// has a param with `source: "interface_name"`; the guard resolves that param's
+/// value and matches it against `device_interfaces.if_name`/`if_descr`. Templates
+/// without such a param (BGP, null-route, etc.) are never blocked here. An
+/// unknown / unmatched interface name proceeds (the command is still gated by the
+/// operating mode and the other safety gates).
+async fn protected_interface_block(
+    pool: &MySqlPool,
+    device_id: u64,
+    template: &Template,
+    params: &Value,
+) -> Option<String> {
+    // Find the interface-name parameter, if any.
+    let schema = template.parameter_schema.as_object()?;
+    let iface_param = schema.iter().find_map(|(name, spec)| {
+        (spec.get("source").and_then(Value::as_str) == Some("interface_name")).then(|| name.clone())
+    })?;
+    let iface = params
+        .get(&iface_param)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let protected: Option<i64> = sqlx::query_scalar(
+        "SELECT protected FROM device_interfaces \
+         WHERE device_id = ? AND (if_name = ? OR if_descr = ?) ORDER BY protected DESC LIMIT 1",
+    )
+    .bind(device_id)
+    .bind(iface)
+    .bind(iface)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    match protected {
+        Some(p) if p != 0 => Some(format!(
+            "interface '{iface}' is flagged as a protected management/transit path; \
+             disruptive interface actions on it are blocked to prevent self-lockout"
+        )),
+        _ => None,
+    }
 }
 
 async fn running_on_device(pool: &MySqlPool, device_id: u64) -> bool {

@@ -660,6 +660,26 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
         let cur_out_disc = out_disc.get(&m.if_index).copied();
         let opt = optics.get(&m.interface_id);
 
+        // Error rates (errors/sec) from the cumulative counters over the same
+        // interval as the bps/pps rates. No baseline / wrap => 0 (rate_from_counters
+        // returns None). Only meaningful when valid_sample = 1 (detection gates on it).
+        let err_elapsed = previous
+            .as_ref()
+            .map(|p| (current.sampled_at - p.sampled_at).num_milliseconds() as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let in_err_rate = super::rate_from_counters(
+            cur_in_err.unwrap_or(0),
+            prev_in_err.unwrap_or(0),
+            err_elapsed,
+        )
+        .unwrap_or(0.0);
+        let out_err_rate = super::rate_from_counters(
+            cur_out_err.unwrap_or(0),
+            prev_out_err.unwrap_or(0),
+            err_elapsed,
+        )
+        .unwrap_or(0.0);
+
         store_metrics(
             pool,
             device_id,
@@ -670,6 +690,8 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             cur_out_err,
             cur_in_disc,
             cur_out_disc,
+            in_err_rate,
+            out_err_rate,
             admin_s.as_deref(),
             oper_s.as_deref(),
             // per-interval error/discard deltas for the history charts
@@ -770,6 +792,8 @@ async fn store_metrics(
     out_errors: Option<u64>,
     in_discards: Option<u64>,
     out_discards: Option<u64>,
+    in_err_rate: f64,
+    out_err_rate: f64,
     admin_status: Option<&str>,
     oper_status: Option<&str>,
     sample_in_errors: u64,
@@ -788,9 +812,10 @@ async fn store_metrics(
             (interface_id, device_id, sampled_at, valid_sample, \
              in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, \
              rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
-             in_errors, out_errors, in_discards, out_discards, admin_status, oper_status, \
+             in_errors, out_errors, in_discards, out_discards, in_err_rate, out_err_rate, \
+             admin_status, oper_status, \
              temp_c, tx_power_dbm, rx_power_dbm) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON DUPLICATE KEY UPDATE \
             sampled_at = VALUES(sampled_at), valid_sample = VALUES(valid_sample), \
             in_octets = VALUES(in_octets), out_octets = VALUES(out_octets), \
@@ -799,7 +824,8 @@ async fn store_metrics(
             tx_pps = VALUES(tx_pps), rx_util_percent = VALUES(rx_util_percent), \
             tx_util_percent = VALUES(tx_util_percent), in_errors = VALUES(in_errors), \
             out_errors = VALUES(out_errors), in_discards = VALUES(in_discards), \
-            out_discards = VALUES(out_discards), admin_status = VALUES(admin_status), \
+            out_discards = VALUES(out_discards), in_err_rate = VALUES(in_err_rate), \
+            out_err_rate = VALUES(out_err_rate), admin_status = VALUES(admin_status), \
             oper_status = VALUES(oper_status), temp_c = VALUES(temp_c), \
             tx_power_dbm = VALUES(tx_power_dbm), rx_power_dbm = VALUES(rx_power_dbm)",
     )
@@ -821,6 +847,8 @@ async fn store_metrics(
     .bind(out_errors)
     .bind(in_discards)
     .bind(out_discards)
+    .bind(in_err_rate)
+    .bind(out_err_rate)
     .bind(admin_status)
     .bind(oper_status)
     .bind(temp_c)

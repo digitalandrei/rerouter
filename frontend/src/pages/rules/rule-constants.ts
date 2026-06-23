@@ -6,8 +6,20 @@ export const METRICS = [
   { value: "tx_pps", label: "Tx pps (SNMP)" },
   { value: "rx_util_percent", label: "Rx utilization % (SNMP)" },
   { value: "tx_util_percent", label: "Tx utilization % (SNMP)" },
+  { value: "in_err_rate", label: "Rx errors/sec (SNMP)" },
+  { value: "out_err_rate", label: "Tx errors/sec (SNMP)" },
   { value: "flow_pps", label: "Flow pps (NetFlow)" },
   { value: "flow_bps", label: "Flow bps (NetFlow)" },
+];
+
+/** Metrics that can be summed across interfaces (cross-device aggregation). */
+export const SUMMABLE_METRICS = [
+  "rx_bps",
+  "tx_bps",
+  "rx_pps",
+  "tx_pps",
+  "in_err_rate",
+  "out_err_rate",
 ];
 
 export const SEVERITIES = ["info", "warning", "critical"];
@@ -60,6 +72,9 @@ export function thresholdHint(metric: string): string {
   }
   if (metric === "oper_status") {
     return "1 = up, 0 = down";
+  }
+  if (metric === "in_err_rate" || metric === "out_err_rate") {
+    return "errors/sec — e.g. 100";
   }
   return "threshold value";
 }

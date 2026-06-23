@@ -50,9 +50,13 @@ struct Observation {
 struct InterfaceRule {
     id: u64,
     name: String,
-    interface_id: u64,
+    /// The target interface for a `single` rule; NULL for a `sum` rule (whose
+    /// members live in `rule_interfaces`).
+    interface_id: Option<u64>,
     device_id: Option<u64>,
     metric: String,
+    /// 'single' (per-interface) | 'sum' (summed across rule_interfaces members).
+    metric_aggregation: String,
     /// Flow-metric selector (NULL for SNMP interface metrics).
     flow_direction: Option<String>,
     flow_protocol: Option<u16>,
@@ -88,6 +92,8 @@ struct CurrentMetrics {
     tx_pps: f64,
     rx_util_percent: f64,
     tx_util_percent: f64,
+    in_err_rate: f64,
+    out_err_rate: f64,
     oper_status: Option<String>,
 }
 
@@ -102,6 +108,8 @@ impl CurrentMetrics {
             "tx_pps" => self.tx_pps,
             "rx_util_percent" => self.rx_util_percent,
             "tx_util_percent" => self.tx_util_percent,
+            "in_err_rate" => self.in_err_rate,
+            "out_err_rate" => self.out_err_rate,
             "oper_status" => {
                 if self.oper_status.as_deref() == Some("up") {
                     1.0
@@ -113,6 +121,17 @@ impl CurrentMetrics {
         })
     }
 }
+
+/// Metrics that can be SUMMED across interfaces for a `sum` rule (rates only —
+/// summing a percentage or a status would be meaningless).
+const SUMMABLE_METRICS: &[&str] = &[
+    "rx_bps",
+    "tx_bps",
+    "rx_pps",
+    "tx_pps",
+    "in_err_rate",
+    "out_err_rate",
+];
 
 /// The prior `rule_states` row (absent => treated as clear/zero).
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -136,7 +155,7 @@ struct RuleStateRow {
 /// and the next still-firing rule can act on a later pass.
 pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<usize> {
     let rules = sqlx::query_as::<_, InterfaceRule>(
-        "SELECT id, name, interface_id, device_id, metric, \
+        "SELECT id, name, interface_id, device_id, metric, metric_aggregation, \
                 flow_direction, flow_protocol, flow_port, flow_port_kind, \
                 operator, threshold_value, \
                 duration_seconds, consecutive_samples, \
@@ -144,7 +163,8 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
                 recovery_consecutive_samples, severity, \
                 automatic_reroute_enabled \
          FROM rules \
-         WHERE enabled = 1 AND interface_id IS NOT NULL AND device_id = ? \
+         WHERE enabled = 1 AND metric_aggregation = 'single' \
+               AND interface_id IS NOT NULL AND device_id = ? \
          ORDER BY CASE severity \
              WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 WHEN 'info' THEN 2 ELSE 3 END, \
              id",
@@ -166,6 +186,40 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
     Ok(fired)
 }
 
+/// Evaluate every `sum` (cross-interface / cross-device) rule once per poll
+/// cycle. These rules have no single owning device, so they run in a global pass
+/// rather than inside `evaluate_device`. Returns the number that fired this cycle.
+pub async fn evaluate_aggregate_rules(pool: &MySqlPool, cfg: &Config) -> Result<usize> {
+    let rules = sqlx::query_as::<_, InterfaceRule>(
+        "SELECT id, name, interface_id, device_id, metric, metric_aggregation, \
+                flow_direction, flow_protocol, flow_port, flow_port_kind, \
+                operator, threshold_value, \
+                duration_seconds, consecutive_samples, \
+                recovery_mode, recovery_threshold_value, recovery_window_seconds, \
+                recovery_consecutive_samples, severity, \
+                automatic_reroute_enabled \
+         FROM rules \
+         WHERE enabled = 1 AND metric_aggregation = 'sum' \
+         ORDER BY CASE severity \
+             WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 WHEN 'info' THEN 2 ELSE 3 END, \
+             id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut fired = 0usize;
+    for rule in rules {
+        match evaluate_rule(pool, cfg, &rule).await {
+            Ok(true) => fired += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(event_type = "rule_eval_failed", rule_id = rule.id, error = %e, "aggregate rule evaluation failed");
+            }
+        }
+    }
+    Ok(fired)
+}
+
 /// Evaluate a single rule and advance its state. Returns Ok(true) iff the rule
 /// transitioned INTO `firing` on this evaluation (the alert edge).
 async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> Result<bool> {
@@ -173,9 +227,12 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         return Ok(false); // unknown operator: never matches.
     };
 
-    // Source the reading from flow buckets or interface metrics. Either path
-    // returns None for no/stale/invalid sample (which must not advance state).
-    let obs = if is_flow_metric(&rule.metric) {
+    // Source the reading from the summed member set, a flow bucket, or a single
+    // interface. Every path returns None for no/stale/invalid data (which must
+    // not advance state) — for `sum`, ANY stale/invalid member blocks the rule.
+    let obs = if rule.metric_aggregation == "sum" {
+        aggregate_observation(pool, cfg, rule).await?
+    } else if is_flow_metric(&rule.metric) {
         flow_observation(pool, cfg, rule).await?
     } else {
         interface_observation(pool, cfg, rule).await?
@@ -350,12 +407,15 @@ async fn interface_observation(
     cfg: &Config,
     rule: &InterfaceRule,
 ) -> Result<Option<Observation>> {
+    let Some(interface_id) = rule.interface_id else {
+        return Ok(None); // single-interface observation needs a target interface.
+    };
     let metrics = sqlx::query_as::<_, CurrentMetrics>(
         "SELECT sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
-                rx_util_percent, tx_util_percent, oper_status \
+                rx_util_percent, tx_util_percent, in_err_rate, out_err_rate, oper_status \
          FROM interface_metrics_current WHERE interface_id = ?",
     )
-    .bind(rule.interface_id)
+    .bind(interface_id)
     .fetch_optional(pool)
     .await?;
 
@@ -376,6 +436,67 @@ async fn interface_observation(
     Ok(Some(Observation {
         value,
         sampled_at: metrics.sampled_at,
+        low_confidence: false,
+    }))
+}
+
+/// Sum an interface metric across a `sum` rule's member interfaces (possibly on
+/// different devices). Conservative: EVERY member must have a valid, fresh sample
+/// — if any is missing / invalid / stale, the whole observation is None (the rule
+/// neither fires nor advances on partial data; doctrine "low confidence blocks").
+/// Only `SUMMABLE_METRICS` are summed; anything else yields None.
+async fn aggregate_observation(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: &InterfaceRule,
+) -> Result<Option<Observation>> {
+    if !SUMMABLE_METRICS.contains(&rule.metric.as_str()) {
+        return Ok(None);
+    }
+    let members = sqlx::query_scalar::<_, u64>(
+        "SELECT interface_id FROM rule_interfaces WHERE rule_id = ?",
+    )
+    .bind(rule.id)
+    .fetch_all(pool)
+    .await?;
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    let stale_after = cfg.telemetry.stale_after_seconds as i64;
+    let mut total = 0f64;
+    let mut newest: Option<Ts> = None;
+    for interface_id in members {
+        let m = sqlx::query_as::<_, CurrentMetrics>(
+            "SELECT sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
+                    rx_util_percent, tx_util_percent, in_err_rate, out_err_rate, oper_status \
+             FROM interface_metrics_current WHERE interface_id = ?",
+        )
+        .bind(interface_id)
+        .fetch_optional(pool)
+        .await?;
+        // Any missing / invalid / stale member blocks the whole sum.
+        let Some(m) = m else { return Ok(None) };
+        if !m.valid_sample {
+            return Ok(None);
+        }
+        match m.sampled_at {
+            Some(ts) if (Utc::now() - ts).num_seconds() <= stale_after => {
+                if newest.map(|n| ts > n).unwrap_or(true) {
+                    newest = Some(ts);
+                }
+            }
+            _ => return Ok(None),
+        }
+        let Some(v) = m.value(&rule.metric) else {
+            return Ok(None);
+        };
+        total += v;
+    }
+
+    Ok(Some(Observation {
+        value: total,
+        sampled_at: newest,
         low_confidence: false,
     }))
 }
@@ -518,7 +639,10 @@ async fn on_fire(
         _ => "above",
     };
 
-    let interface_label = interface_label(pool, rule.interface_id).await;
+    let interface_label = match rule.interface_id {
+        Some(id) => interface_label(pool, id).await,
+        None => aggregate_label(pool, rule.id).await,
+    };
 
     let mut payload = json!({
         "rule_id": rule.id,
@@ -587,7 +711,10 @@ async fn on_fire(
         }
     }
 
-    let dedup_key = format!("rule_fired:rule:{}:iface:{}", rule.id, rule.interface_id);
+    let dedup_key = match rule.interface_id {
+        Some(id) => format!("rule_fired:rule:{}:iface:{}", rule.id, id),
+        None => format!("rule_fired:rule:{}:agg", rule.id),
+    };
     sqlx::query(
         "INSERT INTO alerts (event_type, severity, device_id, interface_id, rule_id, payload_json, dedup_key) \
          VALUES ('rule_fired', ?, ?, ?, ?, ?, ?)",
@@ -604,7 +731,7 @@ async fn on_fire(
     tracing::info!(
         event_type = "rule_fired",
         rule_id = rule.id,
-        interface_id = rule.interface_id,
+        interface_id = ?rule.interface_id,
         metric = %rule.metric,
         observed = value,
         threshold = rule.threshold_value,
@@ -723,6 +850,28 @@ async fn interface_label(pool: &MySqlPool, interface_id: u64) -> String {
             format!("{iface} on {device}")
         }
         None => format!("interface #{interface_id}"),
+    }
+}
+
+/// A short label for a `sum` rule's member set, e.g. "3 interfaces across 2 devices".
+async fn aggregate_label(pool: &MySqlPool, rule_id: u64) -> String {
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COUNT(DISTINCT device_id) FROM rule_interfaces WHERE rule_id = ?",
+    )
+    .bind(rule_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    match row {
+        Some((ifaces, devices)) if ifaces > 0 => {
+            format!(
+                "{ifaces} interface{} across {devices} device{}",
+                if ifaces == 1 { "" } else { "s" },
+                if devices == 1 { "" } else { "s" }
+            )
+        }
+        _ => "interface group".to_string(),
     }
 }
 

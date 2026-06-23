@@ -27,6 +27,7 @@ struct InterfaceRow {
     if_speed_bps: Option<u64>,
     admin_status: Option<String>,
     oper_status: Option<String>,
+    protected: bool,
 }
 
 /// The latest `interface_metrics_current` row (InterfaceMetrics shape).
@@ -45,7 +46,7 @@ struct MetricsRow {
 }
 
 const IFACE_COLS: &str = "id, device_id, if_index, if_name, if_descr, if_alias, if_speed_bps, \
-     admin_status, oper_status";
+     admin_status, oper_status, protected";
 
 const METRIC_COLS: &str = "sampled_at, valid_sample, rx_bps, tx_bps, rx_pps, tx_pps, \
      rx_util_percent, tx_util_percent, in_errors, out_errors";
@@ -78,6 +79,9 @@ fn interface_json(r: &InterfaceRow, metrics: Option<&MetricsRow>) -> Value {
         "if_speed_bps": r.if_speed_bps,
         "admin_status": r.admin_status.clone().unwrap_or_default(),
         "oper_status": r.oper_status.clone().unwrap_or_default(),
+        // True when flagged as the device's management/transit path: the executor
+        // refuses disruptive interface actions (shutdown / MSS clamp) on it.
+        "protected": r.protected,
         "metrics": metrics.map(metrics_json),
     })
 }
@@ -235,6 +239,37 @@ pub async fn metrics(
                 .collect();
             (StatusCode::OK, Json(json!(out)))
         }
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetProtected {
+    /// Mark this interface as the management/transit path (block disruptive
+    /// shutdown / MSS actions on it) or clear the flag.
+    protected: bool,
+}
+
+/// PATCH /api/interfaces/{id}/protected — toggle the management-path guard flag.
+/// Requires `manage_devices`: an admin chooses what the controller may never shut
+/// on itself.
+pub async fn set_protected(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<SetProtected>,
+) -> JsonResp {
+    let res = sqlx::query("UPDATE device_interfaces SET protected = ? WHERE id = ?")
+        .bind(body.protected as i32)
+        .bind(id)
+        .execute(&state.pool)
+        .await;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "protected": body.protected })),
+        ),
+        Ok(_) => err(StatusCode::NOT_FOUND, "interface not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }

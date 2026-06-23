@@ -42,6 +42,7 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     tokio::spawn(prune_samples(pool.clone()));
     tokio::spawn(discover_prefixes_daily(pool.clone()));
+    tokio::spawn(evaluate_aggregate_loop(pool.clone(), cfg.clone()));
     // NetFlow/IPFIX flow collector — a SECOND, read-only telemetry source. No-op
     // unless [flow].enabled; binds its own UDP socket (see docs/flow-telemetry.md).
     tokio::spawn(flow::collector::run(pool.clone(), cfg.clone()));
@@ -125,6 +126,31 @@ async fn prune_samples(pool: MySqlPool) {
         }
 
         tokio::time::sleep(PRUNE_INTERVAL).await;
+    }
+}
+
+/// How often to evaluate cross-interface/cross-device `sum` rules. These have no
+/// owning device loop, so a single global loop drives them. The cadence tracks
+/// the default poll interval; member freshness is enforced inside the engine.
+const AGGREGATE_EVAL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Evaluate aggregate (`metric_aggregation = 'sum'`) rules forever. Read-only and
+/// observe-safe: like every rule path it only renders would-run plans unless the
+/// controller is in enforce mode with the global + per-rule auto switches on.
+async fn evaluate_aggregate_loop(pool: MySqlPool, cfg: Arc<Config>) {
+    // Let device loops populate interface_metrics_current before the first pass.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    loop {
+        match detection::engine::evaluate_aggregate_rules(&pool, &cfg).await {
+            Ok(fired) if fired > 0 => {
+                tracing::info!(event_type = "aggregate_detection", fired, "aggregate rules fired")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(event_type = "aggregate_detection_failed", error = %e, "aggregate rule evaluation failed")
+            }
+        }
+        tokio::time::sleep(AGGREGATE_EVAL_INTERVAL).await;
     }
 }
 

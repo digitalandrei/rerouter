@@ -24,6 +24,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { NotificationsCard } from "./settings/notifications-card";
 
 /** Global RTBH community catalog the blackhole templates pick from. */
 function RtbhCard() {
@@ -276,6 +277,8 @@ export default function Settings() {
       </Card>
 
       <RtbhCard />
+
+      <NotificationsCard />
 
       {confirm && (
         <ConfirmDialog

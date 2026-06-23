@@ -20,6 +20,7 @@
 //! the executor's safety gates (operating_mode, locks, cooldowns, …) own that.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -356,7 +357,72 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         .await;
     }
 
+    // Resolve each peer's OUTBOUND prefix-list (neighbor `route-map NAME out` ->
+    // that route-map's `match ip address prefix-list PL`) so the guided picker
+    // can offer the correct list per peer for the bgp_advertise_* templates. A
+    // best-effort read; failure here never fails the whole discovery.
+    let rm_cmd = "show running-config | section ^route-map".to_string();
+    if let Ok(rm_outcome) = run_commands(pool, device_id, std::slice::from_ref(&rm_cmd)).await {
+        let rm_output = rm_outcome
+            .results
+            .first()
+            .map(|r| r.output.as_str())
+            .unwrap_or("");
+        let rm_to_pl = parse_routemap_prefix_lists(rm_output);
+        for (addr, rm) in parse_neighbor_out_routemaps(output) {
+            if let Some(pl) = rm_to_pl.get(&rm) {
+                let _ = sqlx::query(
+                    "UPDATE device_bgp_peers SET out_prefix_list = ? \
+                     WHERE device_id = ? AND peer_remote_addr = ?",
+                )
+                .bind(pl)
+                .bind(device_id)
+                .bind(addr.to_string())
+                .execute(pool)
+                .await;
+            }
+        }
+    }
+
     Ok(prefixes.len())
+}
+
+/// Parse `neighbor A.B.C.D route-map NAME out` lines from a `router bgp` config
+/// section into (peer addr, outbound route-map name) pairs. IPv4 peers only.
+fn parse_neighbor_out_routemaps(config: &str) -> Vec<(Ipv4Addr, String)> {
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("neighbor ") else {
+            continue;
+        };
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        // [addr, "route-map", NAME, "out"]
+        if toks.len() >= 4 && toks[1] == "route-map" && toks[3] == "out" {
+            if let Ok(addr) = toks[0].parse::<Ipv4Addr>() {
+                out.push((addr, toks[2].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a `route-map` config section into `route-map name -> matched outbound
+/// prefix-list` (`match ip address prefix-list PL`). The first prefix-list seen
+/// for a route-map wins (typically the lowest-sequence permit stanza).
+fn parse_routemap_prefix_lists(config: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut current: Option<String> = None;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("route-map ") {
+            current = rest.split_whitespace().next().map(str::to_string);
+        } else if let Some(rest) = trimmed.strip_prefix("match ip address prefix-list ") {
+            if let (Some(rm), Some(pl)) = (current.clone(), rest.split_whitespace().next()) {
+                map.entry(rm).or_insert_with(|| pl.to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Parse `neighbor A.B.C.D description <free text>` lines from a `router bgp`
@@ -510,6 +576,22 @@ fn is_ipv4(tok: &str) -> bool {
 fn is_u32(tok: &str) -> bool {
     !tok.is_empty() && tok.parse::<u32>().is_ok()
 }
+/// `a.b.c.d/len` (IPv4 CIDR, len 0..=32) — used by prefix-list entries.
+fn is_cidr(tok: &str) -> bool {
+    match tok.split_once('/') {
+        Some((ip, len)) => ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 32),
+        None => false,
+    }
+}
+/// A bare config name token (interface name, prefix-list name): non-empty and
+/// restricted to `[A-Za-z0-9/._:-]` so it can never smuggle a second command or
+/// whitespace. Template params are already whitespace-free; this is defense in depth.
+fn is_name(tok: &str) -> bool {
+    !tok.is_empty()
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | ':' | '-'))
+}
 
 /// True if `cmd` is one of the EXACT command shapes Rerouter is designed to send
 /// (every read, the config-mode entry/exit, and the null-route / BGP-session
@@ -547,6 +629,9 @@ fn command_allowed(cmd: &str) -> bool {
         ["show", "ip", "route", a] => is_ipv4(a),
         ["show", "ip", "bgp", "summary"] => true,
         ["show", "ip", "bgp", "neighbors", a] => is_ipv4(a),
+        ["show", "ip", "bgp", "neighbors", a, "advertised-routes"] => is_ipv4(a),
+        ["show", "interfaces", n] => is_name(n),
+        ["show", "running-config", "interface", n] => is_name(n),
         // null-route (RTBH to Null0), with the optional name / tag the templates use
         ["ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
         ["ip", "route", net, mask, "Null0", "name", _] => is_ipv4(net) && is_ipv4(mask),
@@ -561,6 +646,15 @@ fn command_allowed(cmd: &str) -> bool {
         ["router", "bgp", asn] => is_u32(asn),
         ["neighbor", ip, "shutdown"] => is_ipv4(ip),
         ["no", "neighbor", ip, "shutdown"] => is_ipv4(ip),
+        // BGP per-peer advertisement via outbound prefix-list (+ soft clear)
+        ["ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
+        ["no", "ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
+        ["clear", "ip", "bgp", ip, "soft", "out"] => is_ipv4(ip),
+        // interface-scoped actions: MSS clamp + shutdown / no shutdown
+        ["interface", n] => is_name(n),
+        ["ip", "tcp", "adjust-mss", mss] => is_u32(mss),
+        ["no", "ip", "tcp", "adjust-mss"] => true,
+        ["shutdown"] | ["no", "shutdown"] => true,
         _ => false,
     }
 }
@@ -853,6 +947,20 @@ mod tests {
             "router bgp 65010",
             "neighbor 198.51.100.7 shutdown",
             "no neighbor 198.51.100.7 shutdown",
+            // BGP per-peer advertisement (prefix-list + soft clear + verify read)
+            "ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
+            "no ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
+            "clear ip bgp 198.51.100.7 soft out",
+            "show ip bgp neighbors 198.51.100.7 advertised-routes",
+            // interface MSS clamp + shutdown / no shutdown (+ verify reads)
+            "interface GigabitEthernet0/0",
+            "interface Port-channel1.100",
+            "ip tcp adjust-mss 1436",
+            "no ip tcp adjust-mss",
+            "shutdown",
+            "no shutdown",
+            "show interfaces GigabitEthernet0/0",
+            "show running-config interface GigabitEthernet0/0",
         ] {
             assert!(command_allowed(ok), "should allow: {ok}");
         }
@@ -872,6 +980,12 @@ mod tests {
             "configure terminal\nreload",
             "do reload",
             "write erase",
+            "ip prefix-list PL permit 192.0.2.0/24 ; reload", // chaining / extra tokens
+            "ip prefix-list PL deny 192.0.2.0/24",            // only `permit` allowed
+            "ip prefix-list PL permit notacidr",
+            "clear ip bgp 198.51.100.7 soft in", // outbound-only
+            "interface Gig 0/0",                 // whitespace in name
+            "ip tcp adjust-mss notanumber",
         ] {
             assert!(!command_allowed(bad), "should reject: {bad}");
         }

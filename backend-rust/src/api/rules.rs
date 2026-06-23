@@ -25,7 +25,19 @@ const INTERFACE_METRICS: &[&str] = &[
     "tx_pps",
     "rx_util_percent",
     "tx_util_percent",
+    "in_err_rate",
+    "out_err_rate",
     "oper_status",
+];
+
+/// Metrics that can be SUMMED across interfaces for a `sum` rule (rates only).
+const SUMMABLE_METRICS: &[&str] = &[
+    "rx_bps",
+    "tx_bps",
+    "rx_pps",
+    "tx_pps",
+    "in_err_rate",
+    "out_err_rate",
 ];
 
 /// Flow-derived metrics: evaluated against the latest closed flow bucket for the
@@ -43,6 +55,7 @@ struct RuleRow {
     interface_id: Option<u64>,
     device_id: Option<u64>,
     metric: String,
+    metric_aggregation: String,
     flow_direction: Option<String>,
     flow_protocol: Option<u16>,
     flow_port: Option<u16>,
@@ -73,6 +86,7 @@ struct RuleRow {
 /// Rule columns + resolved target names + the latest evaluation snapshot
 /// (rule_states). Note the table aliases (`r`/`i`/`d`/`rs`).
 const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.metric, \
+     r.metric_aggregation, \
      r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind, \
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
      r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, \
@@ -86,14 +100,16 @@ const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.m
      LEFT JOIN devices d ON d.id = r.device_id \
      LEFT JOIN rule_states rs ON rs.rule_id = r.id";
 
-fn rule_json(r: &RuleRow, actions: Vec<Value>) -> Value {
+fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -> Value {
     json!({
         "id": r.id,
         "name": r.name,
-        "target_kind": "interface",
+        "target_kind": if r.metric_aggregation == "sum" { "interface_group" } else { "interface" },
         "interface_id": r.interface_id,
         "device_id": r.device_id,
         "metric": r.metric,
+        "metric_aggregation": r.metric_aggregation,
+        "member_interface_ids": member_interface_ids,
         "flow_direction": r.flow_direction,
         "flow_protocol": r.flow_protocol,
         "flow_port": r.flow_port,
@@ -165,10 +181,26 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
         .collect()
 }
 
-/// Build the full rule JSON (row + its actions).
+/// Member interface ids of a `sum` rule (empty for a single-interface rule).
+async fn load_member_interfaces(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<u64> {
+    sqlx::query_scalar::<_, u64>(
+        "SELECT interface_id FROM rule_interfaces WHERE rule_id = ? ORDER BY interface_id",
+    )
+    .bind(rule_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Build the full rule JSON (row + its actions + any aggregation members).
 async fn rule_value(pool: &sqlx::MySqlPool, r: &RuleRow) -> Value {
     let actions = load_actions(pool, r.id).await;
-    rule_json(r, actions)
+    let members = if r.metric_aggregation == "sum" {
+        load_member_interfaces(pool, r.id).await
+    } else {
+        Vec::new()
+    };
+    rule_json(r, actions, members)
 }
 
 async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
@@ -206,6 +238,12 @@ pub async fn list(
 pub struct RuleBody {
     name: String,
     interface_id: Option<u64>,
+    /// 'single' (default, per-interface) or 'sum' (summed across `interface_ids`).
+    #[serde(default = "default_aggregation")]
+    metric_aggregation: String,
+    /// Member interfaces for a `sum` rule (may span devices). Ignored otherwise.
+    #[serde(default)]
+    interface_ids: Vec<u64>,
     metric: String,
     // Flow-metric selector (ignored / forced NULL for SNMP interface metrics).
     #[serde(default)]
@@ -251,6 +289,9 @@ fn default_severity() -> String {
 fn default_recovery_mode() -> String {
     "auto".to_string()
 }
+fn default_aggregation() -> String {
+    "single".to_string()
+}
 
 fn valid_recovery_mode(m: &str) -> bool {
     matches!(m, "auto" | "threshold" | "manual")
@@ -278,7 +319,50 @@ async fn validate(
             "unsupported operator".into(),
         ));
     }
-    // A rule targets an interface (v1 detection is interface-scoped).
+    // Aggregation (`sum`) rules target a SET of interfaces (possibly across
+    // devices) rather than one. They have no single owning device (device_id NULL)
+    // and list members in rule_interfaces.
+    if body.metric_aggregation == "sum" {
+        if !SUMMABLE_METRICS.contains(&body.metric.as_str()) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "a summed rule's metric must be one of: {}",
+                    SUMMABLE_METRICS.join(", ")
+                ),
+            ));
+        }
+        if body.interface_ids.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a summed rule needs at least one interface in interface_ids".into(),
+            ));
+        }
+        // Every member must exist.
+        for iid in &body.interface_ids {
+            let exists: Option<u64> =
+                sqlx::query_scalar("SELECT id FROM device_interfaces WHERE id = ?")
+                    .bind(iid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db_error".into()))?;
+            if exists.is_none() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("interface_id {iid} does not exist"),
+                ));
+            }
+        }
+        if !valid_recovery_mode(&body.recovery_mode) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "recovery_mode must be auto, threshold, or manual".into(),
+            ));
+        }
+        return Ok(None); // no single owning device
+    }
+
+    // A single rule targets one interface (v1 detection is interface-scoped).
     let Some(iface_id) = body.interface_id else {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -376,20 +460,26 @@ pub async fn create(
             (None, None, None)
         };
 
+    let is_sum = body.metric_aggregation == "sum";
+    // A summed rule owns no single interface/device; its members live in
+    // rule_interfaces (inserted below).
+    let interface_id = if is_sum { None } else { body.interface_id };
+
     let res = sqlx::query(
-        "INSERT INTO rules (name, interface_id, device_id, metric, \
+        "INSERT INTO rules (name, interface_id, device_id, metric, metric_aggregation, \
             flow_direction, flow_protocol, flow_port, flow_port_kind, \
             operator, threshold_value, \
             duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
             recovery_window_seconds, recovery_consecutive_samples, \
             severity, enabled, automatic_reroute_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
-    .bind(body.interface_id)
+    .bind(interface_id)
     .bind(device_id)
     .bind(&body.metric)
+    .bind(if is_sum { "sum" } else { "single" })
     .bind(flow_direction)
     .bind(flow_protocol)
     .bind(flow_port)
@@ -411,12 +501,36 @@ pub async fn create(
     .execute(&state.pool)
     .await;
 
-    match res {
-        Ok(r) => match fetch_rule(&state.pool, r.last_insert_id()).await {
-            Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
-            _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-        },
-        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    let rule_id = match res {
+        Ok(r) => r.last_insert_id(),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+
+    // Persist the member set for a summed rule (interface + its owning device).
+    if is_sum {
+        for iid in &body.interface_ids {
+            let dev: Option<u64> =
+                sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
+                    .bind(iid)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .unwrap_or(None);
+            let Some(dev) = dev else { continue };
+            let _ = sqlx::query(
+                "INSERT IGNORE INTO rule_interfaces (rule_id, device_id, interface_id) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(rule_id)
+            .bind(dev)
+            .bind(iid)
+            .execute(&state.pool)
+            .await;
+        }
+    }
+
+    match fetch_rule(&state.pool, rule_id).await {
+        Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
+        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
 
@@ -477,7 +591,15 @@ pub async fn update(
         }
     }
     if let Some(metric) = &body.metric {
-        if is_flow_metric(metric) {
+        if existing.metric_aggregation == "sum" {
+            // A summed rule can only change between summable metrics.
+            if !SUMMABLE_METRICS.contains(&metric.as_str()) {
+                return err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "a summed rule's metric must be a summable rate metric",
+                );
+            }
+        } else if is_flow_metric(metric) {
             // Changing into a flow metric requires the rule to already be a flow
             // rule (has a selector). Recreate the rule to change metric family.
             if existing.flow_direction.is_none() {

@@ -18,6 +18,7 @@ import {
   type BgpPeer,
   type BgpNetwork,
   type RtbhCommunity,
+  type Interface,
 } from "@/lib/api";
 
 const inputClass =
@@ -38,6 +39,7 @@ export function ActionParamsForm({
   const [peers, setPeers] = useState<BgpPeer[]>([]);
   const [networks, setNetworks] = useState<BgpNetwork[]>([]);
   const [rtbh, setRtbh] = useState<RtbhCommunity[]>([]);
+  const [interfaces, setInterfaces] = useState<Interface[]>([]);
 
   useEffect(() => {
     api.rtbh.list().then(setRtbh).catch(() => setRtbh([]));
@@ -47,10 +49,12 @@ export function ActionParamsForm({
     if (!deviceId) {
       setPeers([]);
       setNetworks([]);
+      setInterfaces([]);
       return;
     }
     api.devices.bgpPeers(deviceId).then(setPeers).catch(() => setPeers([]));
     api.devices.bgpNetworks(deviceId).then(setNetworks).catch(() => setNetworks([]));
+    api.devices.interfaces(deviceId).then(setInterfaces).catch(() => setInterfaces([]));
   }, [deviceId]);
 
   const localAsns = Array.from(
@@ -65,9 +69,13 @@ export function ActionParamsForm({
   function selectNeighbor(name: string, addr: string) {
     const next = { ...values, [name]: addr };
     const peer = peers.find((p) => p.peer_remote_addr === addr);
-    if (peer?.local_as != null) {
-      for (const [pname, spec] of Object.entries(schema)) {
-        if (spec.source === "bgp_local_as") next[pname] = String(peer.local_as);
+    for (const [pname, spec] of Object.entries(schema)) {
+      // Auto-fill params derived from the chosen neighbor.
+      if (spec.source === "bgp_local_as" && peer?.local_as != null) {
+        next[pname] = String(peer.local_as);
+      }
+      if (spec.source === "peer_out_prefix_list" && peer?.out_prefix_list) {
+        next[pname] = peer.out_prefix_list;
       }
     }
     onChange(next);
@@ -179,6 +187,52 @@ export function ActionParamsForm({
                   </option>
                 ))}
               </select>
+            </label>
+          );
+        }
+
+        if (spec.source === "interface_name") {
+          return (
+            <label key={name} className="block space-y-1 text-sm font-medium">
+              {label}
+              <select
+                className={inputClass}
+                value={values[name] ?? ""}
+                onChange={(e) => set(name, e.target.value)}
+                disabled={!deviceId}
+              >
+                <option value="">
+                  {!deviceId
+                    ? "Pick a router first"
+                    : interfaces.length
+                      ? "Select interface…"
+                      : "no interfaces discovered"}
+                </option>
+                {interfaces.map((i) => (
+                  <option key={i.id} value={i.if_name}>
+                    {i.if_name}
+                    {i.if_alias ? ` · ${i.if_alias}` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        }
+
+        if (spec.source === "peer_out_prefix_list") {
+          // Auto-filled from the chosen neighbor (see selectNeighbor); editable.
+          return (
+            <label key={name} className="block space-y-1 text-sm font-medium">
+              {label}
+              <input
+                className={inputClass}
+                value={values[name] ?? ""}
+                placeholder="from neighbor's outbound route-map"
+                onChange={(e) => set(name, e.target.value)}
+              />
+              <span className="text-[11px] font-normal text-muted-foreground">
+                auto-filled from the selected neighbor's outbound prefix-list
+              </span>
             </label>
           );
         }

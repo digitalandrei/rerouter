@@ -9,4 +9,6 @@ frontend/dist/
 *.env
 !deploy/env/rerouter.example.env
 /etc/rerouter/
-.claude/
+
+# Claude Code: agents/skills are version-controlled; only local overrides are not
+.claude/settings.local.json

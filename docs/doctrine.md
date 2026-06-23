@@ -170,21 +170,30 @@ rerouter/
 │   ├── cloudflare/README.md
 │   ├── systemd/rerouter-controller.service
 │   └── env/rerouter.example.env
-├── agents/
-│   ├── controller-agent.md
-│   ├── frontend-agent.md
-│   ├── traffic-telemetry-agent.md
-│   ├── reroute-safety-agent.md
-│   └── database-agent.md
-└── skills/
-    ├── rust-axum-sqlx.md
-    ├── rust-auth-2fa.md
-    ├── react-shadcn-spa.md
-    ├── ddos-mitigation.md
-    ├── traffic-telemetry.md
-    ├── cloudflare-api.md
-    └── bgp-reroute-safety.md
+└── .claude/                     (version-controlled; agents/skills live here so
+    │                             the Claude Code harness auto-discovers them)
+    ├── settings.json
+    ├── agents/
+    │   ├── controller-agent.md
+    │   ├── frontend-agent.md
+    │   ├── traffic-telemetry-agent.md
+    │   ├── reroute-safety-agent.md
+    │   └── database-agent.md
+    └── skills/
+        ├── rust-axum-sqlx.md
+        ├── rust-auth-2fa.md
+        ├── react-shadcn-spa.md
+        ├── ddos-mitigation.md
+        ├── traffic-telemetry.md
+        ├── cloudflare-api.md
+        ├── bgp-reroute-safety.md
+        └── improve/             (read-only senior-advisor audit skill:
+                                  SKILL.md + references/)
 ```
+
+`.claude/` is intentionally checked into version control (only
+`.claude/settings.local.json` is git-ignored) so agents and skills are shared
+with the team **and** auto-discovered by the Claude Code harness.
 
 ---
 
@@ -276,7 +285,7 @@ Core pages: `/login` (password → TOTP challenge; first-login TOTP enrollment),
 | **Device** | A network device we manage — a Cisco IOS edge router reached by SNMP (telemetry) and SSH (execution). |
 | **Interface** | A monitored interface on a device; telemetry and detection rules target interfaces. |
 | **Telemetry sample** | A normalized traffic measurement for an interface over an interval (SNMP poll). |
-| **Detection rule** | A stateful threshold/condition that fires when an interface's metric matches for a duration / sample count. |
+| **Detection rule** | A stateful threshold/condition that fires when a metric matches for a duration / sample count. The metric is either a single interface's value or the **sum** of a chosen metric (rx/tx bps/pps) across a configured set of interfaces — which may span multiple devices. Conditions may also threshold interface **error rates** (`in_err_rate`/`out_err_rate`). |
 | **Reroute template** | An allowlisted, parameterized device-CLI mitigation (Null0 RTBH announce/withdraw, upstream-tagged blackhole, BGP session enable/disable). |
 | **Reroute (action)** | A single, audited execution of a template against a target device, driven by a state machine. A rule's actions live in `rule_actions` (template + device + params; one rule may drive several routers). |
 | **Lock / cooldown** | Device-scoped safety controls that block actions when state is unsafe or recently changed. |
@@ -304,6 +313,27 @@ catalog (the only way a reroute runs) is:
    (`neighbor … shutdown`).
 6. **`bgp_session_enable`** — bring the neighbor back up (`no … shutdown`;
    rollback of #5).
+7. **`bgp_advertise_add`** — start advertising a prefix toward one upstream BGP
+   peer by adding the prefix to that peer's **outbound route-map's prefix-list**,
+   then `clear ip bgp <neighbor> soft out`. Used for inbound traffic engineering:
+   shift an attacked prefix onto a less-saturated upstream.
+8. **`bgp_advertise_remove`** — stop advertising the prefix toward that upstream
+   (remove the prefix-list entry + soft clear; rollback of #7). "Advertise on
+   other peer(s)" is the same `bgp_advertise_add` template fanned out as extra
+   `rule_actions` targeting the other neighbor(s).
+9. **`iface_tcp_adjust_mss`** — set `ip tcp adjust-mss <mss>` (default 1436) on an
+   interface when a rule activates (MSS clamp).
+10. **`iface_tcp_adjust_mss_remove`** — remove the MSS clamp (rollback of #9).
+11. **`iface_shutdown`** — administratively shut an interface (`shutdown`). A
+    **disruptive** action: it black-holes everything on that link. Guarded against
+    the controller's own management/transit path (see §8).
+12. **`iface_no_shutdown`** — bring the interface back up (`no shutdown`; rollback
+    of #11).
+
+A **combination** (e.g. remove-from-saturated-upstream + advertise-on-others +
+MSS clamp) is expressed as an ordered set of `rule_actions` on one rule — each
+action keeps its own verification and rollback — not a single opaque composite
+template. The UI may offer a one-click preset that attaches such a bundle.
 
 Every method is an action template (see [reroute-engine.md](reroute-engine.md))
 with a parameter schema, verification, and a rollback template. The earlier
@@ -349,8 +379,18 @@ order. The live gates are **device-scoped** (in `enforce` mode):
 - no repeated action inside the per-device cooldown window;
 - no repeated action from the same rule inside the per-rule cooldown window;
 - no action once the global action rate limit for the window is reached;
+- **no interface-level disruptive action (`iface_shutdown`, `iface_tcp_adjust_mss`)
+  on a protected interface** — the executor resolves the target interface and
+  blocks if it is flagged `protected` (the device's management/transit/SSH path).
+  This prevents the controller from black-holing or cutting its own path to the
+  device (self-lockout). Returns a `blocked_reason`; the command is never pushed;
 - (manual triggers additionally require the `trigger_manual_reroute`
   permission, enforced by the API before `execute` is called).
+
+Interface shutdown is the most destructive template in the catalog. Like every
+other action it is blocked entirely in `observe` mode and, in `enforce` mode,
+requires the global automatic switch **and** the per-rule switch before it can
+fire automatically. Never weaken these defaults.
 
 The per-template "safety level", the provider/asset-reachability gate, the
 detection-confidence gate, the telemetry-stale gate, and the
@@ -399,16 +439,27 @@ controls, and the device-scoped execution gates (§7, §8). See
 
 ## 10. Email alerts
 
-Rerouter sends email alerts from the controller itself via SMTP (lettre,
-rustls) on: rule fired (`rule_fired` — carrying the would-run action plan in
-observe mode), reroute started/succeeded/failed, action `uncertain`, device
-unreachable, telemetry stale, and lock created/cleared. An internal async alert
-dispatcher task reads new `alerts` rows, resolves recipients/subscriptions,
-de-duplicates (10-minute window, keyed on the `alerts.dedup_key` — for firing
-alerts `rule_fired:rule:<id>:iface:<id>`), rate-limits (20/hr per recipient with
-digest fallback), sends, and records `alert_deliveries`. `reroute_uncertain`,
+Rerouter sends alerts from the controller itself on: rule fired (`rule_fired` —
+carrying the would-run action plan in observe mode), reroute
+started/succeeded/failed, action `uncertain`, device unreachable, telemetry
+stale, and lock created/cleared. There are two delivery channels:
+
+- **email** via SMTP (lettre, rustls) — SMTP credentials come from the
+  environment (`SMTP_*`); recipients/subscriptions are managed in the DB and via
+  the `/settings` notifications UI;
+- **Microsoft Teams** via incoming webhook (HTTP POST of a MessageCard) —
+  endpoint URLs are stored **encrypted at rest** (AES-256-GCM, `crypto::seal`)
+  in `webhook_endpoints`, managed via the same `/settings` notifications UI with
+  per-event-type routing and a test-send. Webhook URLs are never logged or echoed.
+
+An internal async alert dispatcher task reads new `alerts` rows, resolves
+recipients/subscriptions per channel, de-duplicates (10-minute window, keyed on
+the `alerts.dedup_key` — for firing alerts `rule_fired:rule:<id>:iface:<id>`),
+rate-limits (20/hr per recipient), sends over each channel, and records
+`alert_deliveries` (`channel` ∈ {`email`, `teams`}). `reroute_uncertain`,
 `reroute_failed`, and security events are always sent immediately and never
-collapsed. See [email-alerts.md](email-alerts.md).
+collapsed. No alert payload (email or Teams) ever contains a secret. See
+[email-alerts.md](email-alerts.md).
 
 ---
 

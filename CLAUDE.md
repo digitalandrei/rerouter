@@ -8,8 +8,9 @@ action path as dangerous by default.
 
 - [docs/doctrine.md](docs/doctrine.md) is the source of truth. When in doubt,
   follow the doctrine. If a request conflicts with it, surface the conflict.
-- Per-area detail lives in `docs/`. Agents and skills live in `agents/` and
-  `skills/`.
+- Per-area detail lives in `docs/`. Agents and skills live in `.claude/agents/`
+  and `.claude/skills/` (version-controlled, so the Claude Code harness
+  auto-discovers them).
 
 ## Hard rules
 
