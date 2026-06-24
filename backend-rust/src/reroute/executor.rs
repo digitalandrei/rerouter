@@ -20,6 +20,7 @@ use sqlx::MySqlPool;
 
 use crate::config::Config;
 use crate::detection::cooldown;
+use crate::reroute::guard;
 use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template, VerifyStep};
 use crate::ssh::{RusshExecutor, SshExecutor};
@@ -140,144 +141,17 @@ async fn execute_with<S: SshExecutor>(
         };
     }
 
-    // Protected-interface guard — refuse a disruptive interface action
-    // (shutdown / MSS clamp) on the device's management/transit path, so the
-    // controller cannot black-hole or cut its own path to the device. Applies to
-    // manual, automatic, and rollback triggers alike. (Observe mode and dry-run
-    // returned above, so this only blocks real executions.)
-    if let Some(reason) =
-        protected_interface_block(pool, req.device_id, &req.template, &req.params).await
-    {
-        return blocked(&req, device_name, reason);
+    // Safety gates — gather the facts from the DB, then a PURE decision over them
+    // (see reroute::guard). Order and semantics match the historical gates, so a
+    // blocked action reports the same reason it always did.
+    if let Err(reason) = guard::can_execute(pool, cfg, &req, &plan).await {
+        return blocked(&req, device_name, reason.to_string());
     }
 
-    // Global automatic master switch — gates AUTOMATIC triggers ONLY (manual and
-    // rollback have their own upstream permission checks and must not be disabled
-    // by this switch). Doctrine: automatic execution needs enforce mode AND this
-    // global enable AND the per-rule enable. The runtime value lives in
-    // system_settings; config is only the startup fallback.
-    if req.trigger_type == "automatic"
-        && !crate::api::settings::bool_setting(
-            pool,
-            "automatic_actions_enabled",
-            cfg.safety.automatic_actions_enabled,
-        )
-        .await
-    {
-        return blocked(
-            &req,
-            device_name,
-            "automatic actions are globally disabled (automatic_actions_enabled = false)".into(),
-        );
-    }
-
-    // Verify-or-refuse: when verification is required, an action whose template
-    // has NO verification step can never be confirmed. Never auto-run such a
-    // template; for manual/rollback it still runs but the state machine forces an
-    // `uncertain` outcome instead of reporting success (see run_state_machine).
-    if cfg.reroute.require_verification && plan.verify.is_none() && req.trigger_type == "automatic"
-    {
-        return blocked(
-            &req,
-            device_name,
-            "template has no verification step and reroute.require_verification is enabled".into(),
-        );
-    }
-
-    // Safety gates (device-scoped).
-    if crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await {
-        return blocked(
-            &req,
-            device_name,
-            "global maintenance lock is active".into(),
-        );
-    }
-    if locks::is_blocked(pool, "device", &device_ref)
-        .await
-        .unwrap_or(true)
-    {
-        return blocked(
-            &req,
-            device_name,
-            "device is locked (a prior action needs admin acknowledgement)".into(),
-        );
-    }
-    // NOTE: the "already running on this device" and "unresolved uncertain"
-    // guards are re-checked atomically with the INSERT under a per-device
-    // advisory lock below (see reserve_reroute_slot), so two concurrent triggers
-    // cannot both pass them and double-apply config to one device.
-    if let Ok(Some(until)) = cooldown::active_until(pool, "device", &device_ref).await {
-        return blocked(
-            &req,
-            device_name,
-            format!("device is in cooldown until {}", until.to_rfc3339()),
-        );
-    }
-    // Per-rule re-fire throttle (only for rule-triggered actions).
-    if let Some(rule_id) = req.rule_id {
-        if let Ok(Some(until)) = cooldown::active_until(pool, "rule", &rule_id.to_string()).await {
-            return blocked(
-                &req,
-                device_name,
-                format!("rule {rule_id} is in cooldown until {}", until.to_rfc3339()),
-            );
-        }
-    }
-    // Global circuit breaker: cap executed actions per rolling window across all
-    // devices. Counts real reroute rows (manual + automatic + rollback).
-    let rl_count = cfg.safety.global_action_rate_limit_count;
-    if rl_count > 0 {
-        let recent =
-            recent_reroute_count(pool, cfg.safety.global_action_rate_limit_window_seconds).await;
-        if recent >= rl_count as i64 {
-            return blocked(
-                &req,
-                device_name,
-                format!(
-                    "global action rate limit reached ({recent} in {}s; max {rl_count})",
-                    cfg.safety.global_action_rate_limit_window_seconds
-                ),
-            );
-        }
-    }
-
-    // Reserve a slot under a per-device advisory lock: the already-running /
-    // uncertain re-checks and the INSERT happen atomically, so two concurrent
-    // triggers cannot both pass the guard and push config to the same device.
-    let lock_name = format!("reroute_dev_{}", req.device_id);
-    let mut guard = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            return blocked(
-                &req,
-                device_name,
-                format!("could not acquire device guard: {e}"),
-            )
-        }
-    };
-    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
-        .bind(&lock_name)
-        .fetch_one(&mut *guard)
-        .await
-        .ok()
-        .flatten();
-    if got != Some(1) {
-        return blocked(
-            &req,
-            device_name,
-            "could not acquire the per-device reroute guard (another action is being set up)"
-                .into(),
-        );
-    }
-    let reserved = reserve_reroute_slot(pool, &req, &plan).await;
-    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-        .bind(&lock_name)
-        .execute(&mut *guard)
-        .await;
-    drop(guard);
-    let reroute_id = match reserved {
+    // Reserve a slot under a per-device advisory lock (atomic re-check + INSERT).
+    let reroute_id = match guard::reserve_and_persist(pool, &req, &plan).await {
         Ok(id) => id,
-        Err(reason) => return blocked(&req, device_name, reason),
+        Err(reason) => return blocked(&req, device_name, reason.to_string()),
     };
     audit(
         pool,
@@ -448,26 +322,6 @@ fn final_state_without_verification(applied_ok: bool, require_verification: bool
     }
 }
 
-/// Reserve a reroute row for this device while the caller holds the per-device
-/// advisory lock: re-check the device-scoped guards (already-running / uncertain)
-/// and INSERT atomically. `Err(reason)` means blocked. Pairing the checks with
-/// the INSERT under one lock is what closes the concurrent double-apply race.
-async fn reserve_reroute_slot(
-    pool: &MySqlPool,
-    req: &ActionRequest,
-    plan: &RenderedPlan,
-) -> Result<u64, String> {
-    if running_on_device(pool, req.device_id).await {
-        return Err("another reroute is already running on this device".into());
-    }
-    if has_uncertain(pool, req.device_id).await {
-        return Err("an unresolved uncertain action exists on this device".into());
-    }
-    insert_reroute(pool, req, plan)
-        .await
-        .map_err(|e| format!("could not persist reroute: {e}"))
-}
-
 /// Run the verification `show` read and judge it (substring expect/reject).
 async fn verify<S: SshExecutor>(
     pool: &MySqlPool,
@@ -617,44 +471,6 @@ async fn finalize(
 
 // ---- persistence helpers -------------------------------------------------------
 
-async fn insert_reroute(
-    pool: &MySqlPool,
-    req: &ActionRequest,
-    plan: &RenderedPlan,
-) -> anyhow::Result<u64> {
-    let steps = json!({ "commands": plan.commands, "verify": plan.verify });
-    let res = sqlx::query(
-        "INSERT INTO reroutes \
-            (device_id, rule_id, reroute_template_id, trigger_type, triggered_by_user_id, \
-             state, reason, parameters_json, planned_steps_json) \
-         VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
-    )
-    .bind(req.device_id)
-    .bind(req.rule_id)
-    .bind(req.template.id)
-    .bind(req.trigger_type)
-    .bind(req.user_id)
-    .bind(&req.reason)
-    .bind(sqlx::types::Json(&req.params))
-    .bind(sqlx::types::Json(&steps))
-    .execute(pool)
-    .await?;
-    let reroute_id = res.last_insert_id();
-
-    for (i, cmd) in plan.commands.iter().enumerate() {
-        let _ = sqlx::query(
-            "INSERT INTO reroute_steps (reroute_id, step_number, description, mode, state) \
-             VALUES (?, ?, ?, 'ios_ssh', 'planned')",
-        )
-        .bind(reroute_id)
-        .bind((i + 1) as u32)
-        .bind(cmd)
-        .execute(pool)
-        .await;
-    }
-    Ok(reroute_id)
-}
-
 async fn persist_output(
     pool: &MySqlPool,
     reroute_id: u64,
@@ -757,87 +573,6 @@ async fn device_name(pool: &MySqlPool, device_id: u64) -> Option<String> {
         .await
         .ok()
         .flatten()
-}
-
-/// Block disruptive interface actions targeting a `protected` interface (the
-/// device's management / transit / SSH path). Returns `Some(reason)` to block,
-/// `None` to proceed. A template "targets an interface" when its parameter schema
-/// has a param with `source: "interface_name"`; the guard resolves that param's
-/// value and matches it against `device_interfaces.if_name`/`if_descr`. Templates
-/// without such a param (BGP, null-route, etc.) are never blocked here. An
-/// unknown / unmatched interface name proceeds (the command is still gated by the
-/// operating mode and the other safety gates).
-async fn protected_interface_block(
-    pool: &MySqlPool,
-    device_id: u64,
-    template: &Template,
-    params: &Value,
-) -> Option<String> {
-    // Find the interface-name parameter, if any.
-    let schema = template.parameter_schema.as_object()?;
-    let iface_param = schema.iter().find_map(|(name, spec)| {
-        (spec.get("source").and_then(Value::as_str) == Some("interface_name")).then(|| name.clone())
-    })?;
-    let iface = params
-        .get(&iface_param)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-
-    let protected: Option<i64> = sqlx::query_scalar(
-        "SELECT protected FROM device_interfaces \
-         WHERE device_id = ? AND (if_name = ? OR if_descr = ?) ORDER BY protected DESC LIMIT 1",
-    )
-    .bind(device_id)
-    .bind(iface)
-    .bind(iface)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-
-    match protected {
-        Some(p) if p != 0 => Some(format!(
-            "interface '{iface}' is flagged as a protected management/transit path; \
-             disruptive interface actions on it are blocked to prevent self-lockout"
-        )),
-        _ => None,
-    }
-}
-
-async fn running_on_device(pool: &MySqlPool, device_id: u64) -> bool {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state IN ('planned','pending','running','verifying')",
-    )
-    .bind(device_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(1);
-    n > 0
-}
-
-async fn has_uncertain(pool: &MySqlPool, device_id: u64) -> bool {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state = 'uncertain'",
-    )
-    .bind(device_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(1);
-    n > 0
-}
-
-/// Count reroute rows created within the last `window_secs` (the global
-/// rate-limit window). On a DB error, returns the limit's worst case via a large
-/// number so the breaker fails safe (blocks).
-async fn recent_reroute_count(pool: &MySqlPool, window_secs: u64) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM reroutes WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
-    )
-    .bind(window_secs as i64)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(i64::MAX)
 }
 
 fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> ExecOutcome {

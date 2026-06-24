@@ -278,7 +278,12 @@ impl SshExecutor for RusshExecutor {
                 "verify_read refuses a non-read command: {command:?}"
             ));
         }
-        let outcome = run_commands(&self.pool, device_id, std::slice::from_ref(&command.to_string())).await?;
+        let outcome = run_commands(
+            &self.pool,
+            device_id,
+            std::slice::from_ref(&command.to_string()),
+        )
+        .await?;
         Ok(outcome
             .results
             .first()
@@ -639,7 +644,9 @@ fn is_u32(tok: &str) -> bool {
 /// `a.b.c.d/len` (IPv4 CIDR, len 0..=32) — used by prefix-list entries.
 fn is_cidr(tok: &str) -> bool {
     match tok.split_once('/') {
-        Some((ip, len)) => ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 32),
+        Some((ip, len)) => {
+            ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 32)
+        }
         None => false,
     }
 }
