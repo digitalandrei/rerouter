@@ -227,6 +227,66 @@ pub struct SshOutcome {
     pub pinned_now: bool,
 }
 
+// ---- Executor port (seam) ------------------------------------------------------
+
+/// The seam the reroute `Rerouter` depends on to talk to a device. Two methods
+/// encode the session invariant: `apply` pushes config in ONE session (config
+/// mode must persist across the commands); `verify_read` opens a SEPARATE,
+/// read-only session for one `show`. `RusshExecutor` is the real adapter; tests
+/// inject a fake. Generic (not `dyn`) so we need no `async-trait` dependency;
+/// the `+ Send` bound keeps the futures usable from spawned tasks.
+pub trait SshExecutor: Send + Sync {
+    /// Push `commands` in order over one session and return each command's output.
+    fn apply(
+        &self,
+        device_id: u64,
+        commands: &[String],
+    ) -> impl std::future::Future<Output = Result<SshOutcome>> + Send;
+
+    /// Run one read-only `show` in a fresh session and return its cleaned output.
+    fn verify_read(
+        &self,
+        device_id: u64,
+        command: &str,
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
+}
+
+/// The production adapter: real russh over the wire (credential decrypt, host-key
+/// TOFU, and the fail-closed allowlist all live behind it, in `run_commands` /
+/// `run_on`). Holds a pool handle (cheap to clone — sqlx pools are reference
+/// counted) because credential load + TOFU persistence need it.
+pub struct RusshExecutor {
+    pool: MySqlPool,
+}
+
+impl RusshExecutor {
+    pub fn new(pool: MySqlPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl SshExecutor for RusshExecutor {
+    async fn apply(&self, device_id: u64, commands: &[String]) -> Result<SshOutcome> {
+        run_commands(&self.pool, device_id, commands).await
+    }
+
+    async fn verify_read(&self, device_id: u64, command: &str) -> Result<String> {
+        // Defense in depth: the verify path must never mutate. Every template
+        // verify step is a `show`, so this only rejects a misconfigured one.
+        if !command.trim_start().starts_with("show ") {
+            return Err(anyhow!(
+                "verify_read refuses a non-read command: {command:?}"
+            ));
+        }
+        let outcome = run_commands(&self.pool, device_id, std::slice::from_ref(&command.to_string())).await?;
+        Ok(outcome
+            .results
+            .first()
+            .map(|r| r.output.clone())
+            .unwrap_or_default())
+    }
+}
+
 // ---- Host-key handler (TOFU) ---------------------------------------------------
 
 struct TofuHandler {

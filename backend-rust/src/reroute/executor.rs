@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::detection::cooldown;
 use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template, VerifyStep};
-use crate::ssh;
+use crate::ssh::{RusshExecutor, SshExecutor};
 
 /// What to run and on whose behalf.
 pub struct ActionRequest {
@@ -51,10 +51,54 @@ pub struct ExecOutcome {
     pub device_name: Option<String>,
 }
 
-/// Execute (or render/observe/dry-run) one action against one device.
+/// The reroute engine. Holds its SSH transport behind the [`SshExecutor`] seam
+/// (real russh in prod, a fake in tests) plus the pool and config. Exposes one
+/// public method, `execute`; the `ExecOutcome` contract is unchanged.
+pub struct Rerouter<'a, S: SshExecutor> {
+    pool: &'a MySqlPool,
+    cfg: &'a Config,
+    ssh: S,
+}
+
+impl<'a> Rerouter<'a, RusshExecutor> {
+    /// Production constructor — builds the real russh adapter.
+    pub fn new(pool: &'a MySqlPool, cfg: &'a Config) -> Self {
+        Self {
+            pool,
+            cfg,
+            ssh: RusshExecutor::new(pool.clone()),
+        }
+    }
+}
+
+impl<'a, S: SshExecutor> Rerouter<'a, S> {
+    /// Inject a custom SSH executor (tests pass a fake).
+    pub fn with_ssh(pool: &'a MySqlPool, cfg: &'a Config, ssh: S) -> Self {
+        Self { pool, cfg, ssh }
+    }
+
+    /// Execute (or render/observe/dry-run) one action against one device.
+    pub async fn execute(&self, req: ActionRequest, dry_run: bool) -> ExecOutcome {
+        execute_with(self.pool, self.cfg, &self.ssh, req, dry_run).await
+    }
+}
+
+/// Back-compat free function: build the real `Rerouter` and run it. Keeps the
+/// existing call sites (manual API, detection engine, rollback) unchanged.
 pub async fn execute(
     pool: &MySqlPool,
     cfg: &Config,
+    req: ActionRequest,
+    dry_run: bool,
+) -> ExecOutcome {
+    Rerouter::new(pool, cfg).execute(req, dry_run).await
+}
+
+/// Core orchestration, generic over the [`SshExecutor`] seam.
+async fn execute_with<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    ssh: &S,
     req: ActionRequest,
     dry_run: bool,
 ) -> ExecOutcome {
@@ -258,6 +302,7 @@ pub async fn execute(
 
     let final_state = run_state_machine(
         pool,
+        ssh,
         &req,
         reroute_id,
         &plan,
@@ -307,8 +352,9 @@ pub async fn execute(
 
 /// Push the apply commands, verify the result, finalize the state. Returns the
 /// final state string. Persists before/after each phase.
-async fn run_state_machine(
+async fn run_state_machine<S: SshExecutor>(
     pool: &MySqlPool,
+    ssh: &S,
     req: &ActionRequest,
     reroute_id: u64,
     plan: &RenderedPlan,
@@ -332,7 +378,7 @@ async fn run_state_machine(
 
     // Apply over a single SSH session (config mode state must persist across the
     // command sequence, so this cannot be split into per-command sessions).
-    let apply = ssh::run_commands(pool, req.device_id, &plan.commands).await;
+    let apply = ssh.apply(req.device_id, &plan.commands).await;
     let applied_ok = match &apply {
         Ok(out) => {
             for (i, r) in out.results.iter().enumerate() {
@@ -367,7 +413,7 @@ async fn run_state_machine(
         .bind(reroute_id)
         .execute(pool)
         .await;
-    let verdict = verify(pool, req, reroute_id, plan).await;
+    let verdict = verify(pool, ssh, req, reroute_id, plan).await;
 
     let final_state = match verdict {
         Verdict::Pass => "succeeded",
@@ -423,8 +469,9 @@ async fn reserve_reroute_slot(
 }
 
 /// Run the verification `show` read and judge it (substring expect/reject).
-async fn verify(
+async fn verify<S: SshExecutor>(
     pool: &MySqlPool,
+    ssh: &S,
     req: &ActionRequest,
     reroute_id: u64,
     plan: &RenderedPlan,
@@ -432,13 +479,8 @@ async fn verify(
     let Some(vstep) = plan.verify.as_ref() else {
         return Verdict::None;
     };
-    match ssh::run_commands(pool, req.device_id, std::slice::from_ref(&vstep.command)).await {
-        Ok(out) => {
-            let output = out
-                .results
-                .first()
-                .map(|r| r.output.clone())
-                .unwrap_or_default();
+    match ssh.verify_read(req.device_id, &vstep.command).await {
+        Ok(output) => {
             let pass = judge(&output, vstep);
             persist_verification(
                 pool,
