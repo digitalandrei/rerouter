@@ -353,6 +353,9 @@ export interface RuleAction {
   params: Record<string, unknown>;
   enabled: boolean;
   position: number;
+  /** "flow_dst_host" = resolve the null-route/blackhole host (/32 or /128) from
+   *  the rule's flows at fire/apply time; null/absent = static prefix in params. */
+  auto_target?: string | null;
 }
 
 /** Comparison operators accepted by the rules API (backend rules.rs validation). */
@@ -385,6 +388,9 @@ export interface Rule {
   severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;
+  /** Opt-in: operators may manually apply this rule's actions from a firing alert
+   *  (off by default). Still gated like any manual reroute at apply time. */
+  manual_apply_enabled: boolean;
   reroute_template_id: number | null;
   action_count?: number;
   actions?: RuleAction[];
@@ -487,6 +493,10 @@ export interface RerouteResult {
   would_run?: RenderedPlan | null;
   device_id: number;
   device_name?: string | null;
+  /** Set on a rule-apply result for a flow auto-target action: the resolved host
+   *  CIDR (/32 or /128) and whether the flow sampling was low-confidence. */
+  auto_target?: string | null;
+  auto_target_low_confidence?: boolean;
 }
 
 export interface ManualReroutePayload {
@@ -790,12 +800,24 @@ export const api = {
       request<{ ok: boolean; cleared: boolean }>(`/api/rules/${id}/clear`, {
         method: "POST",
       }),
+    /** Manually apply a firing rule's configured actions (the supervised
+     *  alternative to automatic execution). Gated server-side: requires the
+     *  rule's manual_apply_enabled, the rule to be firing, and (to actually
+     *  execute) enforce mode + trigger_manual_reroute. In observe mode each
+     *  result carries the would-run plan and nothing executes. */
+    apply: (id: number, body?: { reason?: string; dry_run?: boolean }) =>
+      request<{ results: RerouteResult[] }>(`/api/rules/${id}/apply`, {
+        method: "POST",
+        body: body ?? {},
+      }),
     addAction: (
       ruleId: number,
       body: {
         reroute_template_id: number;
         device_id: number;
         params: Record<string, unknown>;
+        /** "flow_dst_host" to auto-target the attacked dst IP (flow rules only). */
+        auto_target?: string | null;
       },
     ) => request<Rule>(`/api/rules/${ruleId}/actions`, { method: "POST", body }),
     removeAction: (ruleId: number, actionId: number) =>

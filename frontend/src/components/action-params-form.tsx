@@ -30,11 +30,14 @@ export function ActionParamsForm({
   deviceId,
   values,
   onChange,
+  omitParams,
 }: {
   schema: Record<string, TemplateParamSpec>;
   deviceId: number | null;
   values: Record<string, string>;
   onChange: (next: Record<string, string>) => void;
+  /** Parameter names to skip rendering (e.g. "prefix" when auto-targeting). */
+  omitParams?: Set<string>;
 }) {
   const [peers, setPeers] = useState<BgpPeer[]>([]);
   const [networks, setNetworks] = useState<BgpNetwork[]>([]);
@@ -83,7 +86,7 @@ export function ActionParamsForm({
 
   return (
     <div className="grid gap-3 sm:grid-cols-2">
-      {Object.entries(schema).map(([name, spec]) => {
+      {Object.entries(schema).filter(([name]) => !omitParams?.has(name)).map(([name, spec]) => {
         const label = (
           <>
             {spec.label ?? name} <span className="text-muted-foreground">({spec.type})</span>

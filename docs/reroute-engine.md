@@ -237,6 +237,49 @@ Manual reroutes are first-class:
 Manual reroutes support **dry-run**: render the exact plan without changing any
 routing (in observe mode every trigger behaves this way regardless).
 
+### Apply a firing rule's mitigation (supervised path)
+
+Between alert-only and unattended automatic execution there is a supervised
+middle ground: an operator manually applies a *firing* rule's own configured
+actions from its alert (Alerts page) or from the dashboard's active-matches list.
+`POST /api/rules/{id}/apply` is opt-in per rule (`rules.manual_apply_enabled`,
+default off, set in the rule editor) and **only permitted while the rule's state
+is `firing`** (you mitigate a live breach, not a cleared one). It runs each
+enabled `rule_action` through the *same* gated executor as a `manual` trigger
+attributed to the operator, so it inherits every protection: blocked in observe
+mode (returns the would-run plan per action), requires `trigger_manual_reroute`,
+and honours device locks, the global maintenance lock, per-device and per-rule
+cooldowns, the rate limit, and the protected-interface guard. Because the trigger
+is `manual`, the global **automatic** master switch does not gate it — this is a
+deliberate operator action — but `rule_id` is set, so the per-rule cooldown still
+applies. This is distinct from `automatic_reroute_enabled` (hands-off execution
+on the firing edge); a rule may enable either, both, or neither.
+
+### Flow auto-target (derive the host from flow data)
+
+A null-route / blackhole action on a **flow rule** (e.g. TCP dport 443) can be
+marked **auto-target** (`rule_actions.auto_target = 'flow_dst_host'`) instead of
+carrying a fixed prefix. At fire / apply time the engine resolves the heaviest
+**destination** IP in the matching flows (the rule's interface + direction +
+protocol + port selector, over a short recent window) and null-routes it as a
+`/32` (IPv4) or `/128` (IPv6). The IPv4 host reuses `null_route_prefix` /
+`blackhole_prefix`; an IPv6 victim swaps to the template's `v6_sibling_template_id`
+(`null_route_prefix_v6`), since IPv6 uses `ipv6 route <pfx>/128 Null0` and the
+renderer is family-aware (a `cidr` param pinned `family:"v6"`).
+
+Guardrails (see [flow-telemetry.md](flow-telemetry.md)):
+
+- **Containment** — the resolved host MUST fall inside one of the null-route
+  device's announced prefixes (`device_bgp_networks`); otherwise the action is
+  skipped (never executed). If the device has no discovered prefixes, auto-target
+  refuses and asks for prefix discovery. We only ever black-hole our own space.
+- **Sampling confidence** — a LOW-confidence flow reading **blocks automatic**
+  execution (doctrine); a manual apply still proceeds (the operator sees the
+  resolved IP). Either way the resolved host is rendered into the would-run plan
+  before anything runs.
+- Auto-target is only attachable to a flow rule + a host-route template (enforced
+  by the API); the prefix param is resolved, not typed.
+
 ## Rollback
 
 Every disruptive template defines a rollback (its paired inverse, via

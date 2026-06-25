@@ -200,6 +200,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
                   device_id: null,
                   enabled: true,
                   automatic_reroute_enabled: false,
+                  manual_apply_enabled: false,
                   reroute_template_id: null,
                 }
               : {
@@ -209,6 +210,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
                   device_id: parseInt(form.device_id, 10),
                   enabled: true,
                   automatic_reroute_enabled: false,
+                  manual_apply_enabled: false,
                   reroute_template_id: null,
                 },
           )

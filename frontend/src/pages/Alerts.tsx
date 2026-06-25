@@ -5,9 +5,12 @@
  * rule that fired and its device/interface (by NAME, falling back to #id), the
  * metric value vs threshold from payload, the timestamp, and the would-run
  * action plan from payload when present (observe mode).
+ *
+ * For rule_fired alerts where the rule is still firing AND manual_apply_enabled,
+ * an "Apply mitigation" button opens ApplyMitigationDialog.
  */
-import { useEffect, useState } from "react";
-import { api, type AlertPage } from "@/lib/api";
+import { useEffect, useState, useCallback } from "react";
+import { api, type AlertPage, type Rule, type SystemSettings } from "@/lib/api";
 import {
   Card,
   CardContent,
@@ -16,6 +19,8 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { SeverityBadge } from "@/components/status-badge";
+import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
+import { useAuth } from "@/lib/auth";
 
 const PAGE_SIZE = 50;
 const DAYS = 7;
@@ -51,12 +56,52 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="font-medium text-amber-700 dark:text-amber-400">Would run: </span>
           {wouldRunActions.map((a, i) => {
-            const t = typeof a.template_name === "string" ? a.template_name : "action";
+            const dn = typeof a.template_display_name === "string" ? a.template_display_name : null;
+            const tn = typeof a.template_name === "string" ? a.template_name : "action";
+            const displayName = dn || tn;
             const d = typeof a.device_name === "string" ? a.device_name : "device";
+            // auto_target may be an object {resolved_cidr, low_confidence, note}
+            // or a "skipped" string when the host couldn't be resolved.
+            const at = a.auto_target;
+            const atObj =
+              at !== null &&
+              at !== undefined &&
+              typeof at === "object" &&
+              !Array.isArray(at)
+                ? (at as { resolved_cidr?: string; low_confidence?: boolean; note?: string })
+                : null;
+            const atSkipped = typeof at === "string" ? at : null;
             return (
-              <code key={i}>
-                {t} on {d}
-              </code>
+              <span key={i} className="inline-flex flex-wrap items-center gap-1">
+                <code>{displayName}</code>
+                {dn && dn !== tn && (
+                  <span className="text-muted-foreground/60">({tn})</span>
+                )}
+                <span className="text-muted-foreground">on {d}</span>
+                {atObj?.resolved_cidr && (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="rounded bg-amber-100 px-1 font-mono text-[10px] text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                      {atObj.resolved_cidr}
+                    </span>
+                    {atObj.low_confidence && (
+                      <span
+                        className="rounded bg-red-100 px-1 text-[10px] text-red-700 dark:bg-red-900/40 dark:text-red-400"
+                        title={atObj.note ?? "Low flow-sampling confidence — auto execution blocked; manual apply still works"}
+                      >
+                        low sampling confidence
+                      </span>
+                    )}
+                  </span>
+                )}
+                {atSkipped && (
+                  <span
+                    className="rounded bg-muted px-1 text-[10px] text-muted-foreground"
+                    title="Could not resolve target host from flows"
+                  >
+                    skipped: {atSkipped}
+                  </span>
+                )}
+              </span>
             );
           })}
         </div>
@@ -73,11 +118,17 @@ function label(name: string | null, id: number | null, prefix: string): string |
 }
 
 export default function Alerts() {
+  const { hasPermission } = useAuth();
+  const canApply = hasPermission("trigger_manual_reroute");
+
   const [page, setPage] = useState<AlertPage | null>(null);
   const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [rulesMap, setRulesMap] = useState<Map<number, Rule>>(new Map());
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [applyRule, setApplyRule] = useState<Rule | null>(null);
 
-  useEffect(() => {
+  const loadAlerts = useCallback(() => {
     setLoading(true);
     api.alerts
       .list({ limit: PAGE_SIZE, offset, days: DAYS })
@@ -85,6 +136,31 @@ export default function Alerts() {
       .catch(() => setPage(null))
       .finally(() => setLoading(false));
   }, [offset]);
+
+  useEffect(() => {
+    loadAlerts();
+  }, [loadAlerts]);
+
+  // Load rules once (for joining with alert.rule_id to get firing state +
+  // manual_apply_enabled). Refresh after apply so button state is up to date.
+  const loadRules = useCallback(() => {
+    api.rules
+      .list()
+      .then((rules) => {
+        const m = new Map<number, Rule>();
+        for (const r of rules) m.set(r.id, r);
+        setRulesMap(m);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    loadRules();
+    api.settings
+      .get()
+      .then(setSettings)
+      .catch(() => {});
+  }, [loadRules]);
 
   const alerts = page?.rows ?? [];
   const total = page?.total ?? 0;
@@ -113,6 +189,20 @@ export default function Alerts() {
                   const rule = label(alert.rule_name, alert.rule_id, "rule");
                   const dev = label(alert.device_name, alert.device_id, "device");
                   const iface = label(alert.interface_name, alert.interface_id, "iface");
+
+                  // Show "Apply mitigation" only for rule_fired alerts where the rule
+                  // is still firing AND manual_apply_enabled is on AND the operator
+                  // has the trigger_manual_reroute permission.
+                  const matchedRule =
+                    alert.event_type === "rule_fired" && alert.rule_id != null
+                      ? (rulesMap.get(alert.rule_id) ?? null)
+                      : null;
+                  const canShowApply =
+                    canApply &&
+                    matchedRule !== null &&
+                    matchedRule.manual_apply_enabled &&
+                    matchedRule.current_state === "firing";
+
                   return (
                     <li key={alert.id} className="py-3">
                       <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -127,6 +217,16 @@ export default function Alerts() {
                           </span>
                         )}
                         <span className="flex-1" />
+                        {canShowApply && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs"
+                            onClick={() => setApplyRule(matchedRule)}
+                          >
+                            Apply mitigation
+                          </Button>
+                        )}
                         <span className="text-xs text-muted-foreground">
                           {new Date(alert.created_at).toLocaleString()}
                         </span>
@@ -163,6 +263,19 @@ export default function Alerts() {
           )}
         </CardContent>
       </Card>
+
+      {applyRule && (
+        <ApplyMitigationDialog
+          rule={applyRule}
+          operatingMode={settings?.operating_mode ?? "observe"}
+          onClose={() => setApplyRule(null)}
+          onApplied={() => {
+            // Refresh rules (state may have changed) and alerts.
+            loadRules();
+            loadAlerts();
+          }}
+        />
+      )}
     </div>
   );
 }

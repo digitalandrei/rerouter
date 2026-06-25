@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 
 use super::{err, AppState};
 use crate::auth::rbac::{self, markers, RequirePermission};
+use crate::reroute::executor::{self, ActionRequest};
+use crate::reroute::flow_target::{self, PreparedAction};
+
+/// Templates whose `prefix` is a host-route target eligible for flow auto-target.
+/// The IPv6 siblings are swapped in automatically, so only the v4 names are listed.
+fn template_supports_auto_target(name: &str) -> bool {
+    matches!(name, "null_route_prefix" | "blackhole_prefix")
+}
 
 type JsonResp = (StatusCode, Json<Value>);
 
@@ -71,6 +79,7 @@ struct RuleRow {
     severity: String,
     enabled: bool,
     automatic_reroute_enabled: bool,
+    manual_apply_enabled: bool,
     reroute_template_id: Option<u64>,
     // Resolved target labels + live evaluation state (for the list UI).
     interface_name: Option<String>,
@@ -91,7 +100,7 @@ const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.m
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
      r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, \
      r.recovery_consecutive_samples, r.severity, r.enabled, \
-     r.automatic_reroute_enabled, r.reroute_template_id, \
+     r.automatic_reroute_enabled, r.manual_apply_enabled, r.reroute_template_id, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
      rs.consecutive_match_count, rs.first_matched_at \
@@ -125,6 +134,7 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
+        "manual_apply_enabled": r.manual_apply_enabled,
         "reroute_template_id": r.reroute_template_id,
         "interface_name": r.interface_name,
         "device_name": r.device_name,
@@ -141,8 +151,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
 /// Load a rule's attached actions (template + target router + params) for the
 /// rule JSON. Joins display names so the SPA needn't re-resolve them.
 async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
-    let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32)>(
-        "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position \
+    let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32, Option<String>)>(
+        "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position, ra.auto_target \
          FROM rule_actions ra \
          JOIN reroute_templates t ON t.id = ra.reroute_template_id \
          JOIN devices d ON d.id = ra.device_id \
@@ -164,6 +174,7 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
                 params,
                 enabled,
                 position,
+                auto_target,
             )| {
                 json!({
                     "id": id,
@@ -175,6 +186,7 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
                     "params": params.map(|j| j.0).unwrap_or(Value::Null),
                     "enabled": enabled,
                     "position": position,
+                    "auto_target": auto_target,
                 })
             },
         )
@@ -274,6 +286,10 @@ pub struct RuleBody {
     enabled: bool,
     #[serde(default)]
     automatic_reroute_enabled: bool,
+    /// Opt-in: allow operators to manually apply this rule's actions from a
+    /// firing alert. Off by default. Gated like any manual reroute at apply time.
+    #[serde(default)]
+    manual_apply_enabled: bool,
     reroute_template_id: Option<u64>,
 }
 
@@ -471,9 +487,9 @@ pub async fn create(
             operator, threshold_value, \
             duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
             recovery_window_seconds, recovery_consecutive_samples, \
-            severity, enabled, automatic_reroute_enabled, \
+            severity, enabled, automatic_reroute_enabled, manual_apply_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(interface_id)
@@ -495,6 +511,7 @@ pub async fn create(
     .bind(&body.severity)
     .bind(body.enabled)
     .bind(body.automatic_reroute_enabled)
+    .bind(body.manual_apply_enabled)
     .bind(body.reroute_template_id)
     .bind(g.session.user_id)
     .bind(g.session.user_id)
@@ -566,6 +583,7 @@ pub struct RuleUpdate {
     severity: Option<String>,
     enabled: Option<bool>,
     automatic_reroute_enabled: Option<bool>,
+    manual_apply_enabled: Option<bool>,
     reroute_template_id: Option<Option<u64>>,
 }
 
@@ -692,6 +710,9 @@ pub async fn update(
     if body.automatic_reroute_enabled.is_some() {
         sets.push("automatic_reroute_enabled = ?");
     }
+    if body.manual_apply_enabled.is_some() {
+        sets.push("manual_apply_enabled = ?");
+    }
     if body.reroute_template_id.is_some() {
         sets.push("reroute_template_id = ?");
     }
@@ -748,6 +769,9 @@ pub async fn update(
         q = q.bind(v);
     }
     if let Some(v) = body.automatic_reroute_enabled {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.manual_apply_enabled {
         q = q.bind(v);
     }
     if let Some(v) = &body.reroute_template_id {
@@ -856,6 +880,161 @@ pub async fn clear(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ApplyBody {
+    /// Optional operator note for the audit log.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Render-only preview (even in enforce mode); changes nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// POST /api/rules/{id}/apply — operator manually applies a FIRING rule's
+/// configured actions: the supervised middle ground between alert-only and
+/// unattended automatic execution.
+///
+/// Refuses unless the rule has `manual_apply_enabled` (the per-rule opt-in) AND is
+/// currently `firing` (manual apply only mitigates a live breach). Each enabled
+/// action then runs through the SAME gated executor as automatic execution, but as
+/// a `manual` trigger attributed to the operator:
+///   * GATE 0 still applies — in observe mode nothing executes; the response
+///     carries the would-run plan per action (`would_run`).
+///   * device locks, the global maintenance lock, per-device/per-rule cooldowns,
+///     the global rate limit, and the protected-interface guard all still apply.
+///   * the global AUTOMATIC master switch does NOT gate it — this is a deliberate
+///     operator action, not unattended automation.
+///
+/// Requires `trigger_manual_reroute` (enforced here, the security boundary).
+pub async fn apply(
+    g: RequirePermission<markers::TriggerManualReroute>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<ApplyBody>,
+) -> JsonResp {
+    let pool = &state.pool;
+    // Existence + opt-in flag + live firing state + flow selector in one read.
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        bool,
+        Option<String>,
+        String,
+        Option<u64>,
+        Option<String>,
+        Option<u16>,
+        Option<u16>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT r.manual_apply_enabled, rs.current_state, r.name, \
+                r.interface_id, r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind \
+         FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    let Some((
+        manual_apply_enabled,
+        current_state,
+        rule_name,
+        interface_id,
+        flow_direction,
+        flow_protocol,
+        flow_port,
+        flow_port_kind,
+    )) = row
+    else {
+        return err(StatusCode::NOT_FOUND, "rule not found");
+    };
+    if !manual_apply_enabled {
+        return err(
+            StatusCode::CONFLICT,
+            "manual apply is not enabled for this rule",
+        );
+    }
+    if current_state.as_deref() != Some("firing") {
+        return err(
+            StatusCode::CONFLICT,
+            "rule is not currently firing; manual apply is only allowed while the threshold is breached",
+        );
+    }
+
+    // The rule's enabled actions (template + target router + params [+ auto-target])
+    // — the same set the firing alert rendered as would-run, in the same order.
+    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
+        "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
+         WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if specs.is_empty() {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "rule has no enabled actions to apply",
+        );
+    }
+
+    let reason = body
+        .reason
+        .clone()
+        .unwrap_or_else(|| format!("manual apply of rule '{rule_name}' (#{id})"));
+    let sel = flow_target::FlowSelector {
+        interface_id,
+        direction: flow_direction,
+        protocol: flow_protocol,
+        port: flow_port,
+        port_kind: flow_port_kind,
+    };
+
+    let mut results = Vec::with_capacity(specs.len());
+    for (template_id, device_id, params_json, auto_target) in specs {
+        let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
+        // Resolve auto-target (flow dst host) here; a manual apply proceeds even on
+        // LOW sampling confidence (the operator confirms the resolved IP), unlike
+        // automatic execution which suppresses it.
+        match flow_target::prepare_action(pool, &sel, template_id, device_id, params, auto_target.as_deref())
+            .await
+        {
+            PreparedAction::Ready {
+                template,
+                params,
+                auto_target: at,
+            } => {
+                let action_reason = match &at {
+                    Some(a) => format!("{reason}; {}", a.note),
+                    None => reason.clone(),
+                };
+                let req = ActionRequest {
+                    device_id,
+                    template,
+                    params,
+                    trigger_type: "manual",
+                    rule_id: Some(id),
+                    user_id: Some(g.session.user_id),
+                    reason: Some(action_reason),
+                };
+                let outcome = executor::execute(pool, &state.config, req, body.dry_run).await;
+                let mut v = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
+                if let (Value::Object(m), Some(a)) = (&mut v, at) {
+                    m.insert("auto_target".into(), json!(a.cidr));
+                    m.insert("auto_target_low_confidence".into(), json!(a.low_confidence));
+                }
+                results.push(v);
+            }
+            PreparedAction::Skip { reason: why } => {
+                results.push(json!({
+                    "device_id": device_id,
+                    "executed": false,
+                    "message": why,
+                }));
+            }
+        }
+    }
+    (StatusCode::OK, Json(json!({ "results": results })))
+}
+
 // ---- Rule action targets (template + router + params) --------------------------
 
 #[derive(Debug, Deserialize)]
@@ -866,6 +1045,10 @@ pub struct RuleActionBody {
     params: Value,
     #[serde(default)]
     position: Option<u32>,
+    /// "flow_dst_host" to resolve the prefix from the rule's flows at fire/apply
+    /// time (only on a flow rule + a host-route template). NULL = static prefix.
+    #[serde(default)]
+    auto_target: Option<String>,
 }
 
 /// POST /api/rules/{id}/actions — attach a device-CLI action to a rule. Validates
@@ -877,14 +1060,15 @@ pub async fn add_action(
     Path(rule_id): Path<u64>,
     Json(body): Json<RuleActionBody>,
 ) -> JsonResp {
-    let rule_exists: Option<u64> = sqlx::query_scalar("SELECT id FROM rules WHERE id = ?")
-        .bind(rule_id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
-    if rule_exists.is_none() {
+    let rule_row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT metric, flow_direction FROM rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let Some((_rule_metric, rule_flow_direction)) = rule_row else {
         return err(StatusCode::NOT_FOUND, "rule not found");
-    }
+    };
 
     let template =
         match crate::reroute::templates::load(&state.pool, body.reroute_template_id).await {
@@ -897,10 +1081,46 @@ pub async fn add_action(
             "only device_cli templates can be attached as rule actions",
         );
     }
-    if let Err(e) =
-        crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params)
-    {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+
+    // Auto-target: only on a flow rule + a host-route template. The host (prefix)
+    // is resolved at fire/apply time, so validate the OTHER params here against a
+    // placeholder prefix; a static action validates the params as given.
+    let auto_target = match body.auto_target.as_deref() {
+        None => None,
+        Some(flow_target::FLOW_DST_HOST) => {
+            if rule_flow_direction.is_none() {
+                return err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "auto-target requires a flow rule (set a flow metric + selector first)",
+                );
+            }
+            if !template_supports_auto_target(&template.name) {
+                return err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this template does not support auto-target (use a null-route / blackhole template)",
+                );
+            }
+            let mut probe = body.params.as_object().cloned().unwrap_or_default();
+            probe.insert("prefix".into(), Value::String("192.0.2.1/32".into()));
+            if let Err(e) = crate::reroute::templates::validate_and_expand(
+                &template.parameter_schema,
+                &Value::Object(probe),
+            ) {
+                return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+            }
+            Some(flow_target::FLOW_DST_HOST)
+        }
+        Some(_) => {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, "unknown auto_target mode");
+        }
+    };
+
+    if auto_target.is_none() {
+        if let Err(e) =
+            crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params)
+        {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+        }
     }
 
     let device_exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
@@ -913,14 +1133,15 @@ pub async fn add_action(
     }
 
     let res = sqlx::query(
-        "INSERT INTO rule_actions (rule_id, reroute_template_id, device_id, params_json, position) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO rule_actions (rule_id, reroute_template_id, device_id, params_json, position, auto_target) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(rule_id)
     .bind(body.reroute_template_id)
     .bind(body.device_id)
     .bind(sqlx::types::Json(&body.params))
     .bind(body.position.unwrap_or(0))
+    .bind(auto_target)
     .execute(&state.pool)
     .await;
 

@@ -165,6 +165,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             get(rules::show).put(rules::update).delete(rules::remove),
         )
         .route("/api/rules/{id}/clear", post(rules::clear))
+        .route("/api/rules/{id}/apply", post(rules::apply))
         .route("/api/rules/{id}/actions", post(rules::add_action))
         .route(
             "/api/rules/{rule_id}/actions/{action_id}",

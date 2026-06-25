@@ -19,6 +19,7 @@ import {
   Workflow,
   Plus,
   X,
+  Info,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -28,6 +29,7 @@ import {
   type Template,
   ApiError,
 } from "@/lib/api";
+import { Label } from "@/components/ui/label";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { Switch } from "@/components/ui/switch";
@@ -79,8 +81,16 @@ function RuleActionsDialog({
   const [templateId, setTemplateId] = useState<string>("");
   const [deviceId, setDeviceId] = useState<string>("");
   const [values, setValues] = useState<Record<string, string>>({});
+  const [autoTarget, setAutoTarget] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Flow rules (those with a flow_direction set) may use auto-targeting for
+  // null-route/blackhole templates, so the backend can resolve the attacked
+  // destination host (/32 or /128) from live flows at fire/apply time.
+  const isFlowRule = Boolean(current.flow_direction);
+  // Template names the backend accepts auto_target on (host-route templates only).
+  const AUTO_TARGET_TEMPLATES = ["null_route_prefix", "blackhole_prefix"];
 
   useEffect(() => {
     api.templates
@@ -96,6 +106,14 @@ function RuleActionsDialog({
   const template = templates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
 
+  // Show the auto-target toggle only when:
+  //   1. The rule being edited is a flow rule (flow_direction set), AND
+  //   2. The selected template is a host-route null-route or blackhole.
+  const showAutoTarget =
+    isFlowRule &&
+    template !== null &&
+    AUTO_TARGET_TEMPLATES.includes(template.name);
+
   async function add() {
     if (!template || !deviceId) {
       setError("Pick a template and a target router.");
@@ -106,18 +124,23 @@ function RuleActionsDialog({
     try {
       const params: Record<string, unknown> = {};
       for (const name of Object.keys(schema)) {
+        // When auto-targeting is on, omit the "prefix" param — the backend
+        // resolves it from live flows at fire/apply time.
+        if (showAutoTarget && autoTarget && name === "prefix") continue;
         if (values[name]) params[name] = values[name];
       }
       const updated = await api.rules.addAction(current.id, {
         reroute_template_id: template.id,
         device_id: parseInt(deviceId, 10),
         params,
+        ...(showAutoTarget && autoTarget ? { auto_target: "flow_dst_host" } : {}),
       });
       setCurrent(updated);
       onChanged(updated);
       setTemplateId("");
       setDeviceId("");
       setValues({});
+      setAutoTarget(false);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to add action");
     } finally {
@@ -139,6 +162,18 @@ function RuleActionsDialog({
     try {
       const updated = await api.rules.update(current.id, {
         automatic_reroute_enabled: !current.automatic_reroute_enabled,
+      });
+      setCurrent(updated);
+      onChanged(updated);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function toggleManualApply() {
+    try {
+      const updated = await api.rules.update(current.id, {
+        manual_apply_enabled: !current.manual_apply_enabled,
       });
       setCurrent(updated);
       onChanged(updated);
@@ -183,6 +218,29 @@ function RuleActionsDialog({
           />
         </div>
 
+        {/* Allow manual apply */}
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
+          <div className="text-sm">
+            <div className="font-medium">Allow manual apply</div>
+            <div className="text-xs text-muted-foreground">
+              Operators can manually apply this rule's actions from a firing alert.
+              Independent of automatic execution; still blocked in observe mode
+              and gated by the manual-reroute permission, locks and cooldowns.
+            </div>
+          </div>
+          <Switch
+            checked={current.manual_apply_enabled}
+            onCheckedChange={() => void toggleManualApply()}
+            disabled={actions.length === 0}
+            aria-label="Toggle manual apply"
+            title={
+              actions.length === 0
+                ? "Attach an action first"
+                : "Allow operators to manually apply this rule's actions from a firing alert"
+            }
+          />
+        </div>
+
         {/* Existing actions */}
         <div className="space-y-2">
           {actions.length === 0 ? (
@@ -196,11 +254,31 @@ function RuleActionsDialog({
                 <span className="font-medium">{a.template_display_name || a.template_name}</span>
                 <span className="text-muted-foreground">on</span>
                 <span className="font-medium">{a.device_name}</span>
-                <span className="text-xs text-muted-foreground">
-                  {Object.entries(a.params ?? {})
-                    .map(([k, v]) => `${k}=${String(v)}`)
-                    .join(", ")}
-                </span>
+                {a.auto_target === "flow_dst_host" ? (
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                    title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
+                  >
+                    target: attacked dst IP (auto /32·/128)
+                  </Badge>
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    {Object.entries(a.params ?? {})
+                      .map(([k, v]) => `${k}=${String(v)}`)
+                      .join(", ")}
+                  </span>
+                )}
+                {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
+                {a.auto_target === "flow_dst_host" &&
+                  Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
+                    <span className="text-xs text-muted-foreground">
+                      {Object.entries(a.params ?? {})
+                        .filter(([k]) => k !== "prefix")
+                        .map(([k, v]) => `${k}=${String(v)}`)
+                        .join(", ")}
+                    </span>
+                  )}
                 <span className="flex-1" />
                 <Button
                   size="icon-sm"
@@ -227,6 +305,7 @@ function RuleActionsDialog({
                 onChange={(e) => {
                   setTemplateId(e.target.value);
                   setValues({});
+                  setAutoTarget(false);
                 }}
               >
                 <option value="">Select template…</option>
@@ -263,7 +342,37 @@ function RuleActionsDialog({
               deviceId={deviceId ? parseInt(deviceId, 10) : null}
               values={values}
               onChange={setValues}
+              omitParams={showAutoTarget && autoTarget ? new Set(["prefix"]) : undefined}
             />
+          )}
+
+          {/* Auto-target toggle — only for flow rules + null-route/blackhole templates */}
+          {showAutoTarget && (
+            <div className="flex items-start gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
+              <Switch
+                id="auto-target-toggle"
+                checked={autoTarget}
+                onCheckedChange={setAutoTarget}
+                aria-label="Auto-target the attacked destination IP"
+              />
+              <div className="space-y-1 text-sm">
+                <Label htmlFor="auto-target-toggle" className="cursor-pointer font-medium">
+                  Auto-target the attacked destination IP
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  Resolve the target host from this rule's flows at mitigation time and null-route
+                  it as a /32 (IPv4) or /128 (IPv6). The host must fall inside the device's
+                  announced prefixes; low flow-sampling confidence blocks automatic execution
+                  (manual apply still works).
+                </p>
+                {autoTarget && (
+                  <p className="text-xs font-medium text-amber-700 dark:text-amber-400 flex items-center gap-1">
+                    <Info className="size-3 shrink-0" />
+                    The prefix parameter is omitted — the backend resolves it from live flows.
+                  </p>
+                )}
+              </div>
+            </div>
           )}
 
           {error && (
@@ -608,17 +717,28 @@ export default function Rules() {
                             : "none"}
                         </Button>
                         {rule.action_count ? (
-                          <Badge
-                            variant={rule.automatic_reroute_enabled ? "destructive" : "outline"}
-                            className="text-[10px]"
-                            title={
-                              rule.automatic_reroute_enabled
-                                ? "Runs automatically in enforce mode"
-                                : "Renders a plan only; run manually"
-                            }
-                          >
-                            {rule.automatic_reroute_enabled ? "auto" : "manual"}
-                          </Badge>
+                          <>
+                            <Badge
+                              variant={rule.automatic_reroute_enabled ? "destructive" : "outline"}
+                              className="text-[10px]"
+                              title={
+                                rule.automatic_reroute_enabled
+                                  ? "Runs automatically in enforce mode"
+                                  : "Renders a plan only; run manually"
+                              }
+                            >
+                              {rule.automatic_reroute_enabled ? "auto" : "manual"}
+                            </Badge>
+                            {rule.manual_apply_enabled && (
+                              <Badge
+                                variant="outline"
+                                className="text-[10px] text-sky-700 dark:text-sky-400"
+                                title="Operators can manually apply this rule's actions from a firing alert"
+                              >
+                                apply
+                              </Badge>
+                            )}
+                          </>
                         ) : null}
                       </div>
                     </TableCell>

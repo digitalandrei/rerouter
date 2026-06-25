@@ -13,7 +13,7 @@
 //!   verification_json: {"method":"ios_show","command":"<show {param}>","expect":<substr>,"reject":<substr>}
 //! A cidr param `X` also exposes `{X_net}` and `{X_mask}` to the renderer.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{Map, Value};
@@ -34,6 +34,10 @@ pub struct Template {
     pub plan: Value,
     pub verification: Value,
     pub rollback_template_id: Option<u64>,
+    /// The IPv6 counterpart of an IPv4 host-route template (e.g. null_route_prefix
+    /// -> null_route_prefix_v6). The auto-target resolver swaps to it when the
+    /// resolved victim is an IPv6 address. NULL for templates without a v6 form.
+    pub v6_sibling_template_id: Option<u64>,
     pub enabled: bool,
 }
 
@@ -50,12 +54,13 @@ struct TemplateRow {
     plan_json: Option<SqlxJson<Value>>,
     verification_json: Option<SqlxJson<Value>>,
     rollback_template_id: Option<u64>,
+    v6_sibling_template_id: Option<u64>,
     enabled: bool,
 }
 
 const COLS: &str = "id, name, display_name, description, provider_type, mode, \
      automatic_allowed, parameter_schema_json, plan_json, \
-     verification_json, rollback_template_id, enabled";
+     verification_json, rollback_template_id, v6_sibling_template_id, enabled";
 
 impl From<TemplateRow> for Template {
     fn from(r: TemplateRow) -> Self {
@@ -71,6 +76,7 @@ impl From<TemplateRow> for Template {
             plan: r.plan_json.map(|j| j.0).unwrap_or(Value::Null),
             verification: r.verification_json.map(|j| j.0).unwrap_or(Value::Null),
             rollback_template_id: r.rollback_template_id,
+            v6_sibling_template_id: r.v6_sibling_template_id,
             enabled: r.enabled,
         }
     }
@@ -179,11 +185,23 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 subst.insert(name.clone(), Value::String(n.to_string()));
             }
             "cidr" => {
-                let (net, mask, norm) =
-                    parse_cidr_v4(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
-                subst.insert(name.clone(), Value::String(norm));
-                subst.insert(format!("{name}_net"), Value::String(net));
-                subst.insert(format!("{name}_mask"), Value::String(mask));
+                // Address family is pinned per-param ("v4" default, "v6" opt-in) so
+                // a value of the wrong family is rejected rather than mis-rendered.
+                let family = spec.get("family").and_then(Value::as_str).unwrap_or("v4");
+                if family == "v6" {
+                    let (net, len, norm) =
+                        parse_cidr_v6(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
+                    subst.insert(name.clone(), Value::String(norm));
+                    subst.insert(format!("{name}_net"), Value::String(net));
+                    subst.insert(format!("{name}_len"), Value::String(len.to_string()));
+                } else {
+                    let (net, mask, len, norm) =
+                        parse_cidr_v4(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
+                    subst.insert(name.clone(), Value::String(norm));
+                    subst.insert(format!("{name}_net"), Value::String(net));
+                    subst.insert(format!("{name}_mask"), Value::String(mask));
+                    subst.insert(format!("{name}_len"), Value::String(len.to_string()));
+                }
             }
             _ => {
                 // Restricted string: no whitespace (prevents CLI injection).
@@ -214,37 +232,68 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
 }
 
 /// True if `child` CIDR is equal to or more-specific than (contained in) `parent`.
+/// Cross-family pairs (v4 vs v6) are never contained.
 fn cidr_contains(parent: &str, child: &str) -> Result<bool> {
-    let (pnet, plen) = parse_cidr_parts(parent)?;
-    let (cnet, clen) = parse_cidr_parts(child)?;
-    if clen < plen {
-        return Ok(false); // child must be equal or longer (more specific)
+    let (pnet, plen) = parse_cidr_any(parent)?;
+    let (cnet, clen) = parse_cidr_any(child)?;
+    if clen < plen || pnet.is_ipv4() != cnet.is_ipv4() {
+        return Ok(false); // child must be same family and equal/more-specific
     }
-    let pmask: u32 = if plen == 0 {
-        0
-    } else {
-        u32::MAX.checked_shl(32 - plen).unwrap_or(0)
-    };
-    Ok((cnet & pmask) == (pnet & pmask))
+    Ok(network_of(cnet, plen) == network_of(pnet, plen))
 }
 
-/// Parse "a.b.c.d/len" -> (u32 network bits, prefix length).
-fn parse_cidr_parts(s: &str) -> Result<(u32, u32)> {
-    let (ip, len) = s
+/// True if host `ip` falls within `cidr` (same family). Best-effort: an
+/// unparseable cidr or a family mismatch is simply "not contained". Used by the
+/// flow auto-target resolver to keep a derived host inside our announced space.
+pub fn cidr_contains_host(cidr: &str, ip: IpAddr) -> bool {
+    match parse_cidr_any(cidr) {
+        Ok((net, len)) if net.is_ipv4() == ip.is_ipv4() => {
+            network_of(ip, len) == network_of(net, len)
+        }
+        _ => false,
+    }
+}
+
+/// Mask an address down to its `len`-bit network (family-aware).
+fn network_of(ip: IpAddr, len: u32) -> IpAddr {
+    match ip {
+        IpAddr::V4(a) => {
+            let mask = if len == 0 {
+                0
+            } else {
+                u32::MAX.checked_shl(32 - len.min(32)).unwrap_or(0)
+            };
+            IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask))
+        }
+        IpAddr::V6(a) => {
+            let mask = if len == 0 {
+                0
+            } else {
+                u128::MAX.checked_shl(128 - len.min(128)).unwrap_or(0)
+            };
+            IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask))
+        }
+    }
+}
+
+/// Parse "addr/len" (v4 or v6) -> (network address, prefix length).
+fn parse_cidr_any(s: &str) -> Result<(IpAddr, u32)> {
+    let (ip_s, len_s) = s
         .split_once('/')
         .ok_or_else(|| anyhow!("invalid CIDR '{s}'"))?;
-    let ip: Ipv4Addr = ip
+    let ip: IpAddr = ip_s
         .trim()
         .parse()
-        .map_err(|_| anyhow!("invalid IPv4 in '{s}'"))?;
-    let len: u32 = len
+        .map_err(|_| anyhow!("invalid IP in '{s}'"))?;
+    let len: u32 = len_s
         .trim()
         .parse()
         .map_err(|_| anyhow!("invalid prefix length in '{s}'"))?;
-    if len > 32 {
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if len > max {
         bail!("prefix length out of range in '{s}'");
     }
-    Ok((u32::from(ip), len))
+    Ok((network_of(ip, len), len))
 }
 
 /// Render a device_cli template into its exact command list + verification.
@@ -351,8 +400,8 @@ fn subst_opt(v: Option<&Value>, subst: &Map<String, Value>) -> Result<Option<Str
     }
 }
 
-/// Parse `a.b.c.d/len` -> (network, netmask, normalized `net/len`). IPv4 only.
-fn parse_cidr_v4(s: &str) -> Result<(String, String, String)> {
+/// Parse `a.b.c.d/len` -> (network, netmask, len, normalized `net/len`). IPv4.
+fn parse_cidr_v4(s: &str) -> Result<(String, String, u32, String)> {
     let (ip_s, len_s) = s
         .split_once('/')
         .ok_or_else(|| anyhow!("expected CIDR a.b.c.d/len"))?;
@@ -376,8 +425,35 @@ fn parse_cidr_v4(s: &str) -> Result<(String, String, String)> {
     Ok((
         Ipv4Addr::from(net).to_string(),
         Ipv4Addr::from(mask).to_string(),
+        len,
         format!("{}/{len}", Ipv4Addr::from(net)),
     ))
+}
+
+/// Parse `addr/len` -> (network address, len, normalized `net/len`). IPv6.
+/// IPv6 routes use prefix/len form (no dotted mask), so only `net` + `len`.
+fn parse_cidr_v6(s: &str) -> Result<(String, u32, String)> {
+    let (ip_s, len_s) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow!("expected CIDR addr/len"))?;
+    let ip: Ipv6Addr = ip_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid IPv6 address"))?;
+    let len: u32 = len_s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid prefix length"))?;
+    if len > 128 {
+        bail!("prefix length must be 0..128");
+    }
+    let mask: u128 = if len == 0 {
+        0
+    } else {
+        u128::MAX.checked_shl(128 - len).unwrap_or(0)
+    };
+    let net_addr = Ipv6Addr::from(u128::from(ip) & mask);
+    Ok((net_addr.to_string(), len, format!("{net_addr}/{len}")))
 }
 
 #[cfg(test)]
@@ -387,10 +463,49 @@ mod tests {
 
     #[test]
     fn cidr_expands_to_net_and_mask() {
-        let (net, mask, norm) = parse_cidr_v4("192.0.2.130/24").unwrap();
+        let (net, mask, len, norm) = parse_cidr_v4("192.0.2.130/24").unwrap();
         assert_eq!(net, "192.0.2.0");
         assert_eq!(mask, "255.255.255.0");
+        assert_eq!(len, 24);
         assert_eq!(norm, "192.0.2.0/24");
+    }
+
+    #[test]
+    fn v6_cidr_param_renders_host_route() {
+        // A family:"v6" cidr param yields {prefix} (normalized) + {prefix_net}; the
+        // IPv6 null-route template uses prefix/len form (no dotted mask).
+        let t = tmpl(
+            json!({"prefix": {"type": "cidr", "family": "v6", "required": true}}),
+            json!({
+                "transport": "ios_ssh", "config_mode": true,
+                "apply": ["ipv6 route {prefix} Null0"],
+            }),
+            json!({"command": "show ipv6 route {prefix_net}", "expect": "Null0"}),
+        );
+        let rp = render(&t, &json!({"prefix": "2001:db8::5/128"})).unwrap();
+        assert_eq!(
+            rp.commands,
+            vec!["configure terminal", "ipv6 route 2001:db8::5/128 Null0", "end"]
+        );
+        assert_eq!(rp.verify.unwrap().command, "show ipv6 route 2001:db8::5");
+        // A v4 value in a v6-pinned param is rejected (not mis-rendered).
+        assert!(render(&t, &json!({"prefix": "192.0.2.1/32"})).is_err());
+    }
+
+    #[test]
+    fn host_containment_is_family_aware() {
+        use std::net::IpAddr;
+        let v4: IpAddr = "203.0.113.45".parse().unwrap();
+        let v6: IpAddr = "2001:db8::dead".parse().unwrap();
+        // host inside / outside an announced v4 prefix
+        assert!(cidr_contains_host("203.0.113.0/24", v4));
+        assert!(!cidr_contains_host("198.51.100.0/24", v4));
+        // v6 host inside its prefix; cross-family never matches
+        assert!(cidr_contains_host("2001:db8::/32", v6));
+        assert!(!cidr_contains_host("203.0.113.0/24", v6));
+        assert!(!cidr_contains_host("2001:db8::/32", v4));
+        // a /32 announced host contains itself
+        assert!(cidr_contains_host("203.0.113.45/32", v4));
     }
 
     #[test]
@@ -442,6 +557,7 @@ mod tests {
             plan,
             verification,
             rollback_template_id: None,
+            v6_sibling_template_id: None,
             enabled: true,
         }
     }

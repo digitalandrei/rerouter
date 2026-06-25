@@ -27,6 +27,7 @@ type Ts = DateTime<Utc>;
 
 use super::condition::Op;
 use crate::config::Config;
+use crate::reroute::flow_target::{self, FlowSelector, PreparedAction};
 
 /// Flow-derived rule metrics (evaluated against the latest closed flow bucket
 /// rather than interface_metrics_current). See docs/flow-telemetry.md.
@@ -705,7 +706,7 @@ async fn on_fire(
             payload["executed_actions"] = json!(executed);
         }
     } else {
-        let would_run_actions = render_would_run_actions(pool, rule.id).await;
+        let would_run_actions = render_would_run_actions(pool, rule).await;
         if !would_run_actions.is_empty() {
             payload["would_run_actions"] = json!(would_run_actions);
         }
@@ -741,55 +742,97 @@ async fn on_fire(
     Ok(())
 }
 
-/// Render every attached action of a rule (template + target router + params)
-/// to its exact would-run commands, for the alert payload. Best-effort and
-/// observe-safe: it loads templates and renders strings; it executes nothing.
-async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> {
+/// The flow selector for auto-target resolution, taken from the rule.
+fn flow_selector(rule: &InterfaceRule) -> FlowSelector {
+    FlowSelector {
+        interface_id: rule.interface_id,
+        direction: rule.flow_direction.clone(),
+        protocol: rule.flow_protocol,
+        port: rule.flow_port,
+        port_kind: rule.flow_port_kind.clone(),
+    }
+}
+
+/// Render every attached action of a rule (template + target router + params) to
+/// its exact would-run commands, for the alert payload. Best-effort and
+/// observe-safe: it resolves auto-target hosts, loads templates, and renders
+/// strings; it executes nothing. An auto-target action that resolves shows the
+/// concrete /32 or /128 in `auto_target.resolved_cidr`; one that cannot resolve
+/// (no in-prefix victim, no flows, …) shows `skipped` instead of commands.
+async fn render_would_run_actions(pool: &MySqlPool, rule: &InterfaceRule) -> Vec<Value> {
     let rows = sqlx::query_as::<
         _,
-        (
-            u64,
-            u64,
-            String,
-            u64,
-            String,
-            Option<sqlx::types::Json<Value>>,
-        ),
+        (u64, u64, u64, String, Option<sqlx::types::Json<Value>>, Option<String>),
     >(
-        "SELECT ra.id, ra.reroute_template_id, t.name, ra.device_id, d.name, ra.params_json \
+        "SELECT ra.id, ra.reroute_template_id, ra.device_id, d.name, ra.params_json, ra.auto_target \
          FROM rule_actions ra \
-         JOIN reroute_templates t ON t.id = ra.reroute_template_id \
          JOIN devices d ON d.id = ra.device_id \
          WHERE ra.rule_id = ? AND ra.enabled = 1 \
          ORDER BY ra.position, ra.id",
     )
-    .bind(rule_id)
+    .bind(rule.id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
+    let sel = flow_selector(rule);
     let mut out = Vec::with_capacity(rows.len());
-    for (action_id, template_id, template_name, device_id, device_name, params_json) in rows {
+    for (action_id, template_id, device_id, device_name, params_json, auto_target) in rows {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
-        let rendered = match crate::reroute::templates::load(pool, template_id).await {
-            Ok(t) => match crate::reroute::templates::render(&t, &params) {
-                Ok(plan) => json!({
-                    "commands": plan.commands,
-                    "verify": plan.verify,
-                }),
-                Err(e) => json!({ "error": e.to_string() }),
-            },
-            Err(_) => json!({ "error": "template not found" }),
-        };
-        out.push(json!({
-            "action_id": action_id,
-            "template_id": template_id,
-            "template_name": template_name,
-            "device_id": device_id,
-            "device_name": device_name,
-            "params": params,
-            "rendered": rendered,
-        }));
+        match flow_target::prepare_action(
+            pool,
+            &sel,
+            template_id,
+            device_id,
+            params.clone(),
+            auto_target.as_deref(),
+        )
+        .await
+        {
+            PreparedAction::Ready {
+                template,
+                params: rparams,
+                auto_target: at,
+            } => {
+                let rendered = match crate::reroute::templates::render(&template, &rparams) {
+                    Ok(plan) => json!({ "commands": plan.commands, "verify": plan.verify }),
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+                let mut v = json!({
+                    "action_id": action_id,
+                    "template_id": template.id,
+                    "template_name": template.name,
+                    "template_display_name": template.display_name,
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "params": rparams,
+                    "rendered": rendered,
+                });
+                if let Some(at) = at {
+                    v["auto_target"] = json!({
+                        "kind": flow_target::FLOW_DST_HOST,
+                        "resolved_cidr": at.cidr,
+                        "low_confidence": at.low_confidence,
+                        "note": at.note,
+                    });
+                }
+                out.push(v);
+            }
+            PreparedAction::Skip { reason } => {
+                let mut v = json!({
+                    "action_id": action_id,
+                    "template_id": template_id,
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "params": params,
+                    "skipped": reason,
+                });
+                if auto_target.is_some() {
+                    v["auto_target"] = json!({ "kind": flow_target::FLOW_DST_HOST, "unresolved": true });
+                }
+                out.push(v);
+            }
+        }
     }
     out
 }
@@ -797,11 +840,13 @@ async fn render_would_run_actions(pool: &MySqlPool, rule_id: u64) -> Vec<Value> 
 /// Execute every attached action of a rule via the reroute executor. Called only
 /// on the firing edge, only in enforce mode, only when the rule's auto switch is
 /// on. The executor re-checks Gate 0 + device locks/cooldowns/uncertain, so a
-/// device that's locked or recently acted on is safely skipped. Returns each
-/// action's outcome for the alert payload.
+/// device that's locked or recently acted on is safely skipped. Auto-target
+/// actions resolve their host from current flows first; a LOW-confidence
+/// resolution is SUPPRESSED for automatic execution (doctrine) — the alert still
+/// shows the would-run target. Returns each action's outcome for the alert payload.
 async fn auto_execute_actions(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> Vec<Value> {
-    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>)>(
-        "SELECT reroute_template_id, device_id, params_json FROM rule_actions \
+    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
+        "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
          WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
     )
     .bind(rule.id)
@@ -809,24 +854,65 @@ async fn auto_execute_actions(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRu
     .await
     .unwrap_or_default();
 
+    let sel = flow_selector(rule);
     let mut out = Vec::with_capacity(specs.len());
-    for (template_id, device_id, params_json) in specs {
-        let template = match crate::reroute::templates::load(pool, template_id).await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    for (template_id, device_id, params_json, auto_target) in specs {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
-        let req = crate::reroute::executor::ActionRequest {
-            device_id,
-            template,
-            params,
-            trigger_type: "automatic",
-            rule_id: Some(rule.id),
-            user_id: None,
-            reason: Some(format!("automatic: rule '{}' fired", rule.name)),
-        };
-        let outcome = crate::reroute::executor::execute(pool, cfg, req, false).await;
-        out.push(serde_json::to_value(&outcome).unwrap_or(Value::Null));
+        match flow_target::prepare_action(pool, &sel, template_id, device_id, params, auto_target.as_deref())
+            .await
+        {
+            PreparedAction::Ready {
+                template,
+                params,
+                auto_target: at,
+            } => {
+                // Doctrine: LOW flow-sampling confidence blocks AUTOMATIC execution.
+                if at.as_ref().is_some_and(|a| a.low_confidence) {
+                    tracing::warn!(
+                        event_type = "auto_target_suppressed",
+                        rule_id = rule.id,
+                        device_id,
+                        "auto-target suppressed: low flow sampling confidence"
+                    );
+                    out.push(json!({
+                        "device_id": device_id,
+                        "executed": false,
+                        "skipped": "auto-target suppressed: LOW flow sampling confidence",
+                        "auto_target": at.map(|a| a.cidr),
+                    }));
+                    continue;
+                }
+                let reason = match &at {
+                    Some(a) => format!("automatic: rule '{}' fired; {}", rule.name, a.note),
+                    None => format!("automatic: rule '{}' fired", rule.name),
+                };
+                let req = crate::reroute::executor::ActionRequest {
+                    device_id,
+                    template,
+                    params,
+                    trigger_type: "automatic",
+                    rule_id: Some(rule.id),
+                    user_id: None,
+                    reason: Some(reason),
+                };
+                let outcome = crate::reroute::executor::execute(pool, cfg, req, false).await;
+                let mut v = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+                if let (Value::Object(m), Some(a)) = (&mut v, at) {
+                    m.insert("auto_target".into(), json!(a.cidr));
+                }
+                out.push(v);
+            }
+            PreparedAction::Skip { reason } => {
+                tracing::warn!(
+                    event_type = "auto_target_skipped",
+                    rule_id = rule.id,
+                    device_id,
+                    reason = %reason,
+                    "auto action skipped (auto-target unresolved)"
+                );
+                out.push(json!({ "device_id": device_id, "executed": false, "skipped": reason }));
+            }
+        }
     }
     out
 }
