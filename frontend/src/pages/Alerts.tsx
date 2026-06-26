@@ -11,6 +11,7 @@
  */
 import { useEffect, useState, useCallback } from "react";
 import { api, type AlertPage, type Rule, type SystemSettings } from "@/lib/api";
+import { humanizeToken, eventTypeLabel } from "@/lib/labels";
 import {
   Card,
   CardContent,
@@ -58,7 +59,7 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
           {wouldRunActions.map((a, i) => {
             const dn = typeof a.template_display_name === "string" ? a.template_display_name : null;
             const tn = typeof a.template_name === "string" ? a.template_name : "action";
-            const displayName = dn || tn;
+            const displayName = dn || humanizeToken(tn);
             const d = typeof a.device_name === "string" ? a.device_name : "device";
             // auto_target may be an object {resolved_cidr, low_confidence, note}
             // or a "skipped" string when the host couldn't be resolved.
@@ -73,9 +74,9 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
             const atSkipped = typeof at === "string" ? at : null;
             return (
               <span key={i} className="inline-flex flex-wrap items-center gap-1">
-                <code>{displayName}</code>
+                <span className="font-medium">{displayName}</span>
                 {dn && dn !== tn && (
-                  <span className="text-muted-foreground/60">({tn})</span>
+                  <span className="text-muted-foreground/60 text-[10px]">({tn})</span>
                 )}
                 <span className="text-muted-foreground">on {d}</span>
                 {atObj?.resolved_cidr && (
@@ -207,7 +208,7 @@ export default function Alerts() {
                     <li key={alert.id} className="py-3">
                       <div className="flex flex-wrap items-center gap-2 text-sm">
                         <SeverityBadge severity={alert.severity} />
-                        <code className="text-xs">{alert.event_type}</code>
+                        <span className="text-xs font-medium">{eventTypeLabel(alert.event_type)}</span>
                         {rule && <span className="font-medium">{rule}</span>}
                         {(dev || iface) && (
                           <span className="text-xs text-muted-foreground">

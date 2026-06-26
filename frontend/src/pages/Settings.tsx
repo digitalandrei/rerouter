@@ -11,6 +11,7 @@
 import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { api, type SystemSettings, type RtbhCommunity, ApiError } from "@/lib/api";
+import { humanizeToken } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -86,7 +87,7 @@ function RtbhCard() {
               >
                 <span className="font-medium">{c.label}</span>
                 <code className="text-xs">{c.community}</code>
-                <Badge variant="outline">{c.kind}</Badge>
+                <Badge variant="outline">{humanizeToken(c.kind)}</Badge>
                 <span className="text-xs text-muted-foreground">tag {c.tag}</span>
                 <span className="flex-1" />
                 {canManage && (

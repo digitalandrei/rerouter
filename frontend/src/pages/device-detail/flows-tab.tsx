@@ -25,6 +25,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { fmtBps, fmtPps } from "@/lib/telemetry";
+import { samplingSourceLabel } from "@/lib/labels";
 
 const WINDOW_MINUTES = 60;
 
@@ -342,7 +343,7 @@ function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
                     <div className="flex items-center gap-1">
                       {e.effective_sampling_rate}:1
                       <Badge variant={e.sampling_confidence === "high" ? "secondary" : "destructive"}>
-                        {e.sampling_source}
+                        {samplingSourceLabel(e.sampling_source)}
                       </Badge>
                     </div>
                   </TableCell>

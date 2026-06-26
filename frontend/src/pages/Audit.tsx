@@ -9,6 +9,7 @@
  */
 import { useEffect, useState } from "react";
 import { api, type AuditEntry } from "@/lib/api";
+import { humanizeToken } from "@/lib/labels";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
@@ -57,8 +58,8 @@ export default function Audit() {
                       {entry.created_at}
                     </TableCell>
                     <TableCell>{entry.actor}</TableCell>
-                    <TableCell>
-                      <code className="text-xs">{entry.action}</code>
+                    <TableCell className="text-sm">
+                      {humanizeToken(entry.action)}
                     </TableCell>
                     <TableCell>{entry.subject}</TableCell>
                     <TableCell>

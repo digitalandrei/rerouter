@@ -39,6 +39,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { ShieldAlert, Shuffle } from "lucide-react";
+import { templateLabelFrom, triggerTypeLabel, humanizeToken } from "@/lib/labels";
 
 function RerouteDrawer({
   id,
@@ -91,7 +92,7 @@ function RerouteDrawer({
             <div className="grid grid-cols-2 gap-2 text-sm">
               <div>
                 <span className="text-muted-foreground">Template: </span>
-                {detail.template_display_name ?? detail.template_name ?? "—"}
+                {templateLabelFrom(detail.template_display_name, detail.template_name)}
               </div>
               <div>
                 <span className="text-muted-foreground">Device: </span>
@@ -99,7 +100,7 @@ function RerouteDrawer({
               </div>
               <div>
                 <span className="text-muted-foreground">Trigger: </span>
-                {detail.trigger_type}
+                {triggerTypeLabel(detail.trigger_type)}
               </div>
               <div>
                 <span className="text-muted-foreground">By: </span>
@@ -272,7 +273,7 @@ export default function Reroutes() {
                   {l.scope_ref ? ` #${l.scope_ref}` : ""}
                 </Badge>
                 <span className="text-muted-foreground">
-                  {l.kind} — {l.reason ?? ""}
+                  {humanizeToken(l.kind)} — {l.reason ?? ""}
                 </span>
               </div>
             ))}
@@ -307,10 +308,10 @@ export default function Reroutes() {
                   <TableRow key={r.id} className="hover:bg-muted/50">
                     <TableCell className="pl-6 font-medium">{r.id}</TableCell>
                     <TableCell>
-                      {r.template_display_name ?? r.template_name ?? "—"}
+                      {templateLabelFrom(r.template_display_name, r.template_name)}
                     </TableCell>
                     <TableCell>{r.device_name ?? "—"}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{r.trigger_type}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{triggerTypeLabel(r.trigger_type)}</TableCell>
                     <TableCell>
                       <StateBadge state={r.state} />
                     </TableCell>

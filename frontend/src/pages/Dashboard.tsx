@@ -10,6 +10,7 @@
  */
 import { useEffect, useState, useCallback } from "react";
 import { api, type SystemStatus, type Alert, type Rule, type SystemSettings } from "@/lib/api";
+import { eventTypeLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -245,7 +246,7 @@ export default function Dashboard() {
                   className="flex items-center gap-3 py-3 text-sm"
                 >
                   <SeverityBadge severity={alert.severity} />
-                  <code className="text-xs">{alert.event_type}</code>
+                  <span className="text-xs font-medium">{eventTypeLabel(alert.event_type)}</span>
                   {alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">
                       device #{alert.device_id}

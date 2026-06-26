@@ -36,6 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
+import { templateLabel, templateLabelFrom } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -251,7 +252,7 @@ function RuleActionsDialog({
                 key={a.id}
                 className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
               >
-                <span className="font-medium">{a.template_display_name || a.template_name}</span>
+                <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
                 <span className="text-muted-foreground">on</span>
                 <span className="font-medium">{a.device_name}</span>
                 {a.auto_target === "flow_dst_host" ? (
@@ -311,7 +312,7 @@ function RuleActionsDialog({
                 <option value="">Select template…</option>
                 {templates.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.display_name || t.name}
+                    {templateLabel(t)}
                   </option>
                 ))}
               </select>

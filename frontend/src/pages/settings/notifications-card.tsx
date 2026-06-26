@@ -13,6 +13,7 @@ import {
   type WebhookEndpoint,
   ApiError,
 } from "@/lib/api";
+import { eventTypeLabel } from "@/lib/labels";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -48,7 +49,7 @@ function EventPicker({
               checked={selected.includes(e)}
               onChange={() => onToggle(e)}
             />
-            {e}
+            {eventTypeLabel(e)}
           </label>
         ))}
       </div>
@@ -57,7 +58,9 @@ function EventPicker({
 }
 
 function eventSummary(events: string[]): string {
-  return events.includes("*") || events.length === 0 ? "all events" : events.join(", ");
+  return events.includes("*") || events.length === 0
+    ? "all events"
+    : events.map(eventTypeLabel).join(", ");
 }
 
 export function NotificationsCard() {

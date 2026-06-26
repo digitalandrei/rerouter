@@ -14,6 +14,7 @@ import {
   type RenderedPlan,
   type TemplateParamSpec,
 } from "@/lib/api";
+import { templateLabel, providerTypeLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -67,10 +68,10 @@ function TemplateCard({ template }: { template: Template }) {
     <Card>
       <CardHeader>
         <div className="flex flex-wrap items-center gap-2">
-          <CardTitle className="text-base">{template.display_name || template.name}</CardTitle>
+          <CardTitle className="text-base">{templateLabel(template)}</CardTitle>
           <code className="text-xs text-muted-foreground">{template.name}</code>
           <Badge variant="outline" className="font-normal text-muted-foreground">
-            {template.provider_type}
+            {providerTypeLabel(template.provider_type)}
           </Badge>
           {!template.enabled && <Badge variant="secondary">disabled</Badge>}
         </div>
@@ -81,7 +82,7 @@ function TemplateCard({ template }: { template: Template }) {
       <CardContent className="space-y-3">
         {!isDeviceCli ? (
           <p className="text-xs text-muted-foreground">
-            External provider ({template.provider_type}) — not wired in v1. The
+            External provider ({providerTypeLabel(template.provider_type)}) — not wired in v1. The
             active mitigation path is the device-CLI templates.
           </p>
         ) : (
