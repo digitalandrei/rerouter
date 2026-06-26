@@ -842,6 +842,34 @@ fn command_allowed(cmd: &str) -> bool {
     }
 }
 
+/// Plan-level safety beyond the per-command allowlist: a bare `shutdown` /
+/// `no shutdown` is an INTERFACE command and must only run in interface config.
+/// In `router bgp` context a bare `shutdown` would shut the entire BGP process,
+/// and in global config it's invalid — so refuse it anywhere but interface mode.
+/// Templates always pair `interface <name>` + `shutdown`; this guards a buggy or
+/// forged plan now that the device account may be full privilege-15 with the
+/// allowlist as the only router-side limit. `neighbor <ip> shutdown` is a
+/// different (fully-specified) command and is unaffected.
+fn sequence_safe(commands: &[String]) -> Result<()> {
+    let mut in_interface = false;
+    for c in commands {
+        match c.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["interface", _] => in_interface = true,
+            ["configure", "terminal"] | ["router", "bgp", _] | ["end"] | ["exit"] => {
+                in_interface = false
+            }
+            ["shutdown"] | ["no", "shutdown"] if !in_interface => {
+                return Err(anyhow!(
+                    "refusing '{}' outside interface config (would affect more than the target interface)",
+                    c.trim()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Lower-level: run commands against already-loaded credentials. Used by
 /// [`run_commands`]; broken out so the executor can reuse one decrypt.
 pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> {
@@ -856,6 +884,8 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
             ));
         }
     }
+    // Plan-level guard: a bare `shutdown` is only safe in interface config.
+    sequence_safe(commands)?;
 
     let observed = Arc::new(Mutex::new(None::<String>));
     let handler = TofuHandler {
@@ -1212,9 +1242,36 @@ mod tests {
             "ipv6 route gggg::/128 Null0",       // not a valid v6 address
             "ipv6 route 203.0.113.0/24 Null0",   // v4 in a v6 command
             "show ipv6 route ; reload",          // chaining / extra tokens
+            // device-destructive verbs are NOT on the allowlist (fail-closed)
+            "no router bgp 65010",               // would delete the BGP process
+            "erase startup-config",
+            "copy running-config startup-config", // controller never persists config
+            "reload in 5",
+            "ip route 203.0.113.0 255.255.255.0 GigabitEthernet0/0", // egress iface, not Null0
         ] {
             assert!(!command_allowed(bad), "should reject: {bad}");
         }
+    }
+
+    #[test]
+    fn shutdown_only_in_interface_context() {
+        let ok = |cmds: &[&str]| {
+            sequence_safe(&cmds.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        // The interface shutdown / no-shutdown templates (interface X first).
+        assert!(ok(&["interface GigabitEthernet0/0", "shutdown"]).is_ok());
+        assert!(ok(&["interface GigabitEthernet0/0", "no shutdown"]).is_ok());
+        assert!(ok(&["interface GigabitEthernet0/0", "ip tcp adjust-mss 1436"]).is_ok());
+        // `neighbor <ip> shutdown` is a different command — fine in router context.
+        assert!(ok(&["router bgp 65010", "neighbor 198.51.100.7 shutdown"]).is_ok());
+        // A BARE shutdown outside interface config is refused (would shut BGP / be
+        // invalid), even though command_allowed() accepts the token in isolation.
+        assert!(ok(&["router bgp 65010", "shutdown"]).is_err());
+        assert!(ok(&["configure terminal", "shutdown"]).is_err());
+        assert!(ok(&["shutdown"]).is_err());
+        assert!(ok(&["no shutdown"]).is_err());
+        // Leaving interface mode re-arms the guard.
+        assert!(ok(&["interface GigabitEthernet0/0", "end", "shutdown"]).is_err());
     }
 
     #[test]
