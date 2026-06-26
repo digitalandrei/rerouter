@@ -28,10 +28,9 @@ const DeviceDetail = lazy(() => import("@/pages/DeviceDetail"));
 const InterfaceDetail = lazy(() => import("@/pages/InterfaceDetail"));
 const Rules = lazy(() => import("@/pages/Rules"));
 const Templates = lazy(() => import("@/pages/Templates"));
-const Reroutes = lazy(() => import("@/pages/Reroutes"));
+const Mitigations = lazy(() => import("@/pages/Mitigations"));
 const ManualReroute = lazy(() => import("@/pages/ManualReroute"));
 const Flows = lazy(() => import("@/pages/Flows"));
-const Alerts = lazy(() => import("@/pages/Alerts"));
 const Audit = lazy(() => import("@/pages/Audit"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const Users = lazy(() => import("@/pages/Users"));
@@ -86,10 +85,11 @@ export default function App() {
               />
               <Route path="/rules" element={<Rules />} />
               <Route path="/templates" element={<Templates />} />
-              <Route path="/mitigations" element={<Reroutes />} />
+              <Route path="/mitigations" element={<Mitigations />} />
               <Route path="/mitigations/manual" element={<ManualReroute />} />
               <Route path="/flows" element={<Flows />} />
-              <Route path="/alerts" element={<Alerts />} />
+              {/* /alerts redirects to the Mitigations page Alerts tab */}
+              <Route path="/alerts" element={<Navigate to="/mitigations?tab=alerts" replace />} />
               <Route path="/audit" element={<Audit />} />
               <Route path="/settings" element={<Settings />} />
               <Route element={<RequirePermission permission="manage_users" />}>

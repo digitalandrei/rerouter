@@ -66,6 +66,16 @@ import {
  * Manage a rule's reroute actions (template + target router + params). The
  * params form is schema-driven: a BGP-neighbor param renders a dropdown of the
  * device's discovered sessions and auto-fills the local AS.
+ *
+ * Template visibility rules:
+ * - MSS templates (iface_tcp_adjust_mss / iface_tcp_adjust_mss_remove) are
+ *   hidden from the dropdown; they're only attached as the second action in the
+ *   BGP-advertise MSS-clamp bundle (see (d) below).
+ * - blackhole_prefix / null_route_prefix on a FLOW rule: auto-detect mode is
+ *   forced (auto_target: "flow_dst_host"); no prefix input is shown.
+ * - blackhole_prefix / null_route_prefix on a non-flow rule: normal prefix input
+ *   with helper text ("Manual target: a prefix you choose ...").
+ * - bgp_advertise_add / bgp_advertise_remove: optional MSS-clamp bundle checkbox.
  */
 function RuleActionsDialog({
   rule,
@@ -77,43 +87,82 @@ function RuleActionsDialog({
   onChanged: (updated: Rule) => void;
 }) {
   const [current, setCurrent] = useState<Rule>(rule);
-  const [templates, setTemplates] = useState<Template[]>([]);
+  const [allTemplates, setAllTemplates] = useState<Template[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [templateId, setTemplateId] = useState<string>("");
   const [deviceId, setDeviceId] = useState<string>("");
   const [values, setValues] = useState<Record<string, string>>({});
-  const [autoTarget, setAutoTarget] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Flow rules (those with a flow_direction set) may use auto-targeting for
-  // null-route/blackhole templates, so the backend can resolve the attacked
-  // destination host (/32 or /128) from live flows at fire/apply time.
+  // BGP + MSS bundle state (only relevant for bgp_advertise_* templates)
+  const [mssBundle, setMssBundle] = useState(false);
+  const [mssInterface, setMssInterface] = useState<string>("");
+  const [mssValue, setMssValue] = useState<string>("1436");
+  const [deviceInterfaces, setDeviceInterfaces] = useState<Array<{ id: number; if_name: string; if_alias: string | null }>>([]);
+
   const isFlowRule = Boolean(current.flow_direction);
-  // Template names the backend accepts auto_target on (host-route templates only).
-  const AUTO_TARGET_TEMPLATES = ["null_route_prefix", "blackhole_prefix"];
+
+  // Template names that support auto-targeting (host-route templates).
+  const HOST_TARGET_TEMPLATES = ["null_route_prefix", "blackhole_prefix"];
+  // MSS templates — hidden from the dropdown; only used in the BGP bundle.
+  const MSS_TEMPLATE_NAMES = ["iface_tcp_adjust_mss", "iface_tcp_adjust_mss_remove"];
+  // BGP advertise templates that support the MSS-clamp bundle.
+  const BGP_ADVERTISE_ADD = "bgp_advertise_add";
+  const BGP_ADVERTISE_REMOVE = "bgp_advertise_remove";
 
   useEffect(() => {
     api.templates
       .list()
-      .then((ts) => setTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
-      .catch(() => setTemplates([]));
+      .then((ts) => setAllTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
+      .catch(() => setAllTemplates([]));
     api.devices
       .list()
       .then(setDevices)
       .catch(() => setDevices([]));
   }, []);
 
-  const template = templates.find((t) => String(t.id) === templateId) ?? null;
+  // Fetch interfaces when device changes (needed for MSS bundle selector).
+  useEffect(() => {
+    if (!deviceId) {
+      setDeviceInterfaces([]);
+      return;
+    }
+    api.devices
+      .interfaces(parseInt(deviceId, 10))
+      .then((ifaces) => setDeviceInterfaces(ifaces.map((i) => ({ id: i.id, if_name: i.if_name, if_alias: i.if_alias }))))
+      .catch(() => setDeviceInterfaces([]));
+  }, [deviceId]);
+
+  // Templates shown in the dropdown: hide MSS templates (they're only used via the bundle).
+  const visibleTemplates = allTemplates.filter((t) => !MSS_TEMPLATE_NAMES.includes(t.name));
+
+  const template = allTemplates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
 
-  // Show the auto-target toggle only when:
-  //   1. The rule being edited is a flow rule (flow_direction set), AND
-  //   2. The selected template is a host-route null-route or blackhole.
-  const showAutoTarget =
-    isFlowRule &&
+  // Is the selected template a host-targeting blackhole/null-route?
+  const isHostTargetTemplate =
+    template !== null && HOST_TARGET_TEMPLATES.includes(template.name);
+
+  // Is the selected template a BGP advertise (add or remove)?
+  const isBgpAdvertise =
     template !== null &&
-    AUTO_TARGET_TEMPLATES.includes(template.name);
+    (template.name === BGP_ADVERTISE_ADD || template.name === BGP_ADVERTISE_REMOVE);
+
+  // For host-targeting templates on a flow rule: always auto-detect (no prefix input).
+  const autoDetectMode = isHostTargetTemplate && isFlowRule;
+
+  // For the params form: omit "prefix" param when in auto-detect mode.
+  const omitForAutoDetect = autoDetectMode ? new Set(["prefix"]) : undefined;
+
+  function resetAddForm() {
+    setTemplateId("");
+    setDeviceId("");
+    setValues({});
+    setMssBundle(false);
+    setMssInterface("");
+    setMssValue("1436");
+  }
 
   async function add() {
     if (!template || !deviceId) {
@@ -125,23 +174,45 @@ function RuleActionsDialog({
     try {
       const params: Record<string, unknown> = {};
       for (const name of Object.keys(schema)) {
-        // When auto-targeting is on, omit the "prefix" param — the backend
-        // resolves it from live flows at fire/apply time.
-        if (showAutoTarget && autoTarget && name === "prefix") continue;
+        if (autoDetectMode && name === "prefix") continue;
         if (values[name]) params[name] = values[name];
       }
+
+      // First action: the selected template
       const updated = await api.rules.addAction(current.id, {
         reroute_template_id: template.id,
         device_id: parseInt(deviceId, 10),
         params,
-        ...(showAutoTarget && autoTarget ? { auto_target: "flow_dst_host" } : {}),
+        ...(autoDetectMode ? { auto_target: "flow_dst_host" } : {}),
       });
-      setCurrent(updated);
-      onChanged(updated);
-      setTemplateId("");
-      setDeviceId("");
-      setValues({});
-      setAutoTarget(false);
+
+      // Second action (BGP bundle): attach an MSS action if the checkbox is on.
+      let finalUpdated = updated;
+      if (isBgpAdvertise && mssBundle) {
+        const mssTemplateName =
+          template.name === BGP_ADVERTISE_ADD
+            ? "iface_tcp_adjust_mss"
+            : "iface_tcp_adjust_mss_remove";
+        const mssTemplate = allTemplates.find((t) => t.name === mssTemplateName);
+        if (!mssTemplate) {
+          setError(`MSS template "${mssTemplateName}" not found. Enable it in Templates.`);
+          setCurrent(updated);
+          onChanged(updated);
+          resetAddForm();
+          return;
+        }
+        const mssParams: Record<string, unknown> = { interface: mssInterface };
+        if (template.name === BGP_ADVERTISE_ADD && mssValue) mssParams.mss = mssValue;
+        finalUpdated = await api.rules.addAction(current.id, {
+          reroute_template_id: mssTemplate.id,
+          device_id: parseInt(deviceId, 10),
+          params: mssParams,
+        });
+      }
+
+      setCurrent(finalUpdated);
+      onChanged(finalUpdated);
+      resetAddForm();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to add action");
     } finally {
@@ -306,11 +377,13 @@ function RuleActionsDialog({
                 onChange={(e) => {
                   setTemplateId(e.target.value);
                   setValues({});
-                  setAutoTarget(false);
+                  setMssBundle(false);
+                  setMssInterface("");
+                  setMssValue("1436");
                 }}
               >
                 <option value="">Select template…</option>
-                {templates.map((t) => (
+                {visibleTemplates.map((t) => (
                   <option key={t.id} value={t.id}>
                     {templateLabel(t)}
                   </option>
@@ -325,6 +398,7 @@ function RuleActionsDialog({
                 onChange={(e) => {
                   setDeviceId(e.target.value);
                   setValues({});
+                  setMssInterface("");
                 }}
               >
                 <option value="">Select router…</option>
@@ -337,42 +411,106 @@ function RuleActionsDialog({
             </label>
           </div>
 
+          {/* Auto-detect note for flow-rule host-targeting templates */}
+          {autoDetectMode && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 dark:border-amber-700 dark:bg-amber-950/30">
+              <Info className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400" />
+              <p className="text-xs text-amber-800 dark:text-amber-300">
+                Auto-detects the attacked destination /32&middot;/128 from this rule's flows.
+                The backend resolves the victim host at mitigation time — no prefix input needed.
+              </p>
+            </div>
+          )}
+
+          {/* Normal prefix-input note for host-targeting templates on non-flow rules */}
+          {isHostTargetTemplate && !isFlowRule && (
+            <p className="text-xs text-muted-foreground">
+              Manual target: a prefix you choose (down to /8 for IPv4, /29 for IPv6).
+              The backend enforces this bound.
+            </p>
+          )}
+
           {template && (
             <ActionParamsForm
               schema={schema}
               deviceId={deviceId ? parseInt(deviceId, 10) : null}
               values={values}
               onChange={setValues}
-              omitParams={showAutoTarget && autoTarget ? new Set(["prefix"]) : undefined}
+              omitParams={omitForAutoDetect}
             />
           )}
 
-          {/* Auto-target toggle — only for flow rules + null-route/blackhole templates */}
-          {showAutoTarget && (
-            <div className="flex items-start gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
-              <Switch
-                id="auto-target-toggle"
-                checked={autoTarget}
-                onCheckedChange={setAutoTarget}
-                aria-label="Auto-target the attacked destination IP"
-              />
-              <div className="space-y-1 text-sm">
-                <Label htmlFor="auto-target-toggle" className="cursor-pointer font-medium">
-                  Auto-target the attacked destination IP
+          {/* BGP Advertise MSS-clamp bundle (rule editor only) */}
+          {isBgpAdvertise && (
+            <div className="space-y-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="mss-bundle-toggle"
+                  checked={mssBundle}
+                  onChange={(e) => {
+                    setMssBundle(e.target.checked);
+                    if (!e.target.checked) {
+                      setMssInterface("");
+                      setMssValue("1436");
+                    }
+                  }}
+                  className="h-4 w-4 rounded border-border"
+                />
+                <Label htmlFor="mss-bundle-toggle" className="cursor-pointer text-sm font-medium">
+                  Also clamp TCP MSS on an interface
                 </Label>
-                <p className="text-xs text-muted-foreground">
-                  Resolve the target host from this rule's flows at mitigation time and null-route
-                  it as a /32 (IPv4) or /128 (IPv6). The host must fall inside the device's
-                  announced prefixes; low flow-sampling confidence blocks automatic execution
-                  (manual apply still works).
-                </p>
-                {autoTarget && (
-                  <p className="text-xs font-medium text-amber-700 dark:text-amber-400 flex items-center gap-1">
-                    <Info className="size-3 shrink-0" />
-                    The prefix parameter is omitted — the backend resolves it from live flows.
-                  </p>
-                )}
               </div>
+              {mssBundle && (
+                <div className="grid gap-3 pl-7 sm:grid-cols-2">
+                  <label className="block space-y-1 text-sm font-medium">
+                    Interface
+                    <select
+                      className={inputClass}
+                      value={mssInterface}
+                      onChange={(e) => setMssInterface(e.target.value)}
+                      disabled={!deviceId}
+                    >
+                      <option value="">
+                        {!deviceId
+                          ? "Pick a router first"
+                          : deviceInterfaces.length
+                            ? "Select interface…"
+                            : "no interfaces discovered"}
+                      </option>
+                      {deviceInterfaces.map((i) => (
+                        <option key={i.id} value={i.if_name}>
+                          {i.if_name}
+                          {i.if_alias ? ` · ${i.if_alias}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {template.name === BGP_ADVERTISE_ADD && (
+                    <label className="block space-y-1 text-sm font-medium">
+                      MSS value (bytes)
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={64}
+                        max={9000}
+                        value={mssValue}
+                        onChange={(e) => setMssValue(e.target.value)}
+                        placeholder="1436"
+                      />
+                    </label>
+                  )}
+                  <p className="col-span-2 text-xs text-muted-foreground pl-0">
+                    Attaches a second action:{" "}
+                    <strong>
+                      {template.name === BGP_ADVERTISE_ADD
+                        ? "TCP MSS clamp"
+                        : "TCP MSS clamp remove"}
+                    </strong>{" "}
+                    on the same router immediately after the BGP action.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 

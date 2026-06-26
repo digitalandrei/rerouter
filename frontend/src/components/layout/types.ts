@@ -10,6 +10,12 @@ export interface NavItem {
    * Users entry behind `manage_users`.
    */
   permission?: string
+  /**
+   * When set, a numeric badge is rendered on this nav item when the value > 0.
+   * The value is supplied at runtime by the sidebar via a badge provider.
+   * The string is a key into the badge context (e.g. "active_rule_matches").
+   */
+  badgeKey?: string
 }
 
 export interface NavGroup {

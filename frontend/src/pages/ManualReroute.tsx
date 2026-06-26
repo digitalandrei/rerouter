@@ -46,16 +46,33 @@ export default function ManualReroute() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // MSS templates are not picked directly from manual reroute — they're only
+  // bundled with BGP advertise via the rule action editor.
+  const MSS_TEMPLATE_NAMES = ["iface_tcp_adjust_mss", "iface_tcp_adjust_mss_remove"];
+  // Host-targeting templates: show helper text about manual prefix bounds.
+  const HOST_TARGET_TEMPLATE_NAMES = ["null_route_prefix", "blackhole_prefix"];
+
   useEffect(() => {
     api.templates
       .list()
-      .then((ts) => setTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
+      .then((ts) =>
+        setTemplates(
+          ts.filter(
+            (t) =>
+              t.provider_type === "device_cli" &&
+              t.enabled &&
+              !MSS_TEMPLATE_NAMES.includes(t.name),
+          ),
+        ),
+      )
       .catch(() => setTemplates([]));
     api.devices.list().then(setDevices).catch(() => setDevices([]));
   }, []);
 
   const template = templates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
+  const isHostTargetTemplate =
+    template !== null && HOST_TARGET_TEMPLATE_NAMES.includes(template.name);
 
   function reset() {
     setValues({});
@@ -168,6 +185,13 @@ export default function ManualReroute() {
             <>
               {template.description && (
                 <p className="text-xs text-muted-foreground">{template.description}</p>
+              )}
+
+              {isHostTargetTemplate && (
+                <p className="text-xs text-muted-foreground">
+                  Manual target: a prefix you choose (down to /8 for IPv4, /29 for IPv6).
+                  The backend enforces this bound and will reject out-of-range values.
+                </p>
               )}
 
               <ActionParamsForm

@@ -188,15 +188,21 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 // Address family is pinned per-param ("v4" default, "v6" opt-in) so
                 // a value of the wrong family is rejected rather than mis-rendered.
                 let family = spec.get("family").and_then(Value::as_str).unwrap_or("v4");
+                // Optional blast-radius bound: the prefix must be /min_len or more
+                // specific (e.g. 8 for v4, 29 for v6). Auto-detected hosts (/32,/128)
+                // always pass; a too-broad manual prefix is refused.
+                let min_len = spec.get("min_len").and_then(Value::as_u64).map(|n| n as u32);
                 if family == "v6" {
                     let (net, len, norm) =
                         parse_cidr_v6(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
+                    enforce_min_len(name, len, min_len)?;
                     subst.insert(name.clone(), Value::String(norm));
                     subst.insert(format!("{name}_net"), Value::String(net));
                     subst.insert(format!("{name}_len"), Value::String(len.to_string()));
                 } else {
                     let (net, mask, len, norm) =
                         parse_cidr_v4(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
+                    enforce_min_len(name, len, min_len)?;
                     subst.insert(name.clone(), Value::String(norm));
                     subst.insert(format!("{name}_net"), Value::String(net));
                     subst.insert(format!("{name}_mask"), Value::String(mask));
@@ -430,6 +436,17 @@ fn parse_cidr_v4(s: &str) -> Result<(String, String, u32, String)> {
     ))
 }
 
+/// Refuse a prefix broader than `min_len` (the blast-radius bound). `None` = no
+/// bound. A more-specific prefix (larger len, e.g. a /32 host) always passes.
+fn enforce_min_len(name: &str, len: u32, min_len: Option<u32>) -> Result<()> {
+    if let Some(min) = min_len {
+        if len < min {
+            bail!("parameter '{name}' must be /{min} or more specific (got /{len})");
+        }
+    }
+    Ok(())
+}
+
 /// Parse `addr/len` -> (network address, len, normalized `net/len`). IPv6.
 /// IPv6 routes use prefix/len form (no dotted mask), so only `net` + `len`.
 fn parse_cidr_v6(s: &str) -> Result<(String, u32, String)> {
@@ -506,6 +523,20 @@ mod tests {
         assert!(!cidr_contains_host("2001:db8::/32", v4));
         // a /32 announced host contains itself
         assert!(cidr_contains_host("203.0.113.45/32", v4));
+    }
+
+    #[test]
+    fn min_len_bounds_manual_prefix() {
+        // v4: min_len 8 -> /8..32 allowed, /7 refused; an auto host /32 always ok.
+        let v4 = json!({"prefix": {"type": "cidr", "required": true, "min_len": 8}});
+        assert!(validate_and_expand(&v4, &json!({"prefix": "203.0.113.5/32"})).is_ok());
+        assert!(validate_and_expand(&v4, &json!({"prefix": "10.0.0.0/8"})).is_ok());
+        assert!(validate_and_expand(&v4, &json!({"prefix": "10.0.0.0/7"})).is_err());
+        // v6: min_len 29 -> /29..128 allowed, /28 refused; an auto host /128 ok.
+        let v6 = json!({"prefix": {"type": "cidr", "family": "v6", "required": true, "min_len": 29}});
+        assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::1/128"})).is_ok());
+        assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::/29"})).is_ok());
+        assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::/28"})).is_err());
     }
 
     #[test]
