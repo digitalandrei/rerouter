@@ -44,23 +44,28 @@ function build(device: Device): Form {
   };
 }
 
-/** Cisco ASR (IOS) commands to enroll our public key under the SSH username, so
- *  the controller can authenticate by key. `key-string` takes the raw Base64 body
- *  (the middle field of the OpenSSH line), not the `ssh-rsa … comment` wrapper.
- *
- *  The body MUST be wrapped: a 2048-bit key is ~360 chars but the IOS terminal
- *  truncates input lines near 256, which yields "%SSH: Failed to decode the Key
- *  Value". IOS concatenates consecutive key-string lines until `exit`. */
-function asrEnrollment(username: string, publicKey: string): string {
+/** Wrap an OpenSSH public key's Base64 body for IOS `key-string`: ≤72-char,
+ *  3-space-indented lines. `key-string` takes the raw Base64 body (the middle
+ *  field of the OpenSSH line), not the `ssh-rsa … comment` wrapper, and it MUST
+ *  be wrapped — a 2048-bit key is ~360 chars but the IOS terminal truncates input
+ *  near 256 ("%SSH: Failed to decode the Key Value"). IOS concatenates
+ *  consecutive key-string lines until `exit`. */
+function wrapKeyString(publicKey: string): string[] {
   const parts = publicKey.trim().split(/\s+/);
   const body = parts.length >= 2 ? parts[1] : publicKey.trim();
-  const wrapped = (body.match(/.{1,72}/g) ?? [body]).map((l) => `   ${l}`);
+  return (body.match(/.{1,72}/g) ?? [body]).map((l) => `   ${l}`);
+}
+
+/** Cisco ASR (IOS) commands to enroll our public key under the SSH username, so
+ *  the controller can authenticate by key. Key-only — for a fresh account that
+ *  also needs the user + restricted view, use `fullRouterSetup`. */
+function asrEnrollment(username: string, publicKey: string): string {
   return [
     "configure terminal",
     " ip ssh pubkey-chain",
     `  username ${username || "rerouter"}`,
     "   key-string",
-    ...wrapped,
+    ...wrapKeyString(publicKey),
     "   exit",
     "  exit",
     " end",
@@ -68,24 +73,10 @@ function asrEnrollment(username: string, publicKey: string): string {
   ].join("\n");
 }
 
-/** The built-in Cisco IOS parser view that limits the controller's account to
- *  exactly the commands Rerouter issues. Also kept in the repo at
- *  deploy/cisco/rerouter-view.ios; surfaced here so it's installable from the
- *  UI. Secrets are placeholders the operator fills in. */
-const RRT_VIEW = `! Restricted parser view for the Rerouter SSH account.
-! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Bind to the local account with
-! 'username <user> view RRT secret <...>'; verify with 'enable view RRT'.
-configure terminal
- aaa new-model
- aaa authentication login default local
- aaa authorization exec default local
- enable secret <ENABLE_SECRET>
-end
-enable view
-configure terminal
-parser view RRT
- secret <VIEW_SECRET>
- ! reads: connectivity, template verification + discovery
+/** The RRT parser-view command grants, by mode — exactly the commands Rerouter
+ *  sends. Shared by the standalone view snippet and the full-setup snippet so the
+ *  two never drift. Mirrors deploy/cisco/rerouter-view.ios. */
+const RRT_VIEW_BODY = ` ! reads: connectivity, template verification + discovery
  commands exec include terminal length 0
  commands exec include show clock
  commands exec include show version
@@ -117,8 +108,81 @@ parser view RRT
  commands interface include shutdown
  commands interface include no shutdown
  ! uncomment so 'show run' also reveals 'network' statements (prefix discovery):
- ! commands router include network
+ ! commands router include network`;
+
+/** The built-in Cisco IOS parser view that limits the controller's account to
+ *  exactly the commands Rerouter issues. Also kept in the repo at
+ *  deploy/cisco/rerouter-view.ios; surfaced here so it's installable from the
+ *  UI. Secrets are placeholders the operator fills in. */
+const RRT_VIEW = `! Restricted parser view for the Rerouter SSH account.
+! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Bind to the local account with
+! 'username <user> view RRT secret <...>'; verify with 'enable view RRT'.
+configure terminal
+ aaa new-model
+ aaa authentication login default local
+ aaa authorization exec default local
+ enable secret <ENABLE_SECRET>
+end
+enable view
+configure terminal
+parser view RRT
+ secret <VIEW_SECRET>
+${RRT_VIEW_BODY}
 end`;
+
+/** Full first-time router setup for the controller's SSH account: AAA, the RRT
+ *  restricted view, the local user bound to that view, and our public key for key
+ *  auth. SSH itself is assumed already enabled (the controller reaches the device
+ *  now), so this never touches the host key / crypto. */
+function fullRouterSetup(username: string, publicKey: string): string {
+  const user = username || "rerouter";
+  return [
+    `! Full Rerouter setup for the SSH account "${user}" on this router.`,
+    `! SSH is assumed already enabled (the controller reaches this device now), so`,
+    `! the host key / crypto is left untouched. Replace every <...> placeholder.`,
+    `! REVIEW before pasting: 'aaa new-model' changes how all logins are authorized.`,
+    ``,
+    `! 1. AAA — local authentication + exec authorization (applies the view on login)`,
+    `configure terminal`,
+    ` aaa new-model`,
+    ` aaa authentication login default local`,
+    ` aaa authorization exec default local`,
+    ` enable secret <ENABLE_SECRET>`,
+    `end`,
+    ``,
+    `! 2. The restricted RRT view (exactly the commands Rerouter sends)`,
+    `enable view`,
+    `configure terminal`,
+    `parser view RRT`,
+    ` secret <VIEW_SECRET>`,
+    RRT_VIEW_BODY,
+    `end`,
+    ``,
+    `! 3. The "${user}" account, bound to the RRT view (the secret is a fallback;`,
+    `!    the controller authenticates with the key below, not this password)`,
+    `configure terminal`,
+    ` username ${user} view RRT secret <USER_SECRET>`,
+    `end`,
+    ``,
+    `! 4. Install the controller's public key for "${user}" (key auth)`,
+    `configure terminal`,
+    ` ip ssh pubkey-chain`,
+    `  username ${user}`,
+    `   key-string`,
+    ...wrapKeyString(publicKey),
+    `   exit`,
+    `  exit`,
+    ` end`,
+    ``,
+    `! 5. Ensure the vty lines accept SSH with local login`,
+    `configure terminal`,
+    ` line vty 0 15`,
+    `  transport input ssh`,
+    `  login local`,
+    `end`,
+    `write memory`,
+  ].join("\n");
+}
 
 /** Device settings tab: rename / hostname / SNMP / SSH credentials, plus the
  *  Test SNMP and Test SSH probes. manage_devices only (gated by the caller). */
@@ -380,6 +444,35 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                             Run these on the router, then use <strong>Test SSH</strong> to confirm key auth.
                           </p>
                         </div>
+                        {/* One-stop bootstrap for a fresh router: account + this key + RRT view. */}
+                        <details className="rounded-md border border-border p-3">
+                          <summary className="flex cursor-pointer items-center justify-between text-sm font-medium">
+                            Full router setup (account + key + view)
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() =>
+                                copy(
+                                  fullRouterSetup(device.ssh_username ?? form.ssh_username, device.ssh_public_key!),
+                                  "Router setup",
+                                )
+                              }
+                            >
+                              <Copy className="size-3.5" />
+                              Copy
+                            </Button>
+                          </summary>
+                          <p className="mt-2 text-xs text-muted-foreground">
+                            First-time bootstrap for a fresh router: creates the{" "}
+                            <code>{device.ssh_username ?? "rerouter"}</code> account, installs this public key, and
+                            applies the least-privilege RRT view. Fill in the <code>&lt;…SECRET&gt;</code> placeholders;
+                            SSH must already be enabled.
+                          </p>
+                          <pre className="mt-2 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
+                            {fullRouterSetup(device.ssh_username ?? form.ssh_username, device.ssh_public_key)}
+                          </pre>
+                        </details>
                       </div>
                     )}
 

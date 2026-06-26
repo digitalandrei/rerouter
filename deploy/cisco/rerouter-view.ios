@@ -96,7 +96,22 @@ configure terminal
  username <REROUTER_USER> view RRT secret <USER_SECRET>
 end
 !
-!  (Publickey for that user is configured separately under `ip ssh pubkey-chain`.)
+!  Install the controller's public key for that user (key auth). Paste the Base64
+!  body of the OpenSSH key (the middle field, NOT `ssh-rsa … comment`), wrapped to
+!  <=72-char lines — IOS truncates long input lines and concatenates key-string
+!  lines until `exit`. The app's device Settings tab shows this pre-filled with the
+!  device's actual key ("Full router setup").
+configure terminal
+ ip ssh pubkey-chain
+  username <REROUTER_USER>
+   key-string
+   <BASE64_PUBKEY_LINE_1>
+   <BASE64_PUBKEY_LINE_2>
+   exit
+  exit
+ end
+write memory
+!
 !  To verify the command set interactively: `enable view RRT`, then <VIEW_SECRET>.
 !
 !  Verify `username ... view` behaviour on your image; if the account cannot be
