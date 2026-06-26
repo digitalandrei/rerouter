@@ -965,6 +965,20 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
     let base_prompt = tail_prompt(&banner).unwrap_or_default();
     let hostname = prompt_hostname(&base_prompt);
 
+    // The account must log straight into privileged EXEC ("name#"). A user-EXEC
+    // session ("name>") can't run the controller's privileged commands (show
+    // running-config, configure terminal, the reroute templates) and we can't
+    // answer an `enable` password prompt on a non-interactive session — fail fast
+    // with an actionable message instead of stalling on the first denied command.
+    if base_prompt.ends_with('>') {
+        return Err(anyhow!(
+            "SSH account logged in at user-EXEC ('{base_prompt}'), not enable mode ('#'). \
+             Rerouter needs privileged EXEC and cannot supply an enable password on a \
+             non-interactive session — give the account privilege 15 so it logs straight \
+             into '#' (e.g. `username <user> privilege 15 …`)."
+        ));
+    }
+
     // Disable paging so long `show` output isn't broken by "--More--".
     send_line(&mut channel, "terminal length 0").await?;
     let _ = read_until(&mut channel, &mut prompt_matcher(&hostname), session_start).await?;

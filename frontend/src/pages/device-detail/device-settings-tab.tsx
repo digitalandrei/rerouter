@@ -115,8 +115,9 @@ const RRT_VIEW_BODY = ` ! reads: connectivity, template verification + discovery
  *  deploy/cisco/rerouter-view.ios; surfaced here so it's installable from the
  *  UI. Secrets are placeholders the operator fills in. */
 const RRT_VIEW = `! Restricted parser view for the Rerouter SSH account.
-! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Bind to the local account with
-! 'username <user> view RRT secret <...>'; verify with 'enable view RRT'.
+! Replace <ENABLE_SECRET> and <VIEW_SECRET>. The account must log into enable
+! mode ("#"): give it 'privilege 15', or bind this view ('username <user> view
+! RRT secret <...>'), which runs at priv 15. Verify with 'enable view RRT'.
 configure terminal
  aaa new-model
  aaa authentication login default local
@@ -131,9 +132,11 @@ ${RRT_VIEW_BODY}
 end`;
 
 /** Full first-time router setup for the controller's SSH account: AAA, the RRT
- *  restricted view, the local user bound to that view, and our public key for key
- *  auth. SSH itself is assumed already enabled (the controller reaches the device
- *  now), so this never touches the host key / crypto. */
+ *  restricted view, the local user at privilege 15 (so the key session logs
+ *  straight into enable mode "#" — required, and a non-interactive session can't
+ *  answer an `enable` password), and our public key for key auth. SSH itself is
+ *  assumed already enabled (the controller reaches the device now), so this never
+ *  touches the host key / crypto. */
 function fullRouterSetup(username: string, publicKey: string): string {
   const user = username || "rerouter";
   return [
@@ -158,11 +161,18 @@ function fullRouterSetup(username: string, publicKey: string): string {
     RRT_VIEW_BODY,
     `end`,
     ``,
-    `! 3. The "${user}" account, bound to the RRT view (the secret is a fallback;`,
-    `!    the controller authenticates with the key below, not this password)`,
+    `! 3. The "${user}" account at privilege 15 so the key session logs straight`,
+    `!    into enable mode ("#") — a non-interactive session can't answer an`,
+    `!    'enable' password prompt. (Secret = fallback; auth uses the key in step 4.)`,
     `configure terminal`,
-    ` username ${user} view RRT secret <USER_SECRET>`,
+    ` username ${user} privilege 15 secret <USER_SECRET>`,
     `end`,
+    `! Least-privilege option: instead of 'privilege 15', bind the RRT view (it runs`,
+    `! at priv 15, so it still logs into "#") — needs 'aaa authorization exec default`,
+    `! local' from step 1:`,
+    `!   username ${user} view RRT secret <USER_SECRET>`,
+    `! If that lands you in user-EXEC (">"), keep 'privilege 15'; the in-app allowlist`,
+    `! still constrains the account to exactly Rerouter's commands.`,
     ``,
     `! 4. Install the controller's public key for "${user}" (key auth)`,
     `configure terminal`,
@@ -465,9 +475,9 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                           </summary>
                           <p className="mt-2 text-xs text-muted-foreground">
                             First-time bootstrap for a fresh router: creates the{" "}
-                            <code>{device.ssh_username ?? "rerouter"}</code> account, installs this public key, and
-                            applies the least-privilege RRT view. Fill in the <code>&lt;…SECRET&gt;</code> placeholders;
-                            SSH must already be enabled.
+                            <code>{device.ssh_username ?? "rerouter"}</code> account at privilege 15 (so it logs
+                            straight into enable mode <code>#</code>), installs this public key, and defines the RRT
+                            view. Fill in the <code>&lt;…SECRET&gt;</code> placeholders; SSH must already be enabled.
                           </p>
                           <pre className="mt-2 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
                             {fullRouterSetup(device.ssh_username ?? form.ssh_username, device.ssh_public_key)}

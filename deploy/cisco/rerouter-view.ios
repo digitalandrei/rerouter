@@ -86,15 +86,23 @@ parser view RRT
 end
 
 ! ============================================================================
-!  Assigning the view to the controller's SSH account
+!  Assigning the account — it MUST log straight into enable mode ("#")
 ! ============================================================================
-!  Bind the view to the local account so it is applied automatically on login —
-!  including the controller's non-interactive (publickey) SSH session — via the
-!  `aaa authorization exec default local` set in step 1:
+!  The controller's commands are all privilege 15, and a non-interactive (key)
+!  session cannot answer an `enable` password prompt — so the account must be
+!  privileged at LOGIN. A user-EXEC (">") session fails. Use privilege 15:
 !
 configure terminal
- username <REROUTER_USER> view RRT secret <USER_SECRET>
+ username <REROUTER_USER> privilege 15 secret <USER_SECRET>
 end
+!
+!  Least-privilege option: instead of `privilege 15`, bind the RRT view — it runs
+!  at privilege 15, so it also lands in "#" — applied at login via the
+!  `aaa authorization exec default local` from step 1:
+!     username <REROUTER_USER> view RRT secret <USER_SECRET>
+!  (`username` takes privilege OR view, not both.) If your image still drops the
+!  account to ">", keep `privilege 15`; the in-app allowlist remains the enforcing
+!  control either way.
 !
 !  Install the controller's public key for that user (key auth). Paste the Base64
 !  body of the OpenSSH key (the middle field, NOT `ssh-rsa … comment`), wrapped to
@@ -113,11 +121,6 @@ configure terminal
 write memory
 !
 !  To verify the command set interactively: `enable view RRT`, then <VIEW_SECRET>.
-!
-!  Verify `username ... view` behaviour on your image; if the account cannot be
-!  pinned to the view, the controller-side allowlist (it only ever sends the
-!  commands above) remains the enforcing control. Tell us and we can instead lower
-!  exactly these commands to a custom privilege level.
 ! ----------------------------------------------------------------------------
 
 ! ============================================================================
