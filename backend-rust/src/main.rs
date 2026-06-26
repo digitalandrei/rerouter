@@ -92,10 +92,17 @@ struct Cli {
 
     /// Debug: run the read-only SSH connectivity probe against a device (by id,
     /// using its stored creds) — the same `show version`/`show clock` the UI
-    /// "Check access" button runs — print the result, and exit. Mirrors the
+    /// "Test SSH" button runs — print the result, and exit. Mirrors the
     /// /api/devices/{id}/ssh-test endpoint for headless diagnosis.
     #[arg(long)]
     ssh_test: Option<u64>,
+
+    /// Debug: run the SSH capability probe against a device (by id) — the same
+    /// config reads + no-op config-mode entry the UI "Command access / Check
+    /// access" panel runs — print per-check ok/denied, and exit. Mirrors the
+    /// /api/devices/{id}/ssh-capabilities endpoint for headless diagnosis.
+    #[arg(long)]
+    ssh_caps: Option<u64>,
 }
 
 #[tokio::main]
@@ -205,6 +212,29 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 eprintln!("SSH FAILED (device {dev_id}): {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(dev_id) = cli.ssh_caps {
+        match rerouter_controller::ssh::probe_capabilities(&pool, dev_id).await {
+            Ok(checks) => {
+                println!("Command access probe (device {dev_id}):");
+                for c in &checks {
+                    println!(
+                        "  [{}] {} ({})",
+                        if c.ok { "OK " } else { "DENY" },
+                        c.name,
+                        c.command
+                    );
+                    if !c.ok && !c.detail.is_empty() {
+                        println!("        -> {}", c.detail);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Command access probe FAILED (device {dev_id}): {e:#}");
                 std::process::exit(1);
             }
         }

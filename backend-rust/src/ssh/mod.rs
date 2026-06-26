@@ -623,11 +623,11 @@ fn cisco_denied(output: &str) -> Option<String> {
 }
 
 /// Probe whether the device's SSH account can run the commands Rerouter needs —
-/// WITHOUT changing any configuration (reads + a no-op config-mode entry/exit).
+/// WITHOUT changing any configuration (reads + a no-op config-mode entry).
 /// Each check reports ok + the router's message on denial. Used by the Settings
 /// "command access" panel so an under-privileged account is obvious.
 pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<CapabilityCheck>> {
-    // Reads first, then enter+leave config mode (nothing is applied).
+    // Reads first, then a no-op config-mode entry (nothing is applied).
     let probes: [(&str, &str); 4] = [
         (
             "Read running-config",
@@ -637,11 +637,15 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
         ("Read BGP table", "show ip bgp summary"),
         ("Enter configuration mode", "configure terminal"),
     ];
-    let commands: Vec<String> = probes
-        .iter()
-        .map(|(_, c)| c.to_string())
-        .chain(std::iter::once("end".to_string())) // leave config mode if we entered it
-        .collect();
+    // We deliberately do NOT append a trailing `end` to leave config mode. If
+    // `configure terminal` is denied (restricted parser view / low privilege) we
+    // are still at the exec prompt, where IOS treats a bare `end` as a hostname to
+    // telnet to — on a box with `ip domain-lookup` enabled that BLOCKS on DNS until
+    // our read budget expires ("timed out waiting for device prompt"), masking the
+    // real per-check results. run_on's best-effort `exit` cleanup leaves config mode
+    // when we did enter it, and (unlike a command in this list) does no follow-up
+    // read, so it cannot hang.
+    let commands: Vec<String> = probes.iter().map(|(_, c)| c.to_string()).collect();
 
     let outcome = run_commands(pool, device_id, &commands).await?;
 
@@ -1001,6 +1005,14 @@ async fn read_until(
                 if done(&buf) {
                     break;
                 }
+                let tail: String = buf.chars().rev().take(400).collect();
+                let tail: String = tail.chars().rev().collect();
+                tracing::warn!(
+                    event_type = "ssh_prompt_timeout",
+                    bytes = buf.len(),
+                    tail = %tail.escape_debug(),
+                    "timed out waiting for device prompt"
+                );
                 return Err(anyhow!("timed out waiting for device prompt"));
             }
         }
