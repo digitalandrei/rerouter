@@ -844,11 +844,13 @@ struct BgpPeerRow {
     peer_admin_status: Option<String>,
     label: Option<String>,
     out_prefix_list: Option<String>,
+    in_route_map: Option<String>,
+    out_route_map: Option<String>,
     last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const BGP_PEER_COLS: &str = "id, device_id, peer_remote_addr, peer_remote_as, local_as, \
-     peer_state, peer_admin_status, label, out_prefix_list, last_polled_at";
+     peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map, last_polled_at";
 
 fn bgp_peer_json(r: &BgpPeerRow) -> Value {
     json!({
@@ -861,8 +863,27 @@ fn bgp_peer_json(r: &BgpPeerRow) -> Value {
         "peer_admin_status": r.peer_admin_status,
         "label": r.label,
         "out_prefix_list": r.out_prefix_list,
+        "in_route_map": r.in_route_map,
+        "out_route_map": r.out_route_map,
         "last_polled_at": r.last_polled_at.map(fmt_ts),
     })
+}
+
+/// GET /api/devices/{id}/route-maps — route-map names discovered on the device
+/// (the Route-Map Change picker source). Read-only.
+pub async fn route_maps(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM device_route_maps WHERE device_id = ? ORDER BY name",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    (StatusCode::OK, Json(json!(names)))
 }
 
 /// GET /api/devices/{id}/bgp-peers — discovered BGP sessions (BgpPeer[]).

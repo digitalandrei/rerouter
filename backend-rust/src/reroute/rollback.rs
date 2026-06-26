@@ -22,6 +22,35 @@ pub async fn rollback_of(
     reason: String,
 ) -> Option<ExecOutcome> {
     let orig = templates::load(pool, template_id).await.ok()?;
+
+    // Route-Map Change reversal restores the PRIOR map when one was snapshotted at
+    // apply (params.prior_route_map): re-apply bgp_route_map_set with the prior
+    // name. With no prior, fall through to the standard rollback template (unset),
+    // which removes the map we set.
+    if orig.name == "bgp_route_map_set" {
+        if let Some(prior) = params
+            .get("prior_route_map")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut restore = params.clone();
+            if let Value::Object(m) = &mut restore {
+                m.insert("route_map".into(), Value::String(prior.to_string()));
+            }
+            let req = ActionRequest {
+                device_id,
+                template: orig, // bgp_route_map_set, now applying the prior map
+                params: restore,
+                trigger_type: "rollback",
+                rule_id: None,
+                user_id,
+                reason: Some(reason),
+            };
+            return Some(executor::execute(pool, cfg, req, false).await);
+        }
+    }
+
     let rollback = templates::load(pool, orig.rollback_template_id?)
         .await
         .ok()?;

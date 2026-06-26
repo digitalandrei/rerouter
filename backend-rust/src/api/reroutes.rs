@@ -186,16 +186,45 @@ pub async fn manual(
         );
     }
 
+    let is_route_map = matches!(
+        template.name.as_str(),
+        "bgp_route_map_set" | "bgp_route_map_unset"
+    );
+
     let mut results = Vec::with_capacity(body.targets.len());
     for target in &body.targets {
         if let Err(e) = templates::validate_and_expand(&template.parameter_schema, &target.params) {
             results.push(json!({ "device_id": target.device_id, "executed": false, "message": e.to_string() }));
             continue;
         }
+        let mut params = target.params.clone();
+
+        // Route-Map Change: the route-map must be one DISCOVERED on the device
+        // (templated-only doctrine — no free-text maps), and for a `set` we
+        // snapshot the neighbor's current map so the change can be reverted.
+        if is_route_map {
+            let rm = params.get("route_map").and_then(Value::as_str).unwrap_or("");
+            if !route_map_known(&state.pool, target.device_id, rm).await {
+                results.push(json!({ "device_id": target.device_id, "executed": false,
+                    "message": format!("route-map '{rm}' was not discovered on this device — run discovery first") }));
+                continue;
+            }
+            if template.name == "bgp_route_map_set" {
+                let neighbor = params.get("neighbor_ip").and_then(Value::as_str).unwrap_or("");
+                let dir = params.get("direction").and_then(Value::as_str).unwrap_or("out");
+                let prior = neighbor_prior_route_map(&state.pool, target.device_id, neighbor, dir)
+                    .await
+                    .unwrap_or_default();
+                if let Value::Object(m) = &mut params {
+                    m.insert("prior_route_map".into(), Value::String(prior));
+                }
+            }
+        }
+
         let req = ActionRequest {
             device_id: target.device_id,
             template: template.clone(),
-            params: target.params.clone(),
+            params,
             trigger_type: "manual",
             rule_id: None,
             user_id: Some(g.session.user_id),
@@ -205,6 +234,48 @@ pub async fn manual(
         results.push(serde_json::to_value(outcome).unwrap_or_else(|_| json!({})));
     }
     (StatusCode::OK, Json(json!({ "results": results })))
+}
+
+/// True if `name` is a route-map discovered on the device (the Route-Map Change
+/// param must reference a known map, not free text).
+async fn route_map_known(pool: &sqlx::MySqlPool, device_id: u64, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM device_route_maps WHERE device_id = ? AND name = ?",
+    )
+    .bind(device_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+/// The neighbor's currently-applied route-map in `dir` (in|out), as last
+/// discovered — the prior map snapshotted so a Route-Map Change can be reverted.
+async fn neighbor_prior_route_map(
+    pool: &sqlx::MySqlPool,
+    device_id: u64,
+    neighbor: &str,
+    dir: &str,
+) -> Option<String> {
+    let col = if dir == "in" {
+        "in_route_map"
+    } else {
+        "out_route_map"
+    };
+    sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT {col} FROM device_bgp_peers WHERE device_id = ? AND peer_remote_addr = ?"
+    ))
+    .bind(device_id)
+    .bind(neighbor)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// POST /api/reroutes/{id}/cancel — cancel a still-pending reroute.

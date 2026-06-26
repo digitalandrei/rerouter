@@ -447,6 +447,37 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
                 .await;
             }
         }
+
+        // Catalog route-map NAMES (the Route-Map Change picker source) and record
+        // each neighbor's CURRENT in/out route-map (used to suggest, and to snapshot
+        // the prior map so a Route-Map Change can be reverted).
+        for name in parse_route_map_names(rm_output) {
+            let _ = sqlx::query(
+                "INSERT INTO device_route_maps (device_id, name, last_discovered_at) \
+                 VALUES (?, ?, UTC_TIMESTAMP()) \
+                 ON DUPLICATE KEY UPDATE last_discovered_at = UTC_TIMESTAMP()",
+            )
+            .bind(device_id)
+            .bind(&name)
+            .execute(pool)
+            .await;
+        }
+        for (addr, name, dir) in parse_neighbor_route_maps(output) {
+            // `col` is whitelisted (in_route_map / out_route_map), never raw input.
+            let col = if dir == "in" {
+                "in_route_map"
+            } else {
+                "out_route_map"
+            };
+            let _ = sqlx::query(&format!(
+                "UPDATE device_bgp_peers SET {col} = ? WHERE device_id = ? AND peer_remote_addr = ?"
+            ))
+            .bind(&name)
+            .bind(device_id)
+            .bind(addr.to_string())
+            .execute(pool)
+            .await;
+        }
     }
 
     Ok(prefixes.len())
@@ -469,6 +500,42 @@ fn parse_neighbor_out_routemaps(config: &str) -> Vec<(Ipv4Addr, String)> {
         }
     }
     out
+}
+
+/// Parse `neighbor A.B.C.D route-map NAME in|out` lines into (addr, name, dir).
+/// Used to record each peer's current applied route-maps. IPv4 peers only.
+fn parse_neighbor_route_maps(config: &str) -> Vec<(Ipv4Addr, String, String)> {
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("neighbor ") else {
+            continue;
+        };
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        // [addr, "route-map", NAME, "in"|"out"]
+        if toks.len() >= 4 && toks[1] == "route-map" && (toks[3] == "in" || toks[3] == "out") {
+            if let Ok(addr) = toks[0].parse::<Ipv4Addr>() {
+                out.push((addr, toks[2].to_string(), toks[3].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Parse the distinct names of all `route-map NAME ...` stanzas in a route-map
+/// config section (the catalog the Route-Map Change picker offers).
+fn parse_route_map_names(config: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in config.lines() {
+        if let Some(rest) = line.trim().strip_prefix("route-map ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                let n = name.to_string();
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Parse a `route-map` config section into `route-map name -> matched outbound
@@ -716,7 +783,14 @@ fn command_allowed(cmd: &str) -> bool {
         // BGP per-peer advertisement via outbound prefix-list (+ soft clear)
         ["ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
         ["no", "ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
-        ["clear", "ip", "bgp", ip, "soft", "out"] => is_ipv4(ip),
+        ["clear", "ip", "bgp", ip, "soft", dir] => is_ipv4(ip) && matches!(*dir, "in" | "out"),
+        // BGP per-peer route-map change (Route-Map Change mitigation), in|out
+        ["neighbor", ip, "route-map", name, dir] => {
+            is_ipv4(ip) && is_name(name) && matches!(*dir, "in" | "out")
+        }
+        ["no", "neighbor", ip, "route-map", name, dir] => {
+            is_ipv4(ip) && is_name(name) && matches!(*dir, "in" | "out")
+        }
         // interface-scoped actions: MSS clamp + shutdown / no shutdown
         ["interface", n] => is_name(n),
         ["ip", "tcp", "adjust-mss", mss] => is_u32(mss),
@@ -1019,6 +1093,11 @@ mod tests {
             "no ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
             "clear ip bgp 198.51.100.7 soft out",
             "show ip bgp neighbors 198.51.100.7 advertised-routes",
+            // BGP per-peer route-map change (Route-Map Change), in + out + soft in
+            "neighbor 198.51.100.7 route-map RM-UPSTREAM-A out",
+            "no neighbor 198.51.100.7 route-map RM-UPSTREAM-A out",
+            "neighbor 198.51.100.7 route-map RM-IN in",
+            "clear ip bgp 198.51.100.7 soft in",
             // interface MSS clamp + shutdown / no shutdown (+ verify reads)
             "interface GigabitEthernet0/0",
             "interface Port-channel1.100",
@@ -1050,11 +1129,53 @@ mod tests {
             "ip prefix-list PL permit 192.0.2.0/24 ; reload", // chaining / extra tokens
             "ip prefix-list PL deny 192.0.2.0/24",            // only `permit` allowed
             "ip prefix-list PL permit notacidr",
-            "clear ip bgp 198.51.100.7 soft in", // outbound-only
+            "clear ip bgp 198.51.100.7 soft both",         // dir must be in|out
+            "neighbor 198.51.100.7 route-map RM-X both",    // dir must be in|out
+            "neighbor 198.51.100.7 route-map bad name out", // route-map name has whitespace
             "interface Gig 0/0",                 // whitespace in name
             "ip tcp adjust-mss notanumber",
         ] {
             assert!(!command_allowed(bad), "should reject: {bad}");
         }
+    }
+
+    #[test]
+    fn parses_neighbor_route_maps_and_names() {
+        let cfg = "router bgp 65010\n\
+neighbor 198.51.100.7 route-map RM-OUT-A out\n\
+neighbor 198.51.100.7 route-map RM-IN-A in\n\
+neighbor 203.0.113.9 route-map RM-OUT-B out\n";
+        let mut nm = parse_neighbor_route_maps(cfg);
+        nm.sort();
+        assert_eq!(
+            nm,
+            vec![
+                (
+                    "198.51.100.7".parse().unwrap(),
+                    "RM-IN-A".to_string(),
+                    "in".to_string()
+                ),
+                (
+                    "198.51.100.7".parse().unwrap(),
+                    "RM-OUT-A".to_string(),
+                    "out".to_string()
+                ),
+                (
+                    "203.0.113.9".parse().unwrap(),
+                    "RM-OUT-B".to_string(),
+                    "out".to_string()
+                ),
+            ]
+        );
+
+        // Distinct route-map names in first-seen order.
+        let rm = "route-map RM-OUT-A permit 10\n\
+match ip address prefix-list PL\n\
+route-map RM-IN-A deny 5\n\
+route-map RM-OUT-A permit 20\n";
+        assert_eq!(
+            parse_route_map_names(rm),
+            vec!["RM-OUT-A".to_string(), "RM-IN-A".to_string()]
+        );
     }
 }

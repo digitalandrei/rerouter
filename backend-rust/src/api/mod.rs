@@ -135,6 +135,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(devices::discover_bgp),
         )
         .route("/api/devices/{id}/bgp-peers", get(devices::bgp_peers))
+        .route("/api/devices/{id}/route-maps", get(devices::route_maps))
         .route(
             "/api/devices/{device_id}/bgp-peers/{peer_id}",
             patch(devices::update_bgp_peer),

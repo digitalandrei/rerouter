@@ -308,6 +308,10 @@ export interface BgpPeer {
   label: string | null;
   /** Outbound route-map's prefix-list, discovered over SSH (bgp_advertise_*). */
   out_prefix_list: string | null;
+  /** Currently-applied inbound/outbound route-map names (discovered over SSH);
+   *  the Route-Map Change picker suggests these and snapshots them for revert. */
+  in_route_map: string | null;
+  out_route_map: string | null;
   last_polled_at: string | null;
 }
 
@@ -527,9 +531,12 @@ export interface TemplateParamSpec {
   label?: string;
   required?: boolean;
   // UI prefill hint: "bgp_local_as" | "bgp_peer" | "announced_prefix" | "rtbh_tag"
+  //   | "interface_name" | "peer_out_prefix_list" | "route_map" | "bgp_direction"
   source?: string;
   // this param must be a subprefix of the named param's CIDR (AWS-SG style)
   subprefix_of?: string;
+  // closed set of allowed values -> rendered as a dropdown (e.g. direction in|out)
+  enum?: string[];
 }
 
 export interface Template {
@@ -687,6 +694,8 @@ export const api = {
       request<Interface[]>(`/api/devices/${id}/interfaces`),
     bgpPeers: (id: number) =>
       request<BgpPeer[]>(`/api/devices/${id}/bgp-peers`),
+    routeMaps: (id: number) =>
+      request<string[]>(`/api/devices/${id}/route-maps`),
     discoverBgp: (id: number) =>
       request<{ discovered: number }>(`/api/devices/${id}/discover-bgp`, {
         method: "POST",

@@ -43,6 +43,7 @@ export function ActionParamsForm({
   const [networks, setNetworks] = useState<BgpNetwork[]>([]);
   const [rtbh, setRtbh] = useState<RtbhCommunity[]>([]);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
+  const [routeMaps, setRouteMaps] = useState<string[]>([]);
 
   useEffect(() => {
     api.rtbh.list().then(setRtbh).catch(() => setRtbh([]));
@@ -53,11 +54,13 @@ export function ActionParamsForm({
       setPeers([]);
       setNetworks([]);
       setInterfaces([]);
+      setRouteMaps([]);
       return;
     }
     api.devices.bgpPeers(deviceId).then(setPeers).catch(() => setPeers([]));
     api.devices.bgpNetworks(deviceId).then(setNetworks).catch(() => setNetworks([]));
     api.devices.interfaces(deviceId).then(setInterfaces).catch(() => setInterfaces([]));
+    api.devices.routeMaps(deviceId).then(setRouteMaps).catch(() => setRouteMaps([]));
   }, [deviceId]);
 
   const localAsns = Array.from(
@@ -236,6 +239,66 @@ export function ActionParamsForm({
               <span className="text-[11px] font-normal text-muted-foreground">
                 auto-filled from the selected neighbor's outbound prefix-list
               </span>
+            </label>
+          );
+        }
+
+        if (spec.source === "route_map") {
+          // Operator picks the NEW map from discovered ones; we surface the
+          // neighbor's CURRENT map (chosen direction) as the prior a revert restores.
+          const neighborParam = Object.entries(schema).find(([, s]) => s.source === "bgp_peer")?.[0];
+          const dirParam = Object.entries(schema).find(([, s]) => s.source === "bgp_direction")?.[0];
+          const selNeighbor = neighborParam ? values[neighborParam] : "";
+          const selDir = (dirParam ? values[dirParam] : "") || "out";
+          const peer = peers.find((p) => p.peer_remote_addr === selNeighbor);
+          const current = peer ? (selDir === "in" ? peer.in_route_map : peer.out_route_map) : null;
+          return (
+            <label key={name} className="block space-y-1 text-sm font-medium">
+              {label}
+              <select
+                className={inputClass}
+                value={values[name] ?? ""}
+                onChange={(e) => set(name, e.target.value)}
+                disabled={!deviceId}
+              >
+                <option value="">
+                  {!deviceId
+                    ? "Pick a router first"
+                    : routeMaps.length
+                      ? "Select route-map…"
+                      : "no route-maps discovered"}
+                </option>
+                {routeMaps.map((rm) => (
+                  <option key={rm} value={rm}>
+                    {rm}
+                  </option>
+                ))}
+              </select>
+              {selNeighbor && (
+                <span className="text-[11px] font-normal text-muted-foreground">
+                  current {selDir} map: {current ?? "none"} (restored on revert)
+                </span>
+              )}
+            </label>
+          );
+        }
+
+        if (spec.enum && spec.enum.length) {
+          return (
+            <label key={name} className="block space-y-1 text-sm font-medium">
+              {label}
+              <select
+                className={inputClass}
+                value={values[name] ?? ""}
+                onChange={(e) => set(name, e.target.value)}
+              >
+                <option value="">Select…</option>
+                {spec.enum.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </select>
             </label>
           );
         }

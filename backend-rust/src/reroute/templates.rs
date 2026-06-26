@@ -214,6 +214,13 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 if provided.chars().any(char::is_whitespace) {
                     bail!("parameter '{name}' must not contain whitespace");
                 }
+                // Optional closed set (e.g. a BGP direction in|out).
+                if let Some(allowed) = spec.get("enum").and_then(Value::as_array) {
+                    if !allowed.iter().any(|v| v.as_str() == Some(provided.as_str())) {
+                        let list: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+                        bail!("parameter '{name}' must be one of: {}", list.join(", "));
+                    }
+                }
                 subst.insert(name.clone(), Value::String(provided));
             }
         }
@@ -523,6 +530,15 @@ mod tests {
         assert!(!cidr_contains_host("2001:db8::/32", v4));
         // a /32 announced host contains itself
         assert!(cidr_contains_host("203.0.113.45/32", v4));
+    }
+
+    #[test]
+    fn enum_param_restricts_values() {
+        // A BGP direction param accepts only its closed set.
+        let schema = json!({"direction": {"type": "string", "required": true, "enum": ["in", "out"]}});
+        assert!(validate_and_expand(&schema, &json!({"direction": "out"})).is_ok());
+        assert!(validate_and_expand(&schema, &json!({"direction": "in"})).is_ok());
+        assert!(validate_and_expand(&schema, &json!({"direction": "both"})).is_err());
     }
 
     #[test]
