@@ -129,6 +129,9 @@ export interface DeviceCreate {
   ssh_password?: string;
   ssh_private_key?: string;
   ssh_key_passphrase?: string;
+  /** With ssh_auth_method "key": generate an in-app keypair instead of pasting
+   *  a private key. The created device returns ssh_public_key for enrollment. */
+  ssh_generate_key?: boolean;
 }
 
 export interface InterfaceMetrics {

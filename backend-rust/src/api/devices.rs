@@ -175,6 +175,11 @@ pub struct CreateDevice {
     ssh_password: Option<String>,
     ssh_private_key: Option<String>,
     ssh_key_passphrase: Option<String>,
+    /// With auth method "key", generate a fresh in-app RSA keypair instead of
+    /// accepting a pasted private key. The public key is returned on the created
+    /// device for router enrollment (same keygen the device-detail button uses).
+    #[serde(default)]
+    ssh_generate_key: bool,
 }
 
 fn default_version() -> String {
@@ -198,6 +203,7 @@ fn validate_ssh<'a>(
     username: Option<&'a str>,
     password: Option<&str>,
     private_key: Option<&str>,
+    will_generate_key: bool,
 ) -> Result<Option<&'a str>, &'static str> {
     let user = username.map(str::trim).filter(|s| !s.is_empty());
     match method {
@@ -209,8 +215,12 @@ fn validate_ssh<'a>(
             Ok(user)
         }
         Some("key") => {
-            if user.is_none() || private_key.map(str::is_empty).unwrap_or(true) {
-                return Err("ssh_auth_method 'key' requires ssh_username and ssh_private_key");
+            if user.is_none() {
+                return Err("ssh_auth_method 'key' requires ssh_username");
+            }
+            // A pasted private key is required UNLESS we're generating one in-app.
+            if !will_generate_key && private_key.map(str::is_empty).unwrap_or(true) {
+                return Err("ssh_auth_method 'key' requires ssh_private_key (or set ssh_generate_key)");
             }
             Ok(user)
         }
@@ -236,25 +246,29 @@ pub async fn create(
             "only SNMP v2c is supported in v1",
         );
     }
+    // Generate an in-app keypair only when key auth is chosen AND no paste given.
+    let generate_key =
+        body.ssh_generate_key && body.ssh_auth_method.as_deref() == Some("key");
+
     // Validate SSH access (password XOR key) before touching the DB.
     let ssh_username = match validate_ssh(
         body.ssh_auth_method.as_deref(),
         body.ssh_username.as_deref(),
         body.ssh_password.as_deref(),
         body.ssh_private_key.as_deref(),
+        generate_key,
     ) {
         Ok(u) => u,
         Err(m) => return err(StatusCode::UNPROCESSABLE_ENTITY, m),
     };
 
-    // Encrypt every secret (community + SSH password/key/passphrase) at rest.
-    let (community_enc, ssh_pw_enc, ssh_key_enc, ssh_pass_enc) = match (
+    // Encrypt community + SSH password/passphrase at rest.
+    let (community_enc, ssh_pw_enc, ssh_pass_enc) = match (
         seal_opt(body.community.as_deref()),
         seal_opt(body.ssh_password.as_deref()),
-        seal_opt(body.ssh_private_key.as_deref()),
         seal_opt(body.ssh_key_passphrase.as_deref()),
     ) {
-        (Ok(c), Ok(p), Ok(k), Ok(pp)) => (c, p, k, pp),
+        (Ok(c), Ok(p), Ok(pp)) => (c, p, pp),
         _ => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -263,10 +277,59 @@ pub async fn create(
         }
     };
 
+    // SSH private key: generate a fresh keypair in-app, or seal the pasted one.
+    // Either way derive the public key so the UI can show it for router enrollment
+    // (the device-detail "Generate key" path does the same; create previously
+    // stored no public key at all).
+    let (ssh_key_enc, ssh_public_key): (Option<Vec<u8>>, Option<String>) = if generate_key {
+        if !crypto::is_configured() {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encryption key not configured",
+            );
+        }
+        let host = if body.hostname.trim().is_empty() {
+            body.name.trim()
+        } else {
+            body.hostname.trim()
+        };
+        let key = match crate::ssh::generate_rsa_key(&format!("rerouter@{host}")) {
+            Ok(k) => k,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "key generation failed"),
+        };
+        match crypto::seal_str(&key.private_key_openssh) {
+            Ok(enc) => (Some(enc), Some(key.public_key_openssh)),
+            Err(_) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "encrypting private key failed",
+                )
+            }
+        }
+    } else {
+        let enc = match seal_opt(body.ssh_private_key.as_deref()) {
+            Ok(k) => k,
+            Err(_) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "encrypting credentials failed",
+                )
+            }
+        };
+        let pubkey = body
+            .ssh_private_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|pem| {
+                crate::ssh::derive_public_openssh(pem, body.ssh_key_passphrase.as_deref())
+            });
+        (enc, pubkey)
+    };
+
     let res = sqlx::query(
         "INSERT INTO devices (name, hostname, snmp_version, snmp_port, community_encrypted, poll_interval_seconds, \
-         ssh_username, ssh_port, ssh_auth_method, ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ssh_username, ssh_port, ssh_auth_method, ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted, ssh_public_key) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(&body.hostname)
@@ -280,6 +343,7 @@ pub async fn create(
     .bind(ssh_pw_enc)
     .bind(ssh_key_enc)
     .bind(ssh_pass_enc)
+    .bind(ssh_public_key)
     .execute(&state.pool)
     .await;
 

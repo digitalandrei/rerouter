@@ -47,6 +47,8 @@ interface AddDeviceForm {
   snmp_port: string;
   poll_interval_seconds: string;
   ssh_auth_method: string;
+  /** When auth method is "key": "generate" (in-app keypair) or "paste". */
+  ssh_key_mode: string;
   ssh_username: string;
   ssh_port: string;
   ssh_password: string;
@@ -62,6 +64,7 @@ const DEFAULT_FORM: AddDeviceForm = {
   snmp_port: "161",
   poll_interval_seconds: "60",
   ssh_auth_method: "none",
+  ssh_key_mode: "generate",
   ssh_username: "",
   ssh_port: "22",
   ssh_password: "",
@@ -139,6 +142,9 @@ export default function Devices() {
         payload.ssh_port = parseInt(form.ssh_port, 10);
         if (form.ssh_auth_method === "password") {
           payload.ssh_password = form.ssh_password;
+        } else if (form.ssh_key_mode === "generate") {
+          // Generate the keypair in-app; the public key comes back on the device.
+          payload.ssh_generate_key = true;
         } else {
           payload.ssh_private_key = form.ssh_private_key;
           if (form.ssh_key_passphrase) {
@@ -146,10 +152,18 @@ export default function Devices() {
           }
         }
       }
-      await api.devices.create(payload);
+      const created = await api.devices.create(payload);
+      const generated =
+        form.ssh_auth_method === "key" && form.ssh_key_mode === "generate";
       setForm(DEFAULT_FORM);
       setShowAdd(false);
-      loadDevices();
+      // After generating a key, open the device so the operator can copy the
+      // public key and the router enrollment commands; otherwise just refresh.
+      if (generated && created?.id) {
+        navigate(`/devices/${created.id}`);
+      } else {
+        loadDevices();
+      }
     } catch (err) {
       setAddError(err instanceof ApiError ? err.message : "Failed to add device");
     } finally {
@@ -342,30 +356,51 @@ export default function Devices() {
                 {form.ssh_auth_method === "key" && (
                   <div className="space-y-4">
                     <label className="block space-y-1 text-sm font-medium">
-                      SSH private key
-                      <textarea
-                        required
-                        rows={6}
-                        className={`${inputClass} font-mono text-xs`}
-                        value={form.ssh_private_key}
-                        onChange={(e) =>
-                          setField("ssh_private_key", e.target.value)
-                        }
-                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-                      />
-                    </label>
-                    <label className="block space-y-1 text-sm font-medium">
-                      Key passphrase (optional)
-                      <input
-                        type="password"
+                      Key source
+                      <select
                         className={inputClass}
-                        value={form.ssh_key_passphrase}
-                        onChange={(e) =>
-                          setField("ssh_key_passphrase", e.target.value)
-                        }
-                        autoComplete="new-password"
-                      />
+                        value={form.ssh_key_mode}
+                        onChange={(e) => setField("ssh_key_mode", e.target.value)}
+                      >
+                        <option value="generate">Generate a new key in-app</option>
+                        <option value="paste">Paste an existing private key</option>
+                      </select>
                     </label>
+                    {form.ssh_key_mode === "generate" ? (
+                      <p className="text-xs text-muted-foreground">
+                        A key pair is generated and the private key stored encrypted.
+                        After saving, the device opens so you can copy the public key
+                        and the router enrollment commands.
+                      </p>
+                    ) : (
+                      <>
+                        <label className="block space-y-1 text-sm font-medium">
+                          SSH private key
+                          <textarea
+                            required
+                            rows={6}
+                            className={`${inputClass} font-mono text-xs`}
+                            value={form.ssh_private_key}
+                            onChange={(e) =>
+                              setField("ssh_private_key", e.target.value)
+                            }
+                            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+                          />
+                        </label>
+                        <label className="block space-y-1 text-sm font-medium">
+                          Key passphrase (optional)
+                          <input
+                            type="password"
+                            className={inputClass}
+                            value={form.ssh_key_passphrase}
+                            onChange={(e) =>
+                              setField("ssh_key_passphrase", e.target.value)
+                            }
+                            autoComplete="new-password"
+                          />
+                        </label>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
