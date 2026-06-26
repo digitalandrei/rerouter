@@ -21,7 +21,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -627,14 +627,21 @@ fn cisco_denied(output: &str) -> Option<String> {
 /// Each check reports ok + the router's message on denial. Used by the Settings
 /// "command access" panel so an under-privileged account is obvious.
 pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<CapabilityCheck>> {
-    // Reads first, then a no-op config-mode entry (nothing is applied).
-    let probes: [(&str, &str); 4] = [
+    // Reads first (these cover every template's *verification* command family:
+    // running-config, ip/ipv6 route, ip bgp, interfaces), then a no-op config-mode
+    // entry. The actual apply verbs (ip route / ipv6 route / ip prefix-list /
+    // router / interface + sub-commands) can't be probed without side effects, so
+    // they aren't executed here — the controller allowlist + the installed parser
+    // view are the enforcing controls for those.
+    let probes: [(&str, &str); 6] = [
         (
             "Read running-config",
             "show running-config | section ^router bgp",
         ),
-        ("Read routing table", "show ip route summary"),
+        ("Read IPv4 routing table", "show ip route summary"),
+        ("Read IPv6 routing table", "show ipv6 route summary"),
         ("Read BGP table", "show ip bgp summary"),
+        ("Read interfaces", "show interfaces summary"),
         ("Enter configuration mode", "configure terminal"),
     ];
     // We deliberately do NOT append a trailing `end` to leave config mode. If
@@ -731,6 +738,18 @@ fn is_cidr(tok: &str) -> bool {
         None => false,
     }
 }
+/// A bare IPv6 address — `{prefix_net}` renders to one for `show ipv6 route`.
+fn is_ipv6(tok: &str) -> bool {
+    tok.parse::<Ipv6Addr>().is_ok()
+}
+/// `addr/len` (IPv6 CIDR, len 0..=128) — `{prefix}` renders to one for the
+/// IPv6 blackhole/null-route templates (`ipv6 route <cidr> Null0`).
+fn is_cidr6(tok: &str) -> bool {
+    match tok.split_once('/') {
+        Some((ip, len)) => ip.parse::<Ipv6Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 128),
+        None => false,
+    }
+}
 /// A bare config name token (interface name, prefix-list name): non-empty and
 /// restricted to `[A-Za-z0-9/._:-]` so it can never smuggle a second command or
 /// whitespace. Template params are already whitespace-free; this is defense in depth.
@@ -775,6 +794,8 @@ fn command_allowed(cmd: &str) -> bool {
         ["show", "running-config"] => true,
         ["show", "ip", "route", "summary"] => true,
         ["show", "ip", "route", a] => is_ipv4(a),
+        ["show", "ipv6", "route", "summary"] => true,
+        ["show", "ipv6", "route", a] => is_ipv6(a) || is_cidr6(a),
         ["show", "ip", "bgp", "summary"] => true,
         ["show", "ip", "bgp", "neighbors", a] => is_ipv4(a),
         ["show", "ip", "bgp", "neighbors", a, "advertised-routes"] => is_ipv4(a),
@@ -790,6 +811,13 @@ fn command_allowed(cmd: &str) -> bool {
         ["no", "ip", "route", net, mask, "Null0", "tag", tag] => {
             is_ipv4(net) && is_ipv4(mask) && is_u32(tag)
         }
+        // IPv6 blackhole/null-route: `ipv6 route <cidr> Null0` (single CIDR token,
+        // no dotted mask), with the optional name / tag the templates render.
+        ["ipv6", "route", p, "Null0"] => is_cidr6(p),
+        ["ipv6", "route", p, "Null0", "name", _] => is_cidr6(p),
+        ["ipv6", "route", p, "Null0", "tag", tag] => is_cidr6(p) && is_u32(tag),
+        ["no", "ipv6", "route", p, "Null0"] => is_cidr6(p),
+        ["no", "ipv6", "route", p, "Null0", "tag", tag] => is_cidr6(p) && is_u32(tag),
         // BGP session shut / no-shut
         ["router", "bgp", asn] => is_u32(asn),
         ["neighbor", ip, "shutdown"] => is_ipv4(ip),
@@ -1107,6 +1135,15 @@ mod tests {
             "ip route 203.0.113.0 255.255.255.0 Null0 tag 666",
             "no ip route 203.0.113.0 255.255.255.0 Null0",
             "no ip route 203.0.113.0 255.255.255.0 Null0 tag 666",
+            // IPv6 blackhole / null-route (single CIDR token) + verify reads
+            "ipv6 route 2001:db8::1/128 Null0",
+            "ipv6 route 2001:db8::1/128 Null0 name RRT-BLACKHOLE",
+            "ipv6 route 2001:db8::/48 Null0 tag 666",
+            "no ipv6 route 2001:db8::1/128 Null0",
+            "no ipv6 route 2001:db8::/48 Null0 tag 666",
+            "show ipv6 route summary",
+            "show ipv6 route 2001:db8::1",
+            "show ipv6 route 2001:db8::/48",
             "router bgp 65010",
             "neighbor 198.51.100.7 shutdown",
             "no neighbor 198.51.100.7 shutdown",
@@ -1156,6 +1193,11 @@ mod tests {
             "neighbor 198.51.100.7 route-map bad name out", // route-map name has whitespace
             "interface Gig 0/0",                 // whitespace in name
             "ip tcp adjust-mss notanumber",
+            "ipv6 route 2001:db8::1 Null0",      // needs a /len (CIDR), not a bare addr
+            "ipv6 route 2001:db8::1/128 10::1",  // next-hop, not Null0
+            "ipv6 route gggg::/128 Null0",       // not a valid v6 address
+            "ipv6 route 203.0.113.0/24 Null0",   // v4 in a v6 command
+            "show ipv6 route ; reload",          // chaining / extra tokens
         ] {
             assert!(!command_allowed(bad), "should reject: {bad}");
         }

@@ -4,10 +4,15 @@
 !  Role-Based CLI Access "view" that limits the controller's SSH account to ONLY
 !  the commands Rerouter actually issues:
 !
-!     reads     : show running-config, show ip route, show ip bgp, show version,
-!                 show clock, terminal length
-!     null-route: [no] ip route <net> <mask> Null0        (RTBH to Null0)
+!     reads      : show running-config, show ip route, show ipv6 route,
+!                  show ip bgp, show interfaces, show version, show clock,
+!                  terminal length
+!     blackhole  : [no] ip route <net> <mask> Null0        (RTBH to Null0, IPv4)
+!                  [no] ipv6 route <cidr> Null0            (RTBH to Null0, IPv6)
 !     bgp session: router bgp <asn> ; [no] neighbor <ip> shutdown
+!     bgp policy : router bgp <asn> ; [no] neighbor <ip> route-map <name> in|out
+!                  [no] ip prefix-list <name> permit <cidr> ; clear ip bgp <ip> soft in|out
+!     interface  : interface <if> ; [no] ip tcp adjust-mss <n> ; [no] shutdown
 !
 !  Everything else is denied by the view (fail-closed). This is defense-in-depth:
 !  the controller ALSO only ever renders these commands from validated templates
@@ -40,20 +45,38 @@ parser view RRT-BGP
  commands exec include show clock
  commands exec include show version
  commands exec include show ip route
+ commands exec include show ipv6 route
  commands exec include show ip bgp
+ commands exec include show interfaces
  commands exec include show running-config
+ !
+ ! -- BGP soft-clear: activates bgp_advertise / bgp_route_map_set (exec-level) --
+ commands exec include clear ip bgp
  !
  ! -- enter global configuration mode --
  commands exec include configure terminal
  !
- ! -- null-route (RTBH to Null0) in global config --
+ ! -- blackhole / null-route (RTBH to Null0), IPv4 + IPv6, in global config --
  commands configure include ip route
  commands configure include no ip route
+ commands configure include ipv6 route
+ commands configure include no ipv6 route
  !
- ! -- BGP session shut / no-shut --
+ ! -- BGP advertise via outbound prefix-list --
+ commands configure include ip prefix-list
+ commands configure include no ip prefix-list
+ !
+ ! -- BGP session shut/no-shut + route-map change --
  commands configure include router bgp
  commands router include neighbor
  commands router include no neighbor
+ !
+ ! -- interface MSS clamp + shut/no-shut --
+ commands configure include interface
+ commands interface include ip tcp adjust-mss
+ commands interface include no ip tcp adjust-mss
+ commands interface include shutdown
+ commands interface include no shutdown
  !
  ! -- OPTIONAL: uncomment so `show running-config` also reveals `network`
  !    statements, which announced-prefix discovery needs. NOTE: including it
@@ -89,13 +112,19 @@ end
 ! ============================================================================
 !  Granularity caveats (why the controller-side allowlist still matters)
 ! ============================================================================
-!  * `commands configure include ip route` permits ANY static route, not only
-!    routes to Null0 — the Null0 keyword sits after the variable net/mask, which
-!    a parser view cannot pin. The controller only ever emits `... Null0`.
+!  * `commands configure include ip route` / `ipv6 route` permit ANY static
+!    route, not only routes to Null0 — the Null0 keyword sits after the variable
+!    net/mask, which a parser view cannot pin. The controller only ever emits
+!    `... Null0`.
 !  * `commands router include neighbor` permits ALL `neighbor` subcommands, not
-!    only `shutdown` — the neighbor IP is a variable, so the view cannot pin the
-!    trailing `shutdown` keyword. The controller only ever emits
-!    `[no] neighbor <ip> shutdown`.
+!    only `shutdown` / `route-map` — the neighbor IP is a variable, so the view
+!    cannot pin the trailing keyword. The controller only ever emits
+!    `[no] neighbor <ip> shutdown` and `[no] neighbor <ip> route-map <name> in|out`.
+!  * `commands configure include interface` + the `interface` sub-commands permit
+!    `[no] shutdown` and `[no] ip tcp adjust-mss <n>` on ANY interface; the
+!    controller only emits these against the interface named in the template.
+!  * `commands configure include ip prefix-list` permits any prefix-list entry;
+!    the controller only emits `[no] ip prefix-list <name> permit <cidr>`.
 !  Pinning to the exact full command line requires TACACS+ command authorization
 !  (regex per line) or the in-app allowlist — not local parser views.
 ! ----------------------------------------------------------------------------

@@ -85,18 +85,37 @@ enable view
 configure terminal
 parser view RRT-BGP
  secret <VIEW_SECRET>
+ ! reads: connectivity, template verification + discovery
  commands exec include terminal length 0
  commands exec include show clock
  commands exec include show version
  commands exec include show ip route
+ commands exec include show ipv6 route
  commands exec include show ip bgp
+ commands exec include show interfaces
  commands exec include show running-config
+ ! BGP soft-clear (activate advertise / route-map change)
+ commands exec include clear ip bgp
+ ! enter global configuration mode
  commands exec include configure terminal
+ ! blackhole / null-route to Null0 (IPv4 + IPv6)
  commands configure include ip route
  commands configure include no ip route
+ commands configure include ipv6 route
+ commands configure include no ipv6 route
+ ! BGP advertise via outbound prefix-list
+ commands configure include ip prefix-list
+ commands configure include no ip prefix-list
+ ! BGP session shut/no-shut + route-map change
  commands configure include router bgp
  commands router include neighbor
  commands router include no neighbor
+ ! interface MSS clamp + shut/no-shut
+ commands configure include interface
+ commands interface include ip tcp adjust-mss
+ commands interface include no ip tcp adjust-mss
+ commands interface include shutdown
+ commands interface include no shutdown
  ! uncomment so 'show run' also reveals 'network' statements (prefix discovery):
  ! commands router include network
 end`;
