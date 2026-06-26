@@ -41,7 +41,7 @@ routing context: announced prefixes and BGP neighbor labels
 (`POST /api/devices/{id}/ssh-capabilities`). In enforce mode the same SSH path
 drives the device-CLI reroute templates. Every SSH command is checked against a
 **fail-closed in-app allowlist**; the restricted view ships at
-[../deploy/cisco/rerouter-bgp-view.ios](../deploy/cisco/rerouter-bgp-view.ios).
+[../deploy/cisco/rerouter-view.ios](../deploy/cisco/rerouter-view.ios).
 
 SSH auth is **password XOR key** (the operator picks one per device):
 

@@ -70,11 +70,11 @@ function asrEnrollment(username: string, publicKey: string): string {
 
 /** The built-in Cisco IOS parser view that limits the controller's account to
  *  exactly the commands Rerouter issues. Also kept in the repo at
- *  deploy/cisco/rerouter-bgp-view.ios; surfaced here so it's installable from the
+ *  deploy/cisco/rerouter-view.ios; surfaced here so it's installable from the
  *  UI. Secrets are placeholders the operator fills in. */
-const RRT_BGP_VIEW = `! Restricted parser view for the Rerouter SSH account.
-! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Assign via TACACS+
-! (shell:cli-view-name=RRT-BGP, priv 15); local logins use 'enable view RRT-BGP'.
+const RRT_VIEW = `! Restricted parser view for the Rerouter SSH account.
+! Replace <ENABLE_SECRET> and <VIEW_SECRET>. Bind to the local account with
+! 'username <user> view RRT secret <...>'; verify with 'enable view RRT'.
 configure terminal
  aaa new-model
  aaa authentication login default local
@@ -83,7 +83,7 @@ configure terminal
 end
 enable view
 configure terminal
-parser view RRT-BGP
+parser view RRT
  secret <VIEW_SECRET>
  ! reads: connectivity, template verification + discovery
  commands exec include terminal length 0
@@ -446,14 +446,14 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
 
                   <details className="rounded-md border border-border p-3">
                     <summary className="flex cursor-pointer items-center justify-between text-sm font-medium">
-                      Restricted IOS view (RRT-BGP)
+                      Restricted IOS view (RRT)
                       <Button
                         type="button"
                         variant="ghost"
                         size="sm"
                         onClick={(e) => {
                           e.preventDefault();
-                          copy(RRT_BGP_VIEW, "View config");
+                          copy(RRT_VIEW, "View config");
                         }}
                       >
                         <Copy className="size-3.5" />
@@ -461,10 +461,10 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                       </Button>
                     </summary>
                     <p className="mt-2 text-xs text-muted-foreground">
-                      A Cisco parser view that limits this account to exactly the commands Rerouter sends. Replace the two secrets; assign via TACACS+ (<code>cli-view-name=RRT-BGP</code>) or test locally with <code>enable view RRT-BGP</code>.
+                      A Cisco parser view that limits this account to exactly the commands Rerouter sends. Replace the two secrets; bind it to the account with <code>username &lt;user&gt; view RRT secret …</code>, or test locally with <code>enable view RRT</code>.
                     </p>
                     <pre className="mt-2 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
-                      {RRT_BGP_VIEW}
+                      {RRT_VIEW}
                     </pre>
                   </details>
                 </div>

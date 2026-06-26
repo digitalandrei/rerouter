@@ -343,7 +343,7 @@ the per-template "safety level" attribute was removed with them. A free-text
 "run this route command" box is never exposed: commands come only from these
 templates with typed params, gated by a fail-closed in-app command allowlist
 (`ssh::command_allowed`), and the router account is further scoped by a
-restricted Cisco parser view (`deploy/cisco/rerouter-bgp-view.ios`).
+restricted Cisco parser view (`deploy/cisco/rerouter-view.ios`).
 
 ---
 

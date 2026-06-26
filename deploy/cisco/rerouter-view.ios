@@ -20,7 +20,7 @@
 !
 !  Replace <ENABLE_SECRET> and <VIEW_SECRET> before pasting. Tested shape for
 !  IOS 15.x; verify command tokens on your image (`?` is your friend inside the
-!  view: `parser view RRT-BGP` then `commands exec include ?`).
+!  view: `parser view RRT` then `commands exec include ?`).
 ! ----------------------------------------------------------------------------
 
 ! ---- 1. one-time prerequisites (AAA + an enable secret to reach root view) ----
@@ -37,7 +37,7 @@ enable view
 
 ! ---- 3. define the restricted view ----
 configure terminal
-parser view RRT-BGP
+parser view RRT
  secret <VIEW_SECRET>
  !
  ! -- reads the controller needs (Test SSH, verify, discovery, label parsing) --
@@ -88,25 +88,21 @@ end
 ! ============================================================================
 !  Assigning the view to the controller's SSH account
 ! ============================================================================
-!  IMPORTANT: IOS does NOT auto-assign a CLI view to a *locally*-authenticated
-!  user — local login lands in the root/privilege context, and a non-interactive
-!  SSH (publickey) session cannot run `enable view RRT-BGP` interactively.
+!  Bind the view to the local account so it is applied automatically on login —
+!  including the controller's non-interactive (publickey) SSH session — via the
+!  `aaa authorization exec default local` set in step 1:
 !
-!  Use ONE of:
+configure terminal
+ username <REROUTER_USER> view RRT secret <USER_SECRET>
+end
 !
-!   (A) TACACS+ (recommended for an automated account): return the view on login
-!       so it is applied with no interaction. Free-radius/ISE/ACS av-pair:
-!           shell:cli-view-name=RRT-BGP
-!       (with priv-lvl 15). This is the clean "priv 15 + view" setup.
+!  (Publickey for that user is configured separately under `ip ssh pubkey-chain`.)
+!  To verify the command set interactively: `enable view RRT`, then <VIEW_SECRET>.
 !
-!   (B) Local testing only: log in interactively and run
-!           enable view RRT-BGP
-!       then supply <VIEW_SECRET>. Good for verifying the command set, but not
-!       usable by the controller's non-interactive session.
-!
-!  If you are local-only with no TACACS+, the controller-side allowlist (it only
-!  ever sends the commands above) remains the enforcing control; tell us and we
-!  can instead lower exactly these commands to a custom privilege level.
+!  Verify `username ... view` behaviour on your image; if the account cannot be
+!  pinned to the view, the controller-side allowlist (it only ever sends the
+!  commands above) remains the enforcing control. Tell us and we can instead lower
+!  exactly these commands to a custom privilege level.
 ! ----------------------------------------------------------------------------
 
 ! ============================================================================
@@ -125,6 +121,6 @@ end
 !    controller only emits these against the interface named in the template.
 !  * `commands configure include ip prefix-list` permits any prefix-list entry;
 !    the controller only emits `[no] ip prefix-list <name> permit <cidr>`.
-!  Pinning to the exact full command line requires TACACS+ command authorization
-!  (regex per line) or the in-app allowlist — not local parser views.
+!  Pinning to the exact full command line (variable tokens included) is the job of
+!  the in-app allowlist, not a local parser view.
 ! ----------------------------------------------------------------------------
