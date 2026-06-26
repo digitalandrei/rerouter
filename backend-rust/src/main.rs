@@ -89,6 +89,13 @@ struct Cli {
     /// OID prefix for --snmp-walk (default ENTITY-MIB entPhysicalName).
     #[arg(long, default_value = "1.3.6.1.2.1.47.1.1.1.1.7")]
     oid: String,
+
+    /// Debug: run the read-only SSH connectivity probe against a device (by id,
+    /// using its stored creds) — the same `show version`/`show clock` the UI
+    /// "Check access" button runs — print the result, and exit. Mirrors the
+    /// /api/devices/{id}/ssh-test endpoint for headless diagnosis.
+    #[arg(long)]
+    ssh_test: Option<u64>,
 }
 
 #[tokio::main]
@@ -174,6 +181,33 @@ async fn main() -> Result<()> {
     }
     if let Some(dev_id) = cli.snmp_walk {
         telemetry::snmp::debug_walk(&pool, dev_id, &cli.oid).await?;
+        return Ok(());
+    }
+    if let Some(dev_id) = cli.ssh_test {
+        let commands = vec![
+            "show version | include (Version|uptime is)".to_string(),
+            "show clock".to_string(),
+        ];
+        match rerouter_controller::ssh::run_commands(&pool, dev_id, &commands).await {
+            Ok(outcome) => {
+                println!(
+                    "SSH OK (device {dev_id}); host key {} ({})",
+                    outcome.fingerprint,
+                    if outcome.pinned_now {
+                        "pinned now — first contact"
+                    } else {
+                        "matches pinned"
+                    }
+                );
+                for r in &outcome.results {
+                    println!("\n$ {}\n{}", r.command, r.output);
+                }
+            }
+            Err(e) => {
+                eprintln!("SSH FAILED (device {dev_id}): {e:#}");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 

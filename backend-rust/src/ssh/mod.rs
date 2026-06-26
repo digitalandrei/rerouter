@@ -348,7 +348,17 @@ fn ios_preferred() -> Preferred {
             cipher::AES_256_CBC,
             cipher::AES_128_CBC,
         ]),
-        mac: Cow::Owned(vec![mac::HMAC_SHA256, mac::HMAC_SHA512, mac::HMAC_SHA1]),
+        // MAC: prefer hmac-sha1 — the one MAC every IOS image here offers, and the
+        // only one proven to work end-to-end with russh 0.61 against these boxes.
+        // SSH picks the CLIENT's first offered MAC the server supports, so listing a
+        // SHA-2 MAC first made russh select hmac-sha2-256 on newer IOS-XE (16.9+,
+        // which adds SHA-2 MACs) and then silently stall *after* auth — the channel
+        // data never decodes, surfacing as "timed out waiting for device prompt".
+        // Older IOS (16.3) offers only hmac-sha1, so it never hit the SHA-2 path and
+        // worked. OpenSSH negotiates hmac-sha2-512 with the same boxes fine, so the
+        // IOS side is healthy — this is russh's SHA-2 MAC path. Keep the SHA-2 MACs
+        // as fallback for any host that does NOT offer hmac-sha1.
+        mac: Cow::Owned(vec![mac::HMAC_SHA1, mac::HMAC_SHA256, mac::HMAC_SHA512]),
         compression: Cow::Borrowed(&[compression::NONE]),
     }
 }
