@@ -56,7 +56,8 @@ global_action_rate_limit_window_seconds = 600
 # Per-rule re-fire throttle and per-device post-action throttle.
 same_rule_cooldown_seconds = 900
 same_device_cooldown_seconds = 300
-mark_running_actions_uncertain_on_startup = true
+# Crash recovery (pending/running/verifying -> uncertain + device lock) is
+# non-negotiable and always runs on startup; there is intentionally no opt-out.
 
 [reroute]
 # Verify the resulting routing state after every action ("never trust 'sent'").

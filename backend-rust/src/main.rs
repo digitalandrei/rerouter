@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
     }
 
     // e. SAFETY: resolve crash-time state before doing anything live.
-    reroute::state_machine::recover_on_startup(&pool, &cfg).await?;
+    reroute::state_machine::recover_on_startup(&pool).await?;
 
     // Internal alert dispatcher (replaces any external queue worker): polls the
     // alerts table and sends email via SMTP. Never blocks the control plane.

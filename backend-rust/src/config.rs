@@ -108,7 +108,6 @@ pub struct Safety {
     /// Per-device throttle: after any action on a device, that device is in
     /// cooldown for this long (0 = none).
     pub same_device_cooldown_seconds: u64,
-    pub mark_running_actions_uncertain_on_startup: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,7 +219,6 @@ impl Default for Safety {
             global_action_rate_limit_window_seconds: 600,
             same_rule_cooldown_seconds: 900,
             same_device_cooldown_seconds: 300,
-            mark_running_actions_uncertain_on_startup: true,
         }
     }
 }
