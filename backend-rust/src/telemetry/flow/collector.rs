@@ -33,6 +33,11 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 /// How often to refresh the device -> source-IP allowlist.
 const ALLOWLIST_INTERVAL: Duration = Duration::from_secs(30);
+/// Hard cap on distinct exporters held in memory. The allowlist normally keeps
+/// this tiny, but with `allowlist_enrolled_only = false` a spoofed-source flood
+/// could otherwise grow the map without bound (memory-exhaustion DoS). When full,
+/// a datagram from a *new* source evicts the least-recently-seen exporter.
+const MAX_EXPORTERS: usize = 10_000;
 
 /// Running counts for a single aggregation key.
 #[derive(Debug, Default, Clone, Copy)]
@@ -144,6 +149,9 @@ struct Exporter {
     dropped_no_template: u64,
     dropped_malformed: u64,
     last_sequence: Option<u32>,
+    /// Unix seconds of the most recent datagram — drives LRU eviction when the
+    /// exporter map hits [`MAX_EXPORTERS`].
+    last_seen: i64,
 }
 
 impl Exporter {
@@ -161,6 +169,7 @@ impl Exporter {
             dropped_no_template: 0,
             dropped_malformed: 0,
             last_sequence: None,
+            last_seen: 0,
         }
     }
 }
@@ -174,6 +183,8 @@ struct State {
     allow: HashMap<IpAddr, u64>,
     /// datagrams dropped because the source is not an enrolled device.
     dropped_not_allowlisted: u64,
+    /// exporters evicted because the map reached [`MAX_EXPORTERS`].
+    evicted_exporters: u64,
 }
 
 /// Spawn the collector (listener + flush + prune + allowlist refresh) when
@@ -237,6 +248,28 @@ async fn recv_loop(socket: Arc<UdpSocket>, cfg: Arc<Config>, state: Arc<Mutex<St
             continue;
         }
 
+        // Bound the exporter map: if this is a new source and we are at capacity,
+        // evict the least-recently-seen exporter so a high-entropy spoofed flood
+        // cannot grow memory without limit.
+        if !st.exporters.contains_key(&src_ip) && st.exporters.len() >= MAX_EXPORTERS {
+            if let Some(victim) = st
+                .exporters
+                .iter()
+                .min_by_key(|(_, ex)| ex.last_seen)
+                .map(|(ip, _)| *ip)
+            {
+                st.exporters.remove(&victim);
+                st.evicted_exporters += 1;
+                tracing::warn!(
+                    event_type = "flow_exporter_evicted",
+                    evicted = %victim,
+                    incoming = %src_ip,
+                    cap = MAX_EXPORTERS,
+                    "exporter map full — evicted least-recently-seen exporter"
+                );
+            }
+        }
+
         let exporter = st
             .exporters
             .entry(src_ip)
@@ -246,6 +279,7 @@ async fn recv_loop(socket: Arc<UdpSocket>, cfg: Arc<Config>, state: Arc<Mutex<St
             exporter.device_id = device_id;
         }
         exporter.datagrams_total += 1;
+        exporter.last_seen = now;
 
         match v9::decode(&buf[..len], &mut exporter.templates) {
             Ok(decoded) => {
