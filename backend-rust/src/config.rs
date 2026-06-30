@@ -135,9 +135,16 @@ pub struct Retention {
 pub struct Flow {
     pub enabled: bool,
     /// UDP bind address for the collector (e.g. a management address reachable
-    /// from the exporting router). NOT loopback-restricted.
+    /// from the exporting router). NOT loopback-restricted. Shared by both the
+    /// NetFlow and the sFlow listeners.
     pub bind_addr: String,
+    /// NetFlow v9 UDP port (the classic flow listener).
     pub bind_port: u16,
+    /// Enable the sFlow v5 listener (a SECOND decoder feeding the same buckets).
+    /// Off by default; only binds when `enabled && sflow_enabled`.
+    pub sflow_enabled: bool,
+    /// UDP port for the sFlow listener (sFlow's default is 6343).
+    pub sflow_port: u16,
     /// Only parse datagrams whose source IP resolves to an enrolled device.
     pub allowlist_enrolled_only: bool,
     /// Retain ~the last hour of aggregated buckets (mirrors interface_samples).
@@ -159,6 +166,8 @@ impl Default for Flow {
             enabled: false,
             bind_addr: "0.0.0.0".into(),
             bind_port: 2055,
+            sflow_enabled: false,
+            sflow_port: 6343,
             allowlist_enrolled_only: true,
             retention_minutes: 70,
             bucket_seconds: 60,

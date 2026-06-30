@@ -7,11 +7,15 @@
 //! telemetry: it ingests, aggregates, and displays. It executes nothing — observe
 //! mode and every reroute gate are unchanged.
 //!
-//! Layout: [`v9`] is the wire decoder (pure, never panics, structured errors);
-//! [`collector`] is the UDP listener + bucket aggregation + DB flush + prune.
-//! The decoder normalizes to [`FlowRecord`] so an IPFIX (v10) decoder is additive.
+//! Layout: [`v9`] (NetFlow v9, template-based) and [`sflow`] (sFlow v5,
+//! stateless, raw-packet-header sampling) are the wire decoders (pure, never
+//! panic, structured errors); [`collector`] is the UDP listener(s) + bucket
+//! aggregation + DB flush + prune. Both decoders normalize to [`FlowRecord`], so
+//! they share all downstream aggregation, storage, API, and UI (an IPFIX v10
+//! decoder would be additive in the same way).
 
 pub mod collector;
+pub mod sflow;
 pub mod v9;
 
 use std::net::IpAddr;

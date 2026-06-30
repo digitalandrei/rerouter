@@ -76,6 +76,10 @@ reroute_logs_days = 365
 enabled = false
 bind_addr = "0.0.0.0"
 bind_port = 2055
+# sFlow v5 listener — a SECOND decoder feeding the same buckets. Off by default;
+# binds only when enabled && sflow_enabled. 6343 is sFlow's default UDP port.
+sflow_enabled = false
+sflow_port = 6343
 # Only parse datagrams whose source IP resolves to an enrolled device.
 allowlist_enrolled_only = true
 # Retain ~the last hour of aggregated buckets (mirrors interface_samples).

@@ -21,9 +21,29 @@ use sqlx::MySqlPool;
 use tokio::net::UdpSocket;
 
 use super::v9::{self, TemplateCache};
-use super::{resolve_sampling, Direction, FlowRecord, PortKind};
+use super::{resolve_sampling, sflow, Direction, FlowRecord, PortKind};
 use crate::config::Config;
 use crate::telemetry::snmp;
+
+/// Which wire protocol a listener decodes. A datagram's protocol is fixed by the
+/// socket it arrived on (NetFlow and sFlow bind separate ports), so the recv loop
+/// never has to sniff the version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    NetflowV9,
+    Sflow,
+}
+
+impl Protocol {
+    /// The `flow_exporters.version` value recorded for this protocol
+    /// (9 = NetFlow v9, 5 = sFlow v5).
+    fn version(self) -> u16 {
+        match self {
+            Protocol::NetflowV9 => 9,
+            Protocol::Sflow => 5,
+        }
+    }
+}
 
 /// Largest UDP payload we will read. NetFlow datagrams are well under this.
 const RECV_BUF: usize = 65_535;
@@ -136,7 +156,10 @@ struct Exporter {
     /// DB `flow_exporters.id`; 0 until first persisted.
     db_id: u64,
     device_id: Option<u64>,
+    /// Wire protocol of the most recent datagram from this source (9 / 5).
+    version: u16,
     observation_domain: u32,
+    /// NetFlow-only template cache; unused (always empty) for sFlow exporters.
     templates: TemplateCache,
     buckets: HashMap<i64, Accum>,
     // resolved sampling inputs (configured is read from the DB at flush time —
@@ -155,10 +178,11 @@ struct Exporter {
 }
 
 impl Exporter {
-    fn new(device_id: Option<u64>) -> Self {
+    fn new(device_id: Option<u64>, version: u16) -> Self {
         Self {
             db_id: 0,
             device_id,
+            version,
             observation_domain: 0,
             templates: TemplateCache::new(),
             buckets: HashMap::new(),
@@ -194,20 +218,48 @@ pub async fn run(pool: MySqlPool, cfg: Arc<Config>) {
     if !cfg.flow.enabled {
         return;
     }
-    let bind = format!("{}:{}", cfg.flow.bind_addr, cfg.flow.bind_port);
-    let socket = match UdpSocket::bind(&bind).await {
+
+    // Bind the NetFlow v9 listener (always, when the collector is enabled).
+    let nf_bind = format!("{}:{}", cfg.flow.bind_addr, cfg.flow.bind_port);
+    let nf_socket = match UdpSocket::bind(&nf_bind).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            tracing::error!(event_type = "flow_bind_failed", bind = %bind, error = %e, "flow collector could not bind UDP — not running");
+            tracing::error!(event_type = "flow_bind_failed", bind = %nf_bind, proto = "netflow_v9", error = %e, "flow collector could not bind UDP — not running");
             return;
         }
     };
     tracing::warn!(
         event_type = "flow_listener_up",
-        bind = %bind,
+        bind = %nf_bind,
+        proto = "netflow_v9",
         allowlist_enrolled_only = cfg.flow.allowlist_enrolled_only,
-        "NetFlow collector listening (deliberate non-loopback UDP exposure — see docs/flow-telemetry.md)"
+        "NetFlow v9 collector listening (deliberate non-loopback UDP exposure — see docs/flow-telemetry.md)"
     );
+
+    // Optionally bind the sFlow v5 listener (a second decoder on its own port,
+    // feeding the same buckets). A bind failure here is non-fatal: NetFlow keeps
+    // running and only sFlow is unavailable.
+    let sflow_socket = if cfg.flow.sflow_enabled {
+        let sf_bind = format!("{}:{}", cfg.flow.bind_addr, cfg.flow.sflow_port);
+        match UdpSocket::bind(&sf_bind).await {
+            Ok(s) => {
+                tracing::warn!(
+                    event_type = "flow_listener_up",
+                    bind = %sf_bind,
+                    proto = "sflow_v5",
+                    allowlist_enrolled_only = cfg.flow.allowlist_enrolled_only,
+                    "sFlow v5 collector listening (deliberate non-loopback UDP exposure — see docs/flow-telemetry.md)"
+                );
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::error!(event_type = "flow_bind_failed", bind = %sf_bind, proto = "sflow_v5", error = %e, "sFlow listener could not bind UDP — sFlow not running");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(Mutex::new(State::default()));
 
@@ -215,12 +267,27 @@ pub async fn run(pool: MySqlPool, cfg: Arc<Config>) {
     tokio::spawn(flush_loop(pool.clone(), cfg.clone(), state.clone()));
     tokio::spawn(prune_loop(pool.clone(), cfg.clone()));
 
-    recv_loop(socket, cfg, state).await;
+    // Both listeners share the same in-memory State (exporter map, allowlist),
+    // so their flows aggregate into the same buckets and exporter-health rows.
+    if let Some(sf) = sflow_socket {
+        tokio::spawn(recv_loop(
+            sf,
+            Protocol::Sflow,
+            cfg.clone(),
+            state.clone(),
+        ));
+    }
+    recv_loop(nf_socket, Protocol::NetflowV9, cfg, state).await;
 }
 
 /// The UDP receive loop. Parses each datagram and folds its flows into the
 /// in-memory buckets. Pure CPU work under a brief lock; no DB, no await held.
-async fn recv_loop(socket: Arc<UdpSocket>, cfg: Arc<Config>, state: Arc<Mutex<State>>) {
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    proto: Protocol,
+    cfg: Arc<Config>,
+    state: Arc<Mutex<State>>,
+) {
     let bucket_secs = cfg.flow.bucket_seconds.max(1) as i64;
     let mut buf = vec![0u8; RECV_BUF];
     loop {
@@ -273,32 +340,53 @@ async fn recv_loop(socket: Arc<UdpSocket>, cfg: Arc<Config>, state: Arc<Mutex<St
         let exporter = st
             .exporters
             .entry(src_ip)
-            .or_insert_with(|| Exporter::new(device_id));
+            .or_insert_with(|| Exporter::new(device_id, proto.version()));
         // Keep the device mapping fresh if the allowlist learned it later.
         if exporter.device_id.is_none() {
             exporter.device_id = device_id;
         }
+        exporter.version = proto.version();
         exporter.datagrams_total += 1;
         exporter.last_seen = now;
 
-        match v9::decode(&buf[..len], &mut exporter.templates) {
-            Ok(decoded) => {
-                exporter.observation_domain = decoded.source_id;
-                exporter.last_sequence = Some(decoded.sequence);
-                exporter.dropped_no_template += decoded.data_without_template as u64;
-                if let Some(rate) = decoded.reported_sampling {
+        // Decode against the right wire protocol, normalizing both to the same
+        // FlowRecord. NetFlow is template-stateful (per-exporter cache); sFlow is
+        // stateless. Either way, a malformed datagram is counted and dropped —
+        // never fatal (doctrine: parsers never panic).
+        // Normalize each decoder's structured error to a String so the two
+        // protocol arms share one result type.
+        let decoded = match proto {
+            Protocol::NetflowV9 => v9::decode(&buf[..len], &mut exporter.templates)
+                .map(|d| {
+                    exporter.observation_domain = d.source_id;
+                    exporter.dropped_no_template += d.data_without_template as u64;
+                    (d.sequence, d.reported_sampling, d.records)
+                })
+                .map_err(|e| e.to_string()),
+            Protocol::Sflow => sflow::decode(&buf[..len])
+                .map(|d| {
+                    exporter.observation_domain = d.sub_agent_id;
+                    (d.sequence, d.reported_sampling, d.records)
+                })
+                .map_err(|e| e.to_string()),
+        };
+
+        match decoded {
+            Ok((sequence, reported_sampling, records)) => {
+                exporter.last_sequence = Some(sequence);
+                if let Some(rate) = reported_sampling {
                     exporter.reported_rate = Some(rate);
                 }
-                if !decoded.records.is_empty() {
+                if !records.is_empty() {
                     let accum = exporter.buckets.entry(bucket_ts).or_default();
-                    for fr in &decoded.records {
+                    for fr in &records {
                         accum.fold(fr);
                     }
                 }
             }
             Err(e) => {
                 exporter.dropped_malformed += 1;
-                tracing::debug!(event_type = "flow_decode_failed", source = %src_ip, error = %e, "dropped malformed flow datagram");
+                tracing::debug!(event_type = "flow_decode_failed", source = %src_ip, proto = ?proto, error = %e, "dropped malformed flow datagram");
             }
         }
     }
@@ -342,6 +430,7 @@ async fn refresh_allowlist(pool: MySqlPool, state: Arc<Mutex<State>>) {
 struct ExporterFlush {
     src_ip: IpAddr,
     device_id: Option<u64>,
+    version: u16,
     observation_domain: u32,
     template_count: u32,
     reported_rate: Option<u32>,
@@ -380,6 +469,7 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                 flushes.push(ExporterFlush {
                     src_ip: *ip,
                     device_id: ex.device_id,
+                    version: ex.version,
                     observation_domain: ex.observation_domain,
                     template_count: ex.templates.len() as u32,
                     reported_rate: ex.reported_rate,
@@ -433,13 +523,14 @@ async fn flush_exporter(
     // Upsert the exporter row and read back operator-set sampling override + id.
     sqlx::query(
         "INSERT INTO flow_exporters (device_id, source_addr, observation_domain, version, template_count) \
-         VALUES (?, ?, ?, 9, ?) \
+         VALUES (?, ?, ?, ?, ?) \
          ON DUPLICATE KEY UPDATE device_id = VALUES(device_id), version = VALUES(version), \
             template_count = VALUES(template_count)",
     )
     .bind(f.device_id)
     .bind(f.src_ip.to_string())
     .bind(f.observation_domain)
+    .bind(f.version)
     .bind(f.template_count)
     .execute(pool)
     .await?;

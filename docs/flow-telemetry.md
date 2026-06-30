@@ -1,15 +1,16 @@
-# Flow Telemetry (NetFlow v9 / IPFIX) — design note
+# Flow Telemetry (NetFlow v9 / sFlow v5 / IPFIX) — design note
 
-> **Status: implemented (NetFlow v9), read-only.** Collector + storage + API +
-> UI are in the tree; IPFIX (v10) is the planned additive decoder. The primary
-> telemetry source remains **SNMP interface polling**
+> **Status: implemented (NetFlow v9 + sFlow v5), read-only.** Collector + storage
+> + API + UI are in the tree; IPFIX (v10) is the planned additive decoder. The
+> primary telemetry source remains **SNMP interface polling**
 > ([telemetry-model.md](telemetry-model.md)); flow telemetry is a *second*,
 > additive source that gives per-tuple visibility SNMP cannot. Code:
-> `backend-rust/src/telemetry/flow/` (`v9.rs` decoder, `collector.rs` listener),
-> `src/api/flows.rs`, migration `20260614000300_flow_collector.sql`,
-> frontend `frontend/src/pages/device-detail/flows-tab.tsx`. OFF by default
-> (`[flow].enabled = false`); the migration is additive and not auto-applied to
-> any running DB.
+> `backend-rust/src/telemetry/flow/` (`v9.rs` + `sflow.rs` decoders,
+> `collector.rs` listener), `src/api/flows.rs`, migration
+> `20260614000300_flow_collector.sql`, frontend
+> `frontend/src/pages/device-detail/flows-tab.tsx`. OFF by default
+> (`[flow].enabled = false`; sFlow additionally gated by `[flow].sflow_enabled`);
+> the migration is additive and not auto-applied to any running DB.
 
 ## Why
 
@@ -35,9 +36,32 @@ gate are unchanged.
   `interface_samples` 70-minute window and its prune job).
 - **Display** per interface: top-10 talkers (5-tuples), top-10 ports, and
   per-interface/direction totals.
-- **Out of scope (future):** sFlow, per-tuple anomaly baselines, flow-driven
-  automatic reroutes. Flow signals may inform detection rules, but auto-execution
-  stays behind the existing global + per-rule enables and enforce mode.
+- **Out of scope (future):** per-tuple anomaly baselines, flow-driven automatic
+  reroutes, sFlow counter samples (they duplicate the SNMP path) and sFlow
+  extended-router AS records. Flow signals may inform detection rules, but
+  auto-execution stays behind the existing global + per-rule enables and enforce
+  mode.
+
+> **sFlow v5 (`sflow.rs`).** A second, additive decoder feeding the *same*
+> `FlowRecord` and all downstream aggregation/storage/API/UI. It differs from
+> NetFlow v9 in two ways that shape the code: (1) it is **stateless** — the
+> datagram is fixed XDR, so there is no template cache and no "data before
+> template" gap; and (2) a flow sample carries a **raw packet header** (the first
+> ~N bytes of the actual packet), not pre-aggregated counts, so the decoder parses
+> Ethernet/802.1Q → IPv4/IPv6 → TCP/UDP/SCTP to build the tuple. Each sample is
+> one packet: `pkts = 1`, `bytes = frame_length` (the on-wire length — L2-inclusive;
+> the SNMP cross-cal tolerance already absorbs the L2/L3 delta). The
+> `sampling_rate` is carried **reliably in every flow sample** (unlike NetFlow's
+> unreliable options template), so it feeds the exporter's `reported` rate as
+> high-confidence. Counter samples (type 2/4) are decoded-past and ignored in v1.
+>
+> **v1 uniform-rate caveat:** the collector resolves one effective rate per
+> exporter per bucket. sFlow's rate is per-sample/per-interface; if an agent uses
+> *different* rates on different interfaces, v1 assumes uniform (last-seen rate
+> wins). Estimates stay faithful for uniform-rate agents (the norm) and for large
+> aggregates; mixed-rate agents are noted as future work. Raw counts plus the
+> stored `effective_sampling_rate` keep every estimate re-derivable if the rate is
+> later corrected.
 
 ## Listener & configuration
 
@@ -48,9 +72,11 @@ chooses — this is a deliberate, documented exposure, off by default.
 
 ```toml
 [flow]
-enabled        = false          # off by default
+enabled        = false          # off by default (master switch for the collector)
 bind_addr      = "0.0.0.0"      # management address that can reach the ASR
-bind_port      = 2055
+bind_port      = 2055           # NetFlow v9 UDP port
+sflow_enabled  = false          # bind the sFlow v5 listener too (needs enabled)
+sflow_port     = 6343           # sFlow's default UDP port
 # Only accept datagrams whose source IP resolves to an enrolled device. A packet
 # from an unknown source is counted and dropped (never parsed into state).
 allowlist_enrolled_only = true
@@ -58,6 +84,13 @@ retention_minutes = 70
 bucket_seconds    = 60          # aggregation bucket width
 top_k_talkers     = 100         # 5-tuples retained per bucket/interface/direction
 ```
+
+NetFlow and sFlow bind **separate UDP ports** and run independent receive loops
+that share the same in-memory state (exporter map, allowlist) and aggregate into
+the same buckets. A datagram's protocol is fixed by the socket it arrived on, so
+the decoder is chosen by port — no version-sniffing on a shared wire. Binding the
+sFlow socket is best-effort: if it fails, NetFlow keeps running and only sFlow is
+unavailable. The exporter row records `version` (9 = NetFlow v9, 5 = sFlow v5).
 
 Safety rules for the listener (doctrine: parsers "never panic", structured
 errors, low confidence blocks automatic actions):
