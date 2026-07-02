@@ -8,7 +8,6 @@
 //! test skips so the unit suite still passes locally. It cleans up its rows so
 //! repeated runs stay isolated.
 
-use rerouter_controller::config::Config;
 use rerouter_controller::db::MIGRATOR;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
@@ -49,9 +48,8 @@ async fn in_flight_reroute_becomes_uncertain_and_locks_the_device() {
     .expect("insert in-flight reroute")
     .last_insert_id();
 
-    // Run startup recovery (default config keeps recovery enabled).
-    let cfg = Config::default();
-    rerouter_controller::reroute::state_machine::recover_on_startup(&pool, &cfg)
+    // Run startup recovery (mandatory since b86269a — no config knob / cfg arg).
+    rerouter_controller::reroute::state_machine::recover_on_startup(&pool)
         .await
         .expect("recover_on_startup");
 

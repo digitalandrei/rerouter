@@ -21,9 +21,13 @@ use sqlx::MySqlPool;
 /// `recovery_degraded` alert and returned as an `Err`, so the controller never
 /// proceeds while silently believing a crashed reroute "did nothing".
 pub async fn recover_on_startup(pool: &MySqlPool) -> Result<()> {
-    // Reroutes caught mid-flight by the crash.
+    // Reroutes caught mid-flight by the crash. `planned` is included: a crash in
+    // the narrow window between slot reservation (state=planned) and the first
+    // transition to `pending` would otherwise leave an orphan row that blocks the
+    // device forever (running_on_device treats `planned` as busy) yet is never
+    // reclaimed. Recovering it is fail-closed and consistent with the doctrine.
     let stuck = sqlx::query_as::<_, (u64, Option<u64>)>(
-        "SELECT id, device_id FROM reroutes WHERE state IN ('pending', 'running', 'verifying')",
+        "SELECT id, device_id FROM reroutes WHERE state IN ('planned', 'pending', 'running', 'verifying')",
     )
     .fetch_all(pool)
     .await

@@ -332,23 +332,58 @@ pub async fn acknowledge_uncertain(
     }
 
     let note = body.note.unwrap_or_default();
-    let _ = sqlx::query(
+    // Only clear the lock / write the "acknowledged" audit row if the state
+    // transition ACTUALLY landed. The `WHERE state = 'uncertain'` guard also
+    // makes a concurrent double-ack a no-op. Swallowing this write (as before)
+    // could unlock a device while the reroute stayed uncertain.
+    let updated = match sqlx::query(
         "UPDATE reroutes SET state = 'failed', verification_status = 'acknowledged', \
-         failure_reason = CONCAT(COALESCE(failure_reason,''), ' | acknowledged by admin: ', ?) WHERE id = ?",
+         failure_reason = CONCAT(COALESCE(failure_reason,''), ' | acknowledged by admin: ', ?) \
+         WHERE id = ? AND state = 'uncertain'",
     )
     .bind(&note)
     .bind(id)
     .execute(&state.pool)
-    .await;
+    .await
+    {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::error!(
+                event_type = "ack_uncertain_persist_failed",
+                reroute_id = id,
+                error = %e,
+                "failed to persist uncertain acknowledgement"
+            );
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not record acknowledgement",
+            );
+        }
+    };
+    if updated == 0 {
+        return err(
+            StatusCode::CONFLICT,
+            "reroute was not in the uncertain state",
+        );
+    }
 
     if let Some(dev) = device_id {
-        let _ = locks::clear(
+        if let Err(e) = locks::clear(
             &state.pool,
             "device",
             Some(&dev.to_string()),
             Some(g.session.user_id),
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                event_type = "ack_uncertain_unlock_failed",
+                reroute_id = id,
+                device_id = dev,
+                error = %e,
+                "acknowledged uncertain reroute but failed to clear the device lock"
+            );
+        }
     }
     let _ = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \

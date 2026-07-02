@@ -410,7 +410,7 @@ async fn finalize(
         _ => None,
     };
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE reroutes SET state = ?, finished_at = UTC_TIMESTAMP(), success = ?, \
          verification_status = ?, failure_reason = ? WHERE id = ?",
     )
@@ -420,11 +420,24 @@ async fn finalize(
     .bind(&failure_reason)
     .bind(reroute_id)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(
+            event_type = "reroute_finalize_persist_failed",
+            reroute_id,
+            device_id = req.device_id,
+            state,
+            error = %e,
+            "failed to persist final reroute state — runtime state may be inconsistent"
+        );
+    }
 
     if state == "uncertain" {
-        // Lock the device; an admin must acknowledge before reroutes resume.
-        let _ = locks::create(
+        // Lock the device; an admin must acknowledge before reroutes resume. If
+        // this write fails the device is NOT actually locked, so make it LOUD:
+        // a silently-unlocked device after an unverifiable reroute is exactly the
+        // failure mode the doctrine forbids (mirrors recover_on_startup).
+        if let Err(e) = locks::create(
             pool,
             "device",
             Some(&req.device_id.to_string()),
@@ -432,12 +445,24 @@ async fn finalize(
             &format!("reroute #{reroute_id} could not be verified"),
             None,
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                event_type = "reroute_lock_persist_failed",
+                reroute_id,
+                device_id = req.device_id,
+                error = %e,
+                "CRITICAL: could not lock device after an uncertain reroute — manual lock required"
+            );
+        }
     }
 
+    // `failed` and `uncertain` are both doctrine-critical (docs/email-alerts.md:
+    // they always fan out to the admin tier). Severity drives that fan-out, so
+    // `failed` must be `critical`, not `warning`.
     let severity = match state {
         "succeeded" => "info",
-        "failed" => "warning",
+        "failed" => "critical",
         "uncertain" => "critical",
         _ => "info",
     };
@@ -532,7 +557,7 @@ async fn enqueue_alert(
         "detail": extra,
     });
     let dedup_key = format!("{event_type}:reroute:{reroute_id}");
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO alerts (event_type, severity, device_id, rule_id, payload_json, dedup_key) \
          VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -543,7 +568,16 @@ async fn enqueue_alert(
     .bind(sqlx::types::Json(&payload))
     .bind(&dedup_key)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(
+            event_type = "reroute_alert_enqueue_failed",
+            reroute_id,
+            alert = %event_type,
+            error = %e,
+            "failed to enqueue reroute alert — operators may not be notified"
+        );
+    }
 }
 
 async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &str, message: &str) {
@@ -552,7 +586,7 @@ async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &s
     } else {
         "controller"
     };
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
          VALUES (?, ?, ?, 'reroute', ?, ?, ?)",
     )
@@ -563,7 +597,16 @@ async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &s
     .bind(reroute_id)
     .bind(message)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(
+            event_type = "reroute_audit_persist_failed",
+            reroute_id,
+            audited = %event,
+            error = %e,
+            "failed to write reroute audit row"
+        );
+    }
 }
 
 async fn device_name(pool: &MySqlPool, device_id: u64) -> Option<String> {
