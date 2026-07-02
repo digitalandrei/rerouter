@@ -252,19 +252,56 @@ pub async fn gather(
     }
 }
 
-/// Reserve a reroute row under a per-device advisory lock: re-check the
-/// device-scoped guards (already-running / uncertain) and INSERT atomically, so
-/// two concurrent triggers cannot both pass and double-apply config to a device.
+/// Reserve a reroute row under advisory locks. For AUTOMATIC triggers we first
+/// take a single GLOBAL lock and re-check the rate limit *inside* it, so N devices
+/// firing at once can't each read a stale count and collectively blow past the
+/// circuit breaker (the count read in `gather` is only an early check; this is the
+/// authoritative one). Then, for every trigger, we take the per-device lock and
+/// re-check the device-scoped guards (already-running / uncertain) and INSERT
+/// atomically. Lock order is ALWAYS global-before-device, so triggers can't deadlock.
 pub async fn reserve_and_persist(
     pool: &MySqlPool,
+    cfg: &Config,
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<u64, BlockReason> {
-    let lock_name = format!("reroute_dev_{}", req.device_id);
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+
+    // Global rate-limit critical section — applied to AUTOMATIC triggers (the ones
+    // that can fire concurrently across many devices in a storm). Held across the
+    // reservation so count-then-insert is atomic vs other automatic reservations.
+    // Manual/rollback are human-paced and keep only the early gather-time rate
+    // check in decide(), which needs no locked re-check.
+    let rate_limit = cfg.safety.global_action_rate_limit_count;
+    let rate_window = cfg.safety.global_action_rate_limit_window_seconds;
+    let use_global = req.trigger_type == "automatic" && rate_limit > 0;
+    if use_global {
+        let got: Option<i64> =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK('rrt_rate_global', 5)")
+                .fetch_one(&mut *conn)
+                .await
+                .ok()
+                .flatten();
+        if got != Some(1) {
+            return Err(BlockReason::GuardBusy);
+        }
+        let recent = recent_reroute_count(pool, rate_window).await;
+        if recent >= rate_limit as i64 {
+            let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+                .execute(&mut *conn)
+                .await;
+            return Err(BlockReason::RateLimit {
+                recent,
+                window_secs: rate_window,
+                max: rate_limit,
+            });
+        }
+    }
+
+    let lock_name = format!("reroute_dev_{}", req.device_id);
     let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
         .bind(&lock_name)
         .fetch_one(&mut *conn)
@@ -272,13 +309,25 @@ pub async fn reserve_and_persist(
         .ok()
         .flatten();
     if got != Some(1) {
+        if use_global {
+            let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+                .execute(&mut *conn)
+                .await;
+        }
         return Err(BlockReason::GuardBusy);
     }
+
     let reserved = reserve_slot(pool, req, plan).await;
+
     let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
         .bind(&lock_name)
         .execute(&mut *conn)
         .await;
+    if use_global {
+        let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+            .execute(&mut *conn)
+            .await;
+    }
     drop(conn);
     reserved
 }

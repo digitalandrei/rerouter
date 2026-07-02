@@ -149,7 +149,7 @@ async fn execute_with<S: SshExecutor>(
     }
 
     // Reserve a slot under a per-device advisory lock (atomic re-check + INSERT).
-    let reroute_id = match guard::reserve_and_persist(pool, &req, &plan).await {
+    let reroute_id = match guard::reserve_and_persist(pool, cfg, &req, &plan).await {
         Ok(id) => id,
         Err(reason) => return blocked(&req, device_name, reason.to_string()),
     };
