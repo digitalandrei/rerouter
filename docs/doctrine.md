@@ -366,8 +366,11 @@ Safety is the most important part of this project. Full detail in
   templates risk-free before ever letting Rerouter act.
 - `enforce` — reroutes may execute, still gated by every rule below.
 
-Only an admin can flip the mode (from `/settings`); the change is audited and
-alerted. Gate 0 of every execution path checks the mode.
+Only an admin can flip the mode (from `/settings`), and **arming** the system
+(observe→enforce, or enabling automatic actions) additionally requires **step-up
+re-authentication** — a fresh password + TOTP at the moment of the change — so a
+stolen admin session alone cannot arm it. The change is audited and alerted.
+Gate 0 of every execution path checks the mode.
 
 Global safety rules — the executor re-checks every gate at execution time, in
 order. The live gates are **device-scoped** (in `enforce` mode):
@@ -438,11 +441,14 @@ Login throttling and account lockout apply per email + real client IP
 (`CF-Connecting-IP`, forwarded by Nginx). Roles: `admin`, `operator`, `viewer`,
 `auditor`, enforced via explicit RBAC tables and axum middleware. Manual
 reroutes require only the `trigger_manual_reroute` permission and accept an
-optional free-text reason for the audit log. The earlier re-authentication
-gate (`POST /api/auth/reauth`, `sessions.reauth_at`, the
+optional free-text reason for the audit log. The earlier *per-reroute*
+re-authentication gate (`POST /api/auth/reauth`, `sessions.reauth_at`, the
 `approve_dangerous_reroute` permission) and typed confirmation were **de-scoped**
-and removed; safety now rests on the operating mode, the template/allowlist
-controls, and the device-scoped execution gates (§7, §8). See
+and removed; safety rests on the operating mode, the template/allowlist controls,
+and the device-scoped execution gates (§7, §8). A narrower step-up re-auth (fresh
+password + TOTP, verified inline — no persisted `reauth_at`) was reintroduced for
+the global **arming** switches only (observe→enforce, automatic-actions-enable),
+per the 2026-07 audit. See
 [authentication.md](authentication.md) and [security.md](security.md).
 
 ---

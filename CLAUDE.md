@@ -22,7 +22,8 @@ action path as dangerous by default.
 - **Never** add arbitrary command/route execution as a first-class feature.
   All reroutes go through validated **action templates** with parameter schemas.
 - **Never** enable automatic reroutes by default. Automatic execution requires an
-  explicit global enable *and* a per-rule enable (on top of enforce mode).
+  explicit global enable *and* a per-rule enable (on top of enforce mode). Arming
+  the system (enforce, or the global enable) requires step-up re-auth (password + TOTP).
 - Every reroute must pass role permissions, the template/allowlist checks,
   cooldowns, locks, and audit logging. (Typed confirmation and per-action re-auth
   were de-scoped — see doctrine §7/§9. The frontend still shows a confirm dialog,
