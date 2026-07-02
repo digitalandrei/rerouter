@@ -32,6 +32,15 @@ pub const DEDUP_WINDOW_SECS: u64 = 600; // 10 minutes per (event_type, asset, ru
 pub const RATE_LIMIT_PER_HOUR: u32 = 20; // per recipient, digest fallback beyond
 const POLL_INTERVAL_SECS: u64 = 5;
 const BATCH: i64 = 50;
+/// Delivery retry policy. A transient send failure (SMTP greylisting, a brief
+/// network blip) must NOT permanently lose an alert — the doctrine requires
+/// uncertain/failed/security alerts to always reach an admin. So a failed
+/// (alert, target) is retried up to MAX_DELIVERY_ATTEMPTS times, each separated by
+/// at least RETRY_BACKOFF_SECS; alerts older than MAX_RETRY_AGE_SECS stop being
+/// re-scanned (a backstop — the per-target attempt cap already bounds retries).
+const MAX_DELIVERY_ATTEMPTS: i64 = 5;
+const RETRY_BACKOFF_SECS: u64 = 300; // 5 min — covers typical greylisting
+const MAX_RETRY_AGE_SECS: u64 = 21_600; // 6 h
 
 /// A new alert awaiting dispatch.
 #[derive(sqlx::FromRow)]
@@ -76,12 +85,35 @@ pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
 /// Process one batch of undelivered alerts. `mailer` is None when SMTP is
 /// unconfigured (the Teams channel may still deliver).
 async fn drain_once(pool: &MySqlPool, mailer: Option<&super::mailer::Mailer>) -> Result<()> {
+    // Select alerts that still have work: never attempted, OR a target whose
+    // latest state is a retryable failure (no later success, under the attempt
+    // cap, and its last attempt older than the backoff). dispatch_alert re-checks
+    // each target precisely; this query is the coarse filter. Ancient alerts drop
+    // out via the age backstop.
     let pending = sqlx::query_as::<_, PendingAlert>(
         "SELECT a.id, a.event_type, a.severity, a.occurrence_count, a.payload_json, a.created_at \
          FROM alerts a \
-         WHERE NOT EXISTS (SELECT 1 FROM alert_deliveries d WHERE d.alert_id = a.id) \
+         WHERE a.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+           AND ( \
+             NOT EXISTS (SELECT 1 FROM alert_deliveries d WHERE d.alert_id = a.id) \
+             OR EXISTS ( \
+               SELECT 1 FROM alert_deliveries d \
+               WHERE d.alert_id = a.id AND d.status = 'failed' \
+                 AND d.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM alert_deliveries s WHERE s.alert_id = a.id AND s.status = 'sent' \
+                     AND ((d.recipient_id IS NOT NULL AND s.recipient_id = d.recipient_id) \
+                       OR (d.endpoint_id IS NOT NULL AND s.endpoint_id = d.endpoint_id))) \
+                 AND (SELECT COUNT(*) FROM alert_deliveries f WHERE f.alert_id = a.id AND f.status = 'failed' \
+                       AND ((d.recipient_id IS NOT NULL AND f.recipient_id = d.recipient_id) \
+                         OR (d.endpoint_id IS NOT NULL AND f.endpoint_id = d.endpoint_id))) < ? \
+             ) \
+           ) \
          ORDER BY a.id ASC LIMIT ?",
     )
+    .bind(MAX_RETRY_AGE_SECS as i64)
+    .bind(RETRY_BACKOFF_SECS as i64)
+    .bind(MAX_DELIVERY_ATTEMPTS)
     .bind(BATCH)
     .fetch_all(pool)
     .await?;
@@ -101,6 +133,67 @@ async fn any_enabled_webhook(pool: &MySqlPool) -> bool {
         .await
         .map(|n| n > 0)
         .unwrap_or(false)
+}
+
+/// Per-target delivery state derived from the alert_deliveries rows, used to drive
+/// retries: whether it already succeeded, whether it was intentionally queued
+/// (dedup / rate-limit / no-audience — treated as settled, not retried), how many
+/// times it has failed, and how long since its last attempt.
+struct DeliveryState {
+    has_sent: bool,
+    settled_queued: bool,
+    failed_count: i64,
+    secs_since_last: Option<i64>,
+}
+
+async fn email_delivery_state(
+    pool: &MySqlPool,
+    alert_id: u64,
+    recipient_id: u64,
+) -> Result<DeliveryState> {
+    delivery_state(pool, alert_id, "email", Some(recipient_id), None).await
+}
+
+async fn teams_delivery_state(
+    pool: &MySqlPool,
+    alert_id: u64,
+    endpoint_id: u64,
+) -> Result<DeliveryState> {
+    delivery_state(pool, alert_id, "teams", None, Some(endpoint_id)).await
+}
+
+async fn delivery_state(
+    pool: &MySqlPool,
+    alert_id: u64,
+    channel: &str,
+    recipient_id: Option<u64>,
+    endpoint_id: Option<u64>,
+) -> Result<DeliveryState> {
+    // CAST(SUM(..) AS SIGNED) so the boolean sums decode as i64 (raw SUM is DECIMAL);
+    // NULL (no rows) -> None -> treated as zero / never-attempted.
+    let (sent, queued, failed, secs): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT CAST(SUM(status = 'sent') AS SIGNED), CAST(SUM(status = 'queued') AS SIGNED), \
+                    CAST(SUM(status = 'failed') AS SIGNED), \
+                    TIMESTAMPDIFF(SECOND, MAX(created_at), UTC_TIMESTAMP()) \
+             FROM alert_deliveries \
+             WHERE alert_id = ? AND channel = ? \
+               AND ((? IS NOT NULL AND recipient_id = ?) OR (? IS NOT NULL AND endpoint_id = ?))",
+        )
+        .bind(alert_id)
+        .bind(channel)
+        .bind(recipient_id)
+        .bind(recipient_id)
+        .bind(endpoint_id)
+        .bind(endpoint_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(DeliveryState {
+        has_sent: sent.unwrap_or(0) > 0,
+        settled_queued: queued.unwrap_or(0) > 0,
+        failed_count: failed.unwrap_or(0),
+        secs_since_last: secs,
+    })
 }
 
 /// Resolve recipients, apply dedup + rate limit, send, and record deliveries for
@@ -138,6 +231,24 @@ async fn dispatch_alert(
             had_audience = true;
         }
         for r in recipients {
+            // Retry gate: skip if already settled (sent, or intentionally queued);
+            // give up past the attempt cap; otherwise honor the backoff between
+            // retries of a failed send.
+            let st = email_delivery_state(pool, alert.id, r.id).await?;
+            if st.has_sent || st.settled_queued {
+                continue;
+            }
+            if st.failed_count >= MAX_DELIVERY_ATTEMPTS {
+                tracing::error!(event_type = "alert_delivery_gave_up", alert_id = alert.id, recipient_id = r.id, channel = "email", attempts = st.failed_count, "giving up on alert delivery after max attempts");
+                continue;
+            }
+            if st.failed_count > 0 {
+                if let Some(since) = st.secs_since_last {
+                    if since < RETRY_BACKOFF_SECS as i64 {
+                        continue; // backoff not elapsed
+                    }
+                }
+            }
             if !always_immediate && recently_delivered(pool, alert, &r).await? {
                 record_delivery(pool, alert.id, r.id, "queued", Some("suppressed: deduplicated within window")).await?;
                 continue;
@@ -161,6 +272,21 @@ async fn dispatch_alert(
         had_audience = true;
     }
     for e in endpoints {
+        let st = teams_delivery_state(pool, alert.id, e.id).await?;
+        if st.has_sent || st.settled_queued {
+            continue;
+        }
+        if st.failed_count >= MAX_DELIVERY_ATTEMPTS {
+            tracing::error!(event_type = "alert_delivery_gave_up", alert_id = alert.id, endpoint_id = e.id, channel = "teams", attempts = st.failed_count, "giving up on alert delivery after max attempts");
+            continue;
+        }
+        if st.failed_count > 0 {
+            if let Some(since) = st.secs_since_last {
+                if since < RETRY_BACKOFF_SECS as i64 {
+                    continue;
+                }
+            }
+        }
         if !always_immediate && webhook_recently_delivered(pool, alert, e.id).await? {
             record_webhook_delivery(pool, alert.id, e.id, "queued", Some("suppressed: deduplicated within window")).await?;
             continue;
