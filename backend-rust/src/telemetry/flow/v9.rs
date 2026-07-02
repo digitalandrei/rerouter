@@ -75,9 +75,16 @@ pub struct Template {
 /// collector per exporter; volatile (in-memory) — after a restart, data sets are
 /// dropped until each template is re-advertised (logged; a telemetry gap, not a
 /// safety issue).
+/// Cap on distinct templates cached per exporter. The key includes `source_id`,
+/// a value the SENDER chooses per datagram, so without a bound a hostile/buggy
+/// exporter could grow this map without limit (a whole-process OOM). Real Cisco
+/// exporters use a handful of templates, so this is very generous.
+const MAX_TEMPLATES: usize = 1024;
+
 #[derive(Debug, Default)]
 pub struct TemplateCache {
-    templates: HashMap<(u32, u16), Template>,
+    templates: HashMap<(u32, u16), (Template, u64)>, // value + last-write tick (LRU)
+    tick: u64,
 }
 
 impl TemplateCache {
@@ -91,10 +98,26 @@ impl TemplateCache {
         self.templates.is_empty()
     }
     fn get(&self, source_id: u32, template_id: u16) -> Option<&Template> {
-        self.templates.get(&(source_id, template_id))
+        self.templates.get(&(source_id, template_id)).map(|(t, _)| t)
     }
     fn insert(&mut self, source_id: u32, template_id: u16, t: Template) {
-        self.templates.insert((source_id, template_id), t);
+        self.tick = self.tick.wrapping_add(1);
+        let key = (source_id, template_id);
+        // At capacity for a NEW key, evict the least-recently-written entry.
+        // Exporters re-advertise their templates periodically, refreshing the
+        // tick, so an actively-used template stays resident.
+        if !self.templates.contains_key(&key) && self.templates.len() >= MAX_TEMPLATES {
+            if let Some(victim) = self
+                .templates
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| *k)
+            {
+                self.templates.remove(&victim);
+            }
+        }
+        let tick = self.tick;
+        self.templates.insert(key, (t, tick));
     }
 }
 
@@ -437,4 +460,33 @@ fn ipv6_from(f: &[u8]) -> Ipv6Addr {
     let mut o = [0u8; 16];
     o.copy_from_slice(&f[..16]);
     Ipv6Addr::from(o)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Template, TemplateCache, MAX_TEMPLATES};
+
+    fn dummy() -> Template {
+        Template {
+            fields: vec![(1, 4)],
+            record_len: 4,
+            is_options: false,
+        }
+    }
+
+    #[test]
+    fn template_cache_is_bounded_under_key_churn() {
+        // A hostile/buggy exporter varying the wire-controlled source_id must not
+        // grow the cache without limit (whole-process OOM). Insert well past the
+        // cap with distinct keys and confirm it stays bounded.
+        let mut cache = TemplateCache::new();
+        for i in 0..(MAX_TEMPLATES as u32 + 500) {
+            cache.insert(i, (i % 512) as u16, dummy());
+        }
+        assert!(
+            cache.len() <= MAX_TEMPLATES,
+            "template cache exceeded cap: {}",
+            cache.len()
+        );
+    }
 }

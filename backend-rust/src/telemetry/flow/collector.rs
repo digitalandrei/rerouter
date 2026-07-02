@@ -83,6 +83,15 @@ type PortKey = (u32, Direction, u8, PortKind, u16);
 type AsKey = (u32, Direction, PortKind, u32);
 type TalkerKey = (u32, Direction, IpAddr, IpAddr, Option<u16>, Option<u16>, u8);
 
+/// Hard cap on distinct talker 5-tuples held per bucket. Under a real spoofed-
+/// source flood (millions of tiny distinct flows — the exact DDoS this tool
+/// watches for) the talker map would otherwise grow until OOM before the
+/// flush-time top-K trim. The iface/port/AS rollups still count every flow, and
+/// the tail beyond top-K is dropped at flush regardless, so capping loses no
+/// aggregate signal — only the identity of tail tuples past the cap. Well above
+/// top_k_talkers so the retained top-K stays accurate.
+const MAX_TALKER_KEYS: usize = 65_536;
+
 /// One bucket's aggregation across the reporting dimensions.
 #[derive(Debug, Default)]
 struct Accum {
@@ -90,6 +99,9 @@ struct Accum {
     port: HashMap<PortKey, Counts>,
     as_: HashMap<AsKey, Counts>,
     talker: HashMap<TalkerKey, Counts>,
+    /// Distinct talker tuples refused this bucket after hitting MAX_TALKER_KEYS
+    /// (surfaced at flush; never silent).
+    talker_dropped: u64,
 }
 
 impl Accum {
@@ -137,18 +149,28 @@ impl Accum {
                 .add(fr.pkts, fr.bytes);
         }
 
-        self.talker
-            .entry((
-                ifindex,
-                dir,
-                fr.src_addr,
-                fr.dst_addr,
-                fr.src_port,
-                fr.dst_port,
-                fr.protocol,
-            ))
-            .or_default()
-            .add(fr.pkts, fr.bytes);
+        // Bounded talker accumulation (see MAX_TALKER_KEYS): always update an
+        // existing tuple, but refuse NEW tuples once at the cap (counted, logged
+        // at flush) so attacker-controlled 5-tuple cardinality can't OOM us.
+        let talker_key = (
+            ifindex,
+            dir,
+            fr.src_addr,
+            fr.dst_addr,
+            fr.src_port,
+            fr.dst_port,
+            fr.protocol,
+        );
+        if let Some(c) = self.talker.get_mut(&talker_key) {
+            c.add(fr.pkts, fr.bytes);
+        } else if self.talker.len() < MAX_TALKER_KEYS {
+            self.talker
+                .entry(talker_key)
+                .or_default()
+                .add(fr.pkts, fr.bytes);
+        } else {
+            self.talker_dropped = self.talker_dropped.saturating_add(1);
+        }
     }
 }
 
@@ -728,12 +750,21 @@ async fn write_bucket(
     let mut talkers: Vec<(&TalkerKey, &Counts)> = acc.talker.iter().collect();
     talkers.sort_by_key(|(_, c)| std::cmp::Reverse(c.bytes));
     let top_k = cfg.flow.top_k_talkers.max(1);
-    if talkers.len() > top_k {
+    if talkers.len() > top_k || acc.talker_dropped > 0 {
         tracing::debug!(
             event_type = "flow_talkers_truncated",
             kept = top_k,
             total = talkers.len(),
+            dropped_over_cap = acc.talker_dropped,
             "truncated talker tail (count preserved in flow_iface_buckets)"
+        );
+    }
+    if acc.talker_dropped > 0 {
+        tracing::warn!(
+            event_type = "flow_talker_cap_hit",
+            dropped = acc.talker_dropped,
+            cap = MAX_TALKER_KEYS,
+            "talker cardinality exceeded the per-bucket cap — tail tuples dropped (aggregate totals unaffected)"
         );
     }
     for ((if_index, dir, src, dst, sport, dport, proto), c) in talkers.into_iter().take(top_k) {
@@ -850,5 +881,45 @@ async fn prune_loop(pool: MySqlPool, cfg: Arc<Config>) {
             }
         }
         tokio::time::sleep(PRUNE_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Accum, FlowRecord, MAX_TALKER_KEYS};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn rec(src: u32) -> FlowRecord {
+        FlowRecord {
+            src_addr: IpAddr::V4(Ipv4Addr::from(src)),
+            dst_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: Some(1234),
+            dst_port: Some(53),
+            protocol: 17,
+            in_if_index: Some(1),
+            out_if_index: None,
+            src_as: None,
+            dst_as: None,
+            direction: None,
+            bytes: 100,
+            pkts: 1,
+        }
+    }
+
+    #[test]
+    fn talker_accumulation_is_bounded_under_flood() {
+        // A spoofed-source flood (millions of distinct 5-tuples — the exact DDoS
+        // this tool watches for) must not grow the talker map without limit;
+        // excess distinct tuples are refused and counted, never silently dropped.
+        let mut acc = Accum::default();
+        for i in 0..(MAX_TALKER_KEYS as u32 + 1000) {
+            acc.fold(&rec(i));
+        }
+        assert!(acc.talker.len() <= MAX_TALKER_KEYS);
+        assert!(
+            acc.talker_dropped >= 1000,
+            "expected >=1000 dropped, got {}",
+            acc.talker_dropped
+        );
     }
 }
