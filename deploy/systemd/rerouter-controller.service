@@ -18,6 +18,26 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/srv/rerouter
 LockPersonality=true
+# Sandboxing: the controller needs no privileges (binds only unprivileged ports —
+# loopback 9277, and optional flow UDP 2055/6343) and parses untrusted bytes from
+# four network sources, so drop everything it doesn't need. Validate with
+# `systemd-analyze security rerouter-controller`.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
