@@ -299,8 +299,10 @@ alerts:              id, event_type, severity, device_id, interface_id,
 alert_recipients:    id, user_id, email, verified_at, created_at
 alert_subscriptions: id, recipient_id, event_type(null=all),
                      enabled, created_at
-alert_deliveries:    id, alert_id, recipient_id, channel(email),
+alert_deliveries:    id, alert_id, recipient_id, channel(email|teams),
                      status(queued|sent|failed|bounced), error, sent_at, created_at
+webhook_endpoints:   id, kind, url (AES-256-GCM sealed at rest), enabled, created_at
+webhook_subscriptions: id, endpoint_id, event_type(null=all), enabled, created_at
 ```
 
 ## audit_logs
@@ -337,5 +339,9 @@ alert_deliveries:    365 days
 audit_logs:          permanent (or 365+ days)
 ```
 
-The controller runs an internal cleanup task honouring these. Never delete
-`audit_logs` automatically without an explicit retention decision.
+> **Status (2026-07):** only `interface_samples` and the `flow_*` buckets are
+> actually pruned today (by the scheduler and the flow collector). `rule_events`,
+> `alerts`, and `alert_deliveries` are **not yet pruned** — the general cleanup
+> task honouring the `[retention]` config is still a TODO, and that config's
+> `traffic_samples_days` / `reroute_logs_days` fields name tables that no longer
+> exist. `audit_logs` is never auto-deleted without an explicit retention decision.

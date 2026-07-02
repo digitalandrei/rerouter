@@ -114,8 +114,10 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   files by Nginx.
 - The controller must reach the managed devices over **SNMP (UDP 161)** for
   telemetry and **SSH (TCP 22)** for reroute actions/discovery, plus the configured
-  SMTP server for alerts. There are no flow-collector / BGP-speaker / Cloudflare /
-  scrubber egress paths in v1.
+  SMTP server for alerts. The optional **flow collector** additionally *listens*
+  for NetFlow v9 / sFlow v5 UDP (off by default; binds a management address, not
+  loopback — a deliberate, source-IP-allowlisted ingress). There are no
+  BGP-speaker / Cloudflare / scrubber egress paths in v1.
 
 ## Authentication hardening
 

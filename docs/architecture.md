@@ -12,8 +12,9 @@ the runtime components, their boundaries, and how they coordinate.
    execution, state machine, email alerts, audit. Binds to localhost only.
 3. **Data sources & actuators** — SNMP interface polling of enrolled devices
    (the v1 telemetry source) and the device-CLI executor that drives reroutes
-   over SSH to Cisco IOS. The flow-collector / BGP-feed / Cloudflare-API /
-   scrubber providers were de-scoped: there is no `providers/` layer in v1.
+   over SSH to Cisco IOS, plus the read-only **flow collector** (NetFlow v9 +
+   sFlow v5, OFF by default). The BGP-feed / Cloudflare-API / scrubber *provider*
+   abstraction was de-scoped: there is no `providers/` layer in v1.
 
 ## Coordination
 
@@ -91,7 +92,8 @@ auth/        sessions, Argon2id passwords, TOTP 2FA, recovery codes, RBAC,
 alerts/      async alert dispatcher: recipients, de-dup, rate limits, SMTP
              (lettre), delivery records
 telemetry/   SNMP interface polling -> normalized per-interface metrics (v1
-             source; snmp.rs). netflow/sflow/bgp/cloudflare are future stubs.
+             source; snmp.rs) + flow/ (NetFlow v9 + sFlow v5 read-only
+             collector, off by default). bgp/cloudflare were de-scoped.
 ssh/         device-CLI executor: fail-closed command allowlist, host-key
              pinning, in-app RSA key generation, BGP peer/prefix discovery
 detection/   stateful rule evaluation, consecutive-sample + duration logic

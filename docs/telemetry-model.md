@@ -23,10 +23,10 @@ Each poll reads the 64-bit `ifXTable`/`ifTable` counters for every interface wit
 
 Prefer the 64-bit `ifHC*` counters; they make wrap extremely rare. SNMP gives
 *volume* per interface — not attack composition (per-source / SYN-rate /
-amplification breakdown). When that detail is needed later, **flow telemetry**
-(NetFlow v9 / IPFIX / sFlow) becomes a second source: per-tuple visibility, but
-sampled, so the **sampling rate** must be stored and applied (a classic
-false-trigger cause). The read-only flow-collector design — listener, sampling
+amplification breakdown). For that detail, **flow telemetry** (NetFlow v9 +
+sFlow v5, **implemented**, off by default) is a second source: per-tuple
+visibility, but sampled, so the **sampling rate** must be stored and applied (a
+classic false-trigger cause). The read-only flow-collector — listener, sampling
 resolution, SNMP cross-calibration, bucketed storage — is specified in
 [flow-telemetry.md](flow-telemetry.md). Flow is a second source, not the v1 path.
 

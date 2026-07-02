@@ -331,6 +331,10 @@ catalog (the only way a reroute runs) is:
 12. **`iface_no_shutdown`** — bring the interface back up (`no shutdown`; rollback
     of #11).
 
+The seed migrations also ship IPv6 null-route and BGP route-map set/unset variants
+beyond the twelve above; the fail-closed `ssh::command_allowed` allowlist and the
+seed migrations are the authoritative command set — keep the two in sync.
+
 A **combination** (e.g. remove-from-saturated-upstream + advertise-on-others +
 MSS clamp) is expressed as an ordered set of `rule_actions` on one rule — each
 action keeps its own verification and rollback — not a single opaque composite

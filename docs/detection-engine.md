@@ -16,12 +16,14 @@ policy; an `enabled` flag; and an `automatic_reroute_enabled` flag (default
 live in the `rule_actions` table (see "Actions" below). (The legacy
 `rules.reroute_template_id` column is unused.)
 
-Metrics come from SNMP interface polling — there are no SYN, per-source, or
-connection-rate metrics (SNMP cannot produce them):
+Metrics come from SNMP interface polling (the v1 source), plus two flow-derived
+metrics when the flow collector is enabled. There are no SYN, per-source, or
+connection-rate metrics from SNMP:
 
 ```text
 rx_bps  tx_bps  rx_pps  tx_pps  rx_util_percent  tx_util_percent
 in_err_rate  out_err_rate  oper_status
+flow_pps  flow_bps            (flow collector, off by default; sampling-estimated)
 ```
 
 `oper_status` resolves to `1` when the link is `up`, else `0`, so a rule like
@@ -77,10 +79,12 @@ Track per rule (`rule_states`): `current_state`, `first_matched_at`,
 `last_metric_value`, `last_evaluated_at`, `last_triggered_reroute_id`.
 
 Rule lifecycle: `clear -> matching -> firing -> (alert / actions) -> cleared`.
-Clearing uses **hysteresis**: once firing, a rule only returns to `clear` after
-the condition has stopped matching for `hysteresis_seconds` (a settle window that
-prevents flapping). A rule still in the `matching` state that stops matching drops
-straight back to `clear`.
+Clearing is governed by the rule's **`recovery_mode`** (`auto` | `threshold` |
+`manual`): `auto` returns to `clear` after the condition stops matching for a
+settle window (`recovery_window_seconds` for flow / `recovery_consecutive_samples`
+for SNMP, falling back to the global default); `threshold` requires a distinct
+`recovery_threshold_value` to be crossed; `manual` holds `firing` until an operator
+clears it. A rule still in `matching` that stops matching drops straight to `clear`.
 
 ## Inputs the engine must respect
 

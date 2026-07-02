@@ -17,20 +17,20 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 ## Controller startup sequence
 
 ```text
-1. Load assets and providers.
-2. Load monitored assets and rules.
+1. Load device + interface inventory.
+2. Load monitored interfaces and rules.
 3. Load last telemetry baselines.
 4. Load active rule states.
 5. Find reroutes in state pending / running / verifying.
 6. Mark unresolved running reroutes as `uncertain`.
 7. Apply a safety lock to each affected device (`auto_crash`).
 8. Reconnect telemetry + device SSH sessions.
-9. Re-read actual routing state from the affected device over SSH.
-10. Attempt verification where possible (does `show ip route <prefix>` still
-    show a `Null0` route? does `show ip bgp neighbors <ip>` report the session
-    as administratively shut?).
-11. Clear the lock only if verification proves the outcome, or an admin
-    acknowledges it.
+9. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
+    routing state on recovery is future work; today the controller does not
+    re-read the device on startup.
+10. The device stays locked and the reroute stays `uncertain` until an **admin
+    acknowledges** it (`POST /api/reroutes/{id}/acknowledge-uncertain`) — there is
+    no automatic clear.
 ```
 
 Do **not** assume no reroute happened just because the process crashed. A
