@@ -135,8 +135,13 @@ export default function Settings() {
     description: string;
     confirmLabel: string;
     destructive: boolean;
-    run: () => Promise<void>;
+    requireReauth?: boolean;
+    run: (creds?: { password: string; totp_code: string }) => Promise<void>;
   } | null>(null);
+  // Step-up credentials collected in the dialog when ARMING the system.
+  const [reauthPw, setReauthPw] = useState("");
+  const [reauthCode, setReauthCode] = useState("");
+  const [reauthErr, setReauthErr] = useState<string | null>(null);
 
   function loadSettings() {
     setLoading(true);
@@ -180,8 +185,11 @@ export default function Settings() {
                     "Enforce mode lets reroutes actually execute (still gated by every other safety rule). This flip is admin-only and audited.",
                   confirmLabel: "Switch to enforce",
                   destructive: true,
-                  run: () =>
-                    api.settings.put({ operating_mode: "enforce" }).then(setSettings),
+                  requireReauth: true,
+                  run: (creds) =>
+                    api.settings
+                      .put({ operating_mode: "enforce", ...creds })
+                      .then(setSettings),
                 });
               } else {
                 void api.settings.put({ operating_mode: "observe" }).then(setSettings);
@@ -221,9 +229,10 @@ export default function Settings() {
                     "With enforce mode on and a rule's own Auto toggle on, a firing rule will execute its reroute with no operator. Admin-only and audited.",
                   confirmLabel: "Enable automatic reroutes",
                   destructive: true,
-                  run: () =>
+                  requireReauth: true,
+                  run: (creds) =>
                     api.settings
-                      .put({ automatic_actions_enabled: true })
+                      .put({ automatic_actions_enabled: true, ...creds })
                       .then(setSettings),
                 });
               } else {
@@ -284,14 +293,68 @@ export default function Settings() {
       {confirm && (
         <ConfirmDialog
           open
-          onOpenChange={(v) => !v && setConfirm(null)}
+          onOpenChange={(v) => {
+            if (!v) {
+              setConfirm(null);
+              setReauthPw("");
+              setReauthCode("");
+              setReauthErr(null);
+            }
+          }}
           title={confirm.title}
-          description={confirm.description}
+          description={
+            <>
+              {confirm.description}
+              {confirm.requireReauth && (
+                <div className="mt-3 space-y-2">
+                  <p className="text-sm font-medium text-foreground">
+                    Confirm it's you — arming the system requires your password and
+                    a current authenticator code.
+                  </p>
+                  <Input
+                    type="password"
+                    autoComplete="current-password"
+                    placeholder="Your password"
+                    value={reauthPw}
+                    onChange={(e) => setReauthPw(e.target.value)}
+                  />
+                  <Input
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    placeholder="6-digit authenticator code"
+                    value={reauthCode}
+                    onChange={(e) => setReauthCode(e.target.value)}
+                  />
+                  {reauthErr && (
+                    <p className="text-sm text-destructive">{reauthErr}</p>
+                  )}
+                </div>
+              )}
+            </>
+          }
           confirmLabel={confirm.confirmLabel}
           destructive={confirm.destructive}
           onConfirm={async () => {
-            await confirm.run();
+            setReauthErr(null);
+            const creds = confirm.requireReauth
+              ? { password: reauthPw, totp_code: reauthCode }
+              : undefined;
+            try {
+              await confirm.run(creds);
+            } catch (e) {
+              const msg = e instanceof ApiError ? e.message : "request failed";
+              setReauthErr(
+                msg === "reauth_required"
+                  ? "Enter your password and authenticator code."
+                  : msg === "reauth_failed"
+                    ? "Password or authenticator code is incorrect."
+                    : msg,
+              );
+              return; // keep the dialog open so the operator can retry
+            }
             setConfirm(null);
+            setReauthPw("");
+            setReauthCode("");
           }}
         />
       )}

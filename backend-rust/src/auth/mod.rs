@@ -644,6 +644,39 @@ async fn consume_recovery_code(
     Ok(true)
 }
 
+/// Step-up re-authentication for a high-risk admin action (arming the system):
+/// verify the user's CURRENT password AND a fresh live TOTP code. Both must pass,
+/// so a stolen session alone can't satisfy it. Recovery codes are intentionally
+/// NOT accepted here — arming can wait until the operator has their authenticator,
+/// and a settings toggle shouldn't burn a single-use recovery code.
+/// Returns Ok(false) on any missing factor / mismatch; Err only on a DB error.
+pub async fn verify_step_up(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    password: &str,
+    totp_code: &str,
+) -> anyhow::Result<bool> {
+    let Some((email, phc, secret_hex)) = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT email, password, two_factor_secret FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(false);
+    };
+    if !password::verify(password, &phc).unwrap_or(false) {
+        return Ok(false);
+    }
+    let Some(secret_hex) = secret_hex.as_deref() else {
+        return Ok(false); // 2FA not enrolled — cannot step up
+    };
+    let Some(secret_b32) = decrypt_secret(secret_hex) else {
+        return Ok(false);
+    };
+    Ok(totp::verify(&secret_b32, totp_code, &email).unwrap_or(false))
+}
+
 /// Insert an audit_logs row (best-effort; auth must not fail because audit did).
 async fn audit(
     pool: &sqlx::MySqlPool,

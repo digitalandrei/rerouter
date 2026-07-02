@@ -949,7 +949,10 @@ export const api = {
 
   settings: {
     get: () => request<SystemSettings>("/api/settings"),
-    put: (settings: Partial<SystemSettings>) =>
+    // `password` + `totp_code` are the step-up re-auth the server requires when
+    // ARMING the system (operating_mode -> enforce, or automatic_actions_enabled
+    // -> true). Ignored for all other/safe changes.
+    put: (settings: Partial<SystemSettings> & { password?: string; totp_code?: string }) =>
       request<SystemSettings>("/api/settings", {
         method: "PUT",
         body: settings,

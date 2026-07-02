@@ -139,6 +139,45 @@ pub async fn update(
 
     let before = all_settings(pool).await;
 
+    // Step-up re-auth for the ARMING changes: turning operating_mode to "enforce"
+    // or automatic_actions_enabled to true arms the whole system, so require a
+    // fresh password + live TOTP right now — a stolen/hijacked admin session must
+    // not be enough on its own. Turning either OFF, or the global maintenance
+    // lock, is a safe direction and needs no step-up.
+    let arming_enforce = body.get("operating_mode").and_then(Value::as_str) == Some("enforce")
+        && before.get("operating_mode").map(String::as_str) != Some("enforce");
+    let arming_auto = body
+        .get("automatic_actions_enabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && before.get("automatic_actions_enabled").map(String::as_str) != Some("true");
+    if arming_enforce || arming_auto {
+        let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+        let totp_code = body.get("totp_code").and_then(Value::as_str).unwrap_or("");
+        // 403 (not 401) on purpose: the SPA hard-redirects to /login on any 401,
+        // which would wrongly log the operator out mid-arming. 403 keeps the
+        // session and lets the UI show the step-up prompt/error.
+        if password.is_empty() || totp_code.is_empty() {
+            return err(StatusCode::FORBIDDEN, "reauth_required");
+        }
+        match crate::auth::verify_step_up(pool, session.user_id, password, totp_code).await {
+            Ok(true) => {}
+            Ok(false) => {
+                audit(
+                    pool,
+                    session.user_id,
+                    "settings_reauth_failed",
+                    &ip,
+                    &ua,
+                    "step-up re-auth failed for an arming settings change",
+                )
+                .await;
+                return err(StatusCode::FORBIDDEN, "reauth_failed");
+            }
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "authz check failed"),
+        }
+    }
+
     // operating_mode: must be "observe" | "enforce".
     if let Some(v) = body.get("operating_mode").and_then(Value::as_str) {
         if v != "observe" && v != "enforce" {
