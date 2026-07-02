@@ -23,18 +23,21 @@ action path as dangerous by default.
   All reroutes go through validated **action templates** with parameter schemas.
 - **Never** enable automatic reroutes by default. Automatic execution requires an
   explicit global enable *and* a per-rule enable (on top of enforce mode).
-- Every reroute must pass role permissions, confirmation (for disruptive levels),
-  allowlists, cooldowns, locks, and audit logging.
+- Every reroute must pass role permissions, the template/allowlist checks,
+  cooldowns, locks, and audit logging. (Typed confirmation and per-action re-auth
+  were de-scoped — see doctrine §7/§9. The frontend still shows a confirm dialog,
+  but it is NOT a server-side gate; do not rely on it for safety.)
 - Prefer clear **state machines** over implicit behaviour. Persist runtime state
   before and after every step of an action.
-- On controller startup, any reroute left in `pending`/`running`/`verifying`
-  becomes `uncertain` and **locks** the affected asset until an admin
+- On controller startup, any reroute left in `planned`/`pending`/`running`/`verifying`
+  becomes `uncertain` and **locks** the affected device until an admin
   acknowledges it. Do not assume "nothing happened" after a crash.
 - Never treat "command/API call sent" as success. Always verify the resulting
   routing state.
-- Telemetry parsers (NetFlow/sFlow/IPFIX, Cloudflare API, BGP) must return
-  structured errors and **never panic**. Low parser confidence blocks automatic
-  actions.
+- Telemetry parsers (SNMP, the NetFlow v9 / sFlow v5 flow collector, and the
+  planned IPFIX decoder) must return structured errors and **never panic**. Low
+  parser *sampling* confidence blocks flow-driven automatic actions — but note it
+  does NOT authenticate the exporter's source (see docs/audit-2026-07.md P0-1).
 
 ## Conventions
 

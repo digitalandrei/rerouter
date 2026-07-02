@@ -136,8 +136,9 @@ rerouter/
 │   │   ├── db/
 │   │   ├── auth/             (sessions.rs, password.rs, totp.rs, rbac.rs)
 │   │   ├── alerts/           (dispatcher.rs, mailer.rs)
-│   │   ├── telemetry/        (snmp.rs — v1 interface polling; netflow.rs/
-│   │   │                      sflow.rs/bgp.rs/cloudflare.rs are inert stubs)
+│   │   ├── telemetry/        (snmp.rs — v1 interface polling; flow/ —
+│   │   │                      NetFlow v9 + sFlow v5 read-only collector, OFF by
+│   │   │                      default; IPFIX planned. bgp/cloudflare de-scoped)
 │   │   ├── detection/        (condition.rs, cooldown.rs, engine.rs)
 │   │   ├── reroute/          (executor.rs, state_machine.rs, templates.rs,
 │   │   │                      locks.rs, rollback.rs)
@@ -393,9 +394,14 @@ requires the global automatic switch **and** the per-rule switch before it can
 fire automatically. Never weaken these defaults.
 
 The per-template "safety level", the provider/asset-reachability gate, the
-detection-confidence gate, the telemetry-stale gate, and the
-newly-discovered-asset gate were **de-scoped** with the provider abstraction;
-the live gates above are the complete set.
+telemetry-stale gate, and the newly-discovered-asset gate were **de-scoped** with
+the provider abstraction. The live gates above — **plus the verify-or-refuse gate**
+(an automatic action whose template has no verification step is refused; see
+`reroute/guard.rs`) — are the set for SNMP-driven device-scoped actions.
+Flow-driven automatic actions additionally require non-low **sampling** confidence
+(see [flow-telemetry.md](flow-telemetry.md)); note that this checks sampling math,
+not exporter identity, so flow-driven auto-execution needs source corroboration
+before it can be trusted (see [audit-2026-07.md](audit-2026-07.md) P0-1).
 
 Cooldowns / rate limit (all config-driven, `[safety]`, applied to manual and
 automatic actions): per-device cooldown (`same_device_cooldown_seconds`, default

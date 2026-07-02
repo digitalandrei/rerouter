@@ -168,7 +168,7 @@ applies.
 
 Pre-aggregate into fixed-width time buckets (`bucket_seconds`, default 60); never
 store raw flows — under the exact DDoS we want to catch, raw 5-tuple cardinality
-is millions/hour. Three purpose-built, individually-bounded bucket tables, because
+is millions/hour. Four purpose-built, individually-bounded bucket tables, because
 a single "top-K talkers" table would **miss a spoofed-source flood** (millions of
 distinct src IPs, each tiny, all to dst/53 — truncating by talker loses them,
 while the port rollup aggregates them all):
@@ -183,6 +183,9 @@ while the port rollup aggregates them all):
   5-tuples only**. The long tail beyond `top_k_talkers` is dropped in memory
   before write; `flow_iface_buckets.flow_count` records how many flows existed so
   the UI shows "top 100 of N" — the truncation is surfaced, never silent.
+- **`flow_as_buckets`** — per `(bucket, interface, direction, src/dst AS)` rollup
+  (added with the flow-rule work). Bounded like the port table; drives AS-level
+  views. Sampling confidence + effective rate are stored per row as elsewhere.
 
 Each row stores raw sampled `pkts`/`bytes`, the `effective_sampling_rate` and
 `sampling_confidence` in force, and `flow_count`. Retention: a prune job deletes
@@ -224,12 +227,14 @@ single bucket), and matches "never assume state survived a restart".
   an "estimated (sampled N:1)" badge and a low-confidence warning when the rate is
   unknown or the SNMP cross-check disagrees.
 
-## Detection hook (future)
+## Detection hook (implemented)
 
-Flow aggregates expose new signals (e.g. dst-port pps, talker pps, unique-source
-count) that a future detector can threshold — the natural home for the
-"big-pps / low-bps to port 53 from peer A" rule. Wiring those into the rule engine
-is **out of scope here**; this note only lands the read-only collector and its
-storage. Any future flow-driven automatic action stays behind the existing
-enforce-mode + global + per-rule enables, and **low sampling confidence blocks
-it** by the rule above.
+Flow aggregates expose signals (dst-port pps, talker pps, unique-source count)
+that the rule engine now thresholds directly — the `flow_pps` / `flow_bps` metrics
+read the latest closed bucket in `detection/engine.rs::flow_observation`, the home
+of the "big-pps / low-bps to port 53 from peer A" detector class. Flow-driven
+**automatic** actions stay behind enforce mode + the global and per-rule enables,
+and **low sampling confidence blocks them**. Caveat (2026-07 audit, P0-1): that
+confidence gate validates sampling *math*, not exporter *identity* — flow-driven
+auto-execution needs source corroboration (SNMP cross-cal / uRPF) before it is
+safe to enable. Until then, keep flow rules on the alert/would-run path only.
