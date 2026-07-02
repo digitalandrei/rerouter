@@ -297,6 +297,11 @@ impl Config {
         if !self.server.bind.starts_with("127.") && !self.server.bind.starts_with("[::1]") {
             anyhow::bail!("server.bind must be loopback; refusing to expose the controller API");
         }
+        // flow.bucket_seconds is a divisor in flow rate math; enforce >= 1 here
+        // once instead of relying on scattered `.max(1)` guards.
+        if self.flow.bucket_seconds == 0 {
+            anyhow::bail!("flow.bucket_seconds must be >= 1");
+        }
         Ok(())
     }
 

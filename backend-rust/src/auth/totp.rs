@@ -66,5 +66,7 @@ pub fn generate_recovery_codes() -> Vec<String> {
         .collect()
 }
 
-// TODO(milestone 1): consume_recovery_code(user, code) — constant-time match
-// against the stored hashes, single-use (delete on match), audited.
+// Recovery-code consumption lives in `auth::consume_recovery_code` (auth/mod.rs):
+// constant-time match against the stored Argon2id hashes, single-use (deleted on
+// match) under `SELECT ... FOR UPDATE`, emitting the `2fa_recovery_used` security
+// alert. It lives there because it needs the DB pool + session context.

@@ -69,9 +69,11 @@ struct Counts {
 
 impl Counts {
     fn add(&mut self, pkts: u64, bytes: u64) {
-        self.pkts += pkts;
-        self.bytes += bytes;
-        self.flows += 1;
+        // Attacker-controlled wire values accumulated across a bucket window:
+        // saturate rather than panic (debug) / wrap (release) on overflow.
+        self.pkts = self.pkts.saturating_add(pkts);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.flows = self.flows.saturating_add(1);
     }
 }
 

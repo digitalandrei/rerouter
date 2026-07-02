@@ -397,9 +397,11 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
         dst_as,
         direction,
         // Cisco exports per-direction counters; a record carries one direction's
-        // (in OR out). Sum so we don't lose the populated side.
-        bytes: in_bytes + out_bytes,
-        pkts: in_pkts + out_pkts,
+        // (in OR out). Sum so we don't lose the populated side. `saturating_add`
+        // because both operands are attacker-controlled u64 wire fields: a raw
+        // `+` panics in debug / wraps in release on a crafted maximal counter.
+        bytes: in_bytes.saturating_add(out_bytes),
+        pkts: in_pkts.saturating_add(out_pkts),
     })
 }
 

@@ -259,6 +259,9 @@ pub fn client_ip(headers: &axum::http::HeaderMap, socket: Option<&std::net::Sock
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        // Only accept a well-formed IP so a garbage/spoofed header can't pollute
+        // the audit trail; otherwise fall back to the trusted socket peer.
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
         .or_else(|| socket.map(|a| a.ip().to_string()))
         .unwrap_or_else(|| "unknown".to_string())
 }

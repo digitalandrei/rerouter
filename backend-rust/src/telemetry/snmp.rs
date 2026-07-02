@@ -612,9 +612,20 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
         .await
         .unwrap_or_default();
 
-    if in_oct.is_empty() && out_oct.is_empty() {
+    // Rate math needs BOTH octet directions. If EITHER walk came back empty
+    // (asymmetric GETBULK timeout, or an agent missing ifXTable), fail LOUD and
+    // mark the device unreachable — never report a device healthy with zero
+    // interfaces refreshed (a silent false "all clear").
+    if in_oct.is_empty() || out_oct.is_empty() {
         let msg =
-            "poll returned no HC octet counters (agent may not support ifXTable / 64-bit counters)";
+            "poll returned incomplete HC octet counters (agent may not support ifXTable / 64-bit counters, or a GETBULK walk timed out)";
+        tracing::warn!(
+            event_type = "snmp_poll_incomplete",
+            device_id,
+            in_octets = in_oct.len(),
+            out_octets = out_oct.len(),
+            "{msg}"
+        );
         mark_unreachable(pool, device_id, msg).await;
         return Err(anyhow!(msg));
     }
