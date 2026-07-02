@@ -198,7 +198,10 @@ export default function ManualReroute() {
                 schema={schema}
                 deviceId={deviceId ? parseInt(deviceId, 10) : null}
                 values={values}
-                onChange={setValues}
+                onChange={(v) => {
+                  setValues(v);
+                  setPreview(null); // params changed — force a fresh preview before Execute
+                }}
               />
 
               <Button size="sm" variant="outline" onClick={() => void doPreview()}>
@@ -241,10 +244,21 @@ export default function ManualReroute() {
                 <Button variant="outline" disabled={busy} onClick={() => void submit(true)}>
                   Dry run
                 </Button>
-                <Button variant="destructive" disabled={busy} onClick={() => void submit(false)}>
+                <Button
+                  variant="destructive"
+                  disabled={busy || !preview}
+                  title={!preview ? "Preview the exact commands before executing" : undefined}
+                  onClick={() => void submit(false)}
+                >
                   Execute
                 </Button>
               </div>
+              {!preview && (
+                <p className="text-xs text-muted-foreground">
+                  Preview the commands first — Execute stays disabled until the exact
+                  commands are shown.
+                </p>
+              )}
 
               {results && (
                 <div className="space-y-2">
