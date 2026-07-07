@@ -266,19 +266,17 @@ export default function ManualReroute() {
               {targetDevice && (
                 <div className="space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <ToneBadge tone={targetDevice.ssh_recent ? "good" : "warn"}>
-                      {targetDevice.ssh_recent
-                        ? "SSH recently reachable"
-                        : "SSH not recently confirmed"}
+                    <ToneBadge tone={targetDevice.ssh_reachable ? "good" : "warn"}>
+                      {targetDevice.ssh_reachable ? "SSH reachable" : "SSH unreachable"}
                     </ToneBadge>
                     <Badge variant="secondary" className="font-normal">
                       {targetDevice.telnet_reachable ? "telnet: open" : "telnet: closed"}
                     </Badge>
                   </div>
-                  {!targetDevice.ssh_recent && (
+                  {!targetDevice.ssh_reachable && (
                     <p className="text-xs text-amber-700 dark:text-amber-400">
-                      Device may be unreachable over SSH — the reroute will be refused if
-                      SSH does not answer.
+                      Device did not answer SSH at the last probe — the reroute will be
+                      refused if SSH does not answer.
                     </p>
                   )}
                 </div>

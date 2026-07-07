@@ -32,7 +32,9 @@ lockout_minutes = 15
 # the device row). These are the rollup/staleness knobs for the poll loop.
 [telemetry]
 metrics_rollup_seconds = 15
-reachability_interval_seconds = 15
+# How often the poll loop probes device SSH reachability (a no-command liveness
+# session, heavier than an SNMP poll). Floored at 60s in code.
+reachability_interval_seconds = 300
 stale_after_seconds = 90
 jitter_percent = 15
 

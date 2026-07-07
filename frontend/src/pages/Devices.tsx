@@ -511,8 +511,8 @@ export default function Devices() {
                         <ToneBadge tone={device.reachable ? "good" : "bad"}>
                           {device.reachable ? "reachable" : "unreachable"}
                         </ToneBadge>
-                        <ToneBadge tone={device.ssh_recent ? "good" : "warn"}>
-                          {device.ssh_recent ? "ssh: recent" : "ssh: stale"}
+                        <ToneBadge tone={device.ssh_reachable ? "good" : "warn"}>
+                          {device.ssh_reachable ? "ssh: reachable" : "ssh: unreachable"}
                         </ToneBadge>
                         <Badge variant="secondary" className="font-normal">
                           {device.telnet_reachable ? "telnet: open" : "telnet: closed"}

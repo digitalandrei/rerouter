@@ -47,6 +47,10 @@ fn device_json(r: &DeviceRow, interface_count: i64) -> Value {
         "telnet_port": r.telnet_port,
         "telnet_reachable": r.telnet_reachable,
         "last_telnet_ok_at": r.last_telnet_ok_at.map(fmt_ts),
+        // ssh_reachable: the last periodic SSH-probe outcome (the display state).
+        // ssh_recent: the reroute gate's 60s recency short-circuit (SSH answered in
+        // the last minute) — a stricter, internal signal.
+        "ssh_reachable": r.ssh_reachable,
         "last_ssh_ok_at": r.last_ssh_ok_at.map(fmt_ts),
         "ssh_recent": crate::reroute::reachability::recent_enough(r.last_ssh_ok_at, chrono::Utc::now()),
         // SSH access (captured at onboarding for future CLI reroute actions;
@@ -104,6 +108,7 @@ struct DeviceRow {
     poll_interval_seconds: u32,
     telnet_port: u16,
     telnet_reachable: bool,
+    ssh_reachable: bool,
     last_telnet_ok_at: Option<chrono::DateTime<chrono::Utc>>,
     last_ssh_ok_at: Option<chrono::DateTime<chrono::Utc>>,
     ssh_username: Option<String>,
@@ -117,7 +122,7 @@ struct DeviceRow {
 
 const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled, reachable, \
      vendor, model, os_version, sys_name, sys_uptime, last_poll_at, last_error, poll_interval_seconds, \
-     telnet_port, telnet_reachable, last_telnet_ok_at, last_ssh_ok_at, \
+     telnet_port, telnet_reachable, ssh_reachable, last_telnet_ok_at, last_ssh_ok_at, \
      ssh_username, ssh_port, ssh_auth_method, ssh_public_key, \
      (ssh_password_encrypted IS NOT NULL) AS ssh_has_password, \
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";

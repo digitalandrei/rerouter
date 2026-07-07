@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rand::Rng;
@@ -271,11 +271,26 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
     let initial = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
     tokio::time::sleep(Duration::from_millis((initial * 1000.0) as u64 / 4)).await;
 
+    // SSH reachability is probed on its own (slow) cadence, NOT every poll — an SSH
+    // session is heavier than an SNMP poll and we must not hammer the device's SSH.
+    // 60s floor guards against a mis-set config. `None` => probe on the first tick
+    // so the UI populates soon after startup (per-device loops are already staggered).
+    let ssh_probe_interval =
+        Duration::from_secs(cfg.telemetry.reachability_interval_seconds.max(60));
+    let mut last_ssh_probe: Option<Instant> = None;
+
     loop {
         let tick = poll_and_detect(&pool, &cfg, device_id).await;
         if let Err(e) = tick {
             tracing::warn!(event_type = "device_tick_failed", device_id, error = %e, "device poll/detect tick failed");
         }
+
+        if last_ssh_probe.is_none_or(|t| t.elapsed() >= ssh_probe_interval) {
+            let ok = crate::reroute::reachability::probe_ssh_and_store(&pool, device_id).await;
+            tracing::debug!(event_type = "ssh_reachability_probed", device_id, reachable = ok, "periodic SSH reachability probe");
+            last_ssh_probe = Some(Instant::now());
+        }
+
         let secs = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
         tokio::time::sleep(Duration::from_millis((secs * 1000.0) as u64)).await;
     }

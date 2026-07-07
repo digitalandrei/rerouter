@@ -117,10 +117,12 @@ export interface Device {
   // pushes config over SSH); telnet port-open is an informational secondary signal.
   telnet_port: number;
   telnet_reachable: boolean;
+  // Last periodic SSH-probe outcome — the display state ("SSH reachable/unreachable").
+  ssh_reachable: boolean;
   last_telnet_ok_at: string | null;
   last_ssh_ok_at: string | null;
-  // Soft "SSH answered lately" hint (60s recency window). The live truth comes
-  // from POST /devices/{id}/reachability-test.
+  // The reroute gate's 60s recency short-circuit (SSH answered in the last minute).
+  // A stricter internal signal; the reachability-test gives the live truth.
   ssh_recent: boolean;
 }
 

@@ -87,7 +87,7 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
     // Live SSH liveness probe: connect + confirm privileged EXEC, run no commands.
     match ssh::ssh_probe(pool, device_id).await {
         Ok(()) => {
-            stamp_ssh_ok(pool, device_id).await;
+            stamp_ssh_result(pool, device_id, true).await;
             Reachability {
                 ssh_ok: true,
                 telnet_open,
@@ -96,23 +96,49 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
                 ssh_error: None,
             }
         }
-        Err(e) => Reachability {
-            ssh_ok: false,
-            telnet_open,
-            via_recency: false,
-            last_ssh_ok_at,
-            ssh_error: Some(e.to_string()),
-        },
+        Err(e) => {
+            // Record the failure so the displayed ssh_reachable reflects it (the
+            // recency timestamp is left untouched — it means "last SUCCESS").
+            stamp_ssh_result(pool, device_id, false).await;
+            Reachability {
+                ssh_ok: false,
+                telnet_open,
+                via_recency: false,
+                last_ssh_ok_at,
+                ssh_error: Some(e.to_string()),
+            }
+        }
     }
 }
 
-/// Record that SSH just answered on `device_id` (keeps the recency window warm).
-/// Best-effort; a failed update just means the next reroute re-probes.
+/// Record an SSH probe outcome on `device_id`. On success sets `ssh_reachable = 1`
+/// and stamps `last_ssh_ok_at` (keeping the reroute-gate recency window warm); on
+/// failure sets `ssh_reachable = 0` and leaves `last_ssh_ok_at` (which means "last
+/// time SSH answered") unchanged. Best-effort.
+pub async fn stamp_ssh_result(pool: &MySqlPool, device_id: u64, ok: bool) {
+    let sql = if ok {
+        "UPDATE devices SET ssh_reachable = 1, last_ssh_ok_at = UTC_TIMESTAMP() WHERE id = ?"
+    } else {
+        "UPDATE devices SET ssh_reachable = 0 WHERE id = ?"
+    };
+    let _ = sqlx::query(sql).bind(device_id).execute(pool).await;
+}
+
+/// Record that SSH just answered on `device_id` (e.g. a successful reroute push) —
+/// keeps the recency window warm and marks the device SSH-reachable.
 pub async fn stamp_ssh_ok(pool: &MySqlPool, device_id: u64) {
-    let _ = sqlx::query("UPDATE devices SET last_ssh_ok_at = UTC_TIMESTAMP() WHERE id = ?")
-        .bind(device_id)
-        .execute(pool)
-        .await;
+    stamp_ssh_result(pool, device_id, true).await;
+}
+
+/// Periodic SSH liveness probe (the poll loop calls this every
+/// `reachability_interval_seconds`). Opens a no-command SSH session and records the
+/// outcome in `ssh_reachable` (+ `last_ssh_ok_at` on success), so the UI shows a
+/// definite SSH reachable/unreachable state and the reroute gate's recency window
+/// is kept warm without an on-demand probe. Returns the outcome for logging.
+pub async fn probe_ssh_and_store(pool: &MySqlPool, device_id: u64) -> bool {
+    let ok = ssh::ssh_probe(pool, device_id).await.is_ok();
+    stamp_ssh_result(pool, device_id, ok).await;
+    ok
 }
 
 /// Periodic telnet TCP port-open probe (INFORMATIONAL). Reads the device host +

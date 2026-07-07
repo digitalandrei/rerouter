@@ -109,12 +109,12 @@ export function OverviewTab({ device }: { device: Device }) {
           <dl className="grid grid-cols-2 gap-4">
             <Fact label="SSH">
               <span className="flex flex-wrap items-center gap-1.5">
-                <ToneBadge tone={device.ssh_recent ? "good" : "warn"}>
-                  {device.ssh_recent ? "recently reachable" : "not recently confirmed"}
+                <ToneBadge tone={device.ssh_reachable ? "good" : "warn"}>
+                  {device.ssh_reachable ? "reachable" : "unreachable"}
                 </ToneBadge>
                 <span className="text-xs font-normal text-muted-foreground">
                   {device.last_ssh_ok_at
-                    ? new Date(device.last_ssh_ok_at).toLocaleString()
+                    ? `ok ${new Date(device.last_ssh_ok_at).toLocaleString()}`
                     : "never"}
                 </span>
               </span>
