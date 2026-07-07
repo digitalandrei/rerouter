@@ -144,13 +144,25 @@ fn window_clause(table: &str, iface: bool) -> String {
 
 // Aggregate columns, in the order the per-dimension tuples place them last:
 // est_bytes, est_pkts, raw_bytes, raw_pkts, max_rate, low_conf.
+//
+// low_conf here is DISPLAY-ONLY and VOLUME-WEIGHTED: the row is flagged low only
+// when low-confidence buckets carry more than 10% of the raw sampled bytes in the
+// window. A brief blip — e.g. the ~1-minute NetFlow-template re-learn after a
+// controller restart writes a few default-rate (low) buckets — is a negligible
+// share of an hour's bytes and no longer flags an otherwise fully-verified
+// interface. This is deliberately LOOSER than the automatic-action gate, which
+// stays strict/fail-safe: detection::engine and reroute::flow_target use
+// MAX(sampling_confidence='low') so ANY unverified bucket blocks auto-reroute.
+// Do NOT "align" them by loosening the engine gate — that would weaken the
+// doctrine "low sampling confidence blocks flow-driven automatic actions".
 fn agg_select() -> &'static str {
     "CAST(SUM(bytes * effective_sampling_rate) AS UNSIGNED) AS est_bytes, \
      CAST(SUM(pkts  * effective_sampling_rate) AS UNSIGNED) AS est_pkts, \
      CAST(SUM(bytes) AS UNSIGNED) AS raw_bytes, \
      CAST(SUM(pkts)  AS UNSIGNED) AS raw_pkts, \
      CAST(MAX(effective_sampling_rate) AS UNSIGNED) AS max_rate, \
-     CAST(MAX(sampling_confidence = 'low') AS UNSIGNED) AS low_conf"
+     CAST(SUM(CASE WHEN sampling_confidence = 'low' THEN bytes ELSE 0 END) \
+          > 0.10 * SUM(bytes) AS UNSIGNED) AS low_conf"
 }
 
 fn agg_json(
