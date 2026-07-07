@@ -82,7 +82,7 @@ export function AppSidebar() {
             {item.icon && <item.icon className="h-4 w-4 shrink-0" />}
             <span className="flex-1">{item.title}</span>
             {badge > 0 && (
-              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive px-1.5 text-[11px] font-semibold text-destructive-foreground">
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive px-1.5 text-[11px] font-semibold text-white">
                 {badge}
               </span>
             )}

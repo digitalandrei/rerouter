@@ -838,7 +838,7 @@ export default function Mitigations() {
           <TabsTrigger value="detections" className="gap-2">
             Detections
             {firingRules.length > 0 && (
-              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive px-1.5 text-[11px] font-semibold text-destructive-foreground">
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive px-1.5 text-[11px] font-semibold text-white">
                 {firingRules.length}
               </span>
             )}
