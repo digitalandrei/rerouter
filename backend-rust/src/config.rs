@@ -116,13 +116,29 @@ pub struct Reroute {
     pub require_verification: bool,
 }
 
-/// Retention windows enforced by the controller's cleanup task
-/// (TODO(milestone 2): the task itself).
+/// Retention windows (in days) enforced by the controller's retention cleanup
+/// task (see `scheduler::retention_cleanup`).
+///
+/// `traffic_samples_days`, `flow_buckets_days`, `alerts_days` and
+/// `rule_events_days` are actively pruned — the short-term telemetry + detection
+/// history the app is built around. `reroute_logs_days` is advisory and NOT
+/// auto-pruned: the reroute action log is the safety trail of traffic-moving
+/// actions, is low-volume (nothing executes in observe mode), and its rows are
+/// live state-machine state — a non-terminal / `uncertain` reroute holds a device
+/// lock — so it needs deliberate state-aware pruning, never a blanket delete.
+/// `audit_logs` (the security/admin trail) is likewise never auto-pruned.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Retention {
+    /// interface_samples — per-interface SNMP history (was a hardcoded 70 min).
     pub traffic_samples_days: u32,
+    /// flow_*_buckets — NetFlow/sFlow per-minute aggregates (was 70 min).
+    pub flow_buckets_days: u32,
+    /// alerts — detection/reroute/security alert events (was never pruned).
+    pub alerts_days: u32,
+    /// rule_events — detection history (matched/fired/cleared). Actively pruned.
     pub rule_events_days: u32,
+    /// reroute action log. Advisory; NOT auto-pruned (safety trail — see above).
     pub reroute_logs_days: u32,
 }
 
@@ -147,9 +163,8 @@ pub struct Flow {
     pub sflow_port: u16,
     /// Only parse datagrams whose source IP resolves to an enrolled device.
     pub allowlist_enrolled_only: bool,
-    /// Retain ~the last hour of aggregated buckets (mirrors interface_samples).
-    pub retention_minutes: i64,
-    /// Aggregation bucket width in seconds.
+    /// Aggregation bucket width in seconds. (Bucket retention is unified under
+    /// [retention].flow_buckets_days — see `scheduler::retention_cleanup`.)
     pub bucket_seconds: u64,
     /// 5-tuples retained per bucket/interface/direction; the tail is truncated
     /// (logged, never silent — the count survives in flow_iface_buckets).
@@ -169,7 +184,6 @@ impl Default for Flow {
             sflow_enabled: false,
             sflow_port: 6343,
             allowlist_enrolled_only: true,
-            retention_minutes: 70,
             bucket_seconds: 60,
             top_k_talkers: 100,
             default_sampling_rate: 1,
@@ -244,7 +258,9 @@ impl Default for Retention {
     fn default() -> Self {
         Self {
             traffic_samples_days: 7,
-            rule_events_days: 90,
+            flow_buckets_days: 7,
+            alerts_days: 7,
+            rule_events_days: 7,
             reroute_logs_days: 365,
         }
     }

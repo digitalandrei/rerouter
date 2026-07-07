@@ -126,7 +126,8 @@ admin_status, oper_status, updated_at
 ## interface_samples
 
 Retained per-interface rate history — the raw per-interface sample history that
-backs the detail-page charts (the scheduler prunes it on a short window; see
+backs the detail-page charts (the scheduler prunes it to
+`[retention].traffic_samples_days`, default 7 days; see
 [Retention defaults](#retention-defaults)). Only derived rates; raw counters stay
 in `interface_metrics_current`.
 
@@ -330,18 +331,26 @@ global_maintenance_lock    seeded 'false'
 
 ## Retention defaults
 
+All windows below are enforced by `scheduler::retention_cleanup`, a single task
+that runs every 10 minutes and honours the `[retention]` config block.
+
 ```text
-interface_samples:   ~70 minutes (pruned every 10 min by the scheduler; telemetry
-                     is intentionally short-lived — just enough for the 60-min charts)
-rule_events:         90 days
-reroutes/outputs:    365 days
-alert_deliveries:    365 days
-audit_logs:          permanent (or 365+ days)
+interface_samples:   7 days   ([retention].traffic_samples_days)
+flow_*_buckets:      7 days   ([retention].flow_buckets_days)
+alerts:              7 days   ([retention].alerts_days)
+rule_events:         7 days   ([retention].rule_events_days)
+reroutes/outputs:    365 days ([retention].reroute_logs_days — advisory, see below)
+alert_deliveries:    follows alerts (ON DELETE CASCADE from the alerts prune)
+audit_logs:          permanent (never auto-deleted without an explicit decision)
 ```
 
-> **Status (2026-07):** only `interface_samples` and the `flow_*` buckets are
-> actually pruned today (by the scheduler and the flow collector). `rule_events`,
-> `alerts`, and `alert_deliveries` are **not yet pruned** — the general cleanup
-> task honouring the `[retention]` config is still a TODO, and that config's
-> `traffic_samples_days` / `reroute_logs_days` fields name tables that no longer
-> exist. `audit_logs` is never auto-deleted without an explicit retention decision.
+> **Status (2026-07):** the short-term telemetry + protection history —
+> `interface_samples`, the four `flow_*_buckets`, `alerts`, and `rule_events` —
+> are actively pruned by `retention_cleanup` (unified: the flow collector no
+> longer prunes its own buckets, and the old hardcoded ~70-minute
+> `interface_samples` window is gone). The `reroutes` action log
+> (`reroute_logs_days`) is **advisory and deliberately NOT auto-pruned**: it is a
+> low-volume safety trail and its rows are live state-machine state (an
+> `uncertain` reroute holds a device lock), so bounding it needs state-aware
+> pruning, not a blanket time delete. `audit_logs` (security/admin trail) is
+> likewise never auto-deleted.

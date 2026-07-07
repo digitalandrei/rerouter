@@ -32,8 +32,10 @@ gate are unchanged.
   rewrite (v9 and IPFIX share field semantics; they differ in header, set IDs —
   template/options `0`/`1` in v9 vs `2`/`3` in IPFIX — and variable-length
   encoding).
-- **Retain the last ~hour** of aggregated flow data (mirrors the
-  `interface_samples` 70-minute window and its prune job).
+- **Retain** aggregated flow data for `[retention].flow_buckets_days` (default
+  7 days), pruned by the unified `scheduler::retention_cleanup` alongside
+  `interface_samples`. Note: per-minute flow buckets are high-cardinality
+  (especially top-talker 5-tuples), so raising this materially increases disk use.
 - **Display** per interface: top-10 talkers (5-tuples), top-10 ports, and
   per-interface/direction totals.
 - **Out of scope (future):** per-tuple anomaly baselines, flow-driven automatic
@@ -80,10 +82,12 @@ sflow_port     = 6343           # sFlow's default UDP port
 # Only accept datagrams whose source IP resolves to an enrolled device. A packet
 # from an unknown source is counted and dropped (never parsed into state).
 allowlist_enrolled_only = true
-retention_minutes = 70
 bucket_seconds    = 60          # aggregation bucket width
 top_k_talkers     = 100         # 5-tuples retained per bucket/interface/direction
 ```
+
+Bucket retention is unified under `[retention].flow_buckets_days` (default 7 days),
+not a `[flow]` setting.
 
 NetFlow and sFlow bind **separate UDP ports** and run independent receive loops
 that share the same in-memory state (exporter map, allowlist) and aggregate into
@@ -188,9 +192,11 @@ while the port rollup aggregates them all):
   views. Sampling confidence + effective rate are stored per row as elsewhere.
 
 Each row stores raw sampled `pkts`/`bytes`, the `effective_sampling_rate` and
-`sampling_confidence` in force, and `flow_count`. Retention: a prune job deletes
-`bucket_ts < now - retention_minutes` from all three, mirroring `prune_samples`.
-`flow_exporters` is durable state (not pruned).
+`sampling_confidence` in force, and `flow_count`. Retention: the unified
+`scheduler::retention_cleanup` deletes `bucket_ts < now - flow_buckets_days` from
+all four bucket tables (see [database.md](database.md#retention-defaults)).
+`flow_exporters` is durable state (pruned only once idle past the flow bucket
+window, so its cascade never removes still-retained buckets).
 
 Top-N queries are then `ORDER BY SUM(bytes|pkts) DESC LIMIT 10` over the window,
 grouped by the relevant dimension.
@@ -198,7 +204,8 @@ grouped by the relevant dimension.
 ## Background task
 
 A `flow::collector::run(pool, cfg)` task spawns from `scheduler::run()` alongside
-`supervise` and `prune_samples` (only when `[flow].enabled`):
+`supervise` and `retention_cleanup` (the collector itself runs only when
+`[flow].enabled`):
 
 1. UDP recv loop → allowlist check → decode header → dispatch sets.
 2. Template sets update the per-exporter template cache; options templates update
@@ -208,7 +215,8 @@ A `flow::collector::run(pool, cfg)` task spawns from `scheduler::run()` alongsid
    three dimensions above.
 4. On bucket close, resolve the effective sampling rate, truncate talkers to
    top-K, and flush to the bucket tables in one transaction.
-5. A sibling prune task trims expired buckets every `PRUNE_INTERVAL`.
+5. Expired buckets are trimmed by the central `scheduler::retention_cleanup`
+   (not the collector), unified with `interface_samples` and `alerts` retention.
 
 Templates are **in-memory** in v1: after a controller restart, data records are
 dropped until each template is re-advertised (seconds-to-minutes). This gap is

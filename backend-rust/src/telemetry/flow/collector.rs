@@ -49,8 +49,6 @@ impl Protocol {
 const RECV_BUF: usize = 65_535;
 /// How often to flush closed buckets + exporter health to the DB.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
-/// How often to prune expired buckets.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 /// How often to refresh the device -> source-IP allowlist.
 const ALLOWLIST_INTERVAL: Duration = Duration::from_secs(30);
 /// Hard cap on distinct exporters held in memory. The allowlist normally keeps
@@ -289,7 +287,8 @@ pub async fn run(pool: MySqlPool, cfg: Arc<Config>) {
 
     tokio::spawn(refresh_allowlist(pool.clone(), state.clone()));
     tokio::spawn(flush_loop(pool.clone(), cfg.clone(), state.clone()));
-    tokio::spawn(prune_loop(pool.clone(), cfg.clone()));
+    // Flow-bucket retention is enforced centrally by scheduler::retention_cleanup
+    // (unified under [retention].flow_buckets_days), not here.
 
     // Both listeners share the same in-memory State (exporter map, allowlist),
     // so their flows aggregate into the same buckets and exporter-health rows.
@@ -852,36 +851,6 @@ async fn cross_calibrate(
         None
     };
     Some((ratio, derived))
-}
-
-/// Delete bucket rows older than the retention window from all three tables.
-async fn prune_loop(pool: MySqlPool, cfg: Arc<Config>) {
-    let minutes = cfg.flow.retention_minutes.max(1);
-    loop {
-        for table in [
-            "flow_iface_buckets",
-            "flow_port_buckets",
-            "flow_as_buckets",
-            "flow_talker_buckets",
-        ] {
-            let sql = format!("DELETE FROM {table} WHERE bucket_ts < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)");
-            match sqlx::query(&sql).bind(minutes).execute(&pool).await {
-                Ok(r) if r.rows_affected() > 0 => {
-                    tracing::debug!(
-                        event_type = "flow_buckets_pruned",
-                        table,
-                        rows = r.rows_affected(),
-                        "pruned old flow buckets"
-                    )
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(event_type = "flow_prune_failed", table, error = %e, "pruning flow buckets failed")
-                }
-            }
-        }
-        tokio::time::sleep(PRUNE_INTERVAL).await;
-    }
 }
 
 #[cfg(test)]

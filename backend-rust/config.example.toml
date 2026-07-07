@@ -63,9 +63,22 @@ same_device_cooldown_seconds = 300
 # Verify the resulting routing state after every action ("never trust 'sent'").
 require_verification = true
 
+# Retention windows (days), enforced by the controller's retention cleanup task.
+# Short-term telemetry + protection history: traffic_samples, flow_buckets,
+# alerts and rule_events are actively pruned. reroute_logs is advisory and NOT
+# auto-pruned (the reroute action log is a low-volume safety trail whose rows are
+# live state-machine state); audit_logs is likewise never auto-pruned.
 [retention]
+# SNMP interface history (interface_samples).
 traffic_samples_days = 7
-rule_events_days = 90
+# NetFlow/sFlow aggregates (flow_*_buckets). Note: per-minute, high-cardinality
+# (esp. top-talker 5-tuples) — raising this materially increases disk use.
+flow_buckets_days = 7
+# Alert events (alerts). Previously kept indefinitely.
+alerts_days = 7
+# Detection history (rule_events: matched/fired/cleared).
+rule_events_days = 7
+# Advisory only — the reroute action log is NOT auto-pruned (see comment above).
 reroute_logs_days = 365
 
 # NetFlow v9 / IPFIX flow collector — a SECOND, read-only telemetry source giving
@@ -82,8 +95,7 @@ sflow_enabled = false
 sflow_port = 6343
 # Only parse datagrams whose source IP resolves to an enrolled device.
 allowlist_enrolled_only = true
-# Retain ~the last hour of aggregated buckets (mirrors interface_samples).
-retention_minutes = 70
+# Bucket retention is unified under [retention].flow_buckets_days above.
 # Aggregation bucket width (seconds) and per-bucket top-K 5-tuples retained.
 bucket_seconds = 60
 top_k_talkers = 100
