@@ -48,6 +48,11 @@ pub struct ExecOutcome {
     pub blocked_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub would_run: Option<RenderedPlan>,
+    /// The rollback (undo) command set for `would_run`, so an observe/dry-run
+    /// preview can show how to reverse the action by hand. `None` when the
+    /// template has no paired rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_run_rollback: Option<RenderedPlan>,
     pub device_id: u64,
     pub device_name: Option<String>,
 }
@@ -112,30 +117,27 @@ async fn execute_with<S: SshExecutor>(
         Err(e) => return blocked(&req, device_name, format!("invalid parameters: {e}")),
     };
 
-    // GATE 0 — operating mode. In observe, return the would-run plan, never run.
+    // GATE 0 — operating mode. In observe (or an enforce-mode dry-run) NOTHING
+    // runs; return the would-run plan plus its rollback (undo) commands so the
+    // preview shows how to reverse the action by hand. The rollback is rendered
+    // only here, never on the executing path.
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
-    if mode != "enforce" {
-        return ExecOutcome {
-            executed: false,
-            reroute_id: None,
-            state: None,
-            message: "observe mode: NOT executed — this is the plan that would run".into(),
-            blocked_reason: None,
-            would_run: Some(plan),
-            device_id: req.device_id,
-            device_name,
+    if mode != "enforce" || dry_run {
+        let would_run_rollback =
+            crate::reroute::rollback::render_rollback_plan(pool, req.template.id, &req.params).await;
+        let message = if mode != "enforce" {
+            "observe mode: NOT executed — this is the plan that would run"
+        } else {
+            "dry run: rendered plan only, nothing executed"
         };
-    }
-
-    // Dry-run: render only, change nothing (even in enforce mode).
-    if dry_run {
         return ExecOutcome {
             executed: false,
             reroute_id: None,
             state: None,
-            message: "dry run: rendered plan only, nothing executed".into(),
+            message: message.into(),
             blocked_reason: None,
             would_run: Some(plan),
+            would_run_rollback,
             device_id: req.device_id,
             device_name,
         };
@@ -146,6 +148,21 @@ async fn execute_with<S: SshExecutor>(
     // blocked action reports the same reason it always did.
     if let Err(reason) = guard::can_execute(pool, cfg, &req, &plan).await {
         return blocked(&req, device_name, reason.to_string());
+    }
+
+    // Reachability preflight (hard gate, every trigger type): a reroute pushes
+    // config over SSH, so a device that does not answer SSH cannot be mitigated.
+    // Refuse up front with a clear reason instead of reserving a slot and failing
+    // mid-push. The 60s recency short-circuit inside `reachable_for_mitigation`
+    // means bursts don't re-probe (and don't trip the device's SSH throttle).
+    let reach = crate::reroute::reachability::reachable_for_mitigation(pool, req.device_id).await;
+    if !reach.ssh_ok {
+        let detail = reach.ssh_error.as_deref().unwrap_or("no SSH response");
+        return blocked(
+            &req,
+            device_name,
+            guard::BlockReason::DeviceUnreachable(detail.to_string()).to_string(),
+        );
     }
 
     // Reserve a slot under a per-device advisory lock (atomic re-check + INSERT).
@@ -164,15 +181,7 @@ async fn execute_with<S: SshExecutor>(
         ),
     )
     .await;
-    enqueue_alert(
-        pool,
-        &req,
-        reroute_id,
-        "reroute_started",
-        "info",
-        json!({ "commands": plan.commands }),
-    )
-    .await;
+    enqueue_alert(pool, &req, reroute_id, "reroute_started", "info", json!({})).await;
 
     let final_state = run_state_machine(
         pool,
@@ -219,6 +228,7 @@ async fn execute_with<S: SshExecutor>(
         message,
         blocked_reason: None,
         would_run: None,
+        would_run_rollback: None,
         device_id: req.device_id,
         device_name,
     }
@@ -270,6 +280,9 @@ async fn run_state_machine<S: SshExecutor>(
                 .bind(reroute_id)
                 .execute(pool)
                 .await;
+            // SSH just answered — keep the reachability recency window warm so a
+            // follow-up reroute in the same storm skips the preflight probe.
+            crate::reroute::reachability::stamp_ssh_ok(pool, req.device_id).await;
             true
         }
         Err(e) => {
@@ -549,11 +562,35 @@ async fn enqueue_alert(
     severity: &str,
     extra: Value,
 ) {
+    // Enrich the payload so the email can render the full picture: WHO acted (for
+    // manual/rollback), the exact commands run, and the rollback commands to undo
+    // it by hand. Rendering is best-effort (params already validated at execution).
+    let actor = crate::alerts::actor_json(pool, req.user_id).await;
+    let (commands, rollback_commands) =
+        match crate::reroute::templates::render(&req.template, &req.params) {
+            Ok(plan) => {
+                let rb = crate::reroute::rollback::render_rollback_plan(
+                    pool,
+                    req.template.id,
+                    &req.params,
+                )
+                .await
+                .map(|p| p.commands);
+                (Some(plan.commands), rb)
+            }
+            Err(_) => (None, None),
+        };
     let payload = json!({
         "reroute_id": reroute_id,
         "template": req.template.name,
+        "template_display_name": req.template.display_name,
         "device_id": req.device_id,
+        "device_name": device_name(pool, req.device_id).await,
         "trigger_type": req.trigger_type,
+        "actor": actor,
+        "reason": req.reason,
+        "commands": commands,
+        "rollback_commands": rollback_commands,
         "detail": extra,
     });
     let dedup_key = format!("{event_type}:reroute:{reroute_id}");
@@ -626,6 +663,7 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
         message: reason.clone(),
         blocked_reason: Some(reason),
         would_run: None,
+        would_run_rollback: None,
         device_id: req.device_id,
         device_name,
     }

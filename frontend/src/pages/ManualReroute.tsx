@@ -18,8 +18,9 @@ import {
   type RerouteResult,
   ApiError,
 } from "@/lib/api";
-import { StateBadge } from "@/components/status-badge";
+import { StateBadge, ToneBadge } from "@/components/status-badge";
 import { templateLabel } from "@/lib/labels";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -41,6 +42,7 @@ export default function ManualReroute() {
   const [deviceId, setDeviceId] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState<RenderedPlan | null>(null);
+  const [previewRollback, setPreviewRollback] = useState<RenderedPlan | null>(null);
   const [reason, setReason] = useState("");
   const [results, setResults] = useState<RerouteResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -70,6 +72,7 @@ export default function ManualReroute() {
   }, []);
 
   const template = templates.find((t) => String(t.id) === templateId) ?? null;
+  const targetDevice = devices.find((d) => String(d.id) === deviceId) ?? null;
   const schema = template?.parameter_schema ?? {};
   const isHostTargetTemplate =
     template !== null && HOST_TARGET_TEMPLATE_NAMES.includes(template.name);
@@ -77,6 +80,7 @@ export default function ManualReroute() {
   function reset() {
     setValues({});
     setPreview(null);
+    setPreviewRollback(null);
     setResults(null);
     setError(null);
   }
@@ -91,10 +95,15 @@ export default function ManualReroute() {
     if (!template) return;
     setError(null);
     setPreview(null);
+    setPreviewRollback(null);
     try {
       const r = await api.templates.render(template.id, buildParams());
-      if (r.ok && r.plan) setPreview(r.plan);
-      else setError(r.error ?? "render failed");
+      if (r.ok && r.plan) {
+        setPreview(r.plan);
+        setPreviewRollback(r.rollback ?? null);
+      } else {
+        setError(r.error ?? "render failed");
+      }
     } catch {
       setError("render request failed");
     }
@@ -169,6 +178,7 @@ export default function ManualReroute() {
                   setDeviceId(e.target.value);
                   setValues({});
                   setPreview(null);
+                  setPreviewRollback(null);
                 }}
               >
                 <option value="">Select router…</option>
@@ -201,6 +211,7 @@ export default function ManualReroute() {
                 onChange={(v) => {
                   setValues(v);
                   setPreview(null); // params changed — force a fresh preview before Execute
+                  setPreviewRollback(null);
                 }}
               />
 
@@ -221,6 +232,18 @@ export default function ManualReroute() {
                       Verify: <code>{preview.verify.command}</code>
                     </div>
                   )}
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Rollback (to undo by hand)
+                  </div>
+                  {previewRollback ? (
+                    <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
+                      {previewRollback.commands.join("\n")}
+                    </pre>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      No rollback defined for this template.
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -238,6 +261,27 @@ export default function ManualReroute() {
                 <p className="text-sm text-destructive" role="alert">
                   {error}
                 </p>
+              )}
+
+              {targetDevice && (
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <ToneBadge tone={targetDevice.ssh_recent ? "good" : "warn"}>
+                      {targetDevice.ssh_recent
+                        ? "SSH recently reachable"
+                        : "SSH not recently confirmed"}
+                    </ToneBadge>
+                    <Badge variant="secondary" className="font-normal">
+                      {targetDevice.telnet_reachable ? "telnet: open" : "telnet: closed"}
+                    </Badge>
+                  </div>
+                  {!targetDevice.ssh_recent && (
+                    <p className="text-xs text-amber-700 dark:text-amber-400">
+                      Device may be unreachable over SSH — the reroute will be refused if
+                      SSH does not answer.
+                    </p>
+                  )}
+                </div>
               )}
 
               <div className="flex gap-2">

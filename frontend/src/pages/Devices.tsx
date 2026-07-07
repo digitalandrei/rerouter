@@ -505,11 +505,19 @@ export default function Devices() {
                       </div>
                     </TableCell>
 
-                    {/* Reachability status */}
+                    {/* Reachability status: SNMP telemetry, SSH (mitigation gate), telnet (informational) */}
                     <TableCell>
-                      <ToneBadge tone={device.reachable ? "good" : "bad"}>
-                        {device.reachable ? "reachable" : "unreachable"}
-                      </ToneBadge>
+                      <div className="flex flex-wrap items-center gap-1">
+                        <ToneBadge tone={device.reachable ? "good" : "bad"}>
+                          {device.reachable ? "reachable" : "unreachable"}
+                        </ToneBadge>
+                        <ToneBadge tone={device.ssh_recent ? "good" : "warn"}>
+                          {device.ssh_recent ? "ssh: recent" : "ssh: stale"}
+                        </ToneBadge>
+                        <Badge variant="secondary" className="font-normal">
+                          {device.telnet_reachable ? "telnet: open" : "telnet: closed"}
+                        </Badge>
+                      </div>
                     </TableCell>
 
                     {/* Actions */}

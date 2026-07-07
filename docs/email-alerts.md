@@ -17,15 +17,22 @@ An alert (an `alerts` row) is generated on:
   crossed its threshold above/below for the configured settle window; the payload
   carries the device, interface, rule, metric/observed value, and — in observe
   mode — the rendered would-run action plan;
-- reroute lifecycle: `reroute_planned` / `reroute_started` / `reroute_failed`;
+- reroute lifecycle: `reroute_planned` / `reroute_started` / `reroute_succeeded`
+  / `reroute_failed`; the payload carries the **actor** (who — for manual and
+  rollback triggers), the exact **commands run**, and the **rollback** commands to
+  undo the action by hand. `rollback` runs are reroute events with
+  `trigger_type = rollback`;
 - `reroute_uncertain` — action left ambiguous (see [state-recovery.md](state-recovery.md));
+- **arming / mode flips** — `operating_mode_changed`, `automatic_actions_changed`,
+  `global_lock_changed`: the highest-consequence state changes (they can allow
+  traffic-moving actions), so they are emitted as alerts with the **actor** and the
+  before → after values, and are in `ALWAYS_IMMEDIATE` (page right away). They are
+  still audited too;
 - security events: `2fa_recovery_used`, `account_locked`.
 
-> Operating-mode flips (`operating_mode_changed`) and lock changes
-> (`global_lock_created` / `global_lock_cleared`) are recorded in the **audit
-> log**, not emailed as alerts, in v1. Device-unreachable / telemetry-stale show
-> up via `GET /api/status` (`telemetry_stale_count`) and stale UI state rather
-> than a dedicated alert email.
+> Device-unreachable / telemetry-stale show up via `GET /api/status`
+> (`telemetry_stale_count`) and stale UI state rather than a dedicated alert email.
+> Safety-lock create/clear and uncertain-acknowledge remain audit-log only.
 
 Each alert type has a default severity and can be enabled/disabled per recipient
 via subscriptions (by **role** and/or **event type**).
@@ -115,6 +122,10 @@ whether it crossed above or below the threshold), the reroute (if any) and its
 state, a timestamp, and a deep link to the relevant UI page. In **observe** mode
 (read-only / alert-only — see [reroute-engine.md](reroute-engine.md) "Operating
 mode"), `rule_fired` alerts additionally include the rendered **would-run action
-plan**: the exact template, target device, prefix, and parameters that `enforce`
-mode would have executed. Never include secrets or raw credentials (no SNMP
-community, SSH password/key, or full command output beyond the rendered plan).
+plan** (and its **rollback** commands): the exact template, target device, prefix,
+and parameters that `enforce` mode would have executed. `reroute_*` emails include
+the **trigger** (manual / automatic / rollback), the **actor** who decided (for
+manual), the **commands run**, and the **rollback** commands to undo the action by
+hand. Arming / mode-flip emails state the before → after change and the actor.
+Never include secrets or raw credentials (no SNMP community, SSH password/key, or
+full command output beyond the rendered plan).

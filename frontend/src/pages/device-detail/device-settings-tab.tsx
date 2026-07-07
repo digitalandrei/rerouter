@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Activity, Copy, KeyRound, ShieldCheck, TerminalSquare } from "lucide-react";
+import { Activity, Copy, KeyRound, ShieldCheck, TerminalSquare, Wifi } from "lucide-react";
 import { toast } from "sonner";
 import { api, type Device, type CapabilityCheck, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -205,6 +205,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   const [checking, setChecking] = useState(false);
   const [caps, setCaps] = useState<CapabilityCheck[] | null>(null);
   const [capsErr, setCapsErr] = useState<string | null>(null);
+  const [reachTesting, setReachTesting] = useState(false);
 
   // Reset only when navigating to a different device (not on the 30s refresh of
   // the same device, which would wipe in-progress edits).
@@ -317,6 +318,25 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       toast.error("SSH test failed");
     } finally {
       setTesting(false);
+    }
+  }
+
+  /** The reroute gate's own reachability decision: SSH is authoritative (a live
+   *  probe unless SSH answered in the last 60s); telnet-open is informational. */
+  async function testReachability() {
+    setReachTesting(true);
+    try {
+      const r = await api.devices.reachabilityTest(device.id);
+      const desc = `ssh ${r.ssh_ok ? "ok" : "no"}${r.via_recency ? " (recent)" : ""} · telnet ${r.telnet_open ? "open" : "closed"}`;
+      if (r.ok) {
+        toast.success("Reachable for mitigations", { description: desc });
+      } else {
+        toast.error(`Not reachable${r.ssh_error ? `: ${r.ssh_error}` : ""}`, { description: desc });
+      }
+    } catch {
+      toast.error("Reachability test failed");
+    } finally {
+      setReachTesting(false);
     }
   }
 
@@ -586,6 +606,15 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
             <Button type="button" variant="outline" disabled={testing} onClick={() => void testSsh()}>
               <TerminalSquare className="size-4" />
               Test SSH
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={reachTesting}
+              onClick={() => void testReachability()}
+            >
+              <Wifi className="size-4" />
+              {reachTesting ? "Testing…" : "Test reachability"}
             </Button>
           </div>
         </form>

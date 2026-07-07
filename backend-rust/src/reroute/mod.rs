@@ -6,6 +6,7 @@ pub mod executor;
 pub mod flow_target;
 pub mod guard;
 pub mod locks;
+pub mod reachability;
 pub mod rollback;
 pub mod state_machine;
 pub mod templates;

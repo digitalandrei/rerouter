@@ -131,6 +131,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(devices::ssh_capabilities),
         )
         .route(
+            "/api/devices/{id}/reachability-test",
+            post(devices::reachability_test),
+        )
+        .route(
             "/api/devices/{id}/discover-bgp",
             post(devices::discover_bgp),
         )

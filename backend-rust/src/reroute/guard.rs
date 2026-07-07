@@ -44,6 +44,7 @@ pub enum BlockReason {
     GuardBusy,
     AlreadyRunning,
     UnresolvedUncertain,
+    DeviceUnreachable(String),
     PersistFailed(String),
 }
 
@@ -97,6 +98,11 @@ impl fmt::Display for BlockReason {
             BlockReason::UnresolvedUncertain => {
                 write!(f, "an unresolved uncertain action exists on this device")
             }
+            BlockReason::DeviceUnreachable(detail) => write!(
+                f,
+                "device is not reachable over SSH for a mitigation ({detail}); a reroute pushes \
+                 config over SSH, so it is refused up front rather than failing mid-push"
+            ),
             BlockReason::PersistFailed(e) => write!(f, "could not persist reroute: {e}"),
         }
     }

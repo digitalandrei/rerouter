@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::{err, AppState};
 use crate::auth::rbac::{markers, RequirePermission};
-use crate::reroute::templates;
+use crate::reroute::{rollback, templates};
 
 type JsonResp = (StatusCode, Json<Value>);
 
@@ -81,7 +81,16 @@ pub async fn render(
         Err(_) => return err(StatusCode::NOT_FOUND, "template not found"),
     };
     match templates::render(&t, &body.params) {
-        Ok(plan) => (StatusCode::OK, Json(json!({ "ok": true, "plan": plan }))),
+        Ok(plan) => {
+            // Also render the rollback (undo) command set, so the operator can see
+            // — and if needed run by hand — exactly what would reverse this action.
+            // `null` when the template has no paired rollback template.
+            let rollback = rollback::render_rollback_plan(&state.pool, id, &body.params).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "plan": plan, "rollback": rollback })),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(json!({ "ok": false, "error": e.to_string() })),

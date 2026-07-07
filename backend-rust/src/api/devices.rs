@@ -40,6 +40,15 @@ fn device_json(r: &DeviceRow, interface_count: i64) -> Value {
         "last_error": r.last_error,
         "poll_interval_seconds": r.poll_interval_seconds,
         "interface_count": interface_count,
+        // Control-plane reachability for mitigations. SSH is authoritative (a
+        // reroute pushes config over SSH); telnet port-open is an informational
+        // secondary signal. `ssh_recent` is the soft "SSH answered lately" hint
+        // (the 60s recency window); the live truth comes from a reachability-test.
+        "telnet_port": r.telnet_port,
+        "telnet_reachable": r.telnet_reachable,
+        "last_telnet_ok_at": r.last_telnet_ok_at.map(fmt_ts),
+        "last_ssh_ok_at": r.last_ssh_ok_at.map(fmt_ts),
+        "ssh_recent": crate::reroute::reachability::recent_enough(r.last_ssh_ok_at, chrono::Utc::now()),
         // SSH access (captured at onboarding for future CLI reroute actions;
         // unused in observe mode). Secrets are NEVER returned — only whether one
         // is stored, plus the non-secret username/port/method.
@@ -93,6 +102,10 @@ struct DeviceRow {
     last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
     last_error: Option<String>,
     poll_interval_seconds: u32,
+    telnet_port: u16,
+    telnet_reachable: bool,
+    last_telnet_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_ssh_ok_at: Option<chrono::DateTime<chrono::Utc>>,
     ssh_username: Option<String>,
     ssh_port: u16,
     ssh_auth_method: Option<String>,
@@ -104,6 +117,7 @@ struct DeviceRow {
 
 const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled, reachable, \
      vendor, model, os_version, sys_name, sys_uptime, last_poll_at, last_error, poll_interval_seconds, \
+     telnet_port, telnet_reachable, last_telnet_ok_at, last_ssh_ok_at, \
      ssh_username, ssh_port, ssh_auth_method, ssh_public_key, \
      (ssh_password_encrypted IS NOT NULL) AS ssh_has_password, \
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";
@@ -737,6 +751,40 @@ pub async fn ssh_capabilities(
             Json(json!({ "ok": false, "error": e.to_string() })),
         ),
     }
+}
+
+/// POST /api/devices/{id}/reachability-test — the "can we mitigate this device
+/// right now?" check. Refreshes the telnet port-open signal, then runs the SSH
+/// reachability decision (a live liveness probe unless a reroute answered SSH in
+/// the last 60s). Returns the [`Reachability`] the reroute gate would see: `ssh_ok`
+/// decides, `telnet_open` is informational. `manage_devices` (superadmin) only.
+pub async fn reachability_test(
+    _g: RequirePermission<markers::ManageDevices>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if exists.is_none() {
+        return err(StatusCode::NOT_FOUND, "device not found");
+    }
+    // Refresh the informational telnet signal, then decide on SSH (authoritative).
+    crate::reroute::reachability::probe_telnet(&state.pool, id).await;
+    let reach = crate::reroute::reachability::reachable_for_mitigation(&state.pool, id).await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "ssh_ok": reach.ssh_ok,
+            "telnet_open": reach.telnet_open,
+            "via_recency": reach.via_recency,
+            "last_ssh_ok_at": reach.last_ssh_ok_at.map(fmt_ts),
+            "ssh_error": reach.ssh_error,
+        })),
+    )
 }
 
 /// POST /api/devices/{id}/ssh-generate-key — generate a fresh 2048-bit RSA client

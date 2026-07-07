@@ -100,6 +100,40 @@ export function OverviewTab({ device }: { device: Device }) {
           </dl>
         </CardContent>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Reachability (for mitigations)</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <dl className="grid grid-cols-2 gap-4">
+            <Fact label="SSH">
+              <span className="flex flex-wrap items-center gap-1.5">
+                <ToneBadge tone={device.ssh_recent ? "good" : "warn"}>
+                  {device.ssh_recent ? "recently reachable" : "not recently confirmed"}
+                </ToneBadge>
+                <span className="text-xs font-normal text-muted-foreground">
+                  {device.last_ssh_ok_at
+                    ? new Date(device.last_ssh_ok_at).toLocaleString()
+                    : "never"}
+                </span>
+              </span>
+            </Fact>
+            <Fact label="Telnet">
+              <span className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="secondary" className="font-normal">
+                  {device.telnet_reachable ? "open" : "closed"}
+                </Badge>
+                <span className="text-xs font-normal text-muted-foreground">
+                  {device.last_telnet_ok_at
+                    ? new Date(device.last_telnet_ok_at).toLocaleString()
+                    : "never"}
+                </span>
+              </span>
+            </Fact>
+          </dl>
+        </CardContent>
+      </Card>
     </div>
   );
 }

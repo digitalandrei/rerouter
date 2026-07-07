@@ -284,6 +284,12 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
 /// One poll + detection pass for a device. Detection runs even if some
 /// interfaces had no fresh sample (the engine filters stale/invalid itself).
 async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<()> {
+    // Telnet port-open probe (informational reachability signal). Independent of
+    // SNMP so it updates even when SNMP is down; cheap TCP connect, never errors,
+    // and never used to gate a reroute (SSH is authoritative — see
+    // reroute::reachability).
+    crate::reroute::reachability::probe_telnet(pool, device_id).await;
+
     // Poll: stores interface_metrics_current + interface_samples. A transport
     // failure marks the device unreachable and returns Err — detection then has
     // nothing fresh and harmlessly no-ops.

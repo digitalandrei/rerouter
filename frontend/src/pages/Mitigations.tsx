@@ -228,6 +228,26 @@ function DetectionsTab({
 // Alerts tab (extracted from former Alerts.tsx)
 // ---------------------------------------------------------------------------
 
+/** Extracts a non-empty `commands: string[]` from a would-run action's
+ *  `rendered` or `rollback` sub-object (each `{ commands: string[] } | null`). */
+function actionCommands(
+  action: Record<string, unknown>,
+  key: "rendered" | "rollback",
+): string[] | null {
+  const obj = action[key];
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    const commands = (obj as { commands?: unknown }).commands;
+    if (
+      Array.isArray(commands) &&
+      commands.length > 0 &&
+      commands.every((c) => typeof c === "string")
+    ) {
+      return commands as string[];
+    }
+  }
+  return null;
+}
+
 function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
   const metric = typeof payload.metric === "string" ? payload.metric : null;
   const value = typeof payload.value === "number" ? payload.value : null;
@@ -303,6 +323,32 @@ function PayloadDetails({ payload }: { payload: Record<string, unknown> }) {
                   </span>
                 )}
               </span>
+            );
+          })}
+        </div>
+      )}
+      {wouldRunActions.some((a) => actionCommands(a, "rendered")) && (
+        <div className="space-y-1.5 pt-1">
+          {wouldRunActions.map((a, i) => {
+            const commands = actionCommands(a, "rendered");
+            if (!commands) return null;
+            const rollbackCommands = actionCommands(a, "rollback");
+            return (
+              <div key={i}>
+                <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
+                  {commands.join("\n")}
+                </pre>
+                {rollbackCommands && (
+                  <>
+                    <div className="mt-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      Rollback (to undo by hand)
+                    </div>
+                    <pre className="mt-0.5 overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
+                      {rollbackCommands.join("\n")}
+                    </pre>
+                  </>
+                )}
+              </div>
             );
           })}
         </div>

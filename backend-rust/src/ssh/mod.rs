@@ -365,6 +365,18 @@ fn ios_preferred() -> Preferred {
 
 // ---- Session -------------------------------------------------------------------
 
+/// SSH liveness probe: open a session and confirm the device answers commands at
+/// privileged EXEC, running NO commands (an empty command list drives
+/// [`run_on`]'s full connect → auth → shell → `#`-prompt → `terminal length 0`
+/// path, then exits). `Ok(())` means SSH is reachable and usable for a reroute; a
+/// structured `Err` explains why not (connect/auth/host-key/prompt). Reused by the
+/// reroute reachability gate and the manual reachability-test endpoint. Never
+/// mutates device config.
+pub async fn ssh_probe(pool: &MySqlPool, device_id: u64) -> Result<()> {
+    let dev = load_device_ssh(pool, device_id).await?;
+    run_on(&dev, &[]).await.map(|_| ())
+}
+
 /// Connect to a device over SSH, run `commands` in order against an interactive
 /// IOS shell, and return each command's output. Pins the host key on first use;
 /// a changed key fails closed. `commands` are sent verbatim — callers MUST pass

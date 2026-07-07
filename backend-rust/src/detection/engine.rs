@@ -798,6 +798,13 @@ async fn render_would_run_actions(pool: &MySqlPool, rule: &InterfaceRule) -> Vec
                     Ok(plan) => json!({ "commands": plan.commands, "verify": plan.verify }),
                     Err(e) => json!({ "error": e.to_string() }),
                 };
+                // The undo command set (if the template has a paired rollback), so
+                // the alert shows how to reverse this mitigation by hand. `null`
+                // when there is no rollback template.
+                let rollback =
+                    crate::reroute::rollback::render_rollback_plan(pool, template.id, &rparams)
+                        .await
+                        .map(|p| json!({ "commands": p.commands }));
                 let mut v = json!({
                     "action_id": action_id,
                     "template_id": template.id,
@@ -807,6 +814,7 @@ async fn render_would_run_actions(pool: &MySqlPool, rule: &InterfaceRule) -> Vec
                     "device_name": device_name,
                     "params": rparams,
                     "rendered": rendered,
+                    "rollback": rollback,
                 });
                 if let Some(at) = at {
                     v["auto_target"] = json!({

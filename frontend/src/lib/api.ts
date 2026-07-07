@@ -113,6 +113,25 @@ export interface Device {
   // OpenSSH public-key line (not a secret) — shown for enrollment on the router.
   // null until a key is generated in-app or derived from a pasted private key.
   ssh_public_key: string | null;
+  // Control-plane reachability for mitigations. SSH is authoritative (a reroute
+  // pushes config over SSH); telnet port-open is an informational secondary signal.
+  telnet_port: number;
+  telnet_reachable: boolean;
+  last_telnet_ok_at: string | null;
+  last_ssh_ok_at: string | null;
+  // Soft "SSH answered lately" hint (60s recency window). The live truth comes
+  // from POST /devices/{id}/reachability-test.
+  ssh_recent: boolean;
+}
+
+/** Result of POST /devices/{id}/reachability-test — the reroute gate's view. */
+export interface ReachabilityResult {
+  ok: boolean;
+  ssh_ok: boolean;
+  telnet_open: boolean;
+  via_recency: boolean;
+  last_ssh_ok_at: string | null;
+  ssh_error: string | null;
 }
 
 /** Payload for enrolling a device. SSH access is optional (password XOR key). */
@@ -498,6 +517,9 @@ export interface RerouteResult {
   message: string;
   blocked_reason?: string | null;
   would_run?: RenderedPlan | null;
+  /** Rollback (undo) command set for `would_run`, shown in observe/dry-run
+   *  previews so the action can be reversed by hand. null when none. */
+  would_run_rollback?: RenderedPlan | null;
   device_id: number;
   device_name?: string | null;
   /** Set on a rule-apply result for a flow auto-target action: the resolved host
@@ -565,6 +587,10 @@ export interface RenderedPlan {
 export interface RenderResult {
   ok: boolean;
   plan?: RenderedPlan;
+  // The rollback (undo) command set, so an operator can see — and if needed run
+  // by hand — exactly what reverses this action. null when the template has no
+  // paired rollback template.
+  rollback?: RenderedPlan | null;
   error?: string;
 }
 
@@ -690,6 +716,13 @@ export const api = {
         `/api/devices/${id}/ssh-capabilities`,
         { method: "POST" },
       ),
+    /** The "can we mitigate this device right now?" check. Refreshes telnet and
+     *  runs the SSH reachability decision the reroute gate uses (live probe
+     *  unless SSH answered in the last 60s). */
+    reachabilityTest: (id: number) =>
+      request<ReachabilityResult>(`/api/devices/${id}/reachability-test`, {
+        method: "POST",
+      }),
     interfaces: (id: number) =>
       request<Interface[]>(`/api/devices/${id}/interfaces`),
     bgpPeers: (id: number) =>

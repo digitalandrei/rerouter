@@ -75,6 +75,16 @@ function ApplyResultRow({ r }: { r: RerouteResult }) {
             Verify: <code>{r.would_run.verify.command}</code>
           </div>
         )}
+        <div className="mt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Rollback (to undo by hand)
+        </div>
+        {r.would_run_rollback ? (
+          <pre className="mt-1 overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
+            {r.would_run_rollback.commands.join("\n")}
+          </pre>
+        ) : (
+          <p className="mt-1 text-xs text-muted-foreground">No rollback defined for this template.</p>
+        )}
       </div>
     );
   }

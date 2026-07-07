@@ -180,14 +180,27 @@ a router, not an asset/prefix). Any failure aborts and logs:
 - no other action is already running on this device;
 - no unresolved (`uncertain`) prior action on this device;
 - the device is not inside its post-action cooldown window;
+- the global action rate limit is not exceeded;
+- **control-plane reachability (preflight):** the target device answers **SSH**.
+  A reroute pushes config over SSH, so a device that does not answer SSH cannot be
+  mitigated — the action is refused up front (`BlockReason::DeviceUnreachable`)
+  rather than reserving a slot and failing mid-push. To avoid re-probing a device
+  we just talked to (and tripping its SSH connection throttle), a successful SSH
+  contact within the last **60 s** (`devices.last_ssh_ok_at`, stamped by the probe
+  and by every successful reroute push) passes without opening a new session. This
+  is a hard gate on **every** trigger (manual, automatic, rollback). A telnet
+  port-open check (`devices.telnet_reachable`, refreshed by the poll loop) is an
+  **informational** secondary signal only — it never gates. See
+  `reroute::reachability`;
 - for manual: the caller has `trigger_manual_reroute` (enforced by the API before
   it calls the executor), with an optional reason recorded for the audit log.
 
 For automatic triggers, the *rule* decides: the firing edge only auto-executes in
-enforce mode when the rule's `automatic_reroute_enabled` is on. There is **no**
-provider-reachability gate, no permitted-prefix-range gate, and no re-auth / typed
-confirmation step (those were de-scoped along with the multi-provider model and
-the `safety_level` classification).
+enforce mode when the rule's `automatic_reroute_enabled` is on. There is no
+permitted-prefix-range gate and no re-auth / typed confirmation step (those were
+de-scoped along with the multi-provider model and the `safety_level`
+classification). The reachability gate above is a control-plane (SSH) preflight,
+distinct from the de-scoped multi-provider "provider reachability".
 
 ## Cooldowns & rate limit
 

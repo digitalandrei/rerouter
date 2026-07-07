@@ -46,6 +46,7 @@ function TemplateCard({ template }: { template: Template }) {
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [plan, setPlan] = useState<RenderedPlan | null>(null);
+  const [rollbackPlan, setRollbackPlan] = useState<RenderedPlan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -53,10 +54,15 @@ function TemplateCard({ template }: { template: Template }) {
     setBusy(true);
     setError(null);
     setPlan(null);
+    setRollbackPlan(null);
     try {
       const r = await api.templates.render(template.id, values);
-      if (r.ok && r.plan) setPlan(r.plan);
-      else setError(r.error ?? "render failed");
+      if (r.ok && r.plan) {
+        setPlan(r.plan);
+        setRollbackPlan(r.rollback ?? null);
+      } else {
+        setError(r.error ?? "render failed");
+      }
     } catch {
       setError("render request failed");
     } finally {
@@ -128,6 +134,18 @@ function TemplateCard({ template }: { template: Template }) {
                     {plan.verify.expect && <> — expect “{plan.verify.expect}”</>}
                     {plan.verify.reject && <> — reject “{plan.verify.reject}”</>}
                   </div>
+                )}
+                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Rollback (to undo by hand)
+                </div>
+                {rollbackPlan ? (
+                  <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
+                    {rollbackPlan.commands.join("\n")}
+                  </pre>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    No rollback defined for this template.
+                  </p>
                 )}
               </div>
             )}

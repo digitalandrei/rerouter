@@ -200,6 +200,18 @@ pub async fn update(
                 &format!("operating_mode {prev} -> {v}"),
             )
             .await;
+            let before = if prev.is_empty() { "observe" } else { &prev };
+            let severity = if v == "enforce" { "critical" } else { "warning" };
+            enqueue_change_alert(
+                pool,
+                session.user_id,
+                "operating_mode_changed",
+                before,
+                v,
+                severity,
+                &format!("operating_mode changed from {before} to {v}"),
+            )
+            .await;
         }
     }
 
@@ -229,6 +241,18 @@ pub async fn update(
                 &format!("automatic_actions_enabled {prev} -> {v}"),
             )
             .await;
+            let before = if prev.is_empty() { "false" } else { &prev };
+            let severity = if b { "critical" } else { "warning" };
+            enqueue_change_alert(
+                pool,
+                session.user_id,
+                "automatic_actions_changed",
+                before,
+                v,
+                severity,
+                &format!("automatic_actions_enabled changed from {before} to {v}"),
+            )
+            .await;
         }
     }
 
@@ -255,11 +279,57 @@ pub async fn update(
                 &format!("global_maintenance_lock {prev} -> {v}"),
             )
             .await;
+            let before = if prev.is_empty() { "false" } else { &prev };
+            enqueue_change_alert(
+                pool,
+                session.user_id,
+                "global_lock_changed",
+                before,
+                v,
+                "warning",
+                &format!("global_maintenance_lock changed from {before} to {v}"),
+            )
+            .await;
         }
     }
 
     let after = all_settings(pool).await;
     (StatusCode::OK, Json(settings_json(&after, &state.config)))
+}
+
+/// Enqueue an alert for an arming / mode-flip change so subscribers are emailed.
+/// These are the highest-consequence state changes (they can allow traffic-moving
+/// actions), so they are in `ALWAYS_IMMEDIATE` and page right away. `before`/`after`
+/// and the acting user are rendered by `alerts::body::render_mode_change`.
+async fn enqueue_change_alert(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    event: &str,
+    before: &str,
+    after: &str,
+    severity: &str,
+    message: &str,
+) {
+    let actor = crate::alerts::actor_json(pool, Some(user_id)).await;
+    let payload = json!({
+        "actor": actor,
+        "before": before,
+        "after": after,
+        "message": message,
+    });
+    let dedup_key = format!("{event}:{before}->{after}");
+    if let Err(e) = sqlx::query(
+        "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) VALUES (?, ?, ?, ?)",
+    )
+    .bind(event)
+    .bind(severity)
+    .bind(sqlx::types::Json(&payload))
+    .bind(&dedup_key)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(event_type = "settings_alert_enqueue_failed", change = %event, error = %e, "failed to enqueue settings-change alert");
+    }
 }
 
 /// Upsert one system_settings row, stamping updated_by.
