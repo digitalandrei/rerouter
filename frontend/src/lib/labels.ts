@@ -59,6 +59,22 @@ export function sshStatusBadge(status: string): {
   }
 }
 
+/** A device's AUTOMATION status derived from SSH health + stability. Returns a
+ *  badge (tone+label) when automatic mitigations targeting the device are held, or
+ *  null when automation is active (device stable). Manual reroutes are still
+ *  allowed once ssh_status='reachable' (the gate blocks a genuinely unreachable
+ *  device). */
+export function automationStatus(d: {
+  ssh_status: string;
+  automation_stable: boolean;
+}): { tone: "warn" | "bad"; label: string } | null {
+  if (d.ssh_status === "reachable") {
+    return d.automation_stable ? null : { tone: "warn", label: "auto held (stabilizing)" };
+  }
+  // no_privilege / unreachable / unknown -> automatic mitigations suspended.
+  return { tone: "bad", label: "auto suspended" };
+}
+
 // Thin aliases so call sites read intently (all just humanizeToken today).
 export const eventTypeLabel = humanizeToken;
 export const providerTypeLabel = humanizeToken;

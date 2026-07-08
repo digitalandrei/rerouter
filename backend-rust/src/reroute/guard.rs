@@ -45,6 +45,7 @@ pub enum BlockReason {
     AlreadyRunning,
     UnresolvedUncertain,
     DeviceUnreachable(String),
+    DeviceStabilizing,
     PersistFailed(String),
 }
 
@@ -102,6 +103,12 @@ impl fmt::Display for BlockReason {
                 f,
                 "device is not reachable over SSH for a mitigation ({detail}); a reroute pushes \
                  config over SSH, so it is refused up front rather than failing mid-push"
+            ),
+            BlockReason::DeviceStabilizing => write!(
+                f,
+                "device has not been continuously SSH-reachable long enough (stabilizing); \
+                 automatic mitigations resume after 5 minutes of continuous reachability. \
+                 A manual reroute is still allowed."
             ),
             BlockReason::PersistFailed(e) => write!(f, "could not persist reroute: {e}"),
         }

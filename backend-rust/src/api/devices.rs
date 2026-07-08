@@ -50,6 +50,15 @@ fn device_json(r: &DeviceRow, interface_count: i64) -> Value {
         "last_ssh_error": r.last_ssh_error,
         "last_ssh_ok_at": r.last_ssh_ok_at.map(fmt_ts),
         "ssh_recent": crate::reroute::reachability::recent_enough(r.last_ssh_ok_at, chrono::Utc::now()),
+        // Automation stability: reachable AND continuously so for the stability
+        // window. AUTOMATIC mitigations targeting this device are held until true;
+        // manual reroutes are allowed (with a warning) once ssh_status=reachable.
+        "ssh_reachable_since": r.ssh_reachable_since.map(fmt_ts),
+        "automation_stable": crate::reroute::reachability::device_stable(
+            &r.ssh_status,
+            r.ssh_reachable_since,
+            chrono::Utc::now(),
+        ),
         // SSH access (captured at onboarding for future CLI reroute actions;
         // unused in observe mode). Secrets are NEVER returned — only whether one
         // is stored, plus the non-secret username/port/method.
@@ -106,6 +115,7 @@ struct DeviceRow {
     ssh_status: String,
     last_ssh_error: Option<String>,
     last_ssh_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    ssh_reachable_since: Option<chrono::DateTime<chrono::Utc>>,
     ssh_username: Option<String>,
     ssh_port: u16,
     ssh_auth_method: Option<String>,
@@ -117,7 +127,7 @@ struct DeviceRow {
 
 const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled, reachable, \
      vendor, model, os_version, sys_name, sys_uptime, last_poll_at, last_error, poll_interval_seconds, \
-     ssh_status, last_ssh_error, last_ssh_ok_at, \
+     ssh_status, last_ssh_error, last_ssh_ok_at, ssh_reachable_since, \
      ssh_username, ssh_port, ssh_auth_method, ssh_public_key, \
      (ssh_password_encrypted IS NOT NULL) AS ssh_has_password, \
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";
@@ -778,8 +788,10 @@ pub async fn reachability_test(
             "ok": true,
             "ssh_ok": reach.ssh_ok,
             "ssh_status": reach.ssh_status,
+            "stable": reach.stable,
             "via_recency": reach.via_recency,
             "last_ssh_ok_at": reach.last_ssh_ok_at.map(fmt_ts),
+            "ssh_reachable_since": reach.ssh_reachable_since.map(fmt_ts),
             "ssh_error": reach.ssh_error,
         })),
     )

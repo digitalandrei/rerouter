@@ -164,6 +164,17 @@ async fn execute_with<S: SshExecutor>(
             guard::BlockReason::DeviceUnreachable(detail.to_string()).to_string(),
         );
     }
+    // Stability gate — AUTOMATIC triggers only. A device that is reachable but has
+    // not been continuously so for the stability window (just recovered / flapping)
+    // does not get auto-mitigated. Manual and rollback triggers bypass this (the
+    // operator may act during the window; a manual rollback is corrective).
+    if req.trigger_type == "automatic" && !reach.stable {
+        return blocked(
+            &req,
+            device_name,
+            guard::BlockReason::DeviceStabilizing.to_string(),
+        );
+    }
 
     // Reserve a slot under a per-device advisory lock (atomic re-check + INSERT).
     let reroute_id = match guard::reserve_and_persist(pool, cfg, &req, &plan).await {

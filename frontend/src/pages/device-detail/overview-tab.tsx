@@ -3,7 +3,7 @@ import { type Device } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ToneBadge } from "@/components/status-badge";
-import { sshStatusBadge } from "@/lib/labels";
+import { sshStatusBadge, automationStatus } from "@/lib/labels";
 
 /** Uppercase-label / bold-value cell used in the info cards. */
 function Fact({ label, children }: { label: string; children: ReactNode }) {
@@ -125,6 +125,25 @@ export function OverviewTab({ device }: { device: Device }) {
                   {device.last_ssh_error}
                 </p>
               )}
+            </Fact>
+            <Fact label="Automation">
+              <span className="flex flex-wrap items-center gap-1.5">
+                {(() => {
+                  const a = automationStatus(device);
+                  return a ? (
+                    <ToneBadge tone={a.tone}>{a.label}</ToneBadge>
+                  ) : (
+                    <ToneBadge tone="good">active</ToneBadge>
+                  );
+                })()}
+                <span className="text-xs font-normal text-muted-foreground">
+                  {device.ssh_status === "reachable" && !device.automation_stable
+                    ? "auto mitigations resume after 5 min reachable · manual allowed"
+                    : device.ssh_status !== "reachable"
+                      ? "auto mitigations held until SSH reachable · manual gated too"
+                      : "auto + manual mitigations enabled"}
+                </span>
+              </span>
             </Fact>
           </dl>
         </CardContent>

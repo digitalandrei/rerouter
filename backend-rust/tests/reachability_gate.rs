@@ -80,6 +80,18 @@ async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
     assert!(r.via_recency, "recent contact must short-circuit the live probe");
     assert_eq!(r.ssh_status, STATUS_REACHABLE);
 
+    // 3) Stability: a just-reachable device is ssh_ok but NOT stable (auto held).
+    //    stamp_ssh_ok started ssh_reachable_since = now, so < 5 min -> not stable.
+    assert!(!r.stable, "a device reachable for <5 min is not stable (auto held)");
+    // Backdate the stability clock past the window -> now stable (auto resumes).
+    sqlx::query("UPDATE devices SET ssh_reachable_since = UTC_TIMESTAMP() - INTERVAL 6 MINUTE WHERE id = ?")
+        .bind(device_id)
+        .execute(&pool)
+        .await
+        .expect("backdate stability clock");
+    let r = reachability::reachable_for_mitigation(&pool, device_id).await;
+    assert!(r.stable, "reachable for >5 min continuous -> stable");
+
     // Cleanup (FKs cascade from devices; be explicit for isolation).
     let _ = sqlx::query("DELETE FROM devices WHERE id = ?")
         .bind(device_id)

@@ -18,7 +18,7 @@ import { api, type Device, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { ToneBadge } from "@/components/status-badge";
-import { sshStatusBadge } from "@/lib/labels";
+import { sshStatusBadge, automationStatus } from "@/lib/labels";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -515,6 +515,10 @@ export default function Devices() {
                         {(() => {
                           const s = sshStatusBadge(device.ssh_status);
                           return <ToneBadge tone={s.tone}>ssh: {s.label}</ToneBadge>;
+                        })()}
+                        {(() => {
+                          const a = automationStatus(device);
+                          return a ? <ToneBadge tone={a.tone}>{a.label}</ToneBadge> : null;
                         })()}
                       </div>
                     </TableCell>

@@ -195,6 +195,17 @@ a router, not an asset/prefix). Any failure aborts and logs:
   isn't privilege 15 — an actionable config fix, still NOT reroute-usable) /
   `unreachable` — for display and to keep the recency window warm. See
   `reroute::reachability`;
+- **stability (AUTOMATIC only):** a device must have been *continuously*
+  SSH-reachable for the **stability window** (`STABILITY_WINDOW`, 5 min) before
+  automatic mitigations targeting it resume — so a just-recovered or flapping
+  device is not auto-acted upon. `devices.ssh_reachable_since` is set when SSH
+  becomes reachable, cleared on any non-reachable probe **and on controller
+  startup** (so the clock restarts after a restart). A reachable-but-not-yet-stable
+  device blocks **automatic** triggers (`BlockReason::DeviceStabilizing`); **manual
+  and rollback triggers are NOT stability-gated** (the operator may act during the
+  window — the UI warns — and a manual rollback is corrective). Detection is
+  unaffected: rules still fire and alert; only the mitigation action is gated (its
+  `blocked_reason` shows in the fired-rule alert's `executed_actions`);
 - for manual: the caller has `trigger_manual_reroute` (enforced by the API before
   it calls the executor), with an optional reason recorded for the audit log.
 

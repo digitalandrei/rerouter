@@ -282,6 +282,13 @@ export default function ManualReroute() {
                       refused if SSH does not answer.
                     </p>
                   )}
+                  {targetDevice.ssh_status === "reachable" &&
+                    !targetDevice.automation_stable && (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">
+                        Device only recently became reachable — automatic mitigations are
+                        held for ~5 min, but you can still proceed with this manual reroute.
+                      </p>
+                    )}
                 </div>
               )}
 

@@ -36,7 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
-import { templateLabel, templateLabelFrom } from "@/lib/labels";
+import { templateLabel, templateLabelFrom, automationStatus } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -326,6 +326,23 @@ function RuleActionsDialog({
                 <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
                 <span className="text-muted-foreground">on</span>
                 <span className="font-medium">{a.device_name}</span>
+                {(() => {
+                  const dev = devices.find((d) => d.id === a.device_id);
+                  const auto = dev ? automationStatus(dev) : null;
+                  return auto ? (
+                    <Badge
+                      variant="outline"
+                      className={
+                        auto.tone === "bad"
+                          ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
+                          : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                      }
+                      title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
+                    >
+                      {auto.label}
+                    </Badge>
+                  ) : null;
+                })()}
                 {a.auto_target === "flow_dst_host" ? (
                   <Badge
                     variant="outline"

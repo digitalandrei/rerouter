@@ -330,7 +330,12 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       const r = await api.devices.reachabilityTest(device.id);
       const recent = r.via_recency ? " (recent)" : "";
       if (r.ssh_ok) {
-        toast.success("Reachable for mitigations", { description: `ssh: reachable${recent}` });
+        const auto = r.stable
+          ? "auto + manual enabled"
+          : "auto held (stabilizing) · manual allowed";
+        toast.success("Reachable for mitigations", {
+          description: `ssh: reachable${recent} · ${auto}`,
+        });
       } else if (r.ssh_status === "no_privilege") {
         toast.error("SSH works but the account is not in enable mode (privilege 15)", {
           description: r.ssh_error ?? "logged in at user-EXEC ('>'), not enable ('#')",

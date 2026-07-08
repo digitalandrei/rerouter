@@ -123,6 +123,11 @@ export interface Device {
   // The last probe's message (e.g. the "give the account privilege 15" hint).
   last_ssh_error: string | null;
   last_ssh_ok_at: string | null;
+  // Automation stability: when SSH became (and stayed) reachable, and whether it
+  // has been reachable long enough (>=5 min) for AUTOMATIC mitigations to resume.
+  // While false, auto reroutes targeting this device are held; manual is allowed.
+  ssh_reachable_since: string | null;
+  automation_stable: boolean;
   // The reroute gate's 60s recency short-circuit (SSH answered in the last minute).
   // A stricter internal signal; the reachability-test gives the live truth.
   ssh_recent: boolean;
@@ -133,8 +138,10 @@ export interface ReachabilityResult {
   ok: boolean;
   ssh_ok: boolean;
   ssh_status: "reachable" | "no_privilege" | "unreachable" | "unknown";
+  stable: boolean;
   via_recency: boolean;
   last_ssh_ok_at: string | null;
+  ssh_reachable_since: string | null;
   ssh_error: string | null;
 }
 
