@@ -365,16 +365,48 @@ fn ios_preferred() -> Preferred {
 
 // ---- Session -------------------------------------------------------------------
 
-/// SSH liveness probe: open a session and confirm the device answers commands at
-/// privileged EXEC, running NO commands (an empty command list drives
-/// [`run_on`]'s full connect → auth → shell → `#`-prompt → `terminal length 0`
-/// path, then exits). `Ok(())` means SSH is reachable and usable for a reroute; a
-/// structured `Err` explains why not (connect/auth/host-key/prompt). Reused by the
-/// reroute reachability gate and the manual reachability-test endpoint. Never
-/// mutates device config.
-pub async fn ssh_probe(pool: &MySqlPool, device_id: u64) -> Result<()> {
-    let dev = load_device_ssh(pool, device_id).await?;
-    run_on(&dev, &[]).await.map(|_| ())
+/// Classification of an SSH liveness probe.
+#[derive(Debug, Clone)]
+pub enum SshReach {
+    /// Answered at privileged EXEC ('#') — usable for a reroute.
+    Privileged,
+    /// Connected + authenticated but landed at user-EXEC ('>'): SSH itself works,
+    /// the account just lacks privilege 15. Carries the actionable message.
+    UserExec(String),
+    /// Could not connect / authenticate / reach a usable prompt. Carries the error.
+    Unreachable(String),
+}
+
+/// True when a [`run_on`] liveness error is the user-EXEC (privilege) case — SSH
+/// connected and authenticated but the account isn't privilege 15. Keyed on
+/// `run_on`'s own stable message and kept beside it on purpose; if that message
+/// changes, keep the `user-EXEC` marker.
+pub fn is_user_exec_error(msg: &str) -> bool {
+    msg.contains("user-EXEC")
+}
+
+/// SSH liveness probe, classified into [`SshReach`]. Runs NO commands (an empty
+/// command list drives [`run_on`]'s full connect → auth → shell → prompt →
+/// `terminal length 0` path, then exits), so it reports whether the device answered
+/// at privileged EXEC, only at user-EXEC (privilege problem), or not at all. Reused
+/// by the reroute reachability gate, the periodic probe, and the manual
+/// reachability-test endpoint. Never mutates device config.
+pub async fn ssh_probe(pool: &MySqlPool, device_id: u64) -> SshReach {
+    let dev = match load_device_ssh(pool, device_id).await {
+        Ok(d) => d,
+        Err(e) => return SshReach::Unreachable(e.to_string()),
+    };
+    match run_on(&dev, &[]).await {
+        Ok(_) => SshReach::Privileged,
+        Err(e) => {
+            let m = e.to_string();
+            if is_user_exec_error(&m) {
+                SshReach::UserExec(m)
+            } else {
+                SshReach::Unreachable(m)
+            }
+        }
+    }
 }
 
 /// Connect to a device over SSH, run `commands` in order against an interactive
@@ -1171,6 +1203,17 @@ fn clean_output(raw: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_user_exec_privilege_error() {
+        // The exact message run_on emits when the account lands at user-EXEC.
+        let m = "SSH account logged in at user-EXEC ('eMA3>'), not enable mode ('#'). \
+                 Rerouter needs privileged EXEC …";
+        assert!(is_user_exec_error(m), "user-EXEC message -> privilege case");
+        // A plain connect/auth failure is NOT the privilege case.
+        assert!(!is_user_exec_error("SSH connect to 10.0.0.1:22 timed out"));
+        assert!(!is_user_exec_error("SSH authentication failed for user 'rerouter'"));
+    }
 
     #[test]
     fn allows_exactly_the_controller_command_set() {

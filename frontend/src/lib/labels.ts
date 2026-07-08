@@ -40,6 +40,25 @@ export function templateLabelFrom(
   return displayName?.trim() || (name ? humanizeToken(name) : "—");
 }
 
+/** Tone + label for a device's SSH reachability status (devices.ssh_status).
+ *  "no_privilege" means SSH works but the account lacks privilege 15 — an
+ *  actionable config fix, so it's a warning, not a hard failure. */
+export function sshStatusBadge(status: string): {
+  tone: "good" | "warn" | "bad" | "neutral";
+  label: string;
+} {
+  switch (status) {
+    case "reachable":
+      return { tone: "good", label: "reachable" };
+    case "no_privilege":
+      return { tone: "warn", label: "no privilege" };
+    case "unreachable":
+      return { tone: "bad", label: "unreachable" };
+    default:
+      return { tone: "neutral", label: "unknown" };
+  }
+}
+
 // Thin aliases so call sites read intently (all just humanizeToken today).
 export const eventTypeLabel = humanizeToken;
 export const providerTypeLabel = humanizeToken;

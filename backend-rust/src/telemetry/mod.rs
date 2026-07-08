@@ -7,7 +7,6 @@
 
 pub mod flow;
 pub mod snmp;
-pub mod telnet;
 
 use chrono::{DateTime, Utc};
 

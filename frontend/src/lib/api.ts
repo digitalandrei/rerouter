@@ -113,13 +113,15 @@ export interface Device {
   // OpenSSH public-key line (not a secret) — shown for enrollment on the router.
   // null until a key is generated in-app or derived from a pasted private key.
   ssh_public_key: string | null;
-  // Control-plane reachability for mitigations. SSH is authoritative (a reroute
-  // pushes config over SSH); telnet port-open is an informational secondary signal.
-  telnet_port: number;
-  telnet_reachable: boolean;
-  // Last periodic SSH-probe outcome — the display state ("SSH reachable/unreachable").
-  ssh_reachable: boolean;
-  last_telnet_ok_at: string | null;
+  // Last periodic SSH-probe outcome — the display state. A reroute pushes config
+  // over SSH, so this gates a mitigation.
+  //   "reachable"    — answered at privileged EXEC (#); usable for a reroute.
+  //   "no_privilege" — SSH works but the account isn't privilege 15 (config fix).
+  //   "unreachable"  — could not connect / authenticate.
+  //   "unknown"      — not probed yet.
+  ssh_status: "reachable" | "no_privilege" | "unreachable" | "unknown";
+  // The last probe's message (e.g. the "give the account privilege 15" hint).
+  last_ssh_error: string | null;
   last_ssh_ok_at: string | null;
   // The reroute gate's 60s recency short-circuit (SSH answered in the last minute).
   // A stricter internal signal; the reachability-test gives the live truth.
@@ -130,7 +132,7 @@ export interface Device {
 export interface ReachabilityResult {
   ok: boolean;
   ssh_ok: boolean;
-  telnet_open: boolean;
+  ssh_status: "reachable" | "no_privilege" | "unreachable" | "unknown";
   via_recency: boolean;
   last_ssh_ok_at: string | null;
   ssh_error: string | null;
@@ -718,9 +720,9 @@ export const api = {
         `/api/devices/${id}/ssh-capabilities`,
         { method: "POST" },
       ),
-    /** The "can we mitigate this device right now?" check. Refreshes telnet and
-     *  runs the SSH reachability decision the reroute gate uses (live probe
-     *  unless SSH answered in the last 60s). */
+    /** The "can we mitigate this device right now?" check — runs the SSH
+     *  reachability decision the reroute gate uses (live probe unless SSH answered
+     *  at privileged EXEC in the last 60s), classified into ssh_status. */
     reachabilityTest: (id: number) =>
       request<ReachabilityResult>(`/api/devices/${id}/reachability-test`, {
         method: "POST",

@@ -216,9 +216,9 @@ impl Default for Telemetry {
         Self {
             metrics_rollup_seconds: 15,
             // How often the poll loop probes device SSH reachability (a no-command
-            // liveness session). 5 min by default — an SSH probe is heavier than an
-            // SNMP poll, and the scheduler floors this at 60s regardless.
-            reachability_interval_seconds: 300,
+            // liveness session, ~one login/logout). 3 min by default — light on the
+            // device; the scheduler floors this at 60s regardless.
+            reachability_interval_seconds: 180,
             stale_after_seconds: 90,
             jitter_percent: 15,
         }

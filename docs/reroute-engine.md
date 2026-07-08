@@ -181,16 +181,19 @@ a router, not an asset/prefix). Any failure aborts and logs:
 - no unresolved (`uncertain`) prior action on this device;
 - the device is not inside its post-action cooldown window;
 - the global action rate limit is not exceeded;
-- **control-plane reachability (preflight):** the target device answers **SSH**.
-  A reroute pushes config over SSH, so a device that does not answer SSH cannot be
-  mitigated — the action is refused up front (`BlockReason::DeviceUnreachable`)
-  rather than reserving a slot and failing mid-push. To avoid re-probing a device
-  we just talked to (and tripping its SSH connection throttle), a successful SSH
-  contact within the last **60 s** (`devices.last_ssh_ok_at`, stamped by the probe
-  and by every successful reroute push) passes without opening a new session. This
-  is a hard gate on **every** trigger (manual, automatic, rollback). A telnet
-  port-open check (`devices.telnet_reachable`, refreshed by the poll loop) is an
-  **informational** secondary signal only — it never gates. See
+- **control-plane reachability (preflight):** the target device answers **SSH at
+  privileged EXEC**. A reroute pushes config over SSH, so a device that does not
+  answer SSH cannot be mitigated — the action is refused up front
+  (`BlockReason::DeviceUnreachable`) rather than reserving a slot and failing
+  mid-push. To avoid re-probing a device we just talked to (and tripping its SSH
+  connection throttle), a successful SSH contact within the last **60 s**
+  (`devices.last_ssh_ok_at`, stamped by the probe and by every successful reroute
+  push) passes without opening a new session. This is a hard gate on **every**
+  trigger (manual, automatic, rollback). A poll-loop probe
+  (`reachability_interval_seconds`, default 3 min) classifies the device into
+  `devices.ssh_status` — `reachable` / `no_privilege` (SSH works but the account
+  isn't privilege 15 — an actionable config fix, still NOT reroute-usable) /
+  `unreachable` — for display and to keep the recency window warm. See
   `reroute::reachability`;
 - for manual: the caller has `trigger_manual_reroute` (enforced by the API before
   it calls the executor), with an optional reason recorded for the audit log.

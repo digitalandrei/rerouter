@@ -18,6 +18,7 @@ import { api, type Device, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { ToneBadge } from "@/components/status-badge";
+import { sshStatusBadge } from "@/lib/labels";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -505,18 +506,16 @@ export default function Devices() {
                       </div>
                     </TableCell>
 
-                    {/* Reachability status: SNMP telemetry, SSH (mitigation gate), telnet (informational) */}
+                    {/* Reachability: SNMP telemetry + SSH (the mitigation gate) */}
                     <TableCell>
                       <div className="flex flex-wrap items-center gap-1">
                         <ToneBadge tone={device.reachable ? "good" : "bad"}>
                           {device.reachable ? "reachable" : "unreachable"}
                         </ToneBadge>
-                        <ToneBadge tone={device.ssh_reachable ? "good" : "warn"}>
-                          {device.ssh_reachable ? "ssh: reachable" : "ssh: unreachable"}
-                        </ToneBadge>
-                        <Badge variant="secondary" className="font-normal">
-                          {device.telnet_reachable ? "telnet: open" : "telnet: closed"}
-                        </Badge>
+                        {(() => {
+                          const s = sshStatusBadge(device.ssh_status);
+                          return <ToneBadge tone={s.tone}>ssh: {s.label}</ToneBadge>;
+                        })()}
                       </div>
                     </TableCell>
 

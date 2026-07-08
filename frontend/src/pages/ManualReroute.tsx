@@ -19,8 +19,7 @@ import {
   ApiError,
 } from "@/lib/api";
 import { StateBadge, ToneBadge } from "@/components/status-badge";
-import { templateLabel } from "@/lib/labels";
-import { Badge } from "@/components/ui/badge";
+import { templateLabel, sshStatusBadge } from "@/lib/labels";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -266,14 +265,18 @@ export default function ManualReroute() {
               {targetDevice && (
                 <div className="space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <ToneBadge tone={targetDevice.ssh_reachable ? "good" : "warn"}>
-                      {targetDevice.ssh_reachable ? "SSH reachable" : "SSH unreachable"}
-                    </ToneBadge>
-                    <Badge variant="secondary" className="font-normal">
-                      {targetDevice.telnet_reachable ? "telnet: open" : "telnet: closed"}
-                    </Badge>
+                    {(() => {
+                      const s = sshStatusBadge(targetDevice.ssh_status);
+                      return <ToneBadge tone={s.tone}>SSH: {s.label}</ToneBadge>;
+                    })()}
                   </div>
-                  {!targetDevice.ssh_reachable && (
+                  {targetDevice.ssh_status === "no_privilege" && (
+                    <p className="text-xs text-amber-700 dark:text-amber-400">
+                      SSH works but the account is not in enable mode (privilege 15) — the
+                      reroute will be refused. Give the account privilege 15 on the router.
+                    </p>
+                  )}
+                  {targetDevice.ssh_status === "unreachable" && (
                     <p className="text-xs text-amber-700 dark:text-amber-400">
                       Device did not answer SSH at the last probe — the reroute will be
                       refused if SSH does not answer.

@@ -286,8 +286,8 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
         }
 
         if last_ssh_probe.is_none_or(|t| t.elapsed() >= ssh_probe_interval) {
-            let ok = crate::reroute::reachability::probe_ssh_and_store(&pool, device_id).await;
-            tracing::debug!(event_type = "ssh_reachability_probed", device_id, reachable = ok, "periodic SSH reachability probe");
+            let status = crate::reroute::reachability::probe_ssh_and_store(&pool, device_id).await;
+            tracing::debug!(event_type = "ssh_reachability_probed", device_id, status, "periodic SSH reachability probe");
             last_ssh_probe = Some(Instant::now());
         }
 
@@ -299,12 +299,6 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
 /// One poll + detection pass for a device. Detection runs even if some
 /// interfaces had no fresh sample (the engine filters stale/invalid itself).
 async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Result<()> {
-    // Telnet port-open probe (informational reachability signal). Independent of
-    // SNMP so it updates even when SNMP is down; cheap TCP connect, never errors,
-    // and never used to gate a reroute (SSH is authoritative — see
-    // reroute::reachability).
-    crate::reroute::reachability::probe_telnet(pool, device_id).await;
-
     // Poll: stores interface_metrics_current + interface_samples. A transport
     // failure marks the device unreachable and returns Err — detection then has
     // nothing fresh and harmlessly no-ops.

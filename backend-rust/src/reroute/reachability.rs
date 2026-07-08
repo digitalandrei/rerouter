@@ -2,17 +2,21 @@
 //! now?" decision that gates a reroute (see [`super::executor`]).
 //!
 //! A reroute pushes config over SSH, so the AUTHORITATIVE signal is: does SSH
-//! answer commands? We probe it with a no-op liveness session ([`ssh::ssh_probe`]:
-//! connect → auth → privileged EXEC → `terminal length 0` → exit, pushing no
-//! config). A telnet port-open check is kept as an INFORMATIONAL secondary signal
-//! (shown in the UI, updated by the periodic poll loop) and never gates — many
-//! hardened routers disable telnet entirely.
+//! answer commands at privileged EXEC? We probe it with a no-op liveness session
+//! ([`ssh::ssh_probe`]: connect → auth → prompt → `terminal length 0` → exit,
+//! pushing no config), classified into three states:
+//!
+//! * `reachable` — answered at `#`; usable for a reroute.
+//! * `no_privilege` — SSH connected + authenticated but landed at `>`; the account
+//!   lacks privilege 15 (an actionable config fix, not a connectivity problem).
+//!   Not usable for a reroute.
+//! * `unreachable` — could not connect / authenticate / reach a prompt.
 //!
 //! To avoid re-probing a device we just talked to — and to avoid tripping the
-//! device's SSH connection throttle during a storm — a successful SSH contact
-//! within [`RECENCY_WINDOW`] counts as reachable without opening a new session.
-//! `devices.last_ssh_ok_at` is stamped by both this probe and every successful
-//! reroute push, so bursts of activity keep the window warm.
+//! device's SSH connection throttle — a successful SSH contact within
+//! [`RECENCY_WINDOW`] counts as reachable without opening a new session.
+//! `devices.last_ssh_ok_at` is stamped only on a `reachable` outcome (a real
+//! privileged success) — by this probe and by every successful reroute push.
 
 use std::time::Duration;
 
@@ -20,27 +24,31 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::MySqlPool;
 
-use crate::ssh;
+use crate::ssh::{self, SshReach};
 
 /// A successful SSH contact newer than this satisfies the gate without re-probing
 /// (honors the operator's "sau în ultimul minut a răspuns" rule).
 pub const RECENCY_WINDOW: Duration = Duration::from_secs(60);
 
+/// Persisted SSH reachability states (also the `devices.ssh_status` values).
+pub const STATUS_REACHABLE: &str = "reachable";
+pub const STATUS_NO_PRIVILEGE: &str = "no_privilege";
+pub const STATUS_UNREACHABLE: &str = "unreachable";
+
 /// The reachability decision for a device.
 #[derive(Debug, Clone, Serialize)]
 pub struct Reachability {
-    /// SSH answered commands — THIS is what gates a reroute. True when a live
-    /// probe just succeeded, or a real SSH contact happened within `RECENCY_WINDOW`.
+    /// SSH is usable for a reroute (answered at privileged EXEC, or a real contact
+    /// within `RECENCY_WINDOW`). THIS is what gates a reroute. `no_privilege` and
+    /// `unreachable` are both `false`.
     pub ssh_ok: bool,
-    /// Telnet port accepted a TCP connection at the last periodic probe.
-    /// Informational only — never gates.
-    pub telnet_open: bool,
+    /// The classified SSH state: `reachable` | `no_privilege` | `unreachable`.
+    pub ssh_status: &'static str,
     /// True when `ssh_ok` was satisfied by a recent contact rather than a fresh probe.
     pub via_recency: bool,
-    /// When SSH last answered (the recency source), if known.
+    /// When SSH last answered at privileged EXEC (the recency source), if known.
     pub last_ssh_ok_at: Option<DateTime<Utc>>,
-    /// Structured reason when SSH did not answer (probe error), for the UI/logs.
-    /// Never contains secrets.
+    /// The probe's message when not reachable, for the UI/logs. Never secrets.
     pub ssh_error: Option<String>,
 }
 
@@ -57,119 +65,115 @@ pub fn recent_enough(last_ssh_ok_at: Option<DateTime<Utc>>, now: DateTime<Utc>) 
     }
 }
 
-/// Decide reachability for a mitigation on `device_id`. SSH is authoritative:
-/// pass on a recent contact, otherwise run a live liveness probe (and stamp
-/// `last_ssh_ok_at` on success). `telnet_open` is read from the cached
-/// periodic-probe column and reported but never gates.
+/// Decide reachability for a mitigation on `device_id`. SSH is authoritative: pass
+/// on a recent privileged contact, otherwise run a live liveness probe and record
+/// the classified outcome.
 pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reachability {
-    let (last_ssh_ok_at, telnet_open) =
-        sqlx::query_as::<_, (Option<DateTime<Utc>>, bool)>(
-            "SELECT last_ssh_ok_at, telnet_reachable FROM devices WHERE id = ?",
-        )
-        .bind(device_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or((None, false));
+    let last_ssh_ok_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT last_ssh_ok_at FROM devices WHERE id = ?",
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
 
     let now = Utc::now();
     if recent_enough(last_ssh_ok_at, now) {
         return Reachability {
             ssh_ok: true,
-            telnet_open,
+            ssh_status: STATUS_REACHABLE,
             via_recency: true,
             last_ssh_ok_at,
             ssh_error: None,
         };
     }
 
-    // Live SSH liveness probe: connect + confirm privileged EXEC, run no commands.
+    // Live SSH liveness probe (no commands), classified.
     match ssh::ssh_probe(pool, device_id).await {
-        Ok(()) => {
-            stamp_ssh_result(pool, device_id, true).await;
+        SshReach::Privileged => {
+            stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await;
             Reachability {
                 ssh_ok: true,
-                telnet_open,
+                ssh_status: STATUS_REACHABLE,
                 via_recency: false,
                 last_ssh_ok_at: Some(now),
                 ssh_error: None,
             }
         }
-        Err(e) => {
-            // Record the failure so the displayed ssh_reachable reflects it (the
-            // recency timestamp is left untouched — it means "last SUCCESS").
-            stamp_ssh_result(pool, device_id, false).await;
+        SshReach::UserExec(msg) => {
+            stamp_ssh_status(pool, device_id, STATUS_NO_PRIVILEGE, Some(&msg)).await;
             Reachability {
                 ssh_ok: false,
-                telnet_open,
+                ssh_status: STATUS_NO_PRIVILEGE,
                 via_recency: false,
                 last_ssh_ok_at,
-                ssh_error: Some(e.to_string()),
+                ssh_error: Some(msg),
+            }
+        }
+        SshReach::Unreachable(msg) => {
+            stamp_ssh_status(pool, device_id, STATUS_UNREACHABLE, Some(&msg)).await;
+            Reachability {
+                ssh_ok: false,
+                ssh_status: STATUS_UNREACHABLE,
+                via_recency: false,
+                last_ssh_ok_at,
+                ssh_error: Some(msg),
             }
         }
     }
 }
 
-/// Record an SSH probe outcome on `device_id`. On success sets `ssh_reachable = 1`
-/// and stamps `last_ssh_ok_at` (keeping the reroute-gate recency window warm); on
-/// failure sets `ssh_reachable = 0` and leaves `last_ssh_ok_at` (which means "last
-/// time SSH answered") unchanged. Best-effort.
-pub async fn stamp_ssh_result(pool: &MySqlPool, device_id: u64, ok: bool) {
-    let sql = if ok {
-        "UPDATE devices SET ssh_reachable = 1, last_ssh_ok_at = UTC_TIMESTAMP() WHERE id = ?"
+/// Persist an SSH probe outcome on `device_id`. On `reachable` also stamps
+/// `last_ssh_ok_at` (keeping the reroute-gate recency window warm) and clears the
+/// error; otherwise records `last_ssh_error` and leaves `last_ssh_ok_at` (which
+/// means "last time SSH answered at privileged EXEC") unchanged. Best-effort.
+pub async fn stamp_ssh_status(
+    pool: &MySqlPool,
+    device_id: u64,
+    status: &str,
+    err: Option<&str>,
+) {
+    let _ = if status == STATUS_REACHABLE {
+        sqlx::query(
+            "UPDATE devices SET ssh_status = ?, last_ssh_error = NULL, last_ssh_ok_at = UTC_TIMESTAMP() WHERE id = ?",
+        )
+        .bind(status)
+        .bind(device_id)
+        .execute(pool)
+        .await
     } else {
-        "UPDATE devices SET ssh_reachable = 0 WHERE id = ?"
+        sqlx::query("UPDATE devices SET ssh_status = ?, last_ssh_error = ? WHERE id = ?")
+            .bind(status)
+            .bind(err)
+            .bind(device_id)
+            .execute(pool)
+            .await
     };
-    let _ = sqlx::query(sql).bind(device_id).execute(pool).await;
 }
 
-/// Record that SSH just answered on `device_id` (e.g. a successful reroute push) —
-/// keeps the recency window warm and marks the device SSH-reachable.
+/// Record that SSH just answered at privileged EXEC on `device_id` (e.g. a
+/// successful reroute push) — keeps the recency window warm and marks the device
+/// reachable.
 pub async fn stamp_ssh_ok(pool: &MySqlPool, device_id: u64) {
-    stamp_ssh_result(pool, device_id, true).await;
+    stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await;
 }
 
 /// Periodic SSH liveness probe (the poll loop calls this every
-/// `reachability_interval_seconds`). Opens a no-command SSH session and records the
-/// outcome in `ssh_reachable` (+ `last_ssh_ok_at` on success), so the UI shows a
-/// definite SSH reachable/unreachable state and the reroute gate's recency window
-/// is kept warm without an on-demand probe. Returns the outcome for logging.
-pub async fn probe_ssh_and_store(pool: &MySqlPool, device_id: u64) -> bool {
-    let ok = ssh::ssh_probe(pool, device_id).await.is_ok();
-    stamp_ssh_result(pool, device_id, ok).await;
-    ok
-}
-
-/// Periodic telnet TCP port-open probe (INFORMATIONAL). Reads the device host +
-/// `telnet_port`, checks whether the port accepts a connection, and stores the
-/// result on the device row (`telnet_reachable` + `last_telnet_ok_at`). Called
-/// from the poll loop; best-effort, never errors, sends nothing to the device CLI.
-/// This signal is displayed but NEVER gates a reroute — SSH is authoritative.
-pub async fn probe_telnet(pool: &MySqlPool, device_id: u64) {
-    let Some((host, port)) =
-        sqlx::query_as::<_, (String, u16)>("SELECT hostname, telnet_port FROM devices WHERE id = ?")
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-    else {
-        return;
+/// `reachability_interval_seconds`). Opens a no-command SSH session, classifies the
+/// outcome, and stores `ssh_status` (+ `last_ssh_ok_at` on `reachable`) so the UI
+/// shows a definite state and the reroute gate's recency window is kept warm.
+/// Returns the resulting status for logging.
+pub async fn probe_ssh_and_store(pool: &MySqlPool, device_id: u64) -> &'static str {
+    let (status, err): (&'static str, Option<String>) = match ssh::ssh_probe(pool, device_id).await
+    {
+        SshReach::Privileged => (STATUS_REACHABLE, None),
+        SshReach::UserExec(m) => (STATUS_NO_PRIVILEGE, Some(m)),
+        SshReach::Unreachable(m) => (STATUS_UNREACHABLE, Some(m)),
     };
-    if crate::telemetry::telnet::telnet_open(&host, port).await {
-        let _ = sqlx::query(
-            "UPDATE devices SET telnet_reachable = 1, last_telnet_ok_at = UTC_TIMESTAMP() WHERE id = ?",
-        )
-        .bind(device_id)
-        .execute(pool)
-        .await;
-    } else {
-        let _ = sqlx::query("UPDATE devices SET telnet_reachable = 0 WHERE id = ?")
-            .bind(device_id)
-            .execute(pool)
-            .await;
-    }
+    stamp_ssh_status(pool, device_id, status, err.as_deref()).await;
+    status
 }
 
 #[cfg(test)]

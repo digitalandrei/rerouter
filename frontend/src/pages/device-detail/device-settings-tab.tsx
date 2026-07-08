@@ -321,17 +321,22 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
     }
   }
 
-  /** The reroute gate's own reachability decision: SSH is authoritative (a live
-   *  probe unless SSH answered in the last 60s); telnet-open is informational. */
+  /** The reroute gate's own SSH reachability decision: a live liveness probe
+   *  unless SSH answered at privileged EXEC in the last 60s. Classifies into
+   *  reachable / no_privilege (SSH ok but not enable) / unreachable. */
   async function testReachability() {
     setReachTesting(true);
     try {
       const r = await api.devices.reachabilityTest(device.id);
-      const desc = `ssh ${r.ssh_ok ? "ok" : "no"}${r.via_recency ? " (recent)" : ""} · telnet ${r.telnet_open ? "open" : "closed"}`;
-      if (r.ok) {
-        toast.success("Reachable for mitigations", { description: desc });
+      const recent = r.via_recency ? " (recent)" : "";
+      if (r.ssh_ok) {
+        toast.success("Reachable for mitigations", { description: `ssh: reachable${recent}` });
+      } else if (r.ssh_status === "no_privilege") {
+        toast.error("SSH works but the account is not in enable mode (privilege 15)", {
+          description: r.ssh_error ?? "logged in at user-EXEC ('>'), not enable ('#')",
+        });
       } else {
-        toast.error(`Not reachable${r.ssh_error ? `: ${r.ssh_error}` : ""}`, { description: desc });
+        toast.error("SSH unreachable", { description: r.ssh_error ?? "no SSH response" });
       }
     } catch {
       toast.error("Reachability test failed");

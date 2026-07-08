@@ -3,6 +3,7 @@ import { type Device } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ToneBadge } from "@/components/status-badge";
+import { sshStatusBadge } from "@/lib/labels";
 
 /** Uppercase-label / bold-value cell used in the info cards. */
 function Fact({ label, children }: { label: string; children: ReactNode }) {
@@ -106,30 +107,24 @@ export function OverviewTab({ device }: { device: Device }) {
           <CardTitle className="text-base">Reachability (for mitigations)</CardTitle>
         </CardHeader>
         <CardContent>
-          <dl className="grid grid-cols-2 gap-4">
+          <dl className="grid grid-cols-1 gap-4">
             <Fact label="SSH">
               <span className="flex flex-wrap items-center gap-1.5">
-                <ToneBadge tone={device.ssh_reachable ? "good" : "warn"}>
-                  {device.ssh_reachable ? "reachable" : "unreachable"}
-                </ToneBadge>
+                {(() => {
+                  const s = sshStatusBadge(device.ssh_status);
+                  return <ToneBadge tone={s.tone}>{s.label}</ToneBadge>;
+                })()}
                 <span className="text-xs font-normal text-muted-foreground">
                   {device.last_ssh_ok_at
                     ? `ok ${new Date(device.last_ssh_ok_at).toLocaleString()}`
                     : "never"}
                 </span>
               </span>
-            </Fact>
-            <Fact label="Telnet">
-              <span className="flex flex-wrap items-center gap-1.5">
-                <Badge variant="secondary" className="font-normal">
-                  {device.telnet_reachable ? "open" : "closed"}
-                </Badge>
-                <span className="text-xs font-normal text-muted-foreground">
-                  {device.last_telnet_ok_at
-                    ? new Date(device.last_telnet_ok_at).toLocaleString()
-                    : "never"}
-                </span>
-              </span>
+              {device.ssh_status !== "reachable" && device.last_ssh_error && (
+                <p className="mt-1 text-xs font-normal text-muted-foreground">
+                  {device.last_ssh_error}
+                </p>
+              )}
             </Fact>
           </dl>
         </CardContent>

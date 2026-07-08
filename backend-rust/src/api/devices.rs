@@ -40,17 +40,14 @@ fn device_json(r: &DeviceRow, interface_count: i64) -> Value {
         "last_error": r.last_error,
         "poll_interval_seconds": r.poll_interval_seconds,
         "interface_count": interface_count,
-        // Control-plane reachability for mitigations. SSH is authoritative (a
-        // reroute pushes config over SSH); telnet port-open is an informational
-        // secondary signal. `ssh_recent` is the soft "SSH answered lately" hint
-        // (the 60s recency window); the live truth comes from a reachability-test.
-        "telnet_port": r.telnet_port,
-        "telnet_reachable": r.telnet_reachable,
-        "last_telnet_ok_at": r.last_telnet_ok_at.map(fmt_ts),
-        // ssh_reachable: the last periodic SSH-probe outcome (the display state).
-        // ssh_recent: the reroute gate's 60s recency short-circuit (SSH answered in
-        // the last minute) — a stricter, internal signal.
-        "ssh_reachable": r.ssh_reachable,
+        // Control-plane SSH reachability for mitigations (a reroute pushes config
+        // over SSH). ssh_status is the last periodic probe outcome:
+        // "reachable" (privileged EXEC) | "no_privilege" (SSH ok but not enable) |
+        // "unreachable" | "unknown". last_ssh_error carries the probe message.
+        // ssh_recent is the reroute gate's 60s recency short-circuit (a stricter,
+        // internal signal); the live truth comes from a reachability-test.
+        "ssh_status": r.ssh_status,
+        "last_ssh_error": r.last_ssh_error,
         "last_ssh_ok_at": r.last_ssh_ok_at.map(fmt_ts),
         "ssh_recent": crate::reroute::reachability::recent_enough(r.last_ssh_ok_at, chrono::Utc::now()),
         // SSH access (captured at onboarding for future CLI reroute actions;
@@ -106,10 +103,8 @@ struct DeviceRow {
     last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
     last_error: Option<String>,
     poll_interval_seconds: u32,
-    telnet_port: u16,
-    telnet_reachable: bool,
-    ssh_reachable: bool,
-    last_telnet_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    ssh_status: String,
+    last_ssh_error: Option<String>,
     last_ssh_ok_at: Option<chrono::DateTime<chrono::Utc>>,
     ssh_username: Option<String>,
     ssh_port: u16,
@@ -122,7 +117,7 @@ struct DeviceRow {
 
 const DEVICE_COLS: &str = "id, name, hostname, snmp_version, snmp_port, enabled, reachable, \
      vendor, model, os_version, sys_name, sys_uptime, last_poll_at, last_error, poll_interval_seconds, \
-     telnet_port, telnet_reachable, ssh_reachable, last_telnet_ok_at, last_ssh_ok_at, \
+     ssh_status, last_ssh_error, last_ssh_ok_at, \
      ssh_username, ssh_port, ssh_auth_method, ssh_public_key, \
      (ssh_password_encrypted IS NOT NULL) AS ssh_has_password, \
      (ssh_private_key_encrypted IS NOT NULL) AS ssh_has_key";
@@ -759,10 +754,10 @@ pub async fn ssh_capabilities(
 }
 
 /// POST /api/devices/{id}/reachability-test — the "can we mitigate this device
-/// right now?" check. Refreshes the telnet port-open signal, then runs the SSH
-/// reachability decision (a live liveness probe unless a reroute answered SSH in
-/// the last 60s). Returns the [`Reachability`] the reroute gate would see: `ssh_ok`
-/// decides, `telnet_open` is informational. `manage_devices` (superadmin) only.
+/// right now?" check. Runs the SSH reachability decision (a live liveness probe
+/// unless SSH answered at privileged EXEC in the last 60s) and returns the
+/// classified result: `ssh_ok` gates a reroute; `ssh_status` distinguishes
+/// reachable / no_privilege / unreachable. `manage_devices` (superadmin) only.
 pub async fn reachability_test(
     _g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
@@ -776,15 +771,13 @@ pub async fn reachability_test(
     if exists.is_none() {
         return err(StatusCode::NOT_FOUND, "device not found");
     }
-    // Refresh the informational telnet signal, then decide on SSH (authoritative).
-    crate::reroute::reachability::probe_telnet(&state.pool, id).await;
     let reach = crate::reroute::reachability::reachable_for_mitigation(&state.pool, id).await;
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "ssh_ok": reach.ssh_ok,
-            "telnet_open": reach.telnet_open,
+            "ssh_status": reach.ssh_status,
             "via_recency": reach.via_recency,
             "last_ssh_ok_at": reach.last_ssh_ok_at.map(fmt_ts),
             "ssh_error": reach.ssh_error,
