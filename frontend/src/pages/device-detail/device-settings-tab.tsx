@@ -321,9 +321,10 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
     }
   }
 
-  /** The reroute gate's own SSH reachability decision: a live liveness probe
-   *  unless SSH answered at privileged EXEC in the last 60s. Classifies into
-   *  reachable / no_privilege (SSH ok but not enable) / unreachable. */
+  /** The reroute gate's own SSH reachability decision: a live probe (the command-
+   *  access checks) unless SSH answered at privileged EXEC in the last 60s.
+   *  Classifies into reachable (enable + all commands runnable) / no_privilege (SSH
+   *  ok but can't run a required command) / unreachable. */
   async function testReachability() {
     setReachTesting(true);
     try {
@@ -337,8 +338,8 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
           description: `ssh: reachable${recent} · ${auto}`,
         });
       } else if (r.ssh_status === "no_privilege") {
-        toast.error("SSH works but the account is not in enable mode (privilege 15)", {
-          description: r.ssh_error ?? "logged in at user-EXEC ('>'), not enable ('#')",
+        toast.error("SSH works but the account can't run every required command", {
+          description: r.ssh_error ?? "not privilege 15, or a parser view denies a command",
         });
       } else {
         toast.error("SSH unreachable", { description: r.ssh_error ?? "no SSH response" });
@@ -548,7 +549,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Verifies the SSH account can run the commands Rerouter needs (config reads + entering config mode). Changes nothing on the router.
+                    Verifies the SSH account can run the commands Rerouter needs (config reads + entering config mode). Changes nothing on the router. This is the same check the controller runs periodically — a device is marked <em>reachable</em> for mitigations only when every command here passes.
                   </p>
                   {capsErr && (
                     <p className="text-sm text-destructive" role="alert">

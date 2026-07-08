@@ -365,14 +365,19 @@ fn ios_preferred() -> Preferred {
 
 // ---- Session -------------------------------------------------------------------
 
-/// Classification of an SSH liveness probe.
+/// Classification of an SSH reachability probe (see [`ssh_probe`]).
 #[derive(Debug, Clone)]
 pub enum SshReach {
-    /// Answered at privileged EXEC ('#') — usable for a reroute.
+    /// Answered at privileged EXEC ('#') AND can run every command a reroute needs
+    /// (all command-access checks pass) — usable for a reroute.
     Privileged,
     /// Connected + authenticated but landed at user-EXEC ('>'): SSH itself works,
     /// the account just lacks privilege 15. Carries the actionable message.
     UserExec(String),
+    /// Reached privileged EXEC ('#') but the account was DENIED one or more of the
+    /// commands a reroute needs (a restrictive privilege level / parser view). SSH
+    /// works; the account can't do the work. Carries the denied-command summary.
+    Restricted(String),
     /// Could not connect / authenticate / reach a usable prompt. Carries the error.
     Unreachable(String),
 }
@@ -385,19 +390,22 @@ pub fn is_user_exec_error(msg: &str) -> bool {
     msg.contains("user-EXEC")
 }
 
-/// SSH liveness probe, classified into [`SshReach`]. Runs NO commands (an empty
-/// command list drives [`run_on`]'s full connect → auth → shell → prompt →
-/// `terminal length 0` path, then exits), so it reports whether the device answered
-/// at privileged EXEC, only at user-EXEC (privilege problem), or not at all. Reused
-/// by the reroute reachability gate, the periodic probe, and the manual
-/// reachability-test endpoint. Never mutates device config.
+/// SSH reachability probe for mitigations, classified into [`SshReach`]. Runs the
+/// SAME command-access checks as the Settings "Check access" panel
+/// ([`probe_capabilities`]): connect → auth → privileged-EXEC → the config reads +
+/// a no-op `configure terminal`, changing NOTHING on the router. A device counts as
+/// [`SshReach::Privileged`] (usable for a reroute) ONLY when it reaches '#' AND every
+/// check passes — so an account that logs in but can't actually run what a reroute
+/// needs (low privilege / restrictive parser view) is caught here, before a mid-push
+/// failure. A user-EXEC login surfaces as [`SshReach::UserExec`] (the capability run
+/// never starts); denied commands as [`SshReach::Restricted`]. Reused by the reroute
+/// reachability gate, the periodic probe, and the manual reachability-test endpoint.
 pub async fn ssh_probe(pool: &MySqlPool, device_id: u64) -> SshReach {
-    let dev = match load_device_ssh(pool, device_id).await {
-        Ok(d) => d,
-        Err(e) => return SshReach::Unreachable(e.to_string()),
-    };
-    match run_on(&dev, &[]).await {
-        Ok(_) => SshReach::Privileged,
+    match probe_capabilities(pool, device_id).await {
+        Ok(checks) => match caps_denied_summary(&checks) {
+            None => SshReach::Privileged,
+            Some(summary) => SshReach::Restricted(summary),
+        },
         Err(e) => {
             let m = e.to_string();
             if is_user_exec_error(&m) {
@@ -718,6 +726,37 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
             }
         })
         .collect())
+}
+
+/// Summarize the denied checks from a [`probe_capabilities`] run into ONE secret-free
+/// line for `ssh_status='no_privilege'` reporting, or `None` when every check passed.
+/// Lists each denied command and the router's own rejection message so the operator
+/// sees exactly what to fix. Pure + unit-tested. (Command names + Cisco error markers
+/// only — never credentials / community strings.)
+pub fn caps_denied_summary(checks: &[CapabilityCheck]) -> Option<String> {
+    let denied: Vec<&CapabilityCheck> = checks.iter().filter(|c| !c.ok).collect();
+    if denied.is_empty() {
+        return None;
+    }
+    let list = denied
+        .iter()
+        .map(|c| {
+            if c.detail.is_empty() {
+                format!("`{}`", c.command)
+            } else {
+                format!("`{}` ({})", c.command, c.detail)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "SSH reached enable mode but the account was denied {}/{} required commands: {}. \
+         Give the account privilege 15 or a parser view that permits these (see the device's \
+         Command access panel).",
+        denied.len(),
+        checks.len(),
+        list
+    ))
 }
 
 /// Parse `network A.B.C.D mask M.M.M.M` (and `network A.B.C.D/len`) lines from a
@@ -1203,6 +1242,47 @@ fn clean_output(raw: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caps_summary_flags_denied_commands_and_stays_secret_free() {
+        let check = |command: &str, ok: bool, detail: &str| CapabilityCheck {
+            name: command.to_string(),
+            command: command.to_string(),
+            ok,
+            detail: detail.to_string(),
+        };
+        // A mix like the operator's box: reads OK, running-config + config-mode denied.
+        let checks = vec![
+            check("show ip route summary", true, ""),
+            check("show ip bgp summary", true, ""),
+            check(
+                "show running-config | section ^router bgp",
+                false,
+                "% Invalid input detected at '^' marker.",
+            ),
+            check(
+                "configure terminal",
+                false,
+                "% Invalid input detected at '^' marker.",
+            ),
+        ];
+        let s = caps_denied_summary(&checks).expect("some checks denied");
+        assert!(s.contains("2/4"), "counts denied of total: {s}");
+        assert!(s.contains("configure terminal"), "names the denied command");
+        assert!(
+            s.contains("show running-config | section ^router bgp"),
+            "names each denied command"
+        );
+        // The summary is safe to log/email — command names + Cisco markers only.
+        let low = s.to_lowercase();
+        assert!(!low.contains("password") && !low.contains("community") && !low.contains("secret"));
+
+        // Every check passing -> nothing to report (device is Privileged).
+        let all_ok = vec![check("show ip route summary", true, "")];
+        assert!(caps_denied_summary(&all_ok).is_none());
+        // No checks at all -> None (not a denial).
+        assert!(caps_denied_summary(&[]).is_none());
+    }
 
     #[test]
     fn classifies_user_exec_privilege_error() {

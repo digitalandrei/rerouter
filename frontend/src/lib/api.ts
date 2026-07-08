@@ -115,12 +115,14 @@ export interface Device {
   ssh_public_key: string | null;
   // Last periodic SSH-probe outcome — the display state. A reroute pushes config
   // over SSH, so this gates a mitigation.
-  //   "reachable"    — answered at privileged EXEC (#); usable for a reroute.
-  //   "no_privilege" — SSH works but the account isn't privilege 15 (config fix).
+  //   "reachable"    — answered at privileged EXEC (#) AND the account can run every
+  //                    command a reroute needs (all command-access checks pass).
+  //   "no_privilege" — SSH works but the account can't do the work: not privilege 15,
+  //                    OR reached # but was denied a required command (parser view).
   //   "unreachable"  — could not connect / authenticate.
   //   "unknown"      — not probed yet.
   ssh_status: "reachable" | "no_privilege" | "unreachable" | "unknown";
-  // The last probe's message (e.g. the "give the account privilege 15" hint).
+  // The last probe's message — for no_privilege, the exact denied commands.
   last_ssh_error: string | null;
   last_ssh_ok_at: string | null;
   // Automation stability: when SSH became (and stayed) reachable, and whether it

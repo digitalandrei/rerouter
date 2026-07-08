@@ -182,19 +182,23 @@ a router, not an asset/prefix). Any failure aborts and logs:
 - the device is not inside its post-action cooldown window;
 - the global action rate limit is not exceeded;
 - **control-plane reachability (preflight):** the target device answers **SSH at
-  privileged EXEC**. A reroute pushes config over SSH, so a device that does not
-  answer SSH cannot be mitigated — the action is refused up front
-  (`BlockReason::DeviceUnreachable`) rather than reserving a slot and failing
-  mid-push. To avoid re-probing a device we just talked to (and tripping its SSH
-  connection throttle), a successful SSH contact within the last **60 s**
-  (`devices.last_ssh_ok_at`, stamped by the probe and by every successful reroute
-  push) passes without opening a new session. This is a hard gate on **every**
-  trigger (manual, automatic, rollback). A poll-loop probe
+  privileged EXEC AND the account can run every command a reroute needs**. A reroute
+  pushes config over SSH, so the probe runs the same **command-access checks** as the
+  Settings "Check access" panel (`ssh::probe_capabilities`: the config reads + a no-op
+  `configure terminal`, changing nothing) — a device that logs in but is denied a
+  required command (low privilege / restrictive parser view) is caught here, not
+  mid-push. The action is refused up front (`BlockReason::DeviceUnreachable`) rather
+  than reserving a slot and failing mid-push. To avoid re-probing a device we just
+  talked to (and tripping its SSH connection throttle), a successful SSH contact
+  within the last **60 s** (`devices.last_ssh_ok_at`, stamped by the probe and by
+  every successful reroute push) passes without opening a new session. This is a hard
+  gate on **every** trigger (manual, automatic, rollback). A poll-loop probe
   (`reachability_interval_seconds`, default 3 min) classifies the device into
-  `devices.ssh_status` — `reachable` / `no_privilege` (SSH works but the account
-  isn't privilege 15 — an actionable config fix, still NOT reroute-usable) /
-  `unreachable` — for display and to keep the recency window warm. See
-  `reroute::reachability`;
+  `devices.ssh_status` — `reachable` (privileged **and** all command-access checks
+  pass) / `no_privilege` (SSH works but the account can't do the work: not privilege
+  15, or reached `#` but was denied a required command — `last_ssh_error` names them;
+  an actionable config fix, still NOT reroute-usable) / `unreachable` — for display
+  and to keep the recency window warm. See `reroute::reachability`;
 - **stability (AUTOMATIC only):** a device must have been *continuously*
   SSH-reachable for the **stability window** (`STABILITY_WINDOW`, 5 min) before
   automatic mitigations targeting it resume — so a just-recovered or flapping

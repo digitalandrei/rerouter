@@ -1,15 +1,19 @@
 //! Device reachability for mitigations — the "can we mitigate this device right
 //! now?" decision that gates a reroute (see [`super::executor`]).
 //!
-//! A reroute pushes config over SSH, so the AUTHORITATIVE signal is: does SSH
-//! answer commands at privileged EXEC? We probe it with a no-op liveness session
-//! ([`ssh::ssh_probe`]: connect → auth → prompt → `terminal length 0` → exit,
-//! pushing no config), classified into three states:
+//! A reroute pushes config over SSH, so the AUTHORITATIVE signal is: can SSH run the
+//! commands a reroute needs, at privileged EXEC? We probe it with the SAME
+//! command-access checks as the Settings "Check access" panel ([`ssh::ssh_probe`] →
+//! [`ssh::probe_capabilities`]: connect → auth → privileged-EXEC → the config reads +
+//! a no-op `configure terminal`, changing nothing), classified into three states:
 //!
-//! * `reachable` — answered at `#`; usable for a reroute.
-//! * `no_privilege` — SSH connected + authenticated but landed at `>`; the account
-//!   lacks privilege 15 (an actionable config fix, not a connectivity problem).
-//!   Not usable for a reroute.
+//! * `reachable` — answered at `#` AND every command-access check passed; usable for
+//!   a reroute.
+//! * `no_privilege` — SSH connected + authenticated but the account can't do the work:
+//!   it landed at `>` (not privilege 15), OR it reached `#` but was denied a required
+//!   command (a restrictive privilege level / parser view). An actionable config fix,
+//!   not a connectivity problem — but NOT usable for a reroute. `last_ssh_error` names
+//!   the exact denied commands.
 //! * `unreachable` — could not connect / authenticate / reach a prompt.
 //!
 //! To avoid re-probing a device we just talked to — and to avoid tripping the
@@ -146,7 +150,9 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
                 ssh_error: None,
             }
         }
-        SshReach::UserExec(msg) => {
+        // Both privilege problems (user-EXEC login, or '#' but a required command
+        // denied) land here: SSH works, the account can't do the work → not mitigatable.
+        SshReach::UserExec(msg) | SshReach::Restricted(msg) => {
             stamp_ssh_status(pool, device_id, STATUS_NO_PRIVILEGE, Some(&msg)).await;
             Reachability {
                 ssh_ok: false,
@@ -225,16 +231,17 @@ pub async fn stamp_ssh_ok(pool: &MySqlPool, device_id: u64) {
     stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await;
 }
 
-/// Periodic SSH liveness probe (the poll loop calls this every
-/// `reachability_interval_seconds`). Opens a no-command SSH session, classifies the
-/// outcome, and stores `ssh_status` (+ `last_ssh_ok_at` on `reachable`) so the UI
-/// shows a definite state and the reroute gate's recency window is kept warm.
-/// Returns the resulting status for logging.
+/// Periodic SSH reachability probe (the poll loop calls this every
+/// `reachability_interval_seconds`). Runs the command-access checks
+/// ([`ssh::probe_capabilities`], changing nothing), classifies the outcome, and
+/// stores `ssh_status` (+ `last_ssh_ok_at` on `reachable`, `last_ssh_error` naming
+/// any denied commands otherwise) so the UI shows a definite state and the reroute
+/// gate's recency window is kept warm. Returns the resulting status for logging.
 pub async fn probe_ssh_and_store(pool: &MySqlPool, device_id: u64) -> &'static str {
     let (status, err): (&'static str, Option<String>) = match ssh::ssh_probe(pool, device_id).await
     {
         SshReach::Privileged => (STATUS_REACHABLE, None),
-        SshReach::UserExec(m) => (STATUS_NO_PRIVILEGE, Some(m)),
+        SshReach::UserExec(m) | SshReach::Restricted(m) => (STATUS_NO_PRIVILEGE, Some(m)),
         SshReach::Unreachable(m) => (STATUS_UNREACHABLE, Some(m)),
     };
     stamp_ssh_status(pool, device_id, status, err.as_deref()).await;

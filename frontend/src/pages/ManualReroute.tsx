@@ -272,8 +272,10 @@ export default function ManualReroute() {
                   </div>
                   {targetDevice.ssh_status === "no_privilege" && (
                     <p className="text-xs text-amber-700 dark:text-amber-400">
-                      SSH works but the account is not in enable mode (privilege 15) — the
-                      reroute will be refused. Give the account privilege 15 on the router.
+                      SSH works but the account can't run every command a reroute needs —
+                      either it's not in enable mode (privilege 15), or a parser view denies
+                      some. The reroute will be refused. See <em>Command access</em> on the
+                      device page for the exact denied commands.
                     </p>
                   )}
                   {targetDevice.ssh_status === "unreachable" && (

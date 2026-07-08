@@ -41,7 +41,9 @@ export function templateLabelFrom(
 }
 
 /** Tone + label for a device's SSH reachability status (devices.ssh_status).
- *  "no_privilege" means SSH works but the account lacks privilege 15 — an
+ *  "reachable" = SSH answered at enable ('#') AND the account can run every command
+ *  a reroute needs. "no_privilege" = SSH works but the account can't do the work —
+ *  either it's not privilege 15, or a parser view denies a required command — an
  *  actionable config fix, so it's a warning, not a hard failure. */
 export function sshStatusBadge(status: string): {
   tone: "good" | "warn" | "bad" | "neutral";
@@ -51,7 +53,7 @@ export function sshStatusBadge(status: string): {
     case "reachable":
       return { tone: "good", label: "reachable" };
     case "no_privilege":
-      return { tone: "warn", label: "no privilege" };
+      return { tone: "warn", label: "insufficient access" };
     case "unreachable":
       return { tone: "bad", label: "unreachable" };
     default:
