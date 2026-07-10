@@ -32,23 +32,66 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the retention cleanup runs.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+/// Keep each retention delete short enough that a large first 48-hour purge
+/// does not monopolize InnoDB locks or starve telemetry/API queries.
+const RETENTION_DELETE_BATCH: u64 = 10_000;
 
 /// Spawn the scheduler supervisor + the retention cleanup task; return. Never
 /// blocks the control plane.
 pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
-    tokio::spawn(retention_cleanup(pool.clone(), cfg.clone()));
-    tokio::spawn(discover_prefixes_daily(pool.clone()));
-    tokio::spawn(evaluate_aggregate_loop(pool.clone(), cfg.clone()));
-    // NetFlow/IPFIX flow collector — a SECOND, read-only telemetry source. No-op
+    spawn_supervised("retention_cleanup", {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        move || retention_cleanup(pool.clone(), cfg.clone())
+    });
+    spawn_supervised("prefix_discovery", {
+        let pool = pool.clone();
+        move || discover_prefixes_daily(pool.clone())
+    });
+    spawn_supervised("aggregate_detection", {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        move || evaluate_aggregate_loop(pool.clone(), cfg.clone())
+    });
+    // NetFlow v9/sFlow v5 collector — a second, passive telemetry source. No-op
     // unless [flow].enabled; binds its own UDP socket (see docs/flow-telemetry.md).
-    tokio::spawn(flow::collector::run(pool.clone(), cfg.clone()));
-    tokio::spawn(supervise(pool, cfg));
+    spawn_supervised("flow_collector", {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        move || flow::collector::run(pool.clone(), cfg.clone())
+    });
+    spawn_supervised("device_poll_supervisor", move || {
+        supervise(pool.clone(), cfg.clone())
+    });
     tracing::info!(
         event_type = "scheduler_started",
         "scheduler supervisor spawned (per-device SNMP poll loops)"
     );
     Ok(())
+}
+
+fn spawn_supervised<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let outcome = tokio::spawn(factory()).await;
+            match outcome {
+                Ok(()) => tracing::error!(
+                    event_type = "background_task_exited",
+                    task = name,
+                    "long-lived background task exited unexpectedly; restarting"
+                ),
+                Err(e) => {
+                    tracing::error!(event_type = "background_task_panicked", task = name, error = %e, "long-lived background task panicked; restarting")
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }
 
 /// How often to revalidate announced prefixes over SSH.
@@ -152,21 +195,37 @@ async fn retention_cleanup(pool: MySqlPool, cfg: Arc<Config>) {
         for spec in &specs {
             // Floor at 1 day so a misconfigured 0 can never mean "delete now".
             let days = spec.days.max(1);
-            // SAFETY: table/ts_column are 'static literals from our own code.
-            let sql = format!(
-                "DELETE FROM {} WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)",
-                spec.table, spec.ts_column
-            );
-            match sqlx::query(&sql).bind(days).execute(&pool).await {
-                Ok(r) if r.rows_affected() > 0 => tracing::debug!(
+            let mut total = 0u64;
+            loop {
+                // SAFETY: table/ts_column are 'static literals from our own code;
+                // the batch size is a compile-time integer constant.
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT {}",
+                    spec.table, spec.ts_column, RETENTION_DELETE_BATCH
+                );
+                match sqlx::query(&sql).bind(days).execute(&pool).await {
+                    Ok(r) => {
+                        let rows = r.rows_affected();
+                        total += rows;
+                        if rows < RETENTION_DELETE_BATCH {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(event_type = "retention_prune_failed", table = spec.table, rows = total, error = %e, "retention prune failed");
+                        break;
+                    }
+                }
+            }
+            if total > 0 {
+                tracing::debug!(
                     event_type = "retention_pruned",
                     table = spec.table,
                     days,
-                    rows = r.rows_affected(),
+                    rows = total,
                     "pruned rows past retention window"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(event_type = "retention_prune_failed", table = spec.table, error = %e, "retention prune failed"),
+                );
             }
         }
 
@@ -177,27 +236,59 @@ async fn retention_cleanup(pool: MySqlPool, cfg: Arc<Config>) {
         // handles an exporter row created but that never sent a datagram.
         match sqlx::query(
             "DELETE FROM flow_exporters \
-             WHERE COALESCE(last_packet_at, created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)",
+             WHERE (last_packet_at IS NOT NULL \
+                    AND last_packet_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)) \
+                OR (last_packet_at IS NULL \
+                    AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY))",
         )
+        .bind(exporter_idle_days)
         .bind(exporter_idle_days)
         .execute(&pool)
         .await
         {
             Ok(r) if r.rows_affected() > 0 => {
-                tracing::info!(event_type = "flow_exporters_pruned", rows = r.rows_affected(), days = exporter_idle_days, "pruned stale flow exporters (idle past flow window)")
+                tracing::info!(
+                    event_type = "flow_exporters_pruned",
+                    rows = r.rows_affected(),
+                    days = exporter_idle_days,
+                    "pruned stale flow exporters (idle past flow window)"
+                )
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(event_type = "exporter_prune_failed", error = %e, "pruning flow_exporters failed"),
+            Err(e) => {
+                tracing::warn!(event_type = "exporter_prune_failed", error = %e, "pruning flow_exporters failed")
+            }
+        }
+
+        // Runtime authorization/safety rows have no historical value after they
+        // expire. Keep these hot lookup tables bounded independently of the
+        // operator-selected telemetry retention windows.
+        for (table, predicate) in [
+            ("sessions", "expires_at < UTC_TIMESTAMP()"),
+            (
+                "action_previews",
+                "expires_at < UTC_TIMESTAMP() OR used_at IS NOT NULL",
+            ),
+            ("cooldowns", "`until` < UTC_TIMESTAMP()"),
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE {predicate}");
+            match sqlx::query(&sql).execute(&pool).await {
+                Ok(r) if r.rows_affected() > 0 => tracing::debug!(
+                    event_type = "runtime_rows_pruned",
+                    table,
+                    rows = r.rows_affected(),
+                    "pruned expired runtime rows"
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(event_type = "runtime_prune_failed", table, error = %e, "runtime row cleanup failed")
+                }
+            }
         }
 
         tokio::time::sleep(PRUNE_INTERVAL).await;
     }
 }
-
-/// How often to evaluate cross-interface/cross-device `sum` rules. These have no
-/// owning device loop, so a single global loop drives them. The cadence tracks
-/// the default poll interval; member freshness is enforced inside the engine.
-const AGGREGATE_EVAL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Evaluate aggregate (`metric_aggregation = 'sum'`) rules forever. Read-only and
 /// observe-safe: like every rule path it only renders would-run plans unless the
@@ -208,14 +299,18 @@ async fn evaluate_aggregate_loop(pool: MySqlPool, cfg: Arc<Config>) {
     loop {
         match detection::engine::evaluate_aggregate_rules(&pool, &cfg).await {
             Ok(fired) if fired > 0 => {
-                tracing::info!(event_type = "aggregate_detection", fired, "aggregate rules fired")
+                tracing::info!(
+                    event_type = "aggregate_detection",
+                    fired,
+                    "aggregate rules fired"
+                )
             }
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(event_type = "aggregate_detection_failed", error = %e, "aggregate rule evaluation failed")
             }
         }
-        tokio::time::sleep(AGGREGATE_EVAL_INTERVAL).await;
+        tokio::time::sleep(Duration::from_secs(cfg.telemetry.metrics_rollup_seconds)).await;
     }
 }
 
@@ -278,8 +373,23 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
     let ssh_probe_interval =
         Duration::from_secs(cfg.telemetry.reachability_interval_seconds.max(60));
     let mut last_ssh_probe: Option<Instant> = None;
+    let mut last_interface_discovery: Option<Instant> = None;
 
     loop {
+        if last_interface_discovery.is_none_or(|t| t.elapsed() >= Duration::from_secs(24 * 3600)) {
+            match snmp::discover_and_store(&pool, device_id).await {
+                Ok(count) => tracing::debug!(
+                    event_type = "interface_inventory_refreshed",
+                    device_id,
+                    interfaces = count,
+                    "interface inventory refreshed"
+                ),
+                Err(e) => {
+                    tracing::warn!(event_type = "interface_inventory_refresh_failed", device_id, error = %e, "periodic interface inventory refresh failed")
+                }
+            }
+            last_interface_discovery = Some(Instant::now());
+        }
         let tick = poll_and_detect(&pool, &cfg, device_id).await;
         if let Err(e) = tick {
             tracing::warn!(event_type = "device_tick_failed", device_id, error = %e, "device poll/detect tick failed");
@@ -287,7 +397,12 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
 
         if last_ssh_probe.is_none_or(|t| t.elapsed() >= ssh_probe_interval) {
             let status = crate::reroute::reachability::probe_ssh_and_store(&pool, device_id).await;
-            tracing::debug!(event_type = "ssh_reachability_probed", device_id, status, "periodic SSH reachability probe");
+            tracing::debug!(
+                event_type = "ssh_reachability_probed",
+                device_id,
+                status,
+                "periodic SSH reachability probe"
+            );
             last_ssh_probe = Some(Instant::now());
         }
 

@@ -42,6 +42,7 @@ export default function ManualReroute() {
   const [values, setValues] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState<RenderedPlan | null>(null);
   const [previewRollback, setPreviewRollback] = useState<RenderedPlan | null>(null);
+  const [previewToken, setPreviewToken] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [results, setResults] = useState<RerouteResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -51,7 +52,12 @@ export default function ManualReroute() {
   // bundled with BGP advertise via the rule action editor.
   const MSS_TEMPLATE_NAMES = ["iface_tcp_adjust_mss", "iface_tcp_adjust_mss_remove"];
   // Host-targeting templates: show helper text about manual prefix bounds.
-  const HOST_TARGET_TEMPLATE_NAMES = ["null_route_prefix", "blackhole_prefix"];
+  const HOST_TARGET_TEMPLATE_NAMES = [
+    "null_route_prefix",
+    "blackhole_prefix",
+    "null_route_prefix_v6",
+    "blackhole_prefix_v6",
+  ];
 
   useEffect(() => {
     api.templates
@@ -80,6 +86,7 @@ export default function ManualReroute() {
     setValues({});
     setPreview(null);
     setPreviewRollback(null);
+    setPreviewToken(null);
     setResults(null);
     setError(null);
   }
@@ -91,21 +98,7 @@ export default function ManualReroute() {
   }
 
   async function doPreview() {
-    if (!template) return;
-    setError(null);
-    setPreview(null);
-    setPreviewRollback(null);
-    try {
-      const r = await api.templates.render(template.id, buildParams());
-      if (r.ok && r.plan) {
-        setPreview(r.plan);
-        setPreviewRollback(r.rollback ?? null);
-      } else {
-        setError(r.error ?? "render failed");
-      }
-    } catch {
-      setError("render request failed");
-    }
+    await submit(true);
   }
 
   async function submit(dry_run: boolean) {
@@ -122,8 +115,20 @@ export default function ManualReroute() {
         targets: [{ device_id: parseInt(deviceId, 10), params: buildParams() }],
         reason: reason.trim() || undefined,
         dry_run,
+        preview_token: dry_run ? undefined : previewToken ?? undefined,
       });
       setResults(res.results);
+      if (dry_run) {
+        const first = res.results[0];
+        setPreview(first?.would_run ?? null);
+        setPreviewRollback(first?.would_run_rollback ?? null);
+        setPreviewToken(res.preview_token ?? null);
+        if (!first?.would_run) {
+          setError(first?.blocked_reason ?? first?.message ?? "preview failed");
+        }
+      } else {
+        setPreviewToken(null);
+      }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "request failed");
     } finally {
@@ -178,6 +183,8 @@ export default function ManualReroute() {
                   setValues({});
                   setPreview(null);
                   setPreviewRollback(null);
+                  setPreviewToken(null);
+                  setResults(null);
                 }}
               >
                 <option value="">Select router…</option>
@@ -211,11 +218,18 @@ export default function ManualReroute() {
                   setValues(v);
                   setPreview(null); // params changed — force a fresh preview before Execute
                   setPreviewRollback(null);
+                  setPreviewToken(null);
+                  setResults(null);
                 }}
               />
 
-              <Button size="sm" variant="outline" onClick={() => void doPreview()}>
-                Preview commands
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy || !deviceId}
+                onClick={() => void doPreview()}
+              >
+                {busy ? "Preparing…" : "Preview commands"}
               </Button>
 
               {preview && (
@@ -252,7 +266,13 @@ export default function ManualReroute() {
                   className={inputClass}
                   value={reason}
                   placeholder="Why is this mitigation being applied?"
-                  onChange={(e) => setReason(e.target.value)}
+                  onChange={(e) => {
+                    setReason(e.target.value);
+                    setPreview(null);
+                    setPreviewRollback(null);
+                    setPreviewToken(null);
+                    setResults(null);
+                  }}
                 />
               </label>
 
@@ -296,7 +316,7 @@ export default function ManualReroute() {
 
               <div className="flex gap-2">
                 <Button variant="outline" disabled={busy} onClick={() => void submit(true)}>
-                  Dry run
+                  Refresh dry run
                 </Button>
                 <Button
                   variant="destructive"

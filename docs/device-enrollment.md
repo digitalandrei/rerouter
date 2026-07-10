@@ -31,11 +31,15 @@ The community is a secret: it is sealed with `crypto::seal` on create/update and
 opened only in memory by the poller. It is never logged and never serialized
 back to a client.
 
+Encryption at rest does not change SNMP v2c on the wire: the protocol sends the
+community and telemetry without encryption. Use a device-specific read-only
+community and restrict UDP/161 to an isolated controller/router management path.
+
 ## SSH access
 
 A device is onboarded with **SSH access**, and SSH is **actively used** by the
 controller — it is no longer an idle, enforce-only field. Even in observe mode the
-controller uses SSH (through a restricted Cisco read-only view) to discover
+controller uses SSH (through a restricted Cisco command view) to discover
 routing context: announced prefixes and BGP neighbor labels
 (`POST /api/devices/{id}/discover-prefixes`) and a command-access probe
 (`POST /api/devices/{id}/ssh-capabilities`). In enforce mode the same SSH path
@@ -50,8 +54,15 @@ SSH auth is **password XOR key** (the operator picks one per device):
 - `password` method: `ssh_password` (encrypted at rest);
 - `key` method: `ssh_private_key` + optional `ssh_key_passphrase` (both
   encrypted at rest);
-- `ssh_host_fingerprint` — pinned at enrollment so a later host-key change can
-  fail closed (doctrine §8 SSH host verification).
+- `ssh_host_fingerprint` — atomically pinned on the first successful read-only
+  probe. Pin persistence is required before any configuration action; a later
+  host-key change fails closed.
+
+TOFU does not authenticate the very first probe. Enroll over a trusted
+management path and compare the pinned fingerprint with the router out of band;
+an attacker present on first contact could otherwise become the stored identity.
+Legacy IOS compatibility also permits SHA-1 KEX/MAC, `ssh-rsa`, and CBC
+fallbacks, so this path belongs on an isolated management network.
 
 **In-app key generation.** Rather than pasting a private key, the operator can
 have the controller mint a device keypair: `POST /api/devices/{id}/ssh-generate-key`
@@ -76,20 +87,21 @@ re-encrypts it.
 
 Discovery walks `ifXTable` + `ifTable` and reconciles `device_interfaces` by
 `(device_id, if_index)`: new interfaces are inserted, existing ones refreshed,
-**without** disturbing the operator's `enabled_for_monitoring` choice. Per
+and absent rows become stale rather than authorizing new actions forever. Per
 interface: `if_name` (ifName), `if_descr` (ifDescr), `if_alias` (operator
-label), `if_speed_bps` (ifHighSpeed×1e6, else ifSpeed), admin/oper status, a
-physical-interface heuristic from ifType, and the monitoring flag.
+label), `if_speed_bps` (ifHighSpeed×1e6, else ifSpeed), admin/oper status, and a
+physical-interface heuristic from ifType.
 
-**Only interfaces with `enabled_for_monitoring = 1` are polled and
-rule-evaluated.** Discovering an interface does not start polling it; the
-operator opts each one in.
+**Every discovered interface is polled and can be rule-targeted.** The obsolete
+`enabled_for_monitoring` flag and endpoint were removed. The scheduler refreshes
+interface inventory at startup and daily; successful metric polls also refresh
+the interface's `last_seen_at`. New actions reject SNMP inventory older than 24h.
 
 ## Enrollment flow
 
 1. Operator adds the device: name, hostname, SNMP version/port, community, and
    optional SSH access (username + password **or** private key).
-   `POST /api/devices` (requires `edit_asset`). The community and any SSH secret
+   `POST /api/devices` (requires `manage_devices`). The community and any SSH secret
    are encrypted before insert.
 2. Operator runs a reachability/identity probe: `POST /api/devices/{id}/test`.
    The controller GETs `sysDescr`/`sysName`/`sysUpTime`, parses vendor/model/OS,
@@ -98,15 +110,13 @@ operator opts each one in.
 3. Operator runs discovery: `POST /api/devices/{id}/discover`. The controller
    walks the interface tables and upserts `device_interfaces`, returning the
    count discovered.
-4. Operator enables monitoring on the interfaces of interest:
-   `PUT /api/interfaces/{id}` `{ "enabled_for_monitoring": true }`.
-5. The scheduler picks the device up (it reloads the enabled-device set
+4. The scheduler picks the device up (it reloads the enabled-device set
    periodically) and starts a per-device poll loop at `poll_interval_seconds`
-   plus jitter. Each poll reads HC counters for the monitored interfaces,
+   plus jitter. Each poll reads HC counters for every discovered interface,
    derives rates against the previous baseline, and stores
    `interface_metrics_current` (one row/interface, carrying the raw counters
    that form the next delta baseline) plus an `interface_samples` history row.
-6. After each poll the detection engine evaluates that device's enabled
+5. After each poll the detection engine evaluates that device's enabled
    interface rules.
 
 ## Polling, baselines, and validity
@@ -125,9 +135,10 @@ operator opts each one in.
 
 ## Rules on interfaces
 
-A detection rule may target a **monitored interface** (XOR a protected asset).
-Interface metrics: `rx_bps`, `tx_bps`, `rx_pps`, `tx_pps`, `rx_util_percent`,
-`tx_util_percent`, `oper_status`. Operators `>`, `<`, `>=`, `<=`, `==`, `!=`.
+A detection rule may target one interface or sum supported rate metrics across an
+interface group. Interface metrics: `rx_bps`, `tx_bps`, `rx_pps`, `tx_pps`,
+`rx_util_percent`, `tx_util_percent`, `in_err_rate`, `out_err_rate`, and
+`oper_status`. Operators `>`, `<`, `>=`, `<=`, `==`, `!=`.
 A firing rule never executes a reroute in observe mode (the shipped default);
 when a reroute template is attached, the alert carries the **would-run plan**
 instead. See [detection-engine.md](detection-engine.md).

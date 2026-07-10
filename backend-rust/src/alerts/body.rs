@@ -375,7 +375,13 @@ mod tests {
             "after": "enforce",
             "message": "operating_mode changed from observe to enforce"
         });
-        let body = render("operating_mode_changed", "critical", 1, chrono::Utc::now(), &payload);
+        let body = render(
+            "operating_mode_changed",
+            "critical",
+            1,
+            chrono::Utc::now(),
+            &payload,
+        );
         assert!(body.contains("Changed:   observe -> enforce"));
         assert!(body.contains("Admin <admin@example.com>"));
         let subj = subject("operating_mode_changed", "critical", &payload);

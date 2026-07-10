@@ -54,7 +54,7 @@ pub struct TopQuery {
     dimension: Option<String>,
     /// Restrict to one interface (device_interfaces.id).
     interface_id: Option<u64>,
-    /// Window in minutes (default 60, clamped to 1..=1440).
+    /// Window in minutes (default 60, clamped to the 48-hour retention window).
     minutes: Option<i64>,
     /// Order by estimated bytes (default) or pkts — pkts surfaces high-pps,
     /// low-bitrate floods (e.g. UDP/53).
@@ -85,7 +85,7 @@ pub async fn top(
     if !device_exists(&state.pool, device_id).await {
         return err(StatusCode::NOT_FOUND, "device not found");
     }
-    let minutes = q.minutes.unwrap_or(60).clamp(1, 1440);
+    let minutes = q.minutes.unwrap_or(60).clamp(1, 48 * 60);
     // Whitelist the ordering metric (interpolated into SQL — must never be raw input).
     let order = match q.metric.as_deref() {
         Some("pkts") => "est_pkts",
@@ -216,8 +216,7 @@ async fn top_traffic(
         )
         .bind(device_id)
         .fetch_all(pool)
-        .await
-        .unwrap_or_default()
+        .await?
         .into_iter()
         .filter_map(|(idx, name, descr)| name.or(descr).map(|n| (idx, n)))
         .collect();

@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Server,
     pub database: Database,
@@ -21,6 +22,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Server {
     /// MUST be a loopback address. Validated in `validate` (both the file and
     /// the built-in-defaults load paths).
@@ -28,6 +30,7 @@ pub struct Server {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Database {
     pub url_env: String,
 }
@@ -36,11 +39,15 @@ pub struct Database {
 /// (SESSION_SECRET) and the credential-encryption key (SECRETS_KEY) come from
 /// the environment, never from this file.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Auth {
     pub session_ttl_hours: u64,
     /// Session TTL when the user ticks "remember me" at login (default 7 days).
     pub remember_me_ttl_hours: u64,
+    /// Absolute inactivity limit for a fully authenticated session.
+    pub idle_timeout_minutes: u64,
+    /// A password-only session may exist only long enough to complete 2FA.
+    pub pre_2fa_ttl_minutes: u64,
     /// Failed logins (per email + real client IP) before lockout.
     pub lockout_threshold: u32,
     pub lockout_minutes: u64,
@@ -51,6 +58,8 @@ impl Default for Auth {
         Self {
             session_ttl_hours: 12,
             remember_me_ttl_hours: 168,
+            idle_timeout_minutes: 60,
+            pre_2fa_ttl_minutes: 10,
             lockout_threshold: 5,
             lockout_minutes: 15,
         }
@@ -61,7 +70,7 @@ impl Default for Auth {
 // SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM) — see alerts::mailer.
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Telemetry {
     pub metrics_rollup_seconds: u64,
     pub reachability_interval_seconds: u64,
@@ -70,11 +79,14 @@ pub struct Telemetry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Detection {
     pub default_consecutive_samples: u32,
     pub default_min_duration_seconds: u64,
-    pub hysteresis_seconds: u64,
+    /// Compatibility-only legacy field. Recovery persistence now lives on each
+    /// rule (`recovery_*`); presence produces a startup warning.
+    #[serde(rename = "hysteresis_seconds")]
+    pub deprecated_hysteresis_seconds: Option<u64>,
 }
 
 /// Global operating mode. `Observe` is the safe read-only / alert-only posture:
@@ -93,7 +105,7 @@ pub enum OperatingMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Safety {
     /// SAFETY: defaults to Observe (read-only / alert-only).
     pub operating_mode: OperatingMode,
@@ -111,13 +123,14 @@ pub struct Safety {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Reroute {
     pub require_verification: bool,
 }
 
 /// Retention windows (in days) enforced by the controller's retention cleanup
-/// task (see `scheduler::retention_cleanup`).
+/// task (see `scheduler::retention_cleanup`). The shipped operational default
+/// keeps short-term data for 48 hours (2 days).
 ///
 /// `traffic_samples_days`, `flow_buckets_days`, `alerts_days` and
 /// `rule_events_days` are actively pruned — the short-term telemetry + detection
@@ -128,7 +141,7 @@ pub struct Reroute {
 /// lock — so it needs deliberate state-aware pruning, never a blanket delete.
 /// `audit_logs` (the security/admin trail) is likewise never auto-pruned.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Retention {
     /// interface_samples — per-interface SNMP history (was a hardcoded 70 min).
     pub traffic_samples_days: u32,
@@ -142,14 +155,17 @@ pub struct Retention {
     pub reroute_logs_days: u32,
 }
 
-/// NetFlow/IPFIX flow collector. A SECOND, read-only telemetry source (see
+/// NetFlow v9/sFlow v5 collector. A second, passive telemetry source (see
 /// docs/flow-telemetry.md). OFF by default. Unlike `server.bind` (loopback-only,
 /// enforced in `validate`), the flow listener must receive UDP from the router,
 /// so its bind address is operator-chosen — a deliberate, documented exposure.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Flow {
     pub enabled: bool,
+    /// Explicit acknowledgement that flow-derived rules may trigger automatic
+    /// actions. Off by default even when collection itself is enabled.
+    pub automatic_actions_enabled: bool,
     /// UDP bind address for the collector (e.g. a management address reachable
     /// from the exporting router). NOT loopback-restricted. Shared by both the
     /// NetFlow and the sFlow listeners.
@@ -173,12 +189,19 @@ pub struct Flow {
     /// override is set. A sampled-looking exporter that falls through to this is
     /// flagged low-confidence (blocks flow-driven automatic actions).
     pub default_sampling_rate: u32,
+    /// Whole-interface flow estimates must remain within this fraction of the
+    /// contemporaneous SNMP rate before they may drive an automatic action.
+    pub snmp_corroboration_min_ratio: f64,
+    /// Flow estimates (including filtered selectors) may never exceed this
+    /// multiple of the contemporaneous SNMP rate for automatic-action trust.
+    pub snmp_corroboration_max_ratio: f64,
 }
 
 impl Default for Flow {
     fn default() -> Self {
         Self {
             enabled: false,
+            automatic_actions_enabled: false,
             bind_addr: "0.0.0.0".into(),
             bind_port: 2055,
             sflow_enabled: false,
@@ -187,6 +210,8 @@ impl Default for Flow {
             bucket_seconds: 60,
             top_k_talkers: 100,
             default_sampling_rate: 1,
+            snmp_corroboration_min_ratio: 0.25,
+            snmp_corroboration_max_ratio: 2.0,
         }
     }
 }
@@ -230,7 +255,7 @@ impl Default for Detection {
         Self {
             default_consecutive_samples: 3,
             default_min_duration_seconds: 30,
-            hysteresis_seconds: 30,
+            deprecated_hysteresis_seconds: None,
         }
     }
 }
@@ -260,27 +285,11 @@ impl Default for Reroute {
 impl Default for Retention {
     fn default() -> Self {
         Self {
-            traffic_samples_days: 7,
-            flow_buckets_days: 7,
-            alerts_days: 7,
-            rule_events_days: 7,
+            traffic_samples_days: 2,
+            flow_buckets_days: 2,
+            alerts_days: 2,
+            rule_events_days: 2,
             reroute_logs_days: 365,
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: Server::default(),
-            database: Database::default(),
-            auth: Auth::default(),
-            telemetry: Telemetry::default(),
-            detection: Detection::default(),
-            safety: Safety::default(),
-            reroute: Reroute::default(),
-            retention: Retention::default(),
-            flow: Flow::default(),
         }
     }
 }
@@ -313,13 +322,103 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         // SAFETY: refuse to start if the API would bind to a non-loopback address.
-        if !self.server.bind.starts_with("127.") && !self.server.bind.starts_with("[::1]") {
+        let api_bind: std::net::SocketAddr = self
+            .server
+            .bind
+            .parse()
+            .context("server.bind must be an IP socket address")?;
+        if !api_bind.ip().is_loopback() {
             anyhow::bail!("server.bind must be loopback; refusing to expose the controller API");
+        }
+        if api_bind.port() == 0 {
+            anyhow::bail!("server.bind must use an explicit non-zero port");
+        }
+        if self.database.url_env.trim().is_empty() {
+            anyhow::bail!("database.url_env must not be empty");
+        }
+        let flow_bind = self
+            .flow
+            .bind_addr
+            .parse::<std::net::IpAddr>()
+            .context("flow.bind_addr must be an IP address")?;
+        if self.flow.enabled && flow_bind.is_unspecified() {
+            anyhow::bail!(
+                "flow.bind_addr must be an explicit management address when flow is enabled"
+            );
         }
         // flow.bucket_seconds is a divisor in flow rate math; enforce >= 1 here
         // once instead of relying on scattered `.max(1)` guards.
         if self.flow.bucket_seconds == 0 {
             anyhow::bail!("flow.bucket_seconds must be >= 1");
+        }
+        if self.flow.enabled && self.flow.bind_port == 0 {
+            anyhow::bail!("flow.bind_port must be non-zero when flow is enabled");
+        }
+        if self.flow.enabled && self.flow.sflow_enabled && self.flow.sflow_port == 0 {
+            anyhow::bail!("flow.sflow_port must be non-zero when sFlow is enabled");
+        }
+        if self.flow.enabled
+            && self.flow.sflow_enabled
+            && self.flow.bind_port == self.flow.sflow_port
+        {
+            anyhow::bail!("flow.bind_port and flow.sflow_port must be different");
+        }
+        if self.flow.automatic_actions_enabled && !self.flow.allowlist_enrolled_only {
+            anyhow::bail!("flow automatic actions require flow.allowlist_enrolled_only = true");
+        }
+        if self.flow.top_k_talkers == 0 || self.flow.top_k_talkers > 65_536 {
+            anyhow::bail!("flow.top_k_talkers must be in 1..=65536");
+        }
+        if self.flow.default_sampling_rate == 0 {
+            anyhow::bail!("flow.default_sampling_rate must be >= 1");
+        }
+        let min = self.flow.snmp_corroboration_min_ratio;
+        let max = self.flow.snmp_corroboration_max_ratio;
+        if !min.is_finite() || !max.is_finite() || min <= 0.0 || min > 1.0 || max < 1.0 || min > max
+        {
+            anyhow::bail!("flow SNMP corroboration ratios must satisfy 0 < min <= 1 <= max");
+        }
+        if self.auth.session_ttl_hours == 0
+            || self.auth.remember_me_ttl_hours == 0
+            || self.auth.idle_timeout_minutes == 0
+            || self.auth.pre_2fa_ttl_minutes == 0
+        {
+            anyhow::bail!("auth session and 2FA timeouts must be non-zero");
+        }
+        if self.auth.remember_me_ttl_hours < self.auth.session_ttl_hours {
+            anyhow::bail!("auth.remember_me_ttl_hours must not be shorter than session_ttl_hours");
+        }
+        if self.auth.lockout_threshold == 0 || self.auth.lockout_minutes == 0 {
+            anyhow::bail!("auth lockout threshold and duration must be non-zero");
+        }
+        if self.safety.global_action_rate_limit_count > 0
+            && self.safety.global_action_rate_limit_window_seconds == 0
+        {
+            anyhow::bail!("the global action rate-limit window must be non-zero");
+        }
+        if self.telemetry.stale_after_seconds == 0
+            || self.telemetry.reachability_interval_seconds == 0
+            || self.telemetry.metrics_rollup_seconds == 0
+        {
+            anyhow::bail!(
+                "telemetry rollup, freshness, and reachability intervals must be non-zero"
+            );
+        }
+        if self.telemetry.jitter_percent > 90 {
+            anyhow::bail!("telemetry.jitter_percent must be in 0..=90");
+        }
+        if self.detection.default_consecutive_samples == 0
+            || self.detection.default_min_duration_seconds == 0
+            || self.detection.default_min_duration_seconds > u32::MAX as u64
+        {
+            anyhow::bail!("detection defaults must be non-zero and fit their rule columns");
+        }
+        if self.detection.deprecated_hysteresis_seconds.is_some() {
+            tracing::warn!(
+                event_type = "deprecated_config_key",
+                key = "detection.hysteresis_seconds",
+                "ignored: configure recovery persistence on each rule instead"
+            );
         }
         Ok(())
     }
@@ -327,5 +426,45 @@ impl Config {
     pub fn database_url(&self) -> Result<String> {
         std::env::var(&self.database.url_env)
             .with_context(|| format!("env {} not set", self.database.url_env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn shipped_example_parses_and_validates() {
+        let cfg: Config = toml::from_str(include_str!("../config.example.toml"))
+            .expect("parse config.example.toml");
+        cfg.validate().expect("validate config.example.toml");
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let raw = include_str!("../config.example.toml").replace(
+            "automatic_actions_enabled = false",
+            "automatic_actions_enabled = false\nautomatic_action_enabled = true",
+        );
+        assert!(toml::from_str::<Config>(&raw).is_err());
+    }
+
+    #[test]
+    fn conflicting_flow_ports_are_rejected() {
+        let mut cfg = Config::default();
+        cfg.flow.enabled = true;
+        cfg.flow.bind_addr = "192.0.2.10".into();
+        cfg.flow.sflow_enabled = true;
+        cfg.flow.sflow_port = cfg.flow.bind_port;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_flow_rejects_wildcard_bind() {
+        let mut cfg = Config::default();
+        cfg.flow.enabled = true;
+        assert!(cfg.validate().is_err());
+        cfg.flow.bind_addr = "192.0.2.10".into();
+        assert!(cfg.validate().is_ok());
     }
 }

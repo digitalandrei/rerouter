@@ -389,7 +389,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
 
           <label className="block space-y-1 text-sm font-medium">
             SNMP community string
-            <input className={inputClass} value={form.community} onChange={(e) => setField("community", e.target.value)} placeholder="leave blank to keep stored value" autoComplete="off" />
+            <input type="password" className={inputClass} value={form.community} onChange={(e) => setField("community", e.target.value)} placeholder="leave blank to keep stored value" autoComplete="new-password" />
           </label>
 
           <div className="space-y-4 rounded-md border border-border p-4">

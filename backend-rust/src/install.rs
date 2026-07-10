@@ -55,7 +55,7 @@ TWO_FACTOR_ISSUER=Rerouter
 
 # --- Generated at install time (32 random bytes hex each) — do not share ---------
 # SESSION_SECRET signs/authenticates session cookies (DB-backed sessions table).
-# SECRETS_KEY is the AES-256-GCM key for provider credentials encrypted at rest.
+# SECRETS_KEY encrypts device, TOTP, and webhook secrets at rest with AES-256-GCM.
 SESSION_SECRET={session_secret}
 SECRETS_KEY={secrets_key}
 ";
@@ -223,42 +223,67 @@ pub async fn create_admin(
     let email = match email {
         Some(v) => v,
         None => prompt("Admin email")?,
-    };
+    }
+    .trim()
+    .to_lowercase();
     let name = match name {
         Some(v) => v,
         None => prompt("Admin name")?,
-    };
+    }
+    .trim()
+    .to_string();
+    anyhow::ensure!(!email.is_empty(), "admin email must not be empty");
+    anyhow::ensure!(!name.is_empty(), "admin name must not be empty");
 
-    let existing: Option<u64> = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
-        .bind(&email)
-        .fetch_optional(pool)
-        .await
-        .context("looking up existing user")?;
+    let existing: Option<(u64, bool)> =
+        sqlx::query_as("SELECT id, two_factor_confirmed_at IS NOT NULL FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(pool)
+            .await
+            .context("looking up existing user")?;
+
+    let mut enrollment_code: Option<String> = None;
 
     let (user_id, created) = match existing {
-        Some(id) => (id, false),
+        Some((id, confirmed)) => {
+            if !confirmed {
+                let code = crate::auth::sessions::generate_token();
+                sqlx::query(
+                    "UPDATE users SET two_factor_enrollment_token_hash = ?, last_totp_step = NULL WHERE id = ?",
+                )
+                    .bind(crate::auth::sessions::hash_token(&code))
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .context("rotating admin enrollment code")?;
+                enrollment_code = Some(code);
+            }
+            (id, false)
+        }
         None => {
             let plain = match password_plain {
                 Some(v) => v,
-                // No extra crates allowed for no-echo input — warn instead.
-                None => prompt(
-                    "Admin password (input will echo; prefer --admin-password/ADMIN_PASSWORD)",
-                )?,
+                None => prompt_password("Admin password")?,
             };
             anyhow::ensure!(
                 plain.len() >= 12,
                 "admin password must be at least 12 characters"
             );
             let phc = password::hash(&plain)?;
+            let code = crate::auth::sessions::generate_token();
             let res = sqlx::query(
-                "INSERT INTO users (name, email, password, two_factor_confirmed_at) VALUES (?, ?, ?, NULL)",
+                "INSERT INTO users \
+                 (name, email, password, two_factor_confirmed_at, two_factor_enrollment_token_hash) \
+                 VALUES (?, ?, ?, NULL, ?)",
             )
             .bind(&name)
             .bind(&email)
             .bind(&phc)
+            .bind(crate::auth::sessions::hash_token(&code))
             .execute(pool)
             .await
             .context("inserting admin user")?;
+            enrollment_code = Some(code);
             (res.last_insert_id(), true)
         }
     };
@@ -286,6 +311,10 @@ pub async fn create_admin(
         );
     } else {
         println!("user '{email}' already exists (id {user_id}); password left unchanged");
+    }
+    if let Some(code) = enrollment_code {
+        println!("one-time 2FA enrollment code: {code}");
+        println!("deliver it separately from the temporary password; it is shown only here");
     }
     if role_rows > 0 {
         println!("attached role 'superadmin' to user id {user_id}");
@@ -383,6 +412,35 @@ fn prompt(label: &str) -> Result<String> {
     std::io::stdin()
         .read_line(&mut line)
         .context("reading stdin")?;
+    let value = line.trim().to_string();
+    anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
+    Ok(value)
+}
+
+fn prompt_password(label: &str) -> Result<String> {
+    struct EchoGuard;
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("stty").arg("echo").status();
+            println!();
+        }
+    }
+
+    print!("{label}: ");
+    std::io::stdout().flush().context("flushing stdout")?;
+    anyhow::ensure!(
+        Command::new("stty")
+            .arg("-echo")
+            .status()
+            .context("disabling terminal echo")?
+            .success(),
+        "could not disable terminal echo; pass --admin-password or ADMIN_PASSWORD instead"
+    );
+    let _guard = EchoGuard;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading password")?;
     let value = line.trim().to_string();
     anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
     Ok(value)

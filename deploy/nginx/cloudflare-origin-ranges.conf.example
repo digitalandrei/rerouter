@@ -1,0 +1,7 @@
+# Generate /etc/nginx/snippets/rerouter-cloudflare-origin-ranges.conf from
+# https://www.cloudflare.com/ips and keep it updated. For every published CIDR,
+# emit the allow directive below. Keep Nginx's connection address unchanged so
+# this ACL evaluates the Cloudflare proxy, not the restored end-client address.
+# This example is intentionally non-routable and must not be installed verbatim.
+
+allow 192.0.2.0/24;

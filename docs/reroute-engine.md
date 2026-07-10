@@ -42,6 +42,10 @@ Each template defines:
 - `verification_json` — the read-back `show` check (see shape below);
 - optional `rollback_template` (how to undo).
 
+`automatic_allowed` is enforced, not descriptive metadata. New templates start
+manual-only. Route-map changes and interface shutdown/no-shutdown remain
+manual-only; only the explicitly seeded allowlist may run from an automatic rule.
+
 ### Plan / verification shape (device_cli)
 
 Every `device_cli` template stores its commands as JSON, not free text:
@@ -80,6 +84,12 @@ blackhole_prefix      ip route {prefix_net} {prefix_mask} Null0 tag {tag}
 blackhole_withdraw    no ip route {prefix_net} {prefix_mask} Null0 tag {tag}
                       verify: show ip route {prefix_net} -> reject "Null0"
 
+null_route_prefix_v6 / null_route_withdraw_v6
+blackhole_prefix_v6 / blackhole_withdraw_v6
+                      IPv6 siblings of the four templates above, using
+                      `ipv6 route {prefix} Null0 [tag {tag}]` and `/128` host
+                      auto-targets. Verification uses `show ipv6 route`.
+
 bgp_session_enable    router bgp {local_asn} ; no neighbor {neighbor_ip} shutdown
                       Bring a BGP neighbor up — e.g. start the GRE scrubber
                       session so routes announce and traffic diverts.
@@ -108,26 +118,36 @@ bgp_advertise_remove  no ip prefix-list {prefix_list_name} permit {prefix}
                       verify: show ip bgp neighbors {neighbor_ip} advertised-routes
                               -> reject "{prefix_net}"
 
+bgp_route_map_set     router bgp {local_asn} ; neighbor {neighbor_ip} route-map
+                      {route_map} {direction}
+                      Restores the exact previously discovered assignment on
+                      rollback (or unsets when none existed). Route-map changes
+                      are manual-only and require fresh peer/map inventory.
+
 iface_tcp_adjust_mss  interface {interface} ; ip tcp adjust-mss {mss}
                       MSS clamp (default 1436) applied when a rule activates.
                       verify: show running-config interface {interface}
+                                      | include ip tcp adjust-mss
                               -> expect "ip tcp adjust-mss {mss}"
                       rollback: iface_tcp_adjust_mss_remove
 
 iface_tcp_adjust_mss_remove
                       interface {interface} ; no ip tcp adjust-mss
                       verify: show running-config interface {interface}
-                              -> reject "adjust-mss"
+                                      | include ip tcp adjust-mss
+                              -> reject "ip tcp adjust-mss"
 
 iface_shutdown        interface {interface} ; shutdown    (DISRUPTIVE)
                       verify: show interfaces {interface}
                               -> expect "administratively down"
                       rollback: iface_no_shutdown
+                      manual-only (automatic_allowed = false)
                       Blocked on interfaces flagged `protected` (see below).
 
 iface_no_shutdown     interface {interface} ; no shutdown
                       verify: show interfaces {interface}
                               -> reject "administratively down"
+                      manual-only (automatic_allowed = false)
 ```
 
 `plan_json` supports an optional `exec_after` array — privileged EXEC commands
@@ -141,13 +161,12 @@ verification and rollback — not a single composite template.
 
 **Protected-interface guard.** `device_interfaces.protected` flags the device's
 management / transit / SSH path. Before executing a template that targets an
-interface (any param with `source: "interface_name"` — `iface_shutdown`,
-`iface_tcp_adjust_mss*`), the executor resolves the interface and **blocks** if it
-is protected, returning a `blocked_reason` and pushing nothing. This prevents the
-controller from cutting or black-holing its own path to the device. Set the flag
-via `PATCH /api/interfaces/{id}/protected` (`manage_devices`). Every disruptive
-command shape above is also gated by the fail-closed `ssh::command_allowed`
-allowlist.
+interface (`iface_shutdown` or `iface_tcp_adjust_mss`), the executor resolves the
+interface and **blocks** if it is protected, returning a `blocked_reason` and
+pushing nothing. Corrective inverses (`iface_no_shutdown` and MSS removal) may
+restore a protected path. Set the flag via
+`PATCH /api/interfaces/{id}/protected` (`manage_devices`). Every command shape
+above is also gated by the fail-closed `ssh::command_allowed` allowlist.
 
 Disruptive templates are paired with their inverse via `rollback_template_id`.
 The old `cloudflare_under_attack` / `flowspec_drop` / `divert_to_scrubber`
@@ -161,9 +180,9 @@ planned -> pending -> running -> verifying -> succeeded
                              \-> uncertain
 ```
 
-Persist state **before and after every step**. `action_outputs` stores each
-step's command/API call, response, and status. Never treat "API/announce sent" as
-success — move to `verifying` and confirm the routing/zone state actually changed.
+Persist state **before and after every step**. `reroute_outputs` stores each
+step's command, response, and status. Never treat "command sent" as success:
+move to `verifying` and confirm the routing state actually changed.
 
 ## Safety gates (checked again at execution time)
 
@@ -175,8 +194,12 @@ a router, not an asset/prefix). Any failure aborts and logs:
   here and returns the would-run plan instead (see "Operating mode" above);
 - not a dry-run request (dry-run renders the plan only, even in enforce mode);
 - no global maintenance lock;
-- the target **device** is not locked (a prior uncertain/failed action that needs
-  admin acknowledgement locks it);
+- all inventory-backed values resolve to canonical, fresh device inventory
+  (24h for SNMP interface/BGP data, 48h for SSH routing context); Null0/RTBH
+  targets must be contained in recently discovered announced space and RTBH tags
+  must exist in the approved catalog;
+- the target **device** is not locked (an uncertain action or crash recovery
+  locks it until acknowledgement);
 - no other action is already running on this device;
 - no unresolved (`uncertain`) prior action on this device;
 - the device is not inside its post-action cooldown window;
@@ -199,6 +222,8 @@ a router, not an asset/prefix). Any failure aborts and logs:
   15, or reached `#` but was denied a required command — `last_ssh_error` names them;
   an actionable config fix, still NOT reroute-usable) / `unreachable` — for display
   and to keep the recency window warm. See `reroute::reachability`;
+- **host identity:** first-contact SSH key pinning must commit successfully before
+  a configuration action can run; a concurrent or later mismatch fails closed;
 - **stability (AUTOMATIC only):** a device must have been *continuously*
   SSH-reachable for the **stability window** (`STABILITY_WINDOW`, 5 min) before
   automatic mitigations targeting it resume — so a just-recovered or flapping
@@ -211,14 +236,15 @@ a router, not an asset/prefix). Any failure aborts and logs:
   unaffected: rules still fire and alert; only the mitigation action is gated (its
   `blocked_reason` shows in the fired-rule alert's `executed_actions`);
 - for manual: the caller has `trigger_manual_reroute` (enforced by the API before
-  it calls the executor), with an optional reason recorded for the audit log.
+  it calls the executor), with an optional reason recorded for the audit log. In
+  enforce mode the caller must also consume a five-minute, single-use token bound
+  to the exact server-rendered plan, audit reason, user, and action scope.
 
-For automatic triggers, the *rule* decides: the firing edge only auto-executes in
-enforce mode when the rule's `automatic_reroute_enabled` is on. There is no
-permitted-prefix-range gate and no re-auth / typed confirmation step (those were
-de-scoped along with the multi-provider model and the `safety_level`
-classification). The reachability gate above is a control-plane (SSH) preflight,
-distinct from the de-scoped multi-provider "provider reachability".
+For automatic triggers, the firing edge only auto-executes in enforce mode when
+the global switch, rule switch, and template `automatic_allowed` policy are all
+on. Prefix containment and fresh inventory are hard gates. Per-action password/
+TOTP re-auth and typed-text confirmation remain de-scoped; global arming requires
+step-up authentication and manual execution requires the exact-preview token.
 
 ## Cooldowns & rate limit
 
@@ -236,13 +262,15 @@ global_action_rate_limit_count      3   global circuit breaker: at most N execut
 Per-device and per-rule cooldowns are recorded in the `cooldowns` table
 (scope `device` / `rule`); the global limit counts actual `reroutes` rows in the
 window. Set any value to `0` (cooldowns) or the count to `0` (rate limit) to
-disable that throttle. These apply to manual and automatic actions alike.
+disable that throttle. These apply to manual and automatic actions. Corrective
+rollback bypasses cooldown/rate throttles but still obeys mode, maintenance and
+device locks, reachability, serialization, persistence, and verification.
 
 ## Locks
 
 Lock scopes: the device-CLI engine uses the `device` scope (and `global`). Locks
-can be manual, automatic after a failed
-action, automatic after crash recovery, or automatic after action uncertainty. A
+can be manual, automatic after crash recovery, or automatic after action
+uncertainty. A
 locked scope blocks all reroutes touching it until cleared (admin ack for
 safety-induced locks).
 
@@ -254,15 +282,20 @@ Manual reroutes are first-class:
 1. User selects a reroute template and one or more target routers (devices).
 2. User fills parameters per target (guided by ASN / neighbor / prefix / RTBH
    pickers; the scrubber neighbor IP, say, can differ per router).
-3. SPA renders the exact would-run commands + verification per target.
-4. The Rust API checks the caller has `trigger_manual_reroute` and records the
-   optional reason. (No re-auth / TOTP / typed-confirmation step — de-scoped.)
-5. For each target the controller re-checks all device-scoped safety gates and
+3. SPA asks the execution endpoint for the exact would-run commands,
+   verification, and rollback plan per target.
+4. In enforce mode the API stores a five-minute hash of that plan and returns a
+   one-time preview token. Execute must present it; the server renders a fresh
+   plan and atomically consumes the token only when the plan is unchanged.
+5. The Rust API checks `trigger_manual_reroute` and records the optional reason.
+6. For each target the controller re-checks all device-scoped safety gates and
    runs the executor independently (multi-router fan-out; one device locked or in
    cooldown is skipped without blocking the others).
-6. Controller pushes the config over SSH, capturing every step's output.
-7. Controller verifies the resulting state with a read-only `show`.
-8. UI shows result + raw output; audit log records everything; email alert sent.
+7. Controller persists the planned row, audit, and started alert before SSH, then
+   pushes config while capturing every step's output.
+8. Controller verifies the resulting state with a read-only `show`.
+9. UI shows result + raw output; the audit log records everything; configured
+   email/Teams deliveries are queued asynchronously.
 ```
 
 Manual reroutes support **dry-run**: render the exact plan without changing any
@@ -286,6 +319,10 @@ deliberate operator action — but `rule_id` is set, so the per-rule cooldown st
 applies. This is distinct from `automatic_reroute_enabled` (hands-off execution
 on the firing edge); a rule may enable either, both, or neither.
 
+In enforce mode this path also requires a server-rendered dry run and consumes a
+five-minute one-use preview token bound to the action set, reason, rule, and
+operator before execution.
+
 ### Flow auto-target (derive the host from flow data)
 
 A null-route / blackhole action on a **flow rule** (e.g. TCP dport 443) can be
@@ -308,6 +345,10 @@ Guardrails (see [flow-telemetry.md](flow-telemetry.md)):
   execution (doctrine); a manual apply still proceeds (the operator sees the
   resolved IP). Either way the resolved host is rendered into the would-run plan
   before anything runs.
+- **Source corroboration** — flow auto additionally requires its separate config
+  switch, an enrolled exporter source, and a contemporaneous same-interface SNMP
+  sample within the configured ratio band. Network ACL/uRPF protection is still
+  required because UDP source allowlisting is not cryptographic identity.
 - Auto-target is only attachable to a flow rule + a host-route template (enforced
   by the API); the prefix param is resolved, not typed.
 
@@ -318,7 +359,11 @@ Every disruptive template defines a rollback (its paired inverse, via
 is **no** auto-expiry / self-clearing after N minutes (de-scoped: a template
 describes *what* it does, not how long it lasts). Rollback runs against the same
 device + parameters as a fresh audited action, with its own verification, exposed
-as `POST /api/reroutes/{id}/rollback`.
+as `POST /api/reroutes/{id}/rollback`. The original must have reached execution;
+cancelled/pre-command failures cannot be rolled back. A server-rendered dry run
+and one-time preview token are mandatory in enforce mode. Rollbacks are
+serialized per original action, reject an active/already-successful sibling, and
+permit a retry only after a failed rollback.
 
 ## Verification examples
 

@@ -59,8 +59,9 @@ For testing, `--install --prefix /tmp/x` installs under a prefix instead of
 
 Then:
 
-**1. Fill in `/srv/rerouter/.env`.** Only `DATABASE_URL` and the `SMTP_*`
-values need editing — the session/secret keys are auto-generated:
+**1. Fill in `/srv/rerouter/.env`.** `DATABASE_URL` is required. Configure
+`SMTP_*` when email delivery is desired; Teams can be configured later in the UI.
+The session/secret keys are auto-generated:
 
 ```bash
 sudo vi /srv/rerouter/.env   # DATABASE_URL + SMTP_HOST/PORT/USERNAME/PASSWORD/FROM
@@ -100,7 +101,9 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
 
 Reads `ADMIN_EMAIL` / `ADMIN_NAME` / `ADMIN_PASSWORD` from flags or an
 interactive prompt, Argon2id-hashes the password, inserts the user (idempotent
-on email) with the `admin` role; TOTP 2FA enrollment happens at first login.
+on email) with the `superadmin` role, and prints a separate one-time TOTP
+enrollment code. Deliver that code out of band; the password alone cannot claim
+the first authenticator.
 
 ## CLI reference
 
@@ -116,8 +119,8 @@ rerouter-controller
   --check                     config check, then exit
   --check-db                  DB connectivity/credential check, then exit
   --migrate                   apply pending sqlx migrations, then exit
-  --seed-templates            currently same as --migrate (seeds ship as migrations;
-                              re-seeding deleted templates is a milestone-3 TODO)
+  --seed-templates            apply pending migrations containing seeds (does not
+                              restore rows deleted after their migration ran)
   --create-admin              create the first admin user (needs a working DB);
                               --admin-email/--admin-name/--admin-password, or
                               ADMIN_EMAIL/ADMIN_NAME/ADMIN_PASSWORD env vars, or
@@ -159,11 +162,20 @@ Internet
   Cloudflare can't validate as strict unless you prefer that path.
 - Lock the origin down: allow inbound 443 only from Cloudflare IP ranges
   (`cloudflared` or firewall allowlist), so the origin cannot be hit directly.
+- Reject every HTTP Host except `rerouter.cloudcraft.ro`. A Cloudflare source-IP
+  list covers all Cloudflare customers; without an exact host guard, another
+  proxied zone could point at the origin and reach the default virtual host.
+- Run `sudo deploy/cloudflare/update-origin-ranges.sh`, then `sudo nginx -t`,
+  before enabling the site. The generated, required include emits `allow` for
+  every official IPv4/IPv6 range; the server block ends with `deny all`. Refresh
+  it whenever Cloudflare changes its ranges.
 - Because Cloudflare proxies, the **real client IP** arrives in
-  `CF-Connecting-IP`. Configure Nginx `real_ip` from Cloudflare ranges and
-  forward the header to the controller, which trusts it for login throttling,
-  account lockout, and audit logs — safe because only Cloudflare can reach
-  Nginx and only Nginx can reach the controller.
+  `CF-Connecting-IP`. Keep Nginx's `$remote_addr` as the Cloudflare peer for the
+  source ACL, then forward Cloudflare's header to the controller. Do not combine
+  `real_ip_header` with the same server-level `allow` list: access checks would
+  see the restored end-client address and deny valid traffic. The header is safe
+  to trust after the Cloudflare-only ACL because only Nginx can reach the
+  controller.
 - Caching: cache only the static SPA assets. Bypass cache for `/api/`
   (authenticated, dynamic).
 - Note: in v1 Cloudflare is **only** the CDN/front for this site — it is **not** a
@@ -176,19 +188,24 @@ See [../deploy/cloudflare/README.md](../deploy/cloudflare/README.md).
 
 Example at [../deploy/nginx/rerouter.conf](../deploy/nginx/rerouter.conf). Key
 points: serve `frontend/dist` as the document root with an SPA fallback to
-`index.html`, proxy `location /api/` to `http://127.0.0.1:9277`, restore real
-IP from Cloudflare and forward `CF-Connecting-IP` to the controller, and
-**never** expose the controller on any other path or port.
+`index.html`, proxy `location /api/` to `http://127.0.0.1:9277`, enforce the
+Cloudflare source ACL and then forward `CF-Connecting-IP` to the controller, and
+**never** expose the controller on any other path or port. The example also sets
+HSTS, CSP, clickjacking/content-type protections, bounded proxy timeouts, and
+no-cache for `index.html`. API responses carry `Cache-Control: no-store`, and the
+proxy explicitly bypasses any configured Nginx cache.
 
 ## systemd
 
 One unit, written by `--install` to
 `/etc/systemd/system/rerouter-controller.service` and mirrored verbatim at
-[../deploy/systemd/rerouter-controller.service](../deploy/systemd/):
+[../deploy/systemd/rerouter-controller.service](../deploy/systemd/rerouter-controller.service):
 
 - `rerouter-controller.service` — the Rust binary, hardened
-  (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
-  `ReadWritePaths=/srv/rerouter`), running as user `rerouter` from
+  (`NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`, `ProtectSystem=strict`,
+  hidden `/proc`, a read-only application directory, empty capability sets,
+  restricted address families/namespaces/syscalls and native syscall ABI only),
+  running as user `rerouter` from
   `/srv/rerouter` with `EnvironmentFile=/srv/rerouter/.env`. It serves the
   API, runs the alert dispatcher, and executes reroutes; there is no separate
   queue worker.
@@ -211,7 +228,8 @@ Everything lives in `/srv/rerouter/`, owned by `rerouter`:
 - `/srv/rerouter/config.toml` — controller config (see
   [../backend-rust/config.example.toml](../backend-rust/config.example.toml)).
   If the file is missing, the controller falls back to built-in defaults that
-  exactly mirror `config.example.toml` and logs a warning.
+  exactly mirror `config.example.toml` and logs a warning. Unknown keys and
+  invalid listener/safety combinations fail validation rather than being ignored.
 
 The `.env` is loaded via `--env-file` (dotenvy); real process environment
 always wins. Never commit secrets to Git, and never overwrite an operator's
@@ -227,8 +245,12 @@ always wins. Never commit secrets to Git, and never overwrite an operator's
 4. Frontend: `npm ci && npm run build` in `frontend/`; deploy `frontend/dist`
    to the Nginx document root.
 5. Nginx + Cloudflare origin cert; restrict origin to Cloudflare IPs.
-6. Create the first admin (`--create-admin`); verify SPA login + 2FA works
-   end-to-end; `GET /api/health` returns OK through the proxy and on
-   localhost.
+6. Create the first superadmin (`--create-admin`); verify SPA login + 2FA works
+   end-to-end; `GET /api/health` confirms process liveness and `GET /api/ready`
+   confirms database readiness through the proxy and on localhost.
+
+If the flow collector is enabled, separately allow UDP 2055 and/or 6343 only
+from exporter management addresses. The web-origin Cloudflare allowlist does not
+protect those UDP listeners; enforce router-to-collector ACL/uRPF controls.
 
 Day-2 operations: [operations-runbook.md](operations-runbook.md).

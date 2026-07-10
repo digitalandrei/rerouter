@@ -1,79 +1,95 @@
-# Authentication & Two-Factor (2FA)
+# Authentication and Two-Factor Authentication
 
-Users must log in to view data. Login is **password + TOTP 2FA**. This document
-covers the login flow, TOTP enrollment, recovery codes, and lockout.
+Every UI/API user authenticates with a password and a second factor. The Rust
+controller owns password verification, TOTP enrollment, recovery codes, session
+revocation, throttling, and audit events.
 
-## Stack
+## Security properties
 
-- Authentication lives in the Rust controller (`rerouter-controller`, axum):
-  session auth backed by a DB `sessions` table, with secure + httponly + SameSite
-  cookies signed with `SESSION_SECRET`.
-- Password hashing with **Argon2id**.
-- TOTP via `totp-rs` — RFC 6238, 30s step, SHA-1, 6 digits, issuer "Rerouter",
-  compatible with Google Authenticator / Authy / 1Password.
-- MariaDB stores users, sessions, and 2FA material (encrypted secret + hashed
-  recovery codes). The schema is owned by sqlx migrations in
-  `backend-rust/migrations/`.
-- The SPA (see [architecture.md](architecture.md)) talks to the auth endpoints
-  (`/api/auth/login`, `/api/auth/totp`, `/api/auth/logout`, `/api/auth/me`)
-  with credentialed fetch; the session cookie is the only client-side state.
-
-## User table additions
-
-On top of the standard `users` columns:
-
-```text
-two_factor_secret            (encrypted, nullable)
-two_factor_recovery_codes    (encrypted JSON array, nullable)
-two_factor_confirmed_at      (timestamp, nullable)
-two_factor_enforced          (bool, default true)
-failed_login_attempts        (int, default 0)
-locked_until                 (timestamp, nullable)
-last_login_at                (timestamp, nullable)
-last_login_ip                (varchar)   -- CF-Connecting-IP
-```
+- Passwords use Argon2id. TOTP secrets and device credentials use AES-256-GCM
+  under `SECRETS_KEY`.
+- Recovery codes are one-time values stored only as Argon2id hashes in a JSON
+  array. They are never recoverable from the database.
+- Browser cookies contain only a random session token. The database stores its
+  SHA-256 hash; `SESSION_SECRET` signs the cookie. Cookies are `HttpOnly`,
+  `Secure` by default, `SameSite=Strict`, and scoped to `/`.
+- Unsafe methods reject browser requests marked `same-site` or `cross-site` and
+  reject an `Origin` authority that differs from `Host`. This covers hostile
+  sibling subdomains in addition to the cookie's cross-site CSRF protection;
+  non-browser clients may omit both headers.
+- Normal sessions have a 12-hour absolute TTL (7 days with Remember me) and a
+  60-minute idle timeout by default. Password-only pre-2FA sessions expire after
+  10 minutes. All values are configurable under `[auth]`.
+- Login failures are throttled by normalized email and trusted real client IP.
+  Account lockout updates are transactional and race-safe.
 
 ## Login flow
 
 ```text
-1. POST /api/auth/login (email + password) over HTTPS (Cloudflare -> Nginx -> controller).
-2. Throttle by email + real IP. On repeated failure, increment
-   failed_login_attempts; lock account when threshold exceeded.
-3. If password OK and 2FA confirmed -> respond with a TOTP challenge.
-4. POST /api/auth/totp; verify within the allowed window (±1 step). On success,
-   create a `sessions` row, issue the session cookie, record
-   last_login_at / last_login_ip, reset failed_login_attempts.
-5. If 2FA not yet enrolled -> force enrollment before granting access
-   (the SPA's /login page runs first-login enrollment).
+1. POST /api/auth/login with email, password, and optional Remember me.
+2. The controller checks the per-IP throttle and account lock, verifies Argon2id,
+   then issues a short-lived pre-2FA session. It never grants API access yet.
+3. POST /api/auth/totp with a live six-digit TOTP or an unused recovery code.
+4. On success, the same session is promoted to fully authenticated, login state
+   is updated, and the normal session cookie lifetime is applied.
+5. Logout or an administrator's 2FA reset expires server-side sessions
+   immediately; deleting a browser cookie is not the revocation boundary.
 ```
 
-## TOTP enrollment
+TOTP uses RFC 6238, SHA-1, six digits, a 30-second period, and a +/-1 step
+verification window. An accepted time-step counter is advanced under a user-row
+lock, so the same or an older TOTP cannot be replayed concurrently or in another
+session. The issuer defaults to `Rerouter`.
+
+## First enrollment
+
+A password alone cannot claim an unconfirmed account's authenticator. User
+creation, administrator 2FA reset, and `--create-admin` each generate a separate
+high-entropy enrollment code. Only its SHA-256 hash is stored; the plaintext is
+shown once and must be delivered out of band.
 
 ```text
-1. Generate a random base32 secret; store encrypted (unconfirmed).
-2. Show otpauth:// QR for issuer "Rerouter" + the user's email.
-3. User submits a code from their authenticator.
-4. On verify, set two_factor_confirmed_at and generate 8 single-use recovery
-   codes (show once, store hashed).
+1. The user signs in with their password and supplies the one-time enrollment code.
+2. The controller creates an encrypted, unconfirmed TOTP secret and returns its
+   otpauth URI/QR data.
+3. The user submits a live authenticator code.
+4. The controller confirms TOTP, consumes the enrollment credential, creates
+   eight recovery codes, and returns those codes once.
 ```
 
-## Recovery codes
+Legacy unconfirmed accounts with no enrollment-token hash must be reset by a
+superadmin or rotated through `--create-admin` before they can enroll.
 
-- 8 codes, single-use, stored hashed (encrypted JSON of hashes).
-- Using a recovery code consumes it and should email the user (security event).
-- Admins can reset a user's 2FA (audited); reset forces re-enrollment at next login.
+## Recovery and reset
+
+- A recovery code is consumed under `SELECT ... FOR UPDATE`, so concurrent
+  requests cannot spend the same code twice.
+- Successful recovery writes `2fa_recovery_used` to the audit log and queues a
+  security alert. Delivery depends on configured alert recipients/channels.
+- A superadmin reset clears TOTP and recovery codes, expires all sessions, and
+  returns a new one-time enrollment code. The reset and session revocation commit
+  atomically with their audit row.
+
+## Step-up for arming
+
+There is no general `/api/auth/reauth` endpoint and reroute previews do not rely
+on persisted re-auth state. The two global arming changes, `observe` to `enforce`
+and enabling automatic actions, require a fresh password and TOTP in the settings
+request itself. Disarming does not. Failed step-up attempts are audited and
+rate-limited with the authentication failure controls.
 
 ## Audit events
 
-`login_success`, `login_failed`, `account_locked`, `2fa_enrolled`,
-`2fa_failed`, `2fa_recovery_used`, `2fa_reset_by_admin`, `logout`. Each carries
-actor, real client IP, and user-agent.
+The controller records `login_success`, `login_failed`, `account_locked`,
+`2fa_enrolled`, `2fa_enrollment_failed`, `2fa_failed`, `2fa_recovery_used`,
+`user_2fa_reset`, `logout`, and persistence-failure variants where applicable.
+Events carry the actor/user, trusted client IP, and user-agent when available.
 
-## Cloudflare note
+## Proxy trust
 
-Because the app is proxied, the real client IP arrives in `CF-Connecting-IP`.
-Throttling, lockout, and audit must use that header. The controller trusts it
-because the only path to it is Cloudflare -> Nginx (origin locked to Cloudflare
-IP ranges) -> loopback proxy to `127.0.0.1:9277`; only Cloudflare can reach
-Nginx and only Nginx can reach the controller. See
+Nginx accepts origin traffic only from current Cloudflare ranges while preserving
+the connecting proxy in `$remote_addr`. Only after that ACL passes does it forward
+Cloudflare's overwritten `CF-Connecting-IP` value to the loopback API. The
+controller validates that value as an IP before using it. Never expose the Rust
+listener directly or forward the header without the proxy-source ACL. See
 [deployment.md](deployment.md).

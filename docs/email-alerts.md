@@ -17,7 +17,7 @@ An alert (an `alerts` row) is generated on:
   crossed its threshold above/below for the configured settle window; the payload
   carries the device, interface, rule, metric/observed value, and — in observe
   mode — the rendered would-run action plan;
-- reroute lifecycle: `reroute_planned` / `reroute_started` / `reroute_succeeded`
+- reroute lifecycle: `reroute_started` / `reroute_succeeded`
   / `reroute_failed`; the payload carries the **actor** (who — for manual and
   rollback triggers), the exact **commands run**, and the **rollback** commands to
   undo the action by hand. `rollback` runs are reroute events with
@@ -28,14 +28,17 @@ An alert (an `alerts` row) is generated on:
   traffic-moving actions), so they are emitted as alerts with the **actor** and the
   before → after values, and are in `ALWAYS_IMMEDIATE` (page right away). They are
   still audited too;
-- security events: `2fa_recovery_used`, `account_locked`.
+- security events: `2fa_recovery_used`, `account_locked`;
+- controller degradation: `automatic_action_failed`, `recovery_degraded`, and
+  `alert_delivery_permanently_failed`.
 
 > Device-unreachable / telemetry-stale show up via `GET /api/status`
 > (`telemetry_stale_count`) and stale UI state rather than a dedicated alert email.
 > Safety-lock create/clear and uncertain-acknowledge remain audit-log only.
 
-Each alert type has a default severity and can be enabled/disabled per recipient
-via subscriptions (by **role** and/or **event type**).
+Each alert type has a default severity and can be routed per recipient by event
+type (NULL means all). Critical alerts additionally include verified recipients
+linked to admin/superadmin users.
 
 ## Pipeline
 
@@ -66,19 +69,24 @@ an alert; the dispatcher resumes from unsent rows.
 
 Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 
-- collapse repeats with the same `alerts.dedup_key` (per event type + the firing
-  device/rule, or user for security events) within a window (default 10 min) into
-  one email, with an occurrence count;
-- per-recipient rate cap (default max 20 emails / hour) with a digest fallback;
-- always send `reroute_uncertain`, `reroute_failed`, and security events
-  immediately (these are never collapsed away).
+- suppress a repeat delivery to the same target when the same `dedup_key` was
+  delivered within the default 10-minute window; every source `alerts` row
+  remains durable and the suppression is recorded in `alert_deliveries`;
+- per-recipient/endpoint rate cap (default max 20/hour). A rate-limited delivery
+  remains retryable after backoff; there is no digest implementation;
+- retry transport failures with backoff, without discarding alerts merely because
+  they are old. After five failed attempts, create a critical
+  `alert_delivery_permanently_failed` meta-alert (without recursive meta-alerts);
+- always send uncertain/failed reroutes, arming changes, automatic-action or
+  startup-recovery degradation, and security events immediately. These bypass
+  de-duplication and rate limits.
 
 ## Recipients & subscriptions
 
 - Recipients are users (or external addresses) with verified email
   (`alert_recipients`).
-- Subscriptions (`alert_subscriptions`): by role (e.g. all `operator`s) and/or by
-  event type (a NULL event type matches all).
+- Subscriptions (`alert_subscriptions`): by event type (a NULL event type matches
+  all).
 - Critical alerts (`uncertain`, `failed`, security events) always fan out to the
   admin tier (`admin` / `superadmin`).
 

@@ -20,20 +20,18 @@ type JsonResp = (StatusCode, Json<Value>);
 /// Event types an operator can route on (kept in sync with the producers).
 pub const EVENT_TYPES: &[&str] = &[
     "rule_fired",
-    "reroute_planned",
     "reroute_started",
     "reroute_succeeded",
     "reroute_failed",
     "reroute_uncertain",
     "operating_mode_changed",
     "automatic_actions_changed",
+    "automatic_action_failed",
+    "recovery_degraded",
     "global_lock_changed",
-    "device_unreachable",
-    "telemetry_stale",
-    "lock_created",
-    "lock_cleared",
     "account_locked",
     "2fa_recovery_used",
+    "alert_delivery_permanently_failed",
 ];
 
 /// GET /api/notifications/event-types — the routable event-type vocabulary.
@@ -48,17 +46,23 @@ pub async fn list_recipients(
     _g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
 ) -> JsonResp {
-    let rows = sqlx::query_as::<_, (u64, String, Option<chrono::DateTime<chrono::Utc>>)>(
+    let rows = match sqlx::query_as::<_, (u64, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT id, email, verified_at FROM alert_recipients \
          WHERE email <> 'unrouted@rerouter.local' ORDER BY email",
     )
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
 
     let mut out = Vec::with_capacity(rows.len());
     for (id, email, verified_at) in rows {
-        let events = subscription_events(&state.pool, "recipient_id", id).await;
+        let events = match subscription_events(&state.pool, "recipient_id", id).await {
+            Ok(events) => events,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
         out.push(json!({
             "id": id,
             "email": email,
@@ -80,56 +84,106 @@ pub struct RecipientBody {
 /// POST /api/notifications/recipients — add an email recipient. Admin-added, so
 /// it is auto-verified (no confirmation email in v1).
 pub async fn add_recipient(
-    _g: RequirePermission<markers::ManageAlerts>,
+    g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
     Json(body): Json<RecipientBody>,
 ) -> JsonResp {
     let email = body.email.trim().to_string();
-    if !email.contains('@') || email.len() > 191 {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "a valid email is required");
+    if email.len() > 191 || email.parse::<lettre::Address>().is_err() {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a valid email is required",
+        );
     }
     if let Some(bad) = invalid_event(&body.event_types) {
         return err(StatusCode::UNPROCESSABLE_ENTITY, &bad);
     }
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "INSERT INTO alert_recipients (email, verified_at) VALUES (?, UTC_TIMESTAMP()) \
          ON DUPLICATE KEY UPDATE verified_at = UTC_TIMESTAMP()",
     )
     .bind(&email)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     let recipient_id = match res {
         Ok(r) if r.last_insert_id() > 0 => r.last_insert_id(),
-        Ok(_) => sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
-            .bind(&email)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0),
+        Ok(_) => {
+            match sqlx::query_scalar::<_, u64>("SELECT id FROM alert_recipients WHERE email = ?")
+                .bind(&email)
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(id) => id,
+                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            }
+        }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
-    replace_subscriptions(
-        &state.pool,
+    if replace_subscriptions(
+        &mut tx,
         "alert_subscriptions",
         "recipient_id",
         recipient_id,
         &body.event_types,
     )
-    .await;
+    .await
+    .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "alert_recipient_saved",
+        "alert_recipient",
+        recipient_id,
+        "alert recipient and subscriptions saved",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
     (StatusCode::CREATED, Json(json!({ "id": recipient_id })))
 }
 
 /// DELETE /api/notifications/recipients/{id}.
 pub async fn remove_recipient(
-    _g: RequirePermission<markers::ManageAlerts>,
+    g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     match sqlx::query("DELETE FROM alert_recipients WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "alert_recipient_deleted",
+                "alert_recipient",
+                id,
+                "alert recipient deleted",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "recipient not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -142,11 +196,14 @@ pub async fn test_recipient(
     Path(id): Path<u64>,
 ) -> JsonResp {
     let email: Option<String> =
-        sqlx::query_scalar("SELECT email FROM alert_recipients WHERE id = ?")
+        match sqlx::query_scalar("SELECT email FROM alert_recipients WHERE id = ?")
             .bind(id)
             .fetch_optional(&state.pool)
             .await
-            .unwrap_or(None);
+        {
+            Ok(email) => email,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
     let Some(email) = email else {
         return err(StatusCode::NOT_FOUND, "recipient not found");
     };
@@ -174,16 +231,22 @@ pub async fn list_webhooks(
     _g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
 ) -> JsonResp {
-    let rows = sqlx::query_as::<_, (u64, String, bool)>(
+    let rows = match sqlx::query_as::<_, (u64, String, bool)>(
         "SELECT id, name, enabled FROM webhook_endpoints ORDER BY name",
     )
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
 
     let mut out = Vec::with_capacity(rows.len());
     for (id, name, enabled) in rows {
-        let events = subscription_events(&state.pool, "endpoint_id", id).await;
+        let events = match subscription_events(&state.pool, "endpoint_id", id).await {
+            Ok(events) => events,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
         out.push(json!({
             "id": id,
             "name": name,
@@ -205,7 +268,7 @@ pub struct WebhookBody {
 
 /// POST /api/notifications/webhooks — register a Teams endpoint.
 pub async fn add_webhook(
-    _g: RequirePermission<markers::ManageAlerts>,
+    g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
     Json(body): Json<WebhookBody>,
 ) -> JsonResp {
@@ -214,54 +277,133 @@ pub async fn add_webhook(
     if name.is_empty() {
         return err(StatusCode::UNPROCESSABLE_ENTITY, "name is required");
     }
-    // A Teams incoming webhook is an HTTPS URL; reject anything else early.
-    if !url.starts_with("https://") {
-        return err(StatusCode::UNPROCESSABLE_ENTITY, "url must be an https:// webhook");
+    if name.len() > 191 || url.len() > 4096 {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "name or url is too long");
+    }
+    if !valid_teams_webhook_url(&url) {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "url must be an official Microsoft Teams/Workflow HTTPS webhook",
+        );
     }
     if let Some(bad) = invalid_event(&body.event_types) {
         return err(StatusCode::UNPROCESSABLE_ENTITY, &bad);
     }
     if !crate::crypto::is_configured() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "secrets key not configured");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "secrets key not configured",
+        );
     }
     let blob = match crate::crypto::seal_str(&url) {
         Ok(b) => b,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not encrypt url"),
+    };
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
     let res = sqlx::query(
         "INSERT INTO webhook_endpoints (kind, name, url_encrypted) VALUES ('teams', ?, ?)",
     )
     .bind(&name)
     .bind(&blob)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     let endpoint_id = match res {
         Ok(r) => r.last_insert_id(),
-        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "a webhook with that name exists"),
+        Err(_) => {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a webhook with that name exists",
+            )
+        }
     };
-    replace_subscriptions(
-        &state.pool,
+    if replace_subscriptions(
+        &mut tx,
         "webhook_subscriptions",
         "endpoint_id",
         endpoint_id,
         &body.event_types,
     )
-    .await;
+    .await
+    .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "webhook_created",
+        "webhook",
+        endpoint_id,
+        "Teams webhook and subscriptions saved",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
     (StatusCode::CREATED, Json(json!({ "id": endpoint_id })))
+}
+
+fn valid_teams_webhook_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    [
+        ".webhook.office.com",
+        ".logic.azure.com",
+        ".powerautomate.com",
+        ".powerplatform.com",
+    ]
+    .iter()
+    .any(|suffix| host.ends_with(suffix))
 }
 
 /// DELETE /api/notifications/webhooks/{id}.
 pub async fn remove_webhook(
-    _g: RequirePermission<markers::ManageAlerts>,
+    g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     match sqlx::query("DELETE FROM webhook_endpoints WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "webhook_deleted",
+                "webhook",
+                id,
+                "Teams webhook deleted",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "webhook not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -304,7 +446,11 @@ fn invalid_event(events: &[String]) -> Option<String> {
 
 /// The routed event types for a recipient/endpoint. Returns `["*"]` when the
 /// subscription is "all events" (a NULL event_type row).
-async fn subscription_events(pool: &sqlx::MySqlPool, fk_col: &str, id: u64) -> Vec<String> {
+async fn subscription_events(
+    pool: &sqlx::MySqlPool,
+    fk_col: &str,
+    id: u64,
+) -> anyhow::Result<Vec<String>> {
     let table = if fk_col == "recipient_id" {
         "alert_subscriptions"
     } else {
@@ -315,43 +461,43 @@ async fn subscription_events(pool: &sqlx::MySqlPool, fk_col: &str, id: u64) -> V
     ))
     .bind(id)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await?;
     if rows.iter().any(|(e,)| e.is_none()) || rows.is_empty() {
-        return vec!["*".to_string()];
+        return Ok(vec!["*".to_string()]);
     }
-    rows.into_iter().filter_map(|(e,)| e).collect()
+    Ok(rows.into_iter().filter_map(|(e,)| e).collect())
 }
 
 /// Replace a recipient/endpoint's subscriptions: clear existing, then insert one
 /// NULL row (all events) when the list is empty, else one row per event type.
 async fn replace_subscriptions(
-    pool: &sqlx::MySqlPool,
+    conn: &mut sqlx::MySqlConnection,
     table: &str,
     fk_col: &str,
     id: u64,
     events: &[String],
-) {
-    let _ = sqlx::query(&format!("DELETE FROM {table} WHERE {fk_col} = ?"))
+) -> anyhow::Result<()> {
+    sqlx::query(&format!("DELETE FROM {table} WHERE {fk_col} = ?"))
         .bind(id)
-        .execute(pool)
-        .await;
+        .execute(&mut *conn)
+        .await?;
     if events.is_empty() {
-        let _ = sqlx::query(&format!(
+        sqlx::query(&format!(
             "INSERT INTO {table} ({fk_col}, event_type) VALUES (?, NULL)"
         ))
         .bind(id)
-        .execute(pool)
-        .await;
+        .execute(&mut *conn)
+        .await?;
     } else {
         for e in events {
-            let _ = sqlx::query(&format!(
+            sqlx::query(&format!(
                 "INSERT INTO {table} ({fk_col}, event_type) VALUES (?, ?)"
             ))
             .bind(id)
             .bind(e)
-            .execute(pool)
-            .await;
+            .execute(&mut *conn)
+            .await?;
         }
     }
+    Ok(())
 }

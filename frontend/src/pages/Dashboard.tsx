@@ -57,11 +57,13 @@ export default function Dashboard() {
     api.settings
       .get()
       .then(setSettings)
-      .catch(() => {});
+      .catch(() => setSettings(null));
   }, []);
 
   useEffect(() => {
     loadData();
+    const timer = setInterval(loadData, 30_000);
+    return () => clearInterval(timer);
   }, [loadData]);
 
   return (

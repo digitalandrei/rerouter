@@ -98,7 +98,9 @@ impl TemplateCache {
         self.templates.is_empty()
     }
     fn get(&self, source_id: u32, template_id: u16) -> Option<&Template> {
-        self.templates.get(&(source_id, template_id)).map(|(t, _)| t)
+        self.templates
+            .get(&(source_id, template_id))
+            .map(|(t, _)| t)
     }
     fn insert(&mut self, source_id: u32, template_id: u16, t: Template) {
         self.tick = self.tick.wrapping_add(1);

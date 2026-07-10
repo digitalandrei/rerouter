@@ -21,8 +21,8 @@ restricts inbound 443 to **Cloudflare IP ranges** and forwards `CF-Connecting-IP
 to the controller, which trusts it as the real client IP for login throttling,
 account lockout, and audit — safe because **only** Cloudflare can reach Nginx and
 **only** Nginx can reach the loopback-bound controller. See
-[../docs/deployment.md](../docs/deployment.md) and
-[../docs/security.md](../docs/security.md).
+[deployment.md](../../docs/deployment.md) and
+[security.md](../../docs/security.md).
 
 That is the whole integration. There is no controller → Cloudflare API egress
 path in v1: no zone-settings edits, no firewall/WAF rule creation, no analytics
@@ -35,10 +35,14 @@ polling. (`docs/telemetry-model.md` lists Cloudflare zone analytics only as a
   token the controller holds. If a token is ever introduced for managing the
   fronting zone, use a **scoped API token** (not the global key), least-privilege,
   and store it as an encrypted secret — never re-expose it in the UI (see
-  [../docs/security.md](../docs/security.md)).
+  [security.md](../../docs/security.md)).
 - Trust `CF-Connecting-IP` **only** over the Cloudflare → Nginx → loopback path.
   Never trust a client-supplied `CF-Connecting-IP` reaching the controller by any
   other route.
+- Keep Nginx's `$remote_addr` as the Cloudflare connection for its origin
+  `allow`/`deny` ACL. Forward Cloudflare's overwritten client header only after
+  that ACL; enabling `real_ip_header` in the same server would make the ACL test
+  the end-client address and reject legitimate traffic.
 
 ## If asked to "reroute through Cloudflare"
 

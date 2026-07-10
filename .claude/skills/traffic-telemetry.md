@@ -1,23 +1,24 @@
 ---
 name: traffic-telemetry
-description: How Rerouter collects and normalizes traffic telemetry — SNMP v2c interface polling (the v1 source) and the read-only NetFlow v9 collector (second source), counter-rate derivation, wrap/reset handling, sampling-rate handling, and on-router verification. 
+description: How Rerouter collects and normalizes traffic telemetry — SNMP v2c interface polling plus passive NetFlow v9/sFlow collection, counter-rate derivation, wrap/reset handling, sampling-rate handling, and on-router verification.
 ---
 
 # Skill: Traffic telemetry
 
 Implementation guidance for the telemetry layer. See
-[../docs/telemetry-model.md](../docs/telemetry-model.md) (rate math) and
-[../docs/flow-telemetry.md](../docs/flow-telemetry.md) (the flow collector).
+[telemetry-model.md](../../docs/telemetry-model.md) (rate math) and
+[flow-telemetry.md](../../docs/flow-telemetry.md) (the flow collector).
 Everything is normalized **per monitored interface**, not per "asset".
 
 ## Sources
 
-- **SNMP v2c interface polling — the v1 source** (`telemetry::snmp`). Read-only,
-  needs no device-side config — exactly what observe mode wants. Polls 64-bit
-  `ifXTable`/`ifTable` counters for interfaces with `enabled_for_monitoring = 1`.
-- **NetFlow v9 collector — second source, off by default** (`telemetry::flow`).
-  A read-only UDP listener that adds per-tuple visibility (top talkers, ports,
-  source ASNs) SNMP can't see. Sampled, so the sampling rate matters.
+- **SNMP v2c interface polling — the primary source** (`telemetry::snmp`).
+  Read-only and polled for every discovered interface. It supplies the
+  authoritative per-interface volume used to corroborate flow automation.
+- **NetFlow v9/sFlow collector — second source, off by default**
+  (`telemetry::flow`). A passive UDP listener that adds per-tuple visibility
+  (top talkers, ports, source ASNs) SNMP cannot provide. Sampled, so the
+  sampling rate matters.
 
 There is **no** continuous BGP feed and **no** Cloudflare analytics source in v1.
 
@@ -52,8 +53,9 @@ too. Detection ignores invalid samples.
 Flow is sampled (e.g. 1:1000). **Multiply** packet/byte counts by the sampling
 rate to estimate real volume; store the rate per exporter and per sample. A wrong
 or missing sampling rate is the #1 cause of false triggers from flow data. The
-collector cross-calibrates flow volume against the SNMP interface counters — see
-[../docs/flow-telemetry.md](../docs/flow-telemetry.md).
+collector cross-calibrates flow volume against fresh same-interface SNMP
+counters. Automatic flow actions require that corroboration in addition to the
+independent flow-auto gate — see [flow-telemetry.md](../../docs/flow-telemetry.md).
 
 ## Staleness
 

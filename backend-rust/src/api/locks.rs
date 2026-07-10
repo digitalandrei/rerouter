@@ -40,26 +40,38 @@ pub async fn create_global(
     let reason = body
         .reason
         .unwrap_or_else(|| "global maintenance lock".into());
-    if locks::create(
-        &state.pool,
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let lock_id = match locks::create_on(
+        &mut tx,
         "global",
+        None,
         None,
         "manual",
         &reason,
         Some(g.session.user_id),
     )
     .await
+    {
+        Ok(id) => id,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "global_lock_created",
+        "lock",
+        lock_id,
+        &reason,
+    )
+    .await
     .is_err()
+        || tx.commit().await.is_err()
     {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
-    audit(
-        &state.pool,
-        g.session.user_id,
-        "global_lock_created",
-        &reason,
-    )
-    .await;
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
@@ -68,26 +80,34 @@ pub async fn clear_global(
     g: RequirePermission<markers::ManageLocks>,
     State(state): State<AppState>,
 ) -> JsonResp {
-    let n = locks::clear(&state.pool, "global", None, Some(g.session.user_id))
-        .await
-        .unwrap_or(0);
-    audit(
-        &state.pool,
-        g.session.user_id,
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let cleared = sqlx::query(
+        "UPDATE locks SET cleared_at = UTC_TIMESTAMP(), cleared_by = ? \
+         WHERE scope = 'global' AND scope_ref IS NULL AND cleared_at IS NULL",
+    )
+    .bind(g.session.user_id)
+    .execute(&mut *tx)
+    .await;
+    let n = match cleared {
+        Ok(result) => result.rows_affected(),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
         "global_lock_cleared",
+        "lock",
+        0,
         &format!("cleared {n} global lock(s)"),
     )
-    .await;
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
     (StatusCode::OK, Json(json!({ "ok": true, "cleared": n })))
-}
-
-async fn audit(pool: &sqlx::MySqlPool, user_id: u64, event: &str, message: &str) {
-    let _ = sqlx::query(
-        "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, message) VALUES ('user', ?, ?, ?)",
-    )
-    .bind(user_id)
-    .bind(event)
-    .bind(message)
-    .execute(pool)
-    .await;
 }

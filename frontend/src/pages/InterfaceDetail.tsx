@@ -137,6 +137,7 @@ export default function InterfaceDetail() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(true);
   const [metricsReady, setMetricsReady] = useState(false);
+  const [metricsError, setMetricsError] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [smoothing, setSmoothing] = useState<SmoothingWindow>(1);
 
@@ -146,7 +147,10 @@ export default function InterfaceDetail() {
     if (!Number.isFinite(ifaceId)) return;
     api.interfaces
       .get(ifaceId)
-      .then(setIface)
+      .then((value) => {
+        setIface(value);
+        setError(null);
+      })
       .catch((err) =>
         setError(err instanceof ApiError ? err.message : "Failed to load interface"),
       )
@@ -157,8 +161,11 @@ export default function InterfaceDetail() {
     if (!Number.isFinite(ifaceId)) return;
     api.interfaces
       .metrics(ifaceId, 60)
-      .then((data) => setSamples(data))
-      .catch(() => setSamples([]))
+      .then((data) => {
+        setSamples(data);
+        setMetricsError(false);
+      })
+      .catch(() => setMetricsError(true))
       .finally(() => setMetricsReady(true));
   }, [ifaceId]);
 
@@ -175,6 +182,7 @@ export default function InterfaceDetail() {
   useEffect(() => {
     setLoading(true);
     setMetricsReady(false);
+    setMetricsError(false);
     setSamples([]);
     loadInterface();
     loadMetrics();
@@ -199,6 +207,16 @@ export default function InterfaceDetail() {
     () => buildChartData(samples, smoothing),
     [samples, smoothing],
   );
+  const newestSampleAt = samples.reduce(
+    (latest, sample) => Math.max(latest, Date.parse(sample.sampled_at) || 0),
+    0,
+  );
+  const freshnessBudgetMs = Math.max(
+    (device?.poll_interval_seconds ?? 30) * 2 * 1_000,
+    90_000,
+  );
+  const telemetryLive =
+    !metricsError && newestSampleAt > 0 && Date.now() - newestSampleAt <= freshnessBudgetMs;
 
   // Optics presence — only render those cards when a transceiver reports values.
   const hasTemp = useMemo(
@@ -405,9 +423,23 @@ export default function InterfaceDetail() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-lg font-semibold">Telemetry — last hour</h2>
         <div className="flex items-center gap-3">
-          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span className="inline-block size-1.5 rounded-full bg-green-500" />
-            live · refreshes every 30 s
+          <span
+            className={`flex items-center gap-1.5 text-xs ${
+              metricsError || !telemetryLive
+                ? "text-amber-700 dark:text-amber-400"
+                : "text-muted-foreground"
+            }`}
+          >
+            <span
+              className={`inline-block size-1.5 rounded-full ${
+                metricsError || !telemetryLive ? "bg-amber-500" : "bg-green-500"
+              }`}
+            />
+            {metricsError
+              ? "refresh failed · showing last data"
+              : telemetryLive
+                ? "live · refreshes every 30 s"
+                : "telemetry stale · refreshes every 30 s"}
           </span>
           <SmoothingControl value={smoothing} onChange={setSmoothing} />
         </div>

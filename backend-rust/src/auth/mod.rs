@@ -44,6 +44,9 @@ struct LoginBody {
     /// "Remember me" — use the longer remember-me TTL (default 7 days).
     #[serde(default)]
     remember: bool,
+    /// Independent one-time code issued by an administrator for first enrollment.
+    #[serde(default)]
+    enrollment_code: Option<String>,
 }
 
 /// POST /api/auth/login — verify email + password (throttled by email + real
@@ -61,6 +64,17 @@ async fn login(
     let ip = client_ip(&headers, Some(&socket));
     let ua = user_agent(&headers);
     let cfg = &state.config.auth;
+    let email = body.email.trim().to_lowercase();
+
+    if ip_throttled(pool, &ip, cfg.lockout_threshold, cfg.lockout_minutes as i64).await {
+        return (
+            jar,
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "too_many_attempts" })),
+            ),
+        );
+    }
 
     // Generic failure response — identical for unknown email and bad password.
     let deny = |jar: SignedCookieJar<Key>| {
@@ -84,18 +98,29 @@ async fn login(
             Option<chrono::DateTime<chrono::Utc>>,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<String>,
+            Option<String>,
         ),
     >(
-        "SELECT id, name, password, two_factor_confirmed_at, locked_until, two_factor_secret \
+        "SELECT id, name, password, two_factor_confirmed_at, locked_until, two_factor_secret, \
+                two_factor_enrollment_token_hash \
          FROM users WHERE email = ?",
     )
-    .bind(&body.email)
+    .bind(&email)
     .fetch_optional(pool)
     .await
     .ok()
     .flatten();
 
-    let Some((user_id, _name, phc, totp_confirmed_at, locked_until, totp_secret_enc)) = row else {
+    let Some((
+        user_id,
+        _name,
+        phc,
+        totp_confirmed_at,
+        locked_until,
+        totp_secret_enc,
+        enrollment_token_hash,
+    )) = row
+    else {
         // Unknown email: same shape + timing-ish as a wrong password.
         let _ = password::verify(&body.password, DUMMY_PHC);
         audit(pool, None, "login_failed", &ip, &ua, "unknown email").await;
@@ -138,6 +163,46 @@ async fn login(
         return deny(jar);
     }
 
+    // First TOTP enrollment requires a second high-entropy code delivered by
+    // the administrator. This keeps a leaked temporary password from claiming
+    // the account and locking out its intended owner.
+    if totp_confirmed_at.is_none() {
+        let supplied = body.enrollment_code.as_deref().map(str::trim);
+        let enrollment_ok =
+            supplied
+                .zip(enrollment_token_hash.as_deref())
+                .is_some_and(|(code, expected)| {
+                    !code.is_empty() && sessions::hash_token(code) == expected
+                });
+        if !enrollment_ok {
+            audit(
+                pool,
+                Some(user_id),
+                "2fa_enrollment_failed",
+                &ip,
+                &ua,
+                "missing or invalid enrollment code",
+            )
+            .await;
+            bump_failure_and_maybe_lock(
+                pool,
+                user_id,
+                cfg.lockout_threshold,
+                cfg.lockout_minutes as i64,
+                &ip,
+                &ua,
+            )
+            .await;
+            return (
+                jar,
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "enrollment_code_required" })),
+                ),
+            );
+        }
+    }
+
     // Password OK — create a pre-2FA session. "Remember me" picks the longer TTL;
     // the chosen lifetime is persisted in the session row (expires_at) so it
     // survives the token rotation at /totp and an app restart.
@@ -146,6 +211,18 @@ async fn login(
     } else {
         cfg.session_ttl_hours
     } as i64;
+    if sessions::expire_unverified_for_user(pool, user_id)
+        .await
+        .is_err()
+    {
+        return (
+            jar,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "session_create_failed" })),
+            ),
+        );
+    }
     let (_session_id, token) = match sessions::create(pool, user_id, &ip, &ua, ttl_hours).await {
         Ok(v) => v,
         Err(_) => {
@@ -162,12 +239,6 @@ async fn login(
         token,
         time::Duration::hours(ttl_hours),
     ));
-
-    // Reset the failure counter on a correct password.
-    let _ = sqlx::query("UPDATE users SET failed_login_attempts = 0 WHERE id = ?")
-        .bind(user_id)
-        .execute(pool)
-        .await;
 
     let confirmed = totp_confirmed_at.is_some() && totp_secret_enc.is_some();
     if confirmed {
@@ -189,14 +260,46 @@ async fn login(
     // No confirmed TOTP -> enrollment. Generate + persist an UNCONFIRMED secret
     // (encrypted). The SPA renders otpauth_url as a QR; secret shown for manual
     // entry. two_factor_confirmed_at stays NULL until /totp succeeds.
-    match totp::enroll(&body.email) {
-        Ok((secret_b32, otpauth_url)) => {
-            if let Ok(enc) = crate::crypto::seal_str(&secret_b32) {
-                let _ = sqlx::query("UPDATE users SET two_factor_secret = ? WHERE id = ?")
+    let enrollment = totp_secret_enc
+        .as_deref()
+        .and_then(decrypt_secret)
+        .and_then(|secret| {
+            totp::enrollment_for_secret(&secret, &email)
+                .ok()
+                .map(|url| (secret, url, false))
+        })
+        .or_else(|| {
+            totp::enroll(&email)
+                .ok()
+                .map(|(secret, url)| (secret, url, true))
+        });
+    match enrollment {
+        Some((secret_b32, otpauth_url, is_new)) => {
+            if is_new {
+                let Ok(enc) = crate::crypto::seal_str(&secret_b32) else {
+                    return (
+                        jar,
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "enrollment_failed" })),
+                        ),
+                    );
+                };
+                if sqlx::query("UPDATE users SET two_factor_secret = ? WHERE id = ?")
                     .bind(hex::encode(enc))
                     .bind(user_id)
                     .execute(pool)
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return (
+                        jar,
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "enrollment_failed" })),
+                        ),
+                    );
+                }
             }
             audit(
                 pool,
@@ -218,7 +321,7 @@ async fn login(
                 ),
             )
         }
-        Err(_) => (
+        None => (
             jar,
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -250,6 +353,16 @@ async fn totp_challenge(
     let ua = user_agent(&headers);
     let cfg = &state.config.auth;
 
+    if ip_throttled(pool, &ip, cfg.lockout_threshold, cfg.lockout_minutes as i64).await {
+        return (
+            jar,
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "too_many_attempts" })),
+            ),
+        );
+    }
+
     // Load the pre-2FA session from the cookie.
     let Some(cookie) = jar.get(sessions::SESSION_COOKIE) else {
         return (
@@ -260,18 +373,19 @@ async fn totp_challenge(
             ),
         );
     };
-    let session = match sessions::validate_pre2fa(pool, cookie.value()).await {
-        Ok(Some(s)) => s,
-        _ => {
-            return (
-                jar,
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "invalid_session" })),
-                ),
-            )
-        }
-    };
+    let session =
+        match sessions::validate_pre2fa(pool, cookie.value(), cfg.pre_2fa_ttl_minutes).await {
+            Ok(Some(s)) => s,
+            _ => {
+                return (
+                    jar,
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "invalid_session" })),
+                    ),
+                )
+            }
+        };
     let user_id = session.user_id;
 
     // Load the user's email + (encrypted) secret + confirmation + lock state.
@@ -332,16 +446,25 @@ async fn totp_challenge(
     let mut used_recovery = false;
     if let Some(secret_hex) = secret_hex.as_deref() {
         if let Some(secret_b32) = decrypt_secret(secret_hex) {
-            ok = totp::verify(&secret_b32, &body.code, &email).unwrap_or(false);
+            match consume_totp_step(pool, user_id, &secret_b32, &body.code, &email).await {
+                Ok(value) => ok = value,
+                Err(e) => {
+                    tracing::error!(event_type = "totp_replay_state_failed", user_id, error = %e, "could not verify and consume TOTP step");
+                    return (
+                        jar,
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "2fa_verify_failed" })),
+                        ),
+                    );
+                }
+            }
         }
     }
     if !ok {
-        match consume_recovery_code(pool, user_id, &body.code).await {
-            Ok(true) => {
-                ok = true;
-                used_recovery = true;
-            }
-            _ => {}
+        if let Ok(true) = consume_recovery_code(pool, user_id, &body.code).await {
+            ok = true;
+            used_recovery = true;
         }
     }
 
@@ -400,13 +523,13 @@ async fn totp_challenge(
     let mut new_recovery_codes: Option<Vec<String>> = None;
     if first_confirmation {
         let codes = totp::generate_recovery_codes();
-        let hashes: Vec<String> = codes
-            .iter()
-            .filter_map(|c| password::hash(c).ok())
-            .collect();
-        if let Ok(json_hashes) = serde_json::to_string(&hashes) {
-            let _ = sqlx::query(
-                "UPDATE users SET two_factor_confirmed_at = UTC_TIMESTAMP(), two_factor_recovery_codes = ?, \
+        let hashes: anyhow::Result<Vec<String>> = codes.iter().map(|c| password::hash(c)).collect();
+        let stored = if let Ok(json_hashes) =
+            hashes.and_then(|h| serde_json::to_string(&h).map_err(anyhow::Error::from))
+        {
+            sqlx::query(
+                "UPDATE users SET two_factor_confirmed_at = UTC_TIMESTAMP(), \
+                 two_factor_enrollment_token_hash = NULL, two_factor_recovery_codes = ?, \
                  failed_login_attempts = 0, locked_until = NULL, \
                  last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
             )
@@ -414,7 +537,22 @@ async fn totp_challenge(
             .bind(&ip)
             .bind(user_id)
             .execute(pool)
-            .await;
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        if !stored {
+            if let Err(e) = sessions::expire(pool, session.id).await {
+                tracing::error!(event_type = "failed_session_revoke_failed", session_id = session.id, error = %e, "could not revoke session after 2FA persistence failure");
+            }
+            return (
+                jar.add(sessions::removal_cookie()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "2fa_persist_failed" })),
+                ),
+            );
         }
         new_recovery_codes = Some(codes);
         audit(
@@ -427,14 +565,27 @@ async fn totp_challenge(
         )
         .await;
     } else {
-        let _ = sqlx::query(
+        if sqlx::query(
             "UPDATE users SET failed_login_attempts = 0, locked_until = NULL, \
              last_login_at = UTC_TIMESTAMP(), last_login_ip = ? WHERE id = ?",
         )
         .bind(&ip)
         .bind(user_id)
         .execute(pool)
-        .await;
+        .await
+        .is_err()
+        {
+            if let Err(e) = sessions::expire(pool, session.id).await {
+                tracing::error!(event_type = "failed_session_revoke_failed", session_id = session.id, error = %e, "could not revoke session after login persistence failure");
+            }
+            return (
+                jar.add(sessions::removal_cookie()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "login_persist_failed" })),
+                ),
+            );
+        }
     }
 
     if used_recovery {
@@ -448,13 +599,16 @@ async fn totp_challenge(
             "recovery code consumed",
         )
         .await;
-        let _ = enqueue_security_alert(
+        if let Err(e) = enqueue_security_alert(
             pool,
             "2fa_recovery_used",
             user_id,
             "a single-use recovery code was used to sign in",
         )
-        .await;
+        .await
+        {
+            tracing::error!(event_type = "security_alert_enqueue_failed", user_id, alert = "2fa_recovery_used", error = %e, "could not enqueue recovery-code-use alert");
+        }
     }
     audit(
         pool,
@@ -466,9 +620,21 @@ async fn totp_challenge(
     )
     .await;
 
-    let user = rbac::load_session_user(pool, user_id)
-        .await
-        .unwrap_or(Value::Null);
+    let user = match rbac::load_session_user(pool, user_id).await {
+        Ok(user) => user,
+        Err(_) => {
+            if let Err(e) = sessions::expire(pool, session.id).await {
+                tracing::error!(event_type = "failed_session_revoke_failed", session_id = session.id, error = %e, "could not revoke session after user lookup failure");
+            }
+            return (
+                jar.add(sessions::removal_cookie()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "user_lookup_failed" })),
+                ),
+            );
+        }
+    };
     let mut resp = json!({ "user": user });
     if let Some(codes) = new_recovery_codes {
         resp["recovery_codes"] = json!(codes); // shown once
@@ -485,19 +651,40 @@ async fn logout(
 ) -> (SignedCookieJar<Key>, JsonResp) {
     let pool = &state.pool;
     if let Some(cookie) = jar.get(sessions::SESSION_COOKIE) {
-        if let Ok(Some(session)) = sessions::validate_pre2fa(pool, cookie.value()).await {
-            let _ = sessions::expire(pool, session.id).await;
-            let ip = client_ip(&headers, Some(&socket));
-            let ua = user_agent(&headers);
-            audit(
-                pool,
-                Some(session.user_id),
-                "logout",
-                &ip,
-                &ua,
-                "session expired",
-            )
-            .await;
+        match sessions::validate(pool, cookie.value(), state.config.auth.idle_timeout_minutes).await
+        {
+            Ok(Some(session)) => {
+                if sessions::expire(pool, session.id).await.is_err() {
+                    return (
+                        jar.add(sessions::removal_cookie()),
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "logout_revoke_failed" })),
+                        ),
+                    );
+                }
+                let ip = client_ip(&headers, Some(&socket));
+                let ua = user_agent(&headers);
+                audit(
+                    pool,
+                    Some(session.user_id),
+                    "logout",
+                    &ip,
+                    &ua,
+                    "session expired",
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return (
+                    jar.add(sessions::removal_cookie()),
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "logout_revoke_failed" })),
+                    ),
+                );
+            }
         }
     }
     let jar = jar.add(sessions::removal_cookie());
@@ -556,29 +743,43 @@ async fn bump_failure_and_maybe_lock(
     ip: &str,
     ua: &str,
 ) {
-    let _ = sqlx::query(
-        "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = ?",
-    )
-    .bind(user_id)
-    .execute(pool)
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let Some((current, locked_until)) =
+            sqlx::query_as::<_, (u32, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT failed_login_attempts, locked_until FROM users WHERE id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            anyhow::bail!("user disappeared while recording auth failure");
+        };
+        let next = current.saturating_add(1);
+        let now = chrono::Utc::now();
+        let was_locked = locked_until.is_some_and(|until| until > now);
+        let lock_until =
+            (next >= threshold).then(|| now + chrono::Duration::minutes(lock_minutes.max(1)));
+        sqlx::query("UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?")
+            .bind(next)
+            .bind(lock_until)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<bool, anyhow::Error>(lock_until.is_some() && !was_locked)
+    }
     .await;
 
-    let current: u32 = sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = ?")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+    let newly_locked = match result {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(event_type = "auth_lockout_persist_failed", user_id, error = %e, "could not persist authentication failure counter; request remains denied");
+            return;
+        }
+    };
 
-    if current >= threshold {
-        let _ = sqlx::query(
-            "UPDATE users SET locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? MINUTE) WHERE id = ?",
-        )
-        .bind(lock_minutes)
-        .bind(user_id)
-        .execute(pool)
-        .await;
+    if newly_locked {
         audit(
             pool,
             Some(user_id),
@@ -588,14 +789,43 @@ async fn bump_failure_and_maybe_lock(
             "failed auth threshold exceeded",
         )
         .await;
-        let _ = enqueue_security_alert(
+        if let Err(e) = enqueue_security_alert(
             pool,
             "account_locked",
             user_id,
             "account locked after repeated failed auth attempts",
         )
-        .await;
+        .await
+        {
+            tracing::error!(event_type = "security_alert_enqueue_failed", user_id, alert = "account_locked", error = %e, "could not enqueue account-lock alert");
+        }
     }
+}
+
+/// Real-IP throttle shared by password, TOTP, and recovery-code failures. Account
+/// lockout remains separate, so distributing guesses across IPs cannot bypass the
+/// per-user counter and distributing users across one IP cannot bypass this gate.
+pub(crate) async fn ip_throttled(
+    pool: &sqlx::MySqlPool,
+    ip: &str,
+    threshold: u32,
+    window_minutes: i64,
+) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM audit_logs \
+         WHERE ip_address = ? AND event_type IN \
+             ('login_failed','2fa_failed','2fa_enrollment_failed','settings_reauth_failed') \
+           AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",
+    )
+    .bind(ip)
+    .bind(window_minutes)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(i64::MAX)
+        >= threshold as i64
 }
 
 /// Single-use recovery-code check, made race-safe. Codes are stored as a JSON
@@ -620,7 +850,8 @@ async fn consume_recovery_code(
         tx.rollback().await?;
         return Ok(false);
     };
-    let mut hashes: Vec<String> = serde_json::from_str(&json_hashes).unwrap_or_default();
+    let mut hashes: Vec<String> = serde_json::from_str(&json_hashes)
+        .map_err(|e| anyhow::anyhow!("stored recovery-code data is invalid: {e}"))?;
     let normalized = code.trim().to_lowercase();
     let mut matched = None;
     for (i, h) in hashes.iter().enumerate() {
@@ -640,6 +871,41 @@ async fn consume_recovery_code(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Verify and consume a TOTP time step atomically. A valid code from a step at
+/// or before the last accepted step is a replay and is rejected.
+async fn consume_totp_step(
+    pool: &sqlx::MySqlPool,
+    user_id: u64,
+    secret_base32: &str,
+    code: &str,
+    account_email: &str,
+) -> anyhow::Result<bool> {
+    let Some(step) = totp::matched_step(secret_base32, code, account_email)? else {
+        return Ok(false);
+    };
+    let mut tx = pool.begin().await?;
+    let last: Option<u64> =
+        sqlx::query_scalar("SELECT last_totp_step FROM users WHERE id = ? FOR UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if last.is_some_and(|last| step <= last) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query("UPDATE users SET last_totp_step = ? WHERE id = ?")
+        .bind(step)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    anyhow::ensure!(
+        updated.rows_affected() == 1,
+        "user disappeared while consuming TOTP step"
+    );
     tx.commit().await?;
     Ok(true)
 }
@@ -674,7 +940,7 @@ pub async fn verify_step_up(
     let Some(secret_b32) = decrypt_secret(secret_hex) else {
         return Ok(false);
     };
-    Ok(totp::verify(&secret_b32, totp_code, &email).unwrap_or(false))
+    consume_totp_step(pool, user_id, &secret_b32, totp_code, &email).await
 }
 
 /// Insert an audit_logs row (best-effort; auth must not fail because audit did).
@@ -686,7 +952,7 @@ async fn audit(
     ua: &str,
     message: &str,
 ) {
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
          VALUES ('user', ?, ?, ?, ?, ?)",
     )
@@ -696,7 +962,10 @@ async fn audit(
     .bind(ip)
     .bind(ua)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(event_type = "auth_audit_persist_failed", audited_event = event, actor_user_id = user_id, error = %e, "could not persist authentication audit event");
+    }
 }
 
 /// Enqueue a security alert (always-immediate event types). Recipient is the
@@ -719,4 +988,49 @@ async fn enqueue_security_alert(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consume_totp_step;
+
+    #[tokio::test]
+    async fn accepted_totp_step_cannot_be_replayed() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+        crate::db::migrate_test_schema(&pool)
+            .await
+            .expect("run migrations");
+
+        let email = format!("totp-replay-{}@example.test", uuid::Uuid::new_v4());
+        let user_id = sqlx::query(
+            "INSERT INTO users (name, email, password) VALUES ('TOTP replay test', ?, 'unused')",
+        )
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .expect("insert test user")
+        .last_insert_id();
+        let (secret, _) = super::totp::enroll(&email).expect("create TOTP secret");
+        let code = super::totp::current_code(&secret, &email).expect("generate current TOTP");
+
+        assert!(consume_totp_step(&pool, user_id, &secret, &code, &email)
+            .await
+            .expect("consume first TOTP"));
+        assert!(!consume_totp_step(&pool, user_id, &secret, &code, &email)
+            .await
+            .expect("reject replayed TOTP"));
+
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("remove test user");
+    }
 }

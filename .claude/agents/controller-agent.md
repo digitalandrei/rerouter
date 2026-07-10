@@ -13,7 +13,9 @@ parameterized templates), and serves the authenticated app API.
 ## Scope (actual backend modules)
 
 - Telemetry ingestion + normalization (`src/telemetry/`): SNMP interface polling
-  (`snmp.rs`) and the read-only NetFlow v9 flow collector (`flow/`).
+  (`snmp.rs`) and passive NetFlow v9/sFlow collection (`flow/`). Flow-triggered
+  automation is separately gated and requires fresh same-interface SNMP
+  corroboration.
 - Detection rule evaluation, stateful (`src/detection/`).
 - Reroute execution + two-phase state machine (`src/reroute/`): executor,
   state_machine, templates, locks, rollback.
@@ -33,13 +35,13 @@ parameterized templates), and serves the authenticated app API.
 
 ## Authoritative docs
 
-- [../docs/architecture.md](../docs/architecture.md)
-- [../docs/telemetry-model.md](../docs/telemetry-model.md)
-- [../docs/detection-engine.md](../docs/detection-engine.md)
-- [../docs/reroute-engine.md](../docs/reroute-engine.md)
-- [../docs/state-recovery.md](../docs/state-recovery.md)
-- [../docs/authentication.md](../docs/authentication.md)
-- [../docs/email-alerts.md](../docs/email-alerts.md)
+- [architecture.md](../../docs/architecture.md)
+- [telemetry-model.md](../../docs/telemetry-model.md)
+- [detection-engine.md](../../docs/detection-engine.md)
+- [reroute-engine.md](../../docs/reroute-engine.md)
+- [state-recovery.md](../../docs/state-recovery.md)
+- [authentication.md](../../docs/authentication.md)
+- [email-alerts.md](../../docs/email-alerts.md)
 
 ## Non-negotiable rules
 

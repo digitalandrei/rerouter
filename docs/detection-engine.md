@@ -26,6 +26,12 @@ in_err_rate  out_err_rate  oper_status
 flow_pps  flow_bps            (flow collector, off by default; sampling-estimated)
 ```
 
+Flow rules select a direction and may select a source/destination port plus an
+optional protocol. A protocol without a port is rejected because the stored
+rollups have no protocol-only bucket; migration
+`20260710000600_disable_ambiguous_flow_rules.sql` disables legacy ambiguous
+rules rather than silently evaluating broader traffic.
+
 `oper_status` resolves to `1` when the link is `up`, else `0`, so a rule like
 `oper_status < 1` fires on link-down. `in_err_rate` / `out_err_rate` are
 errors/sec derived from the cumulative `ifInErrors`/`ifOutErrors` deltas (0 on a
@@ -61,18 +67,18 @@ choose the template(s), target router(s), and parameters.
 
 ## Stateful evaluation
 
-Rule evaluation is **stateful** and runs after every device poll. A single bad
-sample must not trigger anything. A rule **fires on the rising edge** once its
-condition has held long enough, where "long enough" is satisfied by **either**
-gate (logical OR):
+Rule evaluation is **stateful** and runs after every device poll or closed flow
+bucket. A single bad sample must not trigger anything. A rule **fires on the
+rising edge** once its condition satisfies every enabled persistence gate:
 
 ```text
-held for >= duration_seconds        OR
+held for >= duration_seconds        AND
 consecutive_samples valid matches
 ```
 
-So a rule can require a sustained duration, a sample count, or (with one of them
-zeroed) just the other. While firing, the rule does not re-alert each tick.
+A zero disables that gate. The UI uses a duration window for flow rules and
+consecutive samples for SNMP rules, so only one is normally enabled; API clients
+may require both. While firing, the rule does not re-alert each tick.
 
 Track per rule (`rule_states`): `current_state`, `first_matched_at`,
 `last_matched_at`, `last_cleared_at`, `consecutive_match_count`,
@@ -93,6 +99,14 @@ clears it. A rule still in `matching` that stops matching drops straight to `cle
   advances a rule's state (a wrapped/reset/failed counter read is never trusted).
 - SNMP rates are absolute (counter deltas over the poll interval) — no flow
   sampling-rate scaling applies.
+- Flow observations must come from an enrolled exporter, a closed fresh bucket,
+  and non-low sampling confidence. Port selectors are evaluated at the latest
+  interface-bucket timestamp; no matching port row means a current zero with low
+  confidence, never reuse of an older non-zero bucket. Flow-derived automatic
+  actions additionally require the separate off-by-default flow automation gate
+  and contemporaneous same-interface SNMP volume within the configured ratio
+  band. Failed corroboration may still produce a visible rule observation, but
+  it cannot move traffic automatically.
 
 ## Outputs
 

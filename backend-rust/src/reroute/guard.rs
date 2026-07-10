@@ -13,7 +13,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::MySqlPool;
+use sqlx::{Connection, MySqlConnection, MySqlPool};
 
 use crate::config::Config;
 use crate::detection::cooldown;
@@ -40,6 +40,7 @@ pub enum BlockReason {
         window_secs: u64,
         max: u32,
     },
+    GateReadFailed(String),
     GuardConnection(String),
     GuardBusy,
     AlreadyRunning,
@@ -88,6 +89,9 @@ impl fmt::Display for BlockReason {
                 f,
                 "global action rate limit reached ({recent} in {window_secs}s; max {max})"
             ),
+            BlockReason::GateReadFailed(e) => {
+                write!(f, "could not verify a safety gate: {e}")
+            }
             BlockReason::GuardConnection(e) => write!(f, "could not acquire device guard: {e}"),
             BlockReason::GuardBusy => write!(
                 f,
@@ -178,18 +182,22 @@ pub fn decide(i: &GateInputs) -> Result<(), BlockReason> {
     if i.device_locked {
         return Err(BlockReason::DeviceLocked);
     }
-    if let Some(until) = i.device_cooldown_until {
-        return Err(BlockReason::DeviceCooldown(until));
-    }
-    if let (Some(rule_id), Some(until)) = (i.rule_id, i.rule_cooldown_until) {
-        return Err(BlockReason::RuleCooldown { rule_id, until });
-    }
-    if i.rate_limit > 0 && i.recent_count >= i.rate_limit as i64 {
-        return Err(BlockReason::RateLimit {
-            recent: i.recent_count,
-            window_secs: i.rate_window_secs,
-            max: i.rate_limit,
-        });
+    // A rollback is corrective work. Locks and maintenance mode still gate it,
+    // but throttles created by the original action must not prevent its inverse.
+    if i.trigger_type != "rollback" {
+        if let Some(until) = i.device_cooldown_until {
+            return Err(BlockReason::DeviceCooldown(until));
+        }
+        if let (Some(rule_id), Some(until)) = (i.rule_id, i.rule_cooldown_until) {
+            return Err(BlockReason::RuleCooldown { rule_id, until });
+        }
+        if i.rate_limit > 0 && i.recent_count >= i.rate_limit as i64 {
+            return Err(BlockReason::RateLimit {
+                recent: i.recent_count,
+                window_secs: i.rate_window_secs,
+                max: i.rate_limit,
+            });
+        }
     }
     Ok(())
 }
@@ -201,20 +209,22 @@ pub async fn can_execute(
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<(), BlockReason> {
-    decide(&gather(pool, cfg, req, plan).await)
+    decide(&gather(pool, cfg, req, plan).await?)
 }
 
 /// Read the gate facts from the database. Mirrors the executor's previous read
-/// pattern: a lock-read error fails safe (blocks); a cooldown-read error does not.
+/// pattern: every safety-read error fails safe and blocks execution.
 pub async fn gather(
     pool: &MySqlPool,
     cfg: &Config,
     req: &ActionRequest,
     plan: &RenderedPlan,
-) -> GateInputs {
+) -> Result<GateInputs, BlockReason> {
     let device_ref = req.device_id.to_string();
     let protected_interface =
-        protected_interface_name(pool, req.device_id, &req.template, &req.params).await;
+        protected_interface_name(pool, req.device_id, &req.template, &req.params)
+            .await
+            .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
     let automatic_actions_enabled = if req.trigger_type == "automatic" {
         crate::api::settings::bool_setting(
             pool,
@@ -230,15 +240,27 @@ pub async fn gather(
     let device_locked = locks::is_blocked(pool, "device", &device_ref)
         .await
         .unwrap_or(true);
-    let device_cooldown_until = cooldown::active_until(pool, "device", &device_ref)
-        .await
-        .ok()
-        .flatten();
+    let device_cooldown_until = effective_cooldown(
+        pool,
+        "device",
+        &device_ref,
+        req.device_id,
+        None,
+        cfg.safety.same_device_cooldown_seconds,
+    )
+    .await
+    .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
     let rule_cooldown_until = match req.rule_id {
-        Some(rid) => cooldown::active_until(pool, "rule", &rid.to_string())
-            .await
-            .ok()
-            .flatten(),
+        Some(rid) => effective_cooldown(
+            pool,
+            "rule",
+            &rid.to_string(),
+            req.device_id,
+            Some(rid),
+            cfg.safety.same_rule_cooldown_seconds,
+        )
+        .await
+        .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?,
         None => None,
     };
     let rate_limit = cfg.safety.global_action_rate_limit_count;
@@ -248,7 +270,7 @@ pub async fn gather(
     } else {
         0
     };
-    GateInputs {
+    Ok(GateInputs {
         trigger_type: req.trigger_type,
         protected_interface,
         automatic_actions_enabled,
@@ -262,7 +284,48 @@ pub async fn gather(
         rate_limit,
         rate_window_secs,
         recent_count,
+    })
+}
+
+/// Cooldown rows are convenient bookkeeping, but the durable reroute history is
+/// the fallback source of truth. This prevents a post-action cooldown INSERT
+/// failure from permitting an immediate repeat.
+async fn effective_cooldown(
+    pool: &MySqlPool,
+    scope: &str,
+    scope_ref: &str,
+    device_id: u64,
+    rule_id: Option<u64>,
+    seconds: u64,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    if seconds == 0 {
+        return Ok(None);
     }
+    let explicit = cooldown::active_until(pool, scope, scope_ref).await?;
+    let historical: Option<DateTime<Utc>> = if let Some(rule_id) = rule_id {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT DATE_ADD(MAX(started_at), INTERVAL ? SECOND) FROM reroutes \
+             WHERE rule_id = ? AND started_at IS NOT NULL",
+        )
+        .bind(seconds as i64)
+        .bind(rule_id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT DATE_ADD(MAX(started_at), INTERVAL ? SECOND) FROM reroutes \
+             WHERE device_id = ? AND started_at IS NOT NULL",
+        )
+        .bind(seconds as i64)
+        .bind(device_id)
+        .fetch_one(pool)
+        .await?
+    };
+    Ok([explicit, historical]
+        .into_iter()
+        .flatten()
+        .filter(|until| *until > Utc::now())
+        .max())
 }
 
 /// Reserve a reroute row under advisory locks. For AUTOMATIC triggers we first
@@ -283,14 +346,11 @@ pub async fn reserve_and_persist(
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
 
-    // Global rate-limit critical section — applied to AUTOMATIC triggers (the ones
-    // that can fire concurrently across many devices in a storm). Held across the
-    // reservation so count-then-insert is atomic vs other automatic reservations.
-    // Manual/rollback are human-paced and keep only the early gather-time rate
-    // check in decide(), which needs no locked re-check.
+    // Global rate-limit critical section. Every non-corrective trigger participates
+    // so concurrent manual and automatic requests share one authoritative budget.
     let rate_limit = cfg.safety.global_action_rate_limit_count;
     let rate_window = cfg.safety.global_action_rate_limit_window_seconds;
-    let use_global = req.trigger_type == "automatic" && rate_limit > 0;
+    let use_global = req.trigger_type != "rollback" && rate_limit > 0;
     if use_global {
         let got: Option<i64> =
             sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK('rrt_rate_global', 5)")
@@ -301,7 +361,7 @@ pub async fn reserve_and_persist(
         if got != Some(1) {
             return Err(BlockReason::GuardBusy);
         }
-        let recent = recent_reroute_count(pool, rate_window).await;
+        let recent = recent_reroute_count_on(&mut conn, rate_window).await;
         if recent >= rate_limit as i64 {
             let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
                 .execute(&mut *conn)
@@ -330,7 +390,7 @@ pub async fn reserve_and_persist(
         return Err(BlockReason::GuardBusy);
     }
 
-    let reserved = reserve_slot(pool, req, plan).await;
+    let reserved = reserve_slot(&mut conn, req, plan).await;
 
     let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
         .bind(&lock_name)
@@ -346,17 +406,17 @@ pub async fn reserve_and_persist(
 }
 
 async fn reserve_slot(
-    pool: &MySqlPool,
+    conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<u64, BlockReason> {
-    if running_on_device(pool, req.device_id).await {
+    if running_on_device(conn, req.device_id).await {
         return Err(BlockReason::AlreadyRunning);
     }
-    if has_uncertain(pool, req.device_id).await {
+    if has_uncertain(conn, req.device_id).await {
         return Err(BlockReason::UnresolvedUncertain);
     }
-    insert_reroute(pool, req, plan)
+    insert_reroute(conn, req, plan)
         .await
         .map_err(|e| BlockReason::PersistFailed(e.to_string()))
 }
@@ -368,58 +428,75 @@ async fn reserve_slot(
 /// template "targets an interface" when its parameter schema has a param with
 /// `source: "interface_name"`; the value is matched against
 /// `device_interfaces.if_name`/`if_descr`. Templates without such a param (BGP,
-/// null-route, etc.) are never blocked; an unknown interface proceeds.
+/// null-route, etc.) are never blocked. Unknown interface inventory fails closed
+/// for disruptive actions; the explicit corrective templates above bypass it.
 async fn protected_interface_name(
     pool: &MySqlPool,
     device_id: u64,
     template: &Template,
     params: &Value,
-) -> Option<String> {
-    let schema = template.parameter_schema.as_object()?;
+) -> anyhow::Result<Option<String>> {
+    // These are corrective inverses. Their disruptive counterparts remain
+    // protected, including when invoked as a rollback of a prior corrective action.
+    if matches!(
+        template.name.as_str(),
+        "iface_no_shutdown" | "iface_tcp_adjust_mss_remove"
+    ) {
+        return Ok(None);
+    }
+    let Some(schema) = template.parameter_schema.as_object() else {
+        return Ok(None);
+    };
     let iface_param = schema.iter().find_map(|(name, spec)| {
         (spec.get("source").and_then(Value::as_str) == Some("interface_name")).then(|| name.clone())
-    })?;
+    });
+    let Some(iface_param) = iface_param else {
+        return Ok(None);
+    };
     let iface = params
         .get(&iface_param)
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty());
+    let Some(iface) = iface else {
+        return Ok(None);
+    };
 
-    let protected: Option<i64> = sqlx::query_scalar(
-        "SELECT protected FROM device_interfaces \
+    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT if_name, protected FROM device_interfaces \
          WHERE device_id = ? AND (if_name = ? OR if_descr = ?) ORDER BY protected DESC LIMIT 1",
     )
     .bind(device_id)
     .bind(iface)
     .bind(iface)
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    .await?;
 
-    match protected {
-        Some(p) if p != 0 => Some(iface.to_string()),
+    let (canonical_name, protected) =
+        row.ok_or_else(|| anyhow::anyhow!("interface '{iface}' is no longer in device inventory"))?;
+    Ok(match protected {
+        p if p != 0 => Some(canonical_name.unwrap_or_else(|| iface.to_string())),
         _ => None,
-    }
+    })
 }
 
-async fn running_on_device(pool: &MySqlPool, device_id: u64) -> bool {
+async fn running_on_device(conn: &mut MySqlConnection, device_id: u64) -> bool {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state IN ('planned','pending','running','verifying')",
     )
     .bind(device_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or(1);
     n > 0
 }
 
-async fn has_uncertain(pool: &MySqlPool, device_id: u64) -> bool {
+async fn has_uncertain(conn: &mut MySqlConnection, device_id: u64) -> bool {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reroutes WHERE device_id = ? AND state = 'uncertain'",
     )
     .bind(device_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .unwrap_or(1);
     n > 0
@@ -437,41 +514,57 @@ async fn recent_reroute_count(pool: &MySqlPool, window_secs: u64) -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// Same fail-closed count, executed on the connection that owns the advisory
+/// lock so the critical section cannot outlive its lock connection.
+async fn recent_reroute_count_on(conn: &mut MySqlConnection, window_secs: u64) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM reroutes WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(window_secs as i64)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(i64::MAX)
+}
+
 async fn insert_reroute(
-    pool: &MySqlPool,
+    conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> anyhow::Result<u64> {
     let steps = json!({ "commands": plan.commands, "verify": plan.verify });
+    let mut tx = conn.begin().await?;
     let res = sqlx::query(
         "INSERT INTO reroutes \
-            (device_id, rule_id, reroute_template_id, trigger_type, triggered_by_user_id, \
-             state, reason, parameters_json, planned_steps_json) \
-         VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
+            (device_id, rule_id, rule_event_id, reroute_template_id, rollback_of_reroute_id, \
+             trigger_type, triggered_by_user_id, state, reason, parameters_json, planned_steps_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
     )
     .bind(req.device_id)
     .bind(req.rule_id)
+    .bind(req.rule_event_id)
     .bind(req.template.id)
+    .bind(req.rollback_of_reroute_id)
     .bind(req.trigger_type)
     .bind(req.user_id)
     .bind(&req.reason)
     .bind(sqlx::types::Json(&req.params))
     .bind(sqlx::types::Json(&steps))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let reroute_id = res.last_insert_id();
 
     for (i, cmd) in plan.commands.iter().enumerate() {
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO reroute_steps (reroute_id, step_number, description, mode, state) \
              VALUES (?, ?, ?, 'ios_ssh', 'planned')",
         )
         .bind(reroute_id)
         .bind((i + 1) as u32)
         .bind(cmd)
-        .execute(pool)
-        .await;
+        .execute(&mut *tx)
+        .await?;
     }
+    tx.commit().await?;
     Ok(reroute_id)
 }
 

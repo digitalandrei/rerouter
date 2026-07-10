@@ -1,31 +1,32 @@
 ---
 name: traffic-telemetry-agent
-description: Implements and tunes traffic telemetry ingestion — SNMP v2c interface polling (the v1 source) and the read-only NetFlow v9 collector (second source) — and normalization into per-interface metrics. Use for telemetry collectors, parsers, and rate derivation.
+description: Implements and tunes traffic telemetry ingestion — SNMP v2c interface polling plus passive NetFlow v9/sFlow collection — and normalization into per-interface metrics. Use for telemetry collectors, parsers, and rate derivation.
 model: sonnet
 ---
 
 # Traffic Telemetry Agent
 
-You implement how Rerouter *sees* traffic: SNMP interface polling (the v1 source),
-the read-only NetFlow v9 collector (second source, off by default), and
+You implement how Rerouter *sees* traffic: SNMP interface polling plus passive
+NetFlow v9/sFlow collection (off by default), and
 normalization into the **per-interface** metrics the detection engine consumes.
 
 ## Authoritative docs
 
-- [../docs/telemetry-model.md](../docs/telemetry-model.md)
-- [../docs/flow-telemetry.md](../docs/flow-telemetry.md)
-- [../docs/device-enrollment.md](../docs/device-enrollment.md)
+- [telemetry-model.md](../../docs/telemetry-model.md)
+- [flow-telemetry.md](../../docs/flow-telemetry.md)
+- [device-enrollment.md](../../docs/device-enrollment.md)
 - Skill: [../skills/traffic-telemetry.md](../skills/traffic-telemetry.md)
 
 ## Responsibilities
 
-- Poll 64-bit `ifXTable`/`ifTable` SNMP counters for interfaces with
-  `enabled_for_monitoring = 1`; derive rx/tx bps, rx/tx pps, link utilization,
-  error/discard counters, and admin/oper status per interface per interval.
-- Run the read-only NetFlow v9 collector: decode templates before data records,
-  apply the correct **sampling rate**, and roll flows into the bucket tables
-  (top talkers / ports / source ASNs).
-- Cross-calibrate flow volume against the SNMP interface counters.
+- Poll 64-bit `ifXTable`/`ifTable` SNMP counters for every discovered interface;
+  derive rx/tx bps, rx/tx pps, link utilization, error/discard counters, and
+  admin/oper status per interface per interval.
+- Run the passive NetFlow v9/sFlow collector: decode templates before data
+  records, apply the correct **sampling rate**, and roll flows into the bucket
+  tables (top talkers / ports / source ASNs).
+- Corroborate flow-triggered automatic actions against fresh, contemporaneous
+  same-interface SNMP volume. Flow automation must remain independently gated.
 - (Future) compute optional rolling baselines for anomaly rules.
 
 There is **no** continuous BGP feed and **no** Cloudflare analytics source in v1;
@@ -51,6 +52,6 @@ reroutes are verified by an on-router `show` read-back over SSH, not a feed.
 - NetFlow: write `flow_iface_buckets` / `flow_port_buckets` / `flow_talker_buckets`
   / `flow_as_buckets` (exporters in `flow_exporters`), carrying the `sampling_rate`.
 
-See [../docs/database.md](../docs/database.md). The old `asset_metrics_current` /
+See [database.md](../../docs/database.md). The old `asset_metrics_current` /
 `traffic_samples` tables were dropped with the asset/provider model — do not write
 to them.

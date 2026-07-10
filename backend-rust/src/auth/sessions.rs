@@ -1,16 +1,17 @@
 //! DB-backed sessions (`sessions` table). The browser cookie carries only a
 //! random token (signed with SESSION_SECRET via axum-extra's SignedCookieJar);
-//! the DB row holds the SHA-256 hash, the user, TOTP/re-auth state, and the
+//! the DB row holds the SHA-256 hash, the user, TOTP state, and the
 //! expiry. Server-side revocation is therefore immediate. The SPA talks to
-//! /api/ with credentialed fetch; the cookie is HttpOnly + Secure + SameSite=Lax.
+//! /api/ with credentialed fetch; the cookie is HttpOnly + Secure + SameSite=Strict.
 
 use anyhow::{Context, Result};
-use axum::extract::FromRequestParts;
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::{request::Parts, StatusCode};
 use axum_extra::extract::cookie::{Cookie, Key, SameSite, SignedCookieJar};
 use chrono::{DateTime, Duration, Utc};
 use rand::distr::{Alphanumeric, SampleString};
 use sqlx::MySqlPool;
+use std::net::SocketAddr;
 
 use crate::api::AppState;
 
@@ -25,6 +26,10 @@ pub struct Session {
     /// ONLY call /api/auth/totp.
     pub totp_verified: bool,
     pub expires_at: DateTime<Utc>,
+    /// Current request context when produced by the authenticated extractor.
+    /// Direct validation helpers retain the context captured at login.
+    pub ip_address: String,
+    pub user_agent: String,
 }
 
 /// Generate a session token. Only its hash is persisted; the plaintext goes to
@@ -69,12 +74,26 @@ pub async fn create(
     Ok((res.last_insert_id(), token))
 }
 
+/// Keep at most one useful pre-2FA session per user. A correct password may be
+/// retried, but it must not accumulate a bank of independent TOTP guesses.
+pub async fn expire_unverified_for_user(pool: &MySqlPool, user_id: u64) -> Result<()> {
+    sqlx::query(
+        "UPDATE sessions SET expires_at = UTC_TIMESTAMP() \
+         WHERE user_id = ? AND totp_verified = 0 AND expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .context("expiring prior pre-2FA sessions")?;
+    Ok(())
+}
+
 /// Mark a session as 2FA-complete and rotate its token (defense against fixation).
 /// Returns the new plaintext token for a fresh Set-Cookie.
 pub async fn mark_totp_verified_and_rotate(pool: &MySqlPool, session_id: u64) -> Result<String> {
     let token = generate_token();
     let token_hash = hash_token(&token);
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE sessions SET token_hash = ?, totp_verified = 1, last_activity_at = UTC_TIMESTAMP() \
          WHERE id = ?",
     )
@@ -83,47 +102,106 @@ pub async fn mark_totp_verified_and_rotate(pool: &MySqlPool, session_id: u64) ->
     .execute(pool)
     .await
     .context("rotating session token")?;
+    anyhow::ensure!(updated.rows_affected() == 1, "session no longer exists");
     Ok(token)
 }
 
 /// Look up + validate a session by its plaintext token: exists and not expired.
 /// `totp_verified` is returned for the caller/extractor to gate on. Bumps
 /// last_activity_at.
-pub async fn validate(pool: &MySqlPool, token: &str) -> Result<Option<Session>> {
+pub async fn validate(
+    pool: &MySqlPool,
+    token: &str,
+    idle_timeout_minutes: u64,
+) -> Result<Option<Session>> {
     let token_hash = hash_token(token);
     // TIMESTAMP columns decode as DateTime<Utc> (NaiveDateTime maps only to
     // DATETIME in sqlx-mysql); the pool pins the session tz to UTC.
-    let row = sqlx::query_as::<_, (u64, u64, bool, DateTime<Utc>)>(
-        "SELECT id, user_id, totp_verified, expires_at FROM sessions \
-         WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP()",
+    let row = sqlx::query_as::<
+        _,
+        (
+            u64,
+            u64,
+            bool,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, user_id, totp_verified, expires_at, ip_address, user_agent FROM sessions \
+         WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP() \
+           AND last_activity_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",
     )
     .bind(&token_hash)
+    .bind(idle_timeout_minutes as i64)
     .fetch_optional(pool)
     .await
     .context("looking up session")?;
 
-    let Some((id, user_id, totp_verified, expires_at)) = row else {
+    let Some((id, user_id, totp_verified, expires_at, ip_address, user_agent)) = row else {
         return Ok(None);
     };
 
-    // Best-effort activity bump (cheap, throttled by the 1s timestamp resolution).
-    let _ = sqlx::query("UPDATE sessions SET last_activity_at = UTC_TIMESTAMP() WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await;
+    // Activity persistence is not an authentication gate for this request, but a
+    // failure is observable; continued failures naturally expire the session at
+    // the idle boundary rather than extending it without a durable record.
+    if let Err(e) =
+        sqlx::query("UPDATE sessions SET last_activity_at = UTC_TIMESTAMP() WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(event_type = "session_activity_persist_failed", session_id = id, error = %e, "could not update session activity timestamp");
+    }
 
     Ok(Some(Session {
         id,
         user_id,
         totp_verified,
         expires_at,
+        ip_address: ip_address.unwrap_or_default(),
+        user_agent: user_agent.unwrap_or_default(),
     }))
 }
 
 /// Like [`validate`] but does NOT require TOTP — used by /api/auth/totp to load
 /// the pre-2FA session the login step created.
-pub async fn validate_pre2fa(pool: &MySqlPool, token: &str) -> Result<Option<Session>> {
-    validate(pool, token).await
+pub async fn validate_pre2fa(
+    pool: &MySqlPool,
+    token: &str,
+    ttl_minutes: u64,
+) -> Result<Option<Session>> {
+    let token_hash = hash_token(token);
+    let row = sqlx::query_as::<
+        _,
+        (
+            u64,
+            u64,
+            bool,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, user_id, totp_verified, expires_at, ip_address, user_agent FROM sessions \
+         WHERE token_hash = ? AND totp_verified = 0 AND expires_at > UTC_TIMESTAMP() \
+           AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",
+    )
+    .bind(token_hash)
+    .bind(ttl_minutes as i64)
+    .fetch_optional(pool)
+    .await
+    .context("looking up pre-2FA session")?;
+    Ok(row.map(
+        |(id, user_id, totp_verified, expires_at, ip_address, user_agent)| Session {
+            id,
+            user_id,
+            totp_verified,
+            expires_at,
+            ip_address: ip_address.unwrap_or_default(),
+            user_agent: user_agent.unwrap_or_default(),
+        },
+    ))
 }
 
 /// Expire a session immediately (logout / admin revocation).
@@ -149,13 +227,13 @@ fn cookie_secure() -> bool {
 }
 
 /// Build the session cookie carrying `token`, with `max_age` matching the session
-/// row's lifetime. HttpOnly + SameSite=Lax, path=/, Secure per `cookie_secure()`;
+/// row's lifetime. HttpOnly + SameSite=Strict, path=/, Secure per `cookie_secure()`;
 /// the SignedCookieJar adds the SESSION_SECRET signature on the way out.
 pub fn build_cookie(token: String, max_age: time::Duration) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, token))
         .http_only(true)
         .secure(cookie_secure())
-        .same_site(SameSite::Lax)
+        .same_site(SameSite::Strict)
         .path("/")
         .max_age(max_age)
         .build()
@@ -166,7 +244,7 @@ pub fn removal_cookie() -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, ""))
         .http_only(true)
         .secure(cookie_secure())
-        .same_site(SameSite::Lax)
+        .same_site(SameSite::Strict)
         .path("/")
         .max_age(time::Duration::seconds(0))
         .build()
@@ -188,8 +266,22 @@ impl FromRequestParts<AppState> for Session {
         let token = jar
             .get(SESSION_COOKIE)
             .ok_or((StatusCode::UNAUTHORIZED, "missing session"))?;
-        match validate(&state.pool, token.value()).await {
-            Ok(Some(session)) if session.totp_verified => Ok(session),
+        match validate(
+            &state.pool,
+            token.value(),
+            state.config.auth.idle_timeout_minutes,
+        )
+        .await
+        {
+            Ok(Some(mut session)) if session.totp_verified => {
+                let socket = parts
+                    .extensions
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|c| &c.0);
+                session.ip_address = crate::api::client_ip(&parts.headers, socket);
+                session.user_agent = crate::api::user_agent(&parts.headers);
+                Ok(session)
+            }
             Ok(Some(_)) => Err((StatusCode::UNAUTHORIZED, "2fa required")),
             Ok(None) => Err((StatusCode::UNAUTHORIZED, "invalid session")),
             Err(e) => {

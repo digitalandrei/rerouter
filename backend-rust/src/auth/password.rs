@@ -29,7 +29,5 @@ pub fn hash(plain: &str) -> Result<String> {
 /// mismatch; Err only for malformed stored hashes.
 pub fn verify(plain: &str, phc: &str) -> Result<bool> {
     let parsed = PasswordHash::new(phc).map_err(|e| anyhow!("parsing stored hash: {e}"))?;
-    Ok(hasher()
-        .verify_password(plain.as_bytes(), &parsed)
-        .is_ok())
+    Ok(hasher().verify_password(plain.as_bytes(), &parsed).is_ok())
 }

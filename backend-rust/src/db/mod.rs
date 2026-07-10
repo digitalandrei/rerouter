@@ -98,6 +98,37 @@ pub async fn migrate(pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
+/// Unit tests share one disposable schema and run concurrently. Serialize its
+/// first migration pass because MySQL DDL and SQLx's migration-row insert are
+/// not atomic together on a brand-new database.
+#[cfg(test)]
+pub async fn migrate_test_schema(pool: &MySqlPool) -> Result<()> {
+    let database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(pool)
+        .await
+        .context("reading test database name")?;
+    let lock_name = format!("rerouter-test-migrate:{database}");
+    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 30)")
+        .bind(&lock_name)
+        .fetch_one(pool)
+        .await
+        .context("acquiring test migration lock")?;
+    if acquired != Some(1) {
+        anyhow::bail!("timed out acquiring test migration lock");
+    }
+
+    let migration_result = MIGRATOR.run(pool).await.context("running test migrations");
+    let released: Option<i64> = sqlx::query_scalar("SELECT RELEASE_LOCK(?)")
+        .bind(&lock_name)
+        .fetch_one(pool)
+        .await
+        .context("releasing test migration lock")?;
+    if released != Some(1) {
+        anyhow::bail!("test migration lock was not owned at release");
+    }
+    migration_result
+}
+
 /// Human description of a mysql:// URL with the password REDACTED — safe for
 /// logs and error messages.
 fn describe_url(url: &str) -> String {

@@ -361,6 +361,11 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
                       </option>
                     ))}
                   </select>
+                  {form.flow_protocol && !form.flow_port && (
+                    <p className="text-xs text-muted-foreground">
+                      Add a port selector when filtering by protocol.
+                    </p>
+                  )}
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
                   <span className="inline-flex items-center gap-1">

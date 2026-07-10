@@ -26,21 +26,51 @@ pub async fn create(
     pool: &MySqlPool,
     scope: &str,
     scope_ref: Option<&str>,
+    reroute_id: Option<u64>,
     kind: &str,
     reason: &str,
     by: Option<u64>,
 ) -> Result<u64> {
     let res = sqlx::query(
-        "INSERT INTO locks (scope, scope_ref, reason, kind, created_by) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO locks (scope, scope_ref, reroute_id, reason, kind, created_by) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(scope)
     .bind(scope_ref)
+    .bind(reroute_id)
     .bind(reason)
     .bind(kind)
     .bind(by)
     .execute(pool)
     .await
     .context("creating lock")?;
+    Ok(res.last_insert_id())
+}
+
+/// Transaction-scoped variant used by crash recovery so state, lock, alert, and
+/// audit either all commit or all remain retryable on the next startup.
+pub async fn create_on(
+    conn: &mut sqlx::MySqlConnection,
+    scope: &str,
+    scope_ref: Option<&str>,
+    reroute_id: Option<u64>,
+    kind: &str,
+    reason: &str,
+    by: Option<u64>,
+) -> Result<u64> {
+    let res = sqlx::query(
+        "INSERT INTO locks (scope, scope_ref, reroute_id, reason, kind, created_by) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(scope)
+    .bind(scope_ref)
+    .bind(reroute_id)
+    .bind(reason)
+    .bind(kind)
+    .bind(by)
+    .execute(conn)
+    .await
+    .context("creating transaction-scoped lock")?;
     Ok(res.last_insert_id())
 }
 
@@ -80,23 +110,38 @@ pub async fn clear(
 
 /// Active locks as JSON (for the locks / settings API).
 pub async fn list_active(pool: &MySqlPool) -> Result<Vec<Value>> {
-    let rows = sqlx::query_as::<_, (u64, String, Option<String>, Option<String>, String, chrono::DateTime<chrono::Utc>)>(
-        "SELECT id, scope, scope_ref, reason, kind, created_at FROM locks WHERE cleared_at IS NULL ORDER BY created_at DESC",
+    let rows = sqlx::query_as::<
+        _,
+        (
+            u64,
+            String,
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT id, scope, scope_ref, reroute_id, reason, kind, created_at \
+         FROM locks WHERE cleared_at IS NULL ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
     .context("listing locks")?;
     Ok(rows
         .into_iter()
-        .map(|(id, scope, scope_ref, reason, kind, created_at)| {
-            json!({
-                "id": id,
-                "scope": scope,
-                "scope_ref": scope_ref,
-                "reason": reason,
-                "kind": kind,
-                "created_at": created_at.to_rfc3339(),
-            })
-        })
+        .map(
+            |(id, scope, scope_ref, reroute_id, reason, kind, created_at)| {
+                json!({
+                    "id": id,
+                    "scope": scope,
+                    "scope_ref": scope_ref,
+                    "reroute_id": reroute_id,
+                    "reason": reason,
+                    "kind": kind,
+                    "created_at": created_at.to_rfc3339(),
+                })
+            },
+        )
         .collect())
 }

@@ -147,6 +147,18 @@ async fn fetch_device(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<
     Ok(Some(device_json(&row, count)))
 }
 
+async fn require_device(pool: &sqlx::MySqlPool, id: u64) -> Result<(), JsonResp> {
+    match sqlx::query_scalar::<_, u64>("SELECT id FROM devices WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "device not found")),
+        Err(_) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")),
+    }
+}
+
 /// GET /api/devices — every device with its interface count.
 pub async fn list(
     _g: RequirePermission<markers::ViewAsset>,
@@ -162,14 +174,15 @@ pub async fn list(
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
     // interface counts in one query, then zip.
-    let counts: std::collections::HashMap<u64, i64> = sqlx::query_as::<_, (u64, i64)>(
+    let counts: std::collections::HashMap<u64, i64> = match sqlx::query_as::<_, (u64, i64)>(
         "SELECT device_id, COUNT(*) FROM device_interfaces GROUP BY device_id",
     )
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let out: Vec<Value> = rows
         .iter()
         .map(|r| device_json(r, counts.get(&r.id).copied().unwrap_or(0)))
@@ -244,7 +257,9 @@ fn validate_ssh<'a>(
             }
             // A pasted private key is required UNLESS we're generating one in-app.
             if !will_generate_key && private_key.map(str::is_empty).unwrap_or(true) {
-                return Err("ssh_auth_method 'key' requires ssh_private_key (or set ssh_generate_key)");
+                return Err(
+                    "ssh_auth_method 'key' requires ssh_private_key (or set ssh_generate_key)",
+                );
             }
             Ok(user)
         }
@@ -254,7 +269,7 @@ fn validate_ssh<'a>(
 
 /// POST /api/devices — create a device. Encrypts the community before insert.
 pub async fn create(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Json(body): Json<CreateDevice>,
 ) -> JsonResp {
@@ -270,9 +285,32 @@ pub async fn create(
             "only SNMP v2c is supported in v1",
         );
     }
+    let community = match body.community.as_deref() {
+        Some(value) if !value.trim().is_empty() && value.len() <= 255 => value,
+        Some(value) if value.len() > 255 => {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "SNMP community must be at most 255 bytes",
+            )
+        }
+        _ => {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "SNMP v2c community is required",
+            )
+        }
+    };
+    if body.snmp_port == 0 || (body.ssh_auth_method.is_some() && body.ssh_port == 0) {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "ports must be non-zero");
+    }
+    if !(5..=86_400).contains(&body.poll_interval_seconds) {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "poll_interval_seconds must be between 5 and 86400",
+        );
+    }
     // Generate an in-app keypair only when key auth is chosen AND no paste given.
-    let generate_key =
-        body.ssh_generate_key && body.ssh_auth_method.as_deref() == Some("key");
+    let generate_key = body.ssh_generate_key && body.ssh_auth_method.as_deref() == Some("key");
 
     // Validate SSH access (password XOR key) before touching the DB.
     let ssh_username = match validate_ssh(
@@ -288,7 +326,7 @@ pub async fn create(
 
     // Encrypt community + SSH password/passphrase at rest.
     let (community_enc, ssh_pw_enc, ssh_pass_enc) = match (
-        seal_opt(body.community.as_deref()),
+        seal_opt(Some(community)),
         seal_opt(body.ssh_password.as_deref()),
         seal_opt(body.ssh_key_passphrase.as_deref()),
     ) {
@@ -350,6 +388,10 @@ pub async fn create(
         (enc, pubkey)
     };
 
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "INSERT INTO devices (name, hostname, snmp_version, snmp_port, community_encrypted, poll_interval_seconds, \
          ssh_username, ssh_port, ssh_auth_method, ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted, ssh_public_key) \
@@ -368,7 +410,7 @@ pub async fn create(
     .bind(ssh_key_enc)
     .bind(ssh_pass_enc)
     .bind(ssh_public_key)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
 
     let id = match res {
@@ -381,6 +423,20 @@ pub async fn create(
         }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "device_created",
+        "device",
+        id,
+        "device enrolled",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
 
     // Auto-discover right after enrollment: probe identity, then walk interfaces,
     // in the background (best-effort — the scheduler's poll loop also discovers a
@@ -437,18 +493,13 @@ pub struct UpdateDevice {
 /// PUT /api/devices/{id} — partial update. A present, non-empty `community` is
 /// re-encrypted; an absent one leaves the stored ciphertext untouched.
 pub async fn update(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
     Json(body): Json<UpdateDevice>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
     }
     if let Some(v) = &body.snmp_version {
         if v != "v2c" {
@@ -457,6 +508,39 @@ pub async fn update(
                 "only SNMP v2c is supported in v1",
             );
         }
+    }
+    if body.name.as_deref().is_some_and(|v| v.trim().is_empty())
+        || body
+            .hostname
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name and hostname cannot be empty",
+        );
+    }
+    if body.snmp_port == Some(0) || body.ssh_port == Some(0) {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "ports must be non-zero");
+    }
+    if body
+        .poll_interval_seconds
+        .is_some_and(|v| !(5..=86_400).contains(&v))
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "poll_interval_seconds must be between 5 and 86400",
+        );
+    }
+    if body
+        .community
+        .as_deref()
+        .is_some_and(|value| value.len() > 255)
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "SNMP community must be at most 255 bytes",
+        );
     }
     if let Some(m) = body.ssh_auth_method.as_deref() {
         if m != "password" && m != "key" {
@@ -603,7 +687,11 @@ pub async fn update(
     }
     q = q.bind(id);
 
-    match q.execute(&state.pool).await {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    match q.execute(&mut *tx).await {
         Ok(_) => {}
         Err(e) if is_dup(&e) => {
             return err(
@@ -612,6 +700,20 @@ pub async fn update(
             )
         }
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "device_updated",
+        "device",
+        id,
+        "device settings or credentials updated",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
 
     match fetch_device(&state.pool, id).await {
@@ -622,16 +724,36 @@ pub async fn update(
 
 /// DELETE /api/devices/{id}. Cascades to interfaces/metrics/samples via FKs.
 pub async fn remove(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query("DELETE FROM devices WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await;
     match res {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "device_deleted",
+                "device",
+                id,
+                "device deleted",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "device not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -641,17 +763,18 @@ pub async fn remove(
 /// Persists the identity/reachability; returns DeviceTestResult. A failure is a
 /// clean structured 200 `{ok:false, error}` (the device row carries last_error).
 pub async fn test(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "device_snmp_test_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match snmp::test_and_store(&state.pool, id).await {
         Ok(ident) => (
@@ -674,17 +797,18 @@ pub async fn test(
 /// `device_interfaces`. Returns {discovered:N}. A failure surfaces as a 502 with
 /// the structured error (the device is marked unreachable, no panic).
 pub async fn discover(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "interface_discovery_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match snmp::discover_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
@@ -701,17 +825,18 @@ pub async fn discover(
 /// on first contact (TOFU). This proves the russh ↔ IOS algorithm negotiation
 /// works before any reroute relies on it. `manage_devices` (superadmin) only.
 pub async fn ssh_test(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "device_ssh_test_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     let commands = vec![
         "show version | include (Version|uptime is)".to_string(),
@@ -739,17 +864,18 @@ pub async fn ssh_test(
 /// Returns per-command ok/denied so an under-privileged account is obvious in the
 /// device Settings tab. `manage_devices` (superadmin) only.
 pub async fn ssh_capabilities(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "ssh_capability_probe_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match crate::ssh::probe_capabilities(&state.pool, id).await {
         Ok(checks) => (
@@ -769,17 +895,18 @@ pub async fn ssh_capabilities(
 /// classified result: `ssh_ok` gates a reroute; `ssh_status` distinguishes
 /// reachable / no_privilege / unreachable. `manage_devices` (superadmin) only.
 pub async fn reachability_test(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "reachability_test_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     let reach = crate::reroute::reachability::reachable_for_mitigation(&state.pool, id).await;
     (
@@ -803,16 +930,19 @@ pub async fn reachability_test(
 /// Regenerating REPLACES the previous key — key auth then fails until the new
 /// public key is enrolled (`ip ssh pubkey-chain`). `manage_devices` (superadmin).
 pub async fn generate_key(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
     let row: Option<(String, String)> =
-        sqlx::query_as("SELECT name, hostname FROM devices WHERE id = ?")
+        match sqlx::query_as("SELECT name, hostname FROM devices WHERE id = ?")
             .bind(id)
             .fetch_optional(&state.pool)
             .await
-            .unwrap_or(None);
+        {
+            Ok(row) => row,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
     let Some((name, hostname)) = row else {
         return err(StatusCode::NOT_FOUND, "device not found");
     };
@@ -844,6 +974,10 @@ pub async fn generate_key(
         }
     };
 
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "UPDATE devices SET ssh_auth_method = 'key', ssh_private_key_encrypted = ?, \
          ssh_key_passphrase_encrypted = NULL, ssh_public_key = ? WHERE id = ?",
@@ -851,9 +985,21 @@ pub async fn generate_key(
     .bind(enc)
     .bind(&key.public_key_openssh)
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
-    if res.is_err() {
+    if res.is_err()
+        || super::audit_mutation_on(
+            &mut tx,
+            &g.session,
+            "device_ssh_key_rotated",
+            "device",
+            id,
+            "generated and stored a new SSH client key",
+        )
+        .await
+        .is_err()
+        || tx.commit().await.is_err()
+    {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
 
@@ -874,13 +1020,8 @@ pub async fn interfaces(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
     }
     match super::interfaces::load_interfaces_for_device(&state.pool, id).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
@@ -934,13 +1075,18 @@ pub async fn route_maps(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM device_route_maps WHERE device_id = ? ORDER BY name",
+    let names: Vec<String> = match sqlx::query_scalar(
+        "SELECT name FROM device_route_maps WHERE device_id = ? \
+           AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) ORDER BY name",
     )
     .bind(id)
+    .bind(crate::reroute::templates::ROUTING_INVENTORY_MAX_AGE_HOURS)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(names) => names,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     (StatusCode::OK, Json(json!(names)))
 }
 
@@ -967,17 +1113,18 @@ pub async fn bgp_peers(
 /// POST /api/devices/{id}/discover-bgp — walk BGP4-MIB and reconcile peers.
 /// A failure surfaces as a 502 with the structured error (no panic).
 pub async fn discover_bgp(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "bgp_discovery_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match snmp::discover_bgp_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
@@ -996,7 +1143,7 @@ pub struct UpdateBgpPeer {
 
 /// PATCH /api/devices/{device_id}/bgp-peers/{peer_id} — set the operator label.
 pub async fn update_bgp_peer(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path((device_id, peer_id)): Path<(u64, u64)>,
     Json(body): Json<UpdateBgpPeer>,
@@ -1005,14 +1152,34 @@ pub async fn update_bgp_peer(
         .label
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query("UPDATE device_bgp_peers SET label = ? WHERE id = ? AND device_id = ?")
         .bind(label)
         .bind(peer_id)
         .bind(device_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await;
     match res {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "bgp_peer_label_updated",
+                "bgp_peer",
+                peer_id,
+                "BGP peer label updated",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "bgp peer not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -1055,17 +1222,18 @@ pub async fn bgp_networks(
 /// POST /api/devices/{id}/discover-prefixes — SSH-read `network` statements and
 /// reconcile device_bgp_networks. A failure surfaces as a 502 (no panic).
 pub async fn discover_prefixes(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    if let Err(response) = require_device(&state.pool, id).await {
+        return response;
+    }
+    if audit_device_request(&state, &g.session, id, "prefix_discovery_requested")
         .await
-        .unwrap_or(None);
-    if exists.is_none() {
-        return err(StatusCode::NOT_FOUND, "device not found");
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match crate::ssh::discover_prefixes_and_store(&state.pool, id).await {
         Ok(n) => (StatusCode::OK, Json(json!({ "discovered": n }))),
@@ -1074,6 +1242,23 @@ pub async fn discover_prefixes(
             Json(json!({ "error": e.to_string() })),
         ),
     }
+}
+
+async fn audit_device_request(
+    state: &AppState,
+    session: &crate::auth::sessions::Session,
+    device_id: u64,
+    event: &str,
+) -> anyhow::Result<()> {
+    super::audit_mutation(
+        &state.pool,
+        session,
+        event,
+        "device",
+        device_id,
+        "operator requested a device probe or inventory refresh",
+    )
+    .await
 }
 
 /// True if a sqlx error is a MySQL duplicate-key (1062) violation.

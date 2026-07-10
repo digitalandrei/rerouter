@@ -3,7 +3,7 @@
 //! EXCLUSIVELY via Nginx behind Cloudflare. See ../docs/architecture.md for the
 //! endpoint list.
 //!
-//! Every endpoint except GET /api/health requires a valid session (see
+//! Every endpoint except GET /api/health and GET /api/ready requires a valid session (see
 //! auth::sessions::Session) and is authorized via RBAC (auth::rbac) — this
 //! process IS the security boundary. The real client IP arrives via
 //! CF-Connecting-IP, forwarded by Nginx; trusted because only Cloudflare can
@@ -25,8 +25,10 @@ pub mod templates;
 pub mod users;
 
 use anyhow::{Context, Result};
-use axum::extract::FromRef;
-use axum::http::StatusCode;
+use axum::extract::{FromRef, Request};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
@@ -66,9 +68,8 @@ impl FromRef<AppState> for MySqlPool {
 /// hard error — we will not sign cookies with a default key.
 ///
 /// axum-extra's `Key` (cookie crate) needs 64 bytes of key material; the
-/// installer ships a 32-byte SESSION_SECRET. We HKDF-expand the master secret to
-/// the full key via `Key::derive_from`, which is deterministic (stable across
-/// restarts, so sessions survive a restart) and accepts any master >= 32 bytes.
+/// installer ships a 32-byte SESSION_SECRET. We SHA-512-expand the master secret
+/// deterministically so sessions survive a restart.
 /// A secret already >= 64 bytes is used directly.
 pub fn cookie_key_from_env() -> Result<Key> {
     let secret = std::env::var("SESSION_SECRET")
@@ -96,6 +97,200 @@ pub(crate) fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": msg })))
 }
 
+/// Reject browser mutations initiated by another origin. SameSite cookies stop
+/// cross-site CSRF, while Sec-Fetch-Site also distinguishes a potentially
+/// compromised sibling subdomain ("same-site") from this exact origin. Origin
+/// comparison is the fallback for browsers that omit Fetch Metadata headers;
+/// non-browser clients may omit both.
+async fn require_same_origin_mutation(request: Request, next: Next) -> Response {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && mutation_is_cross_origin(request.headers())
+    {
+        return err(StatusCode::FORBIDDEN, "cross_origin_mutation_refused").into_response();
+    }
+    next.run(request).await
+}
+
+async fn no_store_api_response(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn mutation_is_cross_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+    {
+        match site {
+            "same-origin" | "none" => {}
+            "same-site" | "cross-site" => return true,
+            _ => return true,
+        }
+    }
+
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let Some((scheme, authority)) = origin
+        .strip_prefix("https://")
+        .map(|authority| ("https", authority))
+        .or_else(|| {
+            origin
+                .strip_prefix("http://")
+                .map(|authority| ("http", authority))
+        })
+    else {
+        return true;
+    };
+    if authority.is_empty()
+        || authority.contains('/')
+        || !authority.eq_ignore_ascii_case(host.trim())
+    {
+        return true;
+    }
+
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|forwarded| !scheme.eq_ignore_ascii_case(forwarded.trim()))
+}
+
+/// Required audit write for persisted configuration mutations. Callers surface an
+/// error when this fails; failures are also logged so an incomplete trail is never
+/// silent.
+pub(crate) async fn audit_mutation(
+    pool: &MySqlPool,
+    session: &crate::auth::sessions::Session,
+    event_type: &str,
+    entity_type: &str,
+    entity_id: u64,
+    message: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_logs \
+         (actor_type, actor_user_id, event_type, entity_type, entity_id, message, ip_address, user_agent) \
+         VALUES ('user', ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session.user_id)
+    .bind(event_type)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(message)
+    .bind(&session.ip_address)
+    .bind(&session.user_agent)
+    .execute(pool)
+    .await
+    .with_context(|| format!("auditing {event_type} for {entity_type} {entity_id}"))?;
+    Ok(())
+}
+
+pub(crate) async fn audit_mutation_on(
+    conn: &mut sqlx::MySqlConnection,
+    session: &crate::auth::sessions::Session,
+    event_type: &str,
+    entity_type: &str,
+    entity_id: u64,
+    message: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_logs \
+         (actor_type, actor_user_id, event_type, entity_type, entity_id, message, ip_address, user_agent) \
+         VALUES ('user', ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session.user_id)
+    .bind(event_type)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(message)
+    .bind(&session.ip_address)
+    .bind(&session.user_agent)
+    .execute(conn)
+    .await
+    .with_context(|| format!("auditing {event_type} for {entity_type} {entity_id}"))?;
+    Ok(())
+}
+
+fn action_plan_hash(plan: &Value) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(plan).context("serializing action preview")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+pub(crate) async fn store_action_preview(
+    pool: &MySqlPool,
+    user_id: u64,
+    scope: &str,
+    scope_id: Option<u64>,
+    plan: &Value,
+) -> Result<String> {
+    let token = crate::auth::sessions::generate_token();
+    let token_hash = crate::auth::sessions::hash_token(&token);
+    let plan_hash = action_plan_hash(plan)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM action_previews WHERE expires_at <= UTC_TIMESTAMP() OR used_at IS NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO action_previews \
+         (token_hash, user_id, scope, scope_id, plan_hash, expires_at) \
+         VALUES (?, ?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 5 MINUTE))",
+    )
+    .bind(token_hash)
+    .bind(user_id)
+    .bind(scope)
+    .bind(scope_id)
+    .bind(plan_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(token)
+}
+
+pub(crate) async fn consume_action_preview(
+    pool: &MySqlPool,
+    token: &str,
+    user_id: u64,
+    scope: &str,
+    scope_id: Option<u64>,
+    plan: &Value,
+) -> Result<bool> {
+    let token_hash = crate::auth::sessions::hash_token(token);
+    let plan_hash = action_plan_hash(plan)?;
+    let updated = sqlx::query(
+        "UPDATE action_previews SET used_at = UTC_TIMESTAMP() \
+         WHERE token_hash = ? AND user_id = ? AND scope = ? \
+           AND ((scope_id IS NULL AND ? IS NULL) OR scope_id = ?) \
+           AND plan_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(token_hash)
+    .bind(user_id)
+    .bind(scope)
+    .bind(scope_id)
+    .bind(scope_id)
+    .bind(plan_hash)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cookie_key = cookie_key_from_env()?;
     let bind = cfg.server.bind.clone();
@@ -106,8 +301,9 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
     };
 
     let app = Router::new()
-        // unauthenticated liveness probe — everything else requires a session
+        // unauthenticated liveness/readiness probes; status requires a session
         .route("/api/health", get(health::health))
+        .route("/api/ready", get(health::ready))
         .route("/api/status", get(health::status))
         // auth: login (password) -> totp (2FA, issues session) -> logout
         .nest("/api/auth", auth::router())
@@ -150,7 +346,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(devices::discover_prefixes),
         )
         .route("/api/devices/{id}/interfaces", get(devices::interfaces))
-        // flow telemetry (NetFlow/IPFIX) — read-only second source, see flows.rs
+        // flow telemetry (NetFlow v9/sFlow v5) — passive second source, see flows.rs
         .route("/api/devices/{id}/flows/top", get(flows::top))
         .route("/api/devices/{id}/flow-exporters", get(flows::exporters))
         .route("/api/flows/search", get(flows::search))
@@ -236,6 +432,8 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         .route("/api/users", get(users::list).post(users::create))
         .route("/api/users/{id}", put(users::update).delete(users::remove))
         .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
+        .layer(middleware::from_fn(require_same_origin_mutation))
+        .layer(middleware::from_fn(no_store_api_response))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -279,4 +477,61 @@ pub fn user_agent(headers: &axum::http::HeaderMap) -> String {
         .chars()
         .take(512)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mutation_is_cross_origin;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(host: &str, origin: Option<&str>, fetch_site: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_str(host).unwrap());
+        if let Some(origin) = origin {
+            headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+        }
+        if let Some(fetch_site) = fetch_site {
+            headers.insert("sec-fetch-site", HeaderValue::from_str(fetch_site).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn mutation_origin_guard_rejects_sibling_and_cross_site_browsers() {
+        assert!(mutation_is_cross_origin(&headers(
+            "rerouter.example.com",
+            Some("https://tools.example.com"),
+            Some("same-site"),
+        )));
+        assert!(mutation_is_cross_origin(&headers(
+            "rerouter.example.com",
+            Some("https://attacker.test"),
+            Some("cross-site"),
+        )));
+    }
+
+    #[test]
+    fn mutation_origin_guard_accepts_exact_origin_and_cli_requests() {
+        assert!(!mutation_is_cross_origin(&headers(
+            "rerouter.example.com",
+            Some("https://rerouter.example.com"),
+            Some("same-origin"),
+        )));
+        assert!(!mutation_is_cross_origin(&headers(
+            "127.0.0.1:9277",
+            None,
+            None,
+        )));
+    }
+
+    #[test]
+    fn mutation_origin_guard_checks_forwarded_scheme() {
+        let mut headers = headers(
+            "rerouter.example.com",
+            Some("http://rerouter.example.com"),
+            Some("same-origin"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(mutation_is_cross_origin(&headers));
+    }
 }

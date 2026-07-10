@@ -23,6 +23,7 @@ import {
   type Lock,
   type Reroute,
   type RerouteDetail,
+  type RerouteResult,
   type Rule,
   type SystemSettings,
 } from "@/lib/api";
@@ -37,6 +38,8 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -54,7 +57,6 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui/tabs";
-import { ConfirmDialog } from "@/components/confirm-dialog";
 import { PromptDialog } from "@/components/prompt-dialog";
 import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
 import { SeverityBadge, StateBadge, toneClass } from "@/components/status-badge";
@@ -527,6 +529,8 @@ function RerouteDrawer({
   const [busy, setBusy] = useState(false);
   const [ackOpen, setAckOpen] = useState(false);
   const [rollbackOpen, setRollbackOpen] = useState(false);
+  const [rollbackPreview, setRollbackPreview] = useState<RerouteResult | null>(null);
+  const [rollbackToken, setRollbackToken] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api.reroutes.get(id).then(setDetail).catch(() => setDetail(null));
@@ -543,6 +547,21 @@ function RerouteDrawer({
       onChanged();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "action failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function previewRollback() {
+    if (!detail) return;
+    setBusy(true);
+    try {
+      const response = await api.reroutes.rollback(detail.id, { dry_run: true });
+      setRollbackPreview(response.result);
+      setRollbackToken(response.preview_token ?? null);
+      setRollbackOpen(true);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "rollback preview failed");
     } finally {
       setBusy(false);
     }
@@ -657,12 +676,13 @@ function RerouteDrawer({
                     Acknowledge uncertain (clears device lock)
                   </Button>
                 )}
-                {detail.state === "succeeded" && (
+                {(detail.state === "succeeded" ||
+                  (detail.state === "failed" && detail.started_at !== null)) && (
                   <Button
                     size="sm"
                     variant="outline"
                     disabled={busy}
-                    onClick={() => setRollbackOpen(true)}
+                    onClick={() => void previewRollback()}
                   >
                     Roll back
                   </Button>
@@ -689,17 +709,68 @@ function RerouteDrawer({
         />
       )}
       {detail && (
-        <ConfirmDialog
+        <Dialog
           open={rollbackOpen}
-          onOpenChange={setRollbackOpen}
-          title="Roll back this action"
-          description="Runs the template's rollback against the same router and parameters now."
-          confirmLabel="Roll back"
-          onConfirm={async () => {
-            setRollbackOpen(false);
-            await act(() => api.reroutes.rollback(detail.id));
+          onOpenChange={(open) => {
+            if (busy) return;
+            setRollbackOpen(open);
+            if (!open) {
+              setRollbackPreview(null);
+              setRollbackToken(null);
+            }
           }}
-        />
+        >
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Review rollback commands</DialogTitle>
+              <DialogDescription>
+                The controller prepared this rollback from the original router and
+                parameters. Execution rechecks locks, reachability, and verification.
+              </DialogDescription>
+            </DialogHeader>
+            {rollbackPreview?.would_run ? (
+              <div className="max-h-[55vh] space-y-2 overflow-y-auto">
+                <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
+                  {rollbackPreview.would_run.commands.join("\n")}
+                </pre>
+                {rollbackPreview.would_run.verify && (
+                  <p className="text-xs text-muted-foreground">
+                    Verify: <code>{rollbackPreview.would_run.verify.command}</code>
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-sm text-destructive">
+                {rollbackPreview?.blocked_reason ??
+                  rollbackPreview?.message ??
+                  "No rollback plan is available."}
+              </p>
+            )}
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => setRollbackOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={busy || !rollbackPreview?.would_run}
+                onClick={() => {
+                  setRollbackOpen(false);
+                  void act(() =>
+                    api.reroutes.rollback(detail.id, {
+                      preview_token: rollbackToken ?? undefined,
+                    }),
+                  );
+                }}
+              >
+                {busy ? "Rolling back…" : "Execute reviewed rollback"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </>
   );

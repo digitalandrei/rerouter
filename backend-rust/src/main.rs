@@ -49,7 +49,8 @@ struct Cli {
     #[arg(long)]
     migrate: bool,
 
-    /// Re-apply the idempotent starter reroute-template seeds and exit.
+    /// Apply pending migrations that contain starter template seeds and exit.
+    /// Does not restore template rows deleted after their migration ran.
     #[arg(long)]
     seed_templates: bool,
 
@@ -173,12 +174,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if cli.seed_templates {
-        // Seeds ship as idempotent migrations (INSERT IGNORE), so they were
-        // just (re)applied above. TODO(milestone 3): re-seed deliberately
-        // deleted templates outside the migration history.
-        tracing::info!(
-            event_type = "seed_templates_done",
-            "starter template seeds applied; exiting"
+        tracing::warn!(
+            event_type = "seed_templates_migrations_only",
+            "pending seed migrations applied; already-applied migrations do not restore deleted template rows"
         );
         return Ok(());
     }
@@ -247,7 +245,7 @@ async fn main() -> Result<()> {
     // Reset the device stability clocks: after a restart a device must be freshly
     // re-confirmed SSH-reachable for the stability window before AUTOMATIC
     // mitigations resume (manual is unaffected). The poll loop re-establishes it.
-    reroute::reachability::reset_stability(&pool).await;
+    reroute::reachability::reset_stability(&pool).await?;
 
     // Internal alert dispatcher (replaces any external queue worker): polls the
     // alerts table and sends email via SMTP. Never blocks the control plane.

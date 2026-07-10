@@ -36,93 +36,66 @@ pub async fn recover_on_startup(pool: &MySqlPool) -> Result<()> {
     let mut failures = 0usize;
 
     for (reroute_id, device_id) in &stuck {
-        // 1. Mark uncertain (terminal until acknowledged).
-        if let Err(e) = sqlx::query(
-            "UPDATE reroutes SET state = 'uncertain', finished_at = UTC_TIMESTAMP(), \
-             failure_reason = 'controller restarted mid-action; outcome unverified' WHERE id = ?",
-        )
-        .bind(reroute_id)
-        .execute(pool)
-        .await
-        {
-            failures += 1;
-            tracing::error!(
-                event_type = "recovery_write_failed",
-                step = "mark_uncertain",
-                reroute_id,
-                error = %e,
-                "FAILED to mark crashed reroute uncertain — it may stay pending"
-            );
-        }
-
-        // 2. Lock the affected device (auto_crash) until an admin acknowledges.
-        if let Some(dev) = device_id {
-            if let Err(e) = crate::reroute::locks::create(
-                pool,
-                "device",
-                Some(&dev.to_string()),
-                "auto_crash",
-                &format!("reroute #{reroute_id} was in-flight at restart; outcome unknown"),
-                None,
+        let recovered = async {
+            let mut tx = pool.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE reroutes SET state = 'uncertain', finished_at = UTC_TIMESTAMP(), \
+                 failure_reason = 'controller restarted mid-action; outcome unverified' \
+                 WHERE id = ? AND state IN ('planned','pending','running','verifying')",
             )
-            .await
-            {
-                failures += 1;
-                tracing::error!(
-                    event_type = "recovery_write_failed",
-                    step = "lock_device",
-                    reroute_id,
-                    device_id = dev,
-                    error = %e,
-                    "FAILED to lock device after crash — device is NOT protected"
-                );
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "in-flight state changed during recovery"
+            );
+
+            if let Some(dev) = device_id {
+                crate::reroute::locks::create_on(
+                    &mut tx,
+                    "device",
+                    Some(&dev.to_string()),
+                    Some(*reroute_id),
+                    "auto_crash",
+                    &format!("reroute #{reroute_id} was in-flight at restart; outcome unknown"),
+                    None,
+                )
+                .await?;
             }
-        }
 
-        // 3. Alert (uncertain is always sent, never collapsed).
-        let payload = serde_json::json!({
-            "reroute_id": reroute_id,
-            "device_id": device_id,
-            "reason": "controller restart mid-action",
-        });
-        if let Err(e) = sqlx::query(
-            "INSERT INTO alerts (event_type, severity, device_id, payload_json, dedup_key) \
-             VALUES ('reroute_uncertain', 'critical', ?, ?, ?)",
-        )
-        .bind(device_id)
-        .bind(sqlx::types::Json(&payload))
-        .bind(format!("reroute_uncertain:reroute:{reroute_id}"))
-        .execute(pool)
-        .await
-        {
-            failures += 1;
-            tracing::error!(
-                event_type = "recovery_write_failed",
-                step = "alert",
-                reroute_id,
-                error = %e,
-                "FAILED to enqueue uncertain alert"
-            );
+            let payload = serde_json::json!({
+                "reroute_id": reroute_id,
+                "device_id": device_id,
+                "reason": "controller restart mid-action",
+            });
+            sqlx::query(
+                "INSERT INTO alerts (event_type, severity, device_id, payload_json, dedup_key) \
+                 VALUES ('reroute_uncertain', 'critical', ?, ?, ?)",
+            )
+            .bind(device_id)
+            .bind(sqlx::types::Json(&payload))
+            .bind(format!("reroute_uncertain:reroute:{reroute_id}"))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO audit_logs \
+                 (actor_type, event_type, entity_type, entity_id, reroute_id, message) \
+                 VALUES ('system', 'reroute_uncertain', 'reroute', ?, ?, \
+                         'marked uncertain on startup recovery')",
+            )
+            .bind(reroute_id)
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<(), anyhow::Error>(())
         }
+        .await;
 
-        // 4. Audit.
-        if let Err(e) = sqlx::query(
-            "INSERT INTO audit_logs (actor_type, event_type, entity_type, entity_id, reroute_id, message) \
-             VALUES ('system', 'reroute_uncertain', 'reroute', ?, ?, 'marked uncertain on startup recovery')",
-        )
-        .bind(reroute_id)
-        .bind(reroute_id)
-        .execute(pool)
-        .await
-        {
+        if let Err(e) = recovered {
             failures += 1;
-            tracing::error!(
-                event_type = "recovery_write_failed",
-                step = "audit",
-                reroute_id,
-                error = %e,
-                "FAILED to write recovery audit row"
-            );
+            tracing::error!(event_type = "recovery_transaction_failed", reroute_id, error = %e, "FAILED to atomically recover in-flight reroute; startup will abort and retry next time");
         }
     }
 

@@ -25,9 +25,10 @@ action path as dangerous by default.
   explicit global enable *and* a per-rule enable (on top of enforce mode). Arming
   the system (enforce, or the global enable) requires step-up re-auth (password + TOTP).
 - Every reroute must pass role permissions, the template/allowlist checks,
-  cooldowns, locks, and audit logging. (Typed confirmation and per-action re-auth
-  were de-scoped — see doctrine §7/§9. The frontend still shows a confirm dialog,
-  but it is NOT a server-side gate; do not rely on it for safety.)
+  cooldowns, locks, and audit logging. In enforce mode, every operator-triggered
+  action and rollback must present a short-lived, single-use server token bound
+  to the exact preview just rendered. This preview binding is a server-side gate;
+  frontend state alone is never sufficient.
 - Prefer clear **state machines** over implicit behaviour. Persist runtime state
   before and after every step of an action.
 - On controller startup, any reroute left in `planned`/`pending`/`running`/`verifying`
@@ -35,16 +36,18 @@ action path as dangerous by default.
   acknowledges it. Do not assume "nothing happened" after a crash.
 - Never treat "command/API call sent" as success. Always verify the resulting
   routing state.
-- Telemetry parsers (SNMP, the NetFlow v9 / sFlow v5 flow collector, and the
-  planned IPFIX decoder) must return structured errors and **never panic**. Low
-  parser *sampling* confidence blocks flow-driven automatic actions — but note it
-  does NOT authenticate the exporter's source (see docs/audit-2026-07.md P0-1).
+- Telemetry parsers (SNMP and the NetFlow v9 / sFlow v5 flow collector) must
+  return structured errors and **never panic**.
+  Flow-driven automatic action additionally requires explicit flow-auto config,
+  an enrolled source, non-low sampling confidence, and contemporaneous same-
+  interface SNMP corroboration. UDP source allowlisting is not cryptographic
+  identity; deployments must also enforce management-plane ACL/uRPF controls.
 
 ## Conventions
 
 - Rust: `tokio` + `axum` + `sqlx` (MariaDB); `argon2` (Argon2id) + `totp-rs` for
   auth/2FA; `lettre` for email alerts. Structured logging via `tracing`.
-- Frontend: Vite + React + TypeScript + Tailwind + shadcn/ui SPA in `frontend/`,
+- Frontend: Vite + React 19 + TypeScript + Tailwind + shadcn/ui SPA in `frontend/`,
   served statically by Nginx.
 - DB: MariaDB only. Migrations are sqlx SQL files in `backend-rust/migrations/`.
 - Bootstrap: the installer lives in `src/install.rs`; `.env` is loaded via
@@ -57,6 +60,8 @@ action path as dangerous by default.
 
 ## When implementing
 
-Follow the milestone order in the doctrine: docs → schema → telemetry skeleton →
-web UI → detection → manual reroutes → automatic reroutes. Do not jump ahead to
-automatic destructive actions before manual actions are proven safe.
+Treat doctrine, migrations, backend behavior, frontend contracts, deployment
+examples, and tests as one change surface. New automatic-capable templates must
+be explicitly opted into `automatic_allowed`; interface shutdown and route-map
+changes remain manual-only. Preserve the shipped `observe` default and add
+failure-path tests whenever a change touches execution, recovery, or identity.

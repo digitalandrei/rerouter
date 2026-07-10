@@ -1,13 +1,13 @@
 # Asset & Provider Enrollment
 
-> **Not implemented in v1.** This asset/provider enrollment model was superseded
+> **Archived, non-normative design.** This asset/provider enrollment model was superseded
 > by **device enrollment** — see [device-enrollment.md](device-enrollment.md).
 > v1 enrolls **devices** (routers) and polls their **interfaces** over SNMP;
 > reroutes run as device-CLI templates over SSH. There are no provider adapters
 > (Cloudflare / BGP-RTBH / FlowSpec / scrubber) and no `/api/assets` or
 > `/api/providers` endpoints. This document is retained for design context only;
-> the `protected_assets` / `reroute_providers` tables survive merely as legacy
-> foreign keys.
+> the `protected_assets` / `reroute_providers` tables and their foreign keys were
+> removed by migration `20260614000100_drop_asset_provider_model.sql`.
 
 Rerouter protects **assets** (prefixes / IPs / services) by rerouting through
 **providers** (Cloudflare, BGP upstreams, scrubbing centers). Both are enrolled

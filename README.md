@@ -2,9 +2,9 @@
 
 Rerouter is a safety-critical DDoS-mitigation control plane. It watches traffic
 telemetry for your protected prefixes, detects attack conditions against editable
-thresholds, and executes controlled **reroute** actions — blackhole/RTBH a prefix,
-add a FlowSpec drop, enable Cloudflare "Under Attack" mode, or steer traffic to a
-scrubbing center — through audited, allowlisted templates.
+thresholds, and executes controlled **reroute** actions on Cisco IOS devices:
+Null0/RTBH routes, BGP session and advertisement changes, route-map changes, and
+bounded interface actions through audited, allowlisted templates.
 
 It is not just a dashboard. It is an operations control-plane for traffic
 steering. Safety, auditability, and predictable state recovery are core
@@ -14,17 +14,17 @@ requirements: the app prefers doing nothing over doing the wrong thing.
 
 - **Rust controller binary** (`backend-rust/`) — traffic telemetry collection,
   detection rule engine, reroute execution, state machine, plus the full
-  authenticated REST API: session auth with TOTP 2FA, RBAC, email alerting (SMTP
-  alert dispatcher), and sqlx database migrations. Binds to localhost only and
+  authenticated REST API: session auth with TOTP 2FA, RBAC, email/Teams alert
+  delivery, and sqlx database migrations. Binds to localhost only and
   runs as a long-lived systemd service.
 - **React + Shadcn SPA** (`frontend/`) — Vite + React + TypeScript + Tailwind +
   shadcn/ui single-page app: login with TOTP 2FA, operational dashboards,
-  asset/provider CRUD, detection-rule editor, manual reroute triggers,
-  email-alert configuration, and audit views. Built to `frontend/dist` and
+  device/interface management, detection-rule editor, manual reroute triggers,
+  notification configuration, and audit views. Built to `frontend/dist` and
   served statically by Nginx.
 - **MariaDB** — the controller's database; schema owned by sqlx migrations in
   `backend-rust/migrations/`.
-- **Cloudflare + Nginx** — Cloudflare fronts the dev/prod site at
+- **Cloudflare + Nginx** — Cloudflare fronts the production site at
   `rerouter.cloudcraft.ro`; Nginx is the origin, serves the SPA, and
   reverse-proxies `/api/` to the controller on `127.0.0.1:9277`.
 
@@ -46,7 +46,8 @@ sudo systemctl start rerouter-controller
 journalctl -fu rerouter-controller        # preflights DB creds, seeds a fresh database itself
 ```
 
-Create the first admin with `--create-admin`. With `embed-ui`, browse the UI
+Create the first superadmin with `--create-admin`; it prints the independent
+one-time code required to bind first-login TOTP enrollment. With `embed-ui`, browse the UI
 through an SSH tunnel (`ssh -L 9277:127.0.0.1:9277 server`) — the API bind
 stays loopback-only. Full details (including the Nginx + Cloudflare production
 topology): [docs/deployment.md](docs/deployment.md).
@@ -74,12 +75,17 @@ flip the operating mode to `enforce` (audited) before Rerouter ever acts.
 
 Beyond that, automatic reroutes are **disabled by default** even in enforce
 mode. Every reroute must be defined as an action template and is allowlisted,
-rate-limited, cooled down, and audited. Disruptive reroutes require typed
-confirmation and a reason, and any action left unresolved by a crash is marked
-`uncertain` and locks the affected asset until an admin acknowledges it.
+rate-limited, cooled down, audited, and verified with a separate read-only SSH
+session. Enforce-mode manual actions, rule applies, and rollbacks require a short-lived,
+single-use token bound to the exact server-rendered preview. Fresh device
+inventory bounds every new target; interface shutdown and route-map changes are
+manual-only. Any action left unresolved by a crash is marked `uncertain` and
+locks the affected device until an admin acknowledges it.
 
 ## Status
 
-Bootstrap scaffolding. See [docs/doctrine.md](docs/doctrine.md) section
-"Implementation milestones" for the build order. Milestone 1 is monitoring-only:
-no reroutes are executed.
+Inventory, telemetry, detection, the authenticated UI, alert delivery, manual
+and gated automatic execution, rollback, and crash recovery are implemented.
+The shipped database default remains `observe`; production arming is always an
+explicit, step-up-authenticated operator decision. See the latest
+[re-audit](docs/audit-2026-07-10.md) for verified safeguards and residual risks.

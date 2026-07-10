@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use rand::distr::{Alphanumeric, SampleString};
+use std::time::{SystemTime, UNIX_EPOCH};
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// Default TOTP issuer label when TWO_FACTOR_ISSUER is unset.
@@ -38,7 +39,7 @@ fn instance(secret: Secret, account_email: &str) -> Result<TOTP> {
 
 /// Begin enrollment: generate a random base32 secret and the otpauth:// URL the
 /// SPA renders as a QR code. The secret stays UNCONFIRMED (encrypted at rest)
-/// until the user proves possession via `verify`; only then is
+/// until the user proves possession via [`matched_step`]; only then is
 /// two_factor_confirmed_at set and the recovery codes issued (shown once).
 pub fn enroll(account_email: &str) -> Result<(String, String)> {
     let secret = Secret::generate_secret();
@@ -46,10 +47,38 @@ pub fn enroll(account_email: &str) -> Result<(String, String)> {
     Ok((secret.to_encoded().to_string(), otpauth_url))
 }
 
-/// Verify a 6-digit code against the (decrypted) base32 secret, ±1 step.
-pub fn verify(secret_base32: &str, code: &str, account_email: &str) -> Result<bool> {
+/// Rebuild enrollment material for an already-persisted unconfirmed secret. A
+/// repeated password login must not replace the secret and let a password-only
+/// attacker race the legitimate enrollment.
+pub fn enrollment_for_secret(secret_base32: &str, account_email: &str) -> Result<String> {
+    instance(Secret::Encoded(secret_base32.to_string()), account_email).map(|totp| totp.get_url())
+}
+
+/// Return the RFC 6238 time-step counter matched by a valid code. The caller
+/// persists this value atomically to reject replay across concurrent sessions.
+pub fn matched_step(secret_base32: &str, code: &str, account_email: &str) -> Result<Option<u64>> {
     let totp = instance(Secret::Encoded(secret_base32.to_string()), account_email)?;
-    totp.check_current(code)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow!("system time: {e}"))?
+        .as_secs();
+    let code = code.trim();
+    if !totp.check(code, now) {
+        return Ok(None);
+    }
+    let current = now / 30;
+    for step in current.saturating_sub(1)..=current.saturating_add(1) {
+        if totp.generate(step * 30) == code {
+            return Ok(Some(step));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+pub(crate) fn current_code(secret_base32: &str, account_email: &str) -> Result<String> {
+    instance(Secret::Encoded(secret_base32.to_string()), account_email)?
+        .generate_current()
         .map_err(|e| anyhow!("system time: {e}"))
 }
 

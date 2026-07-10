@@ -1,7 +1,8 @@
 # Flow Telemetry (NetFlow v9 / sFlow v5 / IPFIX) — design note
 
-> **Status: implemented (NetFlow v9 + sFlow v5), read-only.** Collector + storage
-> + API + UI are in the tree; IPFIX (v10) is the planned additive decoder. The
+> **Status: implemented (NetFlow v9 + sFlow v5).** Passive collection, storage,
+> API/UI, `flow_pps`/`flow_bps` detection, and tightly gated automatic signaling
+> are in the tree; IPFIX (v10) is the planned additive decoder. The
 > primary telemetry source remains **SNMP interface polling**
 > ([telemetry-model.md](telemetry-model.md)); flow telemetry is a *second*,
 > additive source that gives per-tuple visibility SNMP cannot. Code:
@@ -20,10 +21,10 @@ case is a high-pps / low-bitrate flood — e.g. a UDP/53 reflection from peer A 
 that barely moves the bitrate graph but is obvious as "N Mpps to dst port 53 on
 ingress interface X". Flow telemetry is the base for that class of detector.
 
-This note covers a **read-only flow collector**: it ingests NetFlow, aggregates,
-and displays. It is a telemetry source, not an action path. Like all telemetry it
-*feeds* detection but never executes anything — observe mode and every reroute
-gate are unchanged.
+The collector itself is passive: it ingests and aggregates, and never sends a
+packet to a router. Its buckets do feed detection. A flow rule can execute only
+through the normal reroute engine and the additional flow-auto gates documented
+below; observe mode and every standard reroute gate remain authoritative.
 
 ## Scope (v1)
 
@@ -33,16 +34,18 @@ gate are unchanged.
   template/options `0`/`1` in v9 vs `2`/`3` in IPFIX — and variable-length
   encoding).
 - **Retain** aggregated flow data for `[retention].flow_buckets_days` (default
-  7 days), pruned by the unified `scheduler::retention_cleanup` alongside
+  2 days / 48 hours), pruned by the unified `scheduler::retention_cleanup` alongside
   `interface_samples`. Note: per-minute flow buckets are high-cardinality
   (especially top-talker 5-tuples), so raising this materially increases disk use.
 - **Display** per interface: top-10 talkers (5-tuples), top-10 ports, and
   per-interface/direction totals.
-- **Out of scope (future):** per-tuple anomaly baselines, flow-driven automatic
-  reroutes, sFlow counter samples (they duplicate the SNMP path) and sFlow
-  extended-router AS records. Flow signals may inform detection rules, but
-  auto-execution stays behind the existing global + per-rule enables and enforce
-  mode.
+- **Implemented detection:** the latest closed interface bucket drives
+  `flow_pps` and `flow_bps`; an optional protocol+port selector is evaluated at
+  that same timestamp, so disappeared traffic becomes a current zero rather than
+  a stale remembered value. Protocol-only selectors are rejected because no
+  protocol-only rollup exists; legacy ambiguous rules are disabled by migration.
+- **Out of scope (future):** per-tuple anomaly baselines, sFlow counter samples
+  (they duplicate the SNMP path), sFlow extended-router AS records, and IPFIX.
 
 > **sFlow v5 (`sflow.rs`).** A second, additive decoder feeding the *same*
 > `FlowRecord` and all downstream aggregation/storage/API/UI. It differs from
@@ -75,7 +78,8 @@ chooses — this is a deliberate, documented exposure, off by default.
 ```toml
 [flow]
 enabled        = false          # off by default (master switch for the collector)
-bind_addr      = "0.0.0.0"      # management address that can reach the ASR
+automatic_actions_enabled = false # separate acknowledgement for flow auto
+bind_addr      = "0.0.0.0"      # inert while off; replace with explicit mgmt IP
 bind_port      = 2055           # NetFlow v9 UDP port
 sflow_enabled  = false          # bind the sFlow v5 listener too (needs enabled)
 sflow_port     = 6343           # sFlow's default UDP port
@@ -84,9 +88,17 @@ sflow_port     = 6343           # sFlow's default UDP port
 allowlist_enrolled_only = true
 bucket_seconds    = 60          # aggregation bucket width
 top_k_talkers     = 100         # 5-tuples retained per bucket/interface/direction
+default_sampling_rate = 1
+snmp_corroboration_min_ratio = 0.25
+snmp_corroboration_max_ratio = 2.0
 ```
 
-Bucket retention is unified under `[retention].flow_buckets_days` (default 7 days),
+When `enabled = true`, configuration validation rejects wildcard addresses such
+as `0.0.0.0` and `::`; bind the collector to the explicit management-interface
+address that receives exporter traffic. Enforce the same source boundary in the
+host firewall.
+
+Bucket retention is unified under `[retention].flow_buckets_days` (default 2 days / 48 hours),
 not a `[flow]` setting.
 
 NetFlow and sFlow bind **separate UDP ports** and run independent receive loops
@@ -102,6 +114,9 @@ errors, low confidence blocks automatic actions):
 - **Source-IP allowlist.** Only datagrams from enrolled `devices` (matched by
   `hostname`/management IP) are parsed. Everything else increments a drop counter
   and is discarded — no template state, no records.
+- **Protocol/domain identity.** In-memory state and durable exporter rows are
+  keyed by source address, wire protocol, and NetFlow observation-domain/sFlow
+  sub-agent id. Templates and buckets cannot leak across those identities.
 - **Never panic on malformed input.** Every decode step returns a structured
   error; a bad datagram is logged + counted and the loop continues. A
   single malformed packet must never take down the collector.
@@ -239,10 +254,21 @@ single bucket), and matches "never assume state survived a restart".
 
 Flow aggregates expose signals (dst-port pps, talker pps, unique-source count)
 that the rule engine now thresholds directly — the `flow_pps` / `flow_bps` metrics
-read the latest closed bucket in `detection/engine.rs::flow_observation`, the home
-of the "big-pps / low-bps to port 53 from peer A" detector class. Flow-driven
-**automatic** actions stay behind enforce mode + the global and per-rule enables,
-and **low sampling confidence blocks them**. Caveat (2026-07 audit, P0-1): that
-confidence gate validates sampling *math*, not exporter *identity* — flow-driven
-auto-execution needs source corroboration (SNMP cross-cal / uRPF) before it is
-safe to enable. Until then, keep flow rules on the alert/would-run path only.
+read the latest closed interface bucket in
+`detection/engine.rs::flow_observation`; protocol+port rules narrow that same
+bucket rather than selecting the last historical bucket that happened to match.
+This is the home of the "big-pps / low-bps to port 53 from peer A" detector class. Flow-driven
+**automatic** actions require all of the following: enforce mode; global and
+per-rule enables; `[flow].automatic_actions_enabled = true`;
+`allowlist_enrolled_only = true`; non-low sampling confidence; and a fresh,
+same-direction SNMP sample on the same interface. Whole-interface flow estimates
+must fit the configured minimum/maximum ratio to SNMP; filtered protocol+port
+selectors must remain below the maximum because they are only a subset of the
+interface total. SNMP and the flow bucket must also be contemporaneous.
+
+This corroboration means forged UDP cannot act while the physical interface is
+quiet. It does **not** cryptographically authenticate flow composition: spoofed
+datagrams could still steer a target during a real high-volume event. Enforce
+router-to-collector ACLs, source validation/uRPF, and management-plane isolation
+before enabling flow auto. Deployments without those controls should keep
+`automatic_actions_enabled = false` and use alerts/manual previews only.

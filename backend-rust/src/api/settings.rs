@@ -24,15 +24,22 @@ use crate::config::{Config, OperatingMode};
 type JsonResp = (StatusCode, Json<Value>);
 
 /// The resolved runtime operating mode: the `system_settings.operating_mode`
-/// row, or the config fallback (observe) if the row is missing/unreadable. Used
-/// by /status, the detection engine (GATE 0), and the settings response.
+/// row, or the config fallback if the row is missing. Read failures always fail
+/// closed to observe. Used by /status, the detection engine (GATE 0), and the
+/// settings response.
 pub async fn operating_mode(pool: &sqlx::MySqlPool, cfg: &Config) -> &'static str {
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = 'operating_mode'")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    let stored: Option<String> = match sqlx::query_scalar(
+        "SELECT `value` FROM system_settings WHERE `key` = 'operating_mode'",
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(event_type = "operating_mode_read_failed", error = %e, "could not read operating mode; failing closed to observe");
+            return "observe";
+        }
+    };
     match stored.as_deref() {
         Some("enforce") => "enforce",
         Some("observe") => "observe",
@@ -44,15 +51,23 @@ pub async fn operating_mode(pool: &sqlx::MySqlPool, cfg: &Config) -> &'static st
     }
 }
 
-/// Read a boolean setting (`"true"`/`"false"`), defaulting to `default`.
+/// Read a boolean setting (`"true"`/`"false"`), defaulting to `default` when
+/// absent. Read failures fail closed: maintenance is active and other gates are
+/// disabled.
 pub async fn bool_setting(pool: &sqlx::MySqlPool, key: &str, default: bool) -> bool {
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key` = ?")
-            .bind(key)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    let stored: Option<String> = match sqlx::query_scalar(
+        "SELECT `value` FROM system_settings WHERE `key` = ?",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::error!(event_type = "safety_setting_read_failed", setting = key, error = %e, "could not read safety setting; using its fail-closed value");
+            return key == "global_maintenance_lock";
+        }
+    };
     match stored.as_deref() {
         Some("true") => true,
         Some("false") => false,
@@ -61,13 +76,14 @@ pub async fn bool_setting(pool: &sqlx::MySqlPool, key: &str, default: bool) -> b
 }
 
 /// Load every system_settings row into a string map.
-async fn all_settings(pool: &sqlx::MySqlPool) -> BTreeMap<String, String> {
-    sqlx::query_as::<_, (String, String)>("SELECT `key`, `value` FROM system_settings")
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+async fn all_settings(pool: &sqlx::MySqlPool) -> anyhow::Result<BTreeMap<String, String>> {
+    Ok(
+        sqlx::query_as::<_, (String, String)>("SELECT `key`, `value` FROM system_settings")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Build the SystemSettings JSON: the typed fields the contract pins, plus every
@@ -84,7 +100,7 @@ fn settings_json(map: &BTreeMap<String, String>, cfg: &Config) -> Value {
     let automatic = map
         .get("automatic_actions_enabled")
         .map(|v| v == "true")
-        .unwrap_or(false);
+        .unwrap_or(cfg.safety.automatic_actions_enabled);
     let global_lock = map
         .get("global_maintenance_lock")
         .map(|v| v == "true")
@@ -112,8 +128,18 @@ pub async fn show(
     _g: rbac::RequirePermission<rbac::markers::ViewDashboard>,
     State(state): State<AppState>,
 ) -> JsonResp {
-    let map = all_settings(&state.pool).await;
-    (StatusCode::OK, Json(settings_json(&map, &state.config)))
+    match all_settings(&state.pool).await {
+        Ok(map) => (StatusCode::OK, Json(settings_json(&map, &state.config))),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+struct SettingChange {
+    key: &'static str,
+    event: &'static str,
+    before: String,
+    after: String,
+    severity: &'static str,
 }
 
 /// PUT /api/settings — admin only. Accepts a partial SystemSettings; persists the
@@ -137,7 +163,19 @@ pub async fn update(
     let ip = client_ip(&headers, Some(&socket));
     let ua = user_agent(&headers);
 
-    let before = all_settings(pool).await;
+    let before = match all_settings(pool).await {
+        Ok(settings) => settings,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let resolved_before = settings_json(&before, &state.config);
+    let before_mode = resolved_before
+        .get("operating_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("observe");
+    let before_auto = resolved_before
+        .get("automatic_actions_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Step-up re-auth for the ARMING changes: turning operating_mode to "enforce"
     // or automatic_actions_enabled to true arms the whole system, so require a
@@ -145,13 +183,23 @@ pub async fn update(
     // not be enough on its own. Turning either OFF, or the global maintenance
     // lock, is a safe direction and needs no step-up.
     let arming_enforce = body.get("operating_mode").and_then(Value::as_str) == Some("enforce")
-        && before.get("operating_mode").map(String::as_str) != Some("enforce");
+        && before_mode != "enforce";
     let arming_auto = body
         .get("automatic_actions_enabled")
         .and_then(Value::as_bool)
         == Some(true)
-        && before.get("automatic_actions_enabled").map(String::as_str) != Some("true");
+        && !before_auto;
     if arming_enforce || arming_auto {
+        if crate::auth::ip_throttled(
+            pool,
+            &ip,
+            state.config.auth.lockout_threshold,
+            state.config.auth.lockout_minutes as i64,
+        )
+        .await
+        {
+            return err(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+        }
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
         let totp_code = body.get("totp_code").and_then(Value::as_str).unwrap_or("");
         // 403 (not 401) on purpose: the SPA hard-redirects to /login on any 401,
@@ -163,7 +211,7 @@ pub async fn update(
         match crate::auth::verify_step_up(pool, session.user_id, password, totp_code).await {
             Ok(true) => {}
             Ok(false) => {
-                audit(
+                audit_reauth_failure(
                     pool,
                     session.user_id,
                     "settings_reauth_failed",
@@ -178,181 +226,147 @@ pub async fn update(
         }
     }
 
-    // operating_mode: must be "observe" | "enforce".
-    if let Some(v) = body.get("operating_mode").and_then(Value::as_str) {
+    let mut changes = Vec::new();
+
+    // Validate the full patch before writing any of it.
+    if let Some(raw) = body.get("operating_mode") {
+        let Some(v) = raw.as_str() else {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "operating_mode must be a string",
+            );
+        };
         if v != "observe" && v != "enforce" {
             return err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "operating_mode must be observe or enforce",
             );
         }
-        let prev = before.get("operating_mode").cloned().unwrap_or_default();
-        if prev != v {
-            if let Err(_e) = upsert(pool, "operating_mode", v, session.user_id).await {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
-            }
-            audit(
-                pool,
-                session.user_id,
-                "operating_mode_changed",
-                &ip,
-                &ua,
-                &format!("operating_mode {prev} -> {v}"),
-            )
-            .await;
-            let before = if prev.is_empty() { "observe" } else { &prev };
-            let severity = if v == "enforce" { "critical" } else { "warning" };
-            enqueue_change_alert(
-                pool,
-                session.user_id,
-                "operating_mode_changed",
-                before,
-                v,
-                severity,
-                &format!("operating_mode changed from {before} to {v}"),
-            )
-            .await;
+        if before_mode != v {
+            changes.push(SettingChange {
+                key: "operating_mode",
+                event: "operating_mode_changed",
+                before: before_mode.to_string(),
+                after: v.to_string(),
+                severity: if v == "enforce" {
+                    "critical"
+                } else {
+                    "warning"
+                },
+            });
         }
     }
 
-    // automatic_actions_enabled: boolean.
-    if let Some(b) = body
-        .get("automatic_actions_enabled")
-        .and_then(Value::as_bool)
-    {
+    if let Some(raw) = body.get("automatic_actions_enabled") {
+        let Some(b) = raw.as_bool() else {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "automatic_actions_enabled must be boolean",
+            );
+        };
         let v = if b { "true" } else { "false" };
-        let prev = before
-            .get("automatic_actions_enabled")
-            .cloned()
-            .unwrap_or_default();
-        if prev != v {
-            if upsert(pool, "automatic_actions_enabled", v, session.user_id)
-                .await
-                .is_err()
-            {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
-            }
-            audit(
-                pool,
-                session.user_id,
-                "automatic_actions_changed",
-                &ip,
-                &ua,
-                &format!("automatic_actions_enabled {prev} -> {v}"),
-            )
-            .await;
-            let before = if prev.is_empty() { "false" } else { &prev };
-            let severity = if b { "critical" } else { "warning" };
-            enqueue_change_alert(
-                pool,
-                session.user_id,
-                "automatic_actions_changed",
-                before,
-                v,
-                severity,
-                &format!("automatic_actions_enabled changed from {before} to {v}"),
-            )
-            .await;
+        if before_auto != b {
+            changes.push(SettingChange {
+                key: "automatic_actions_enabled",
+                event: "automatic_actions_changed",
+                before: before_auto.to_string(),
+                after: v.to_string(),
+                severity: if b { "critical" } else { "warning" },
+            });
         }
     }
 
-    // global_lock maps to the global_maintenance_lock row.
-    if let Some(b) = body.get("global_lock").and_then(Value::as_bool) {
+    if let Some(raw) = body.get("global_lock") {
+        let Some(b) = raw.as_bool() else {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "global_lock must be boolean",
+            );
+        };
         let v = if b { "true" } else { "false" };
-        let prev = before
-            .get("global_maintenance_lock")
-            .cloned()
-            .unwrap_or_default();
-        if prev != v {
-            if upsert(pool, "global_maintenance_lock", v, session.user_id)
-                .await
-                .is_err()
-            {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
-            }
-            audit(
-                pool,
-                session.user_id,
-                "global_lock_changed",
-                &ip,
-                &ua,
-                &format!("global_maintenance_lock {prev} -> {v}"),
-            )
-            .await;
-            let before = if prev.is_empty() { "false" } else { &prev };
-            enqueue_change_alert(
-                pool,
-                session.user_id,
-                "global_lock_changed",
-                before,
-                v,
-                "warning",
-                &format!("global_maintenance_lock changed from {before} to {v}"),
-            )
-            .await;
+        let was_locked = resolved_before
+            .get("global_lock")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if was_locked != b {
+            changes.push(SettingChange {
+                key: "global_maintenance_lock",
+                event: "global_lock_changed",
+                before: was_locked.to_string(),
+                after: v.to_string(),
+                severity: "warning",
+            });
         }
     }
 
-    let after = all_settings(pool).await;
-    (StatusCode::OK, Json(settings_json(&after, &state.config)))
-}
+    if !changes.is_empty() {
+        let actor = crate::alerts::actor_json(pool, Some(session.user_id)).await;
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
+        for change in &changes {
+            let message = format!(
+                "{} changed from {} to {}",
+                change.key, change.before, change.after
+            );
+            let payload = json!({
+                "actor": actor.clone(),
+                "before": change.before,
+                "after": change.after,
+                "message": message,
+            });
+            let write = async {
+                sqlx::query(
+                    "INSERT INTO system_settings (`key`, `value`, updated_by) VALUES (?, ?, ?) \
+                     ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_by = VALUES(updated_by)",
+                )
+                .bind(change.key)
+                .bind(&change.after)
+                .bind(session.user_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO audit_logs \
+                     (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
+                     VALUES ('user', ?, ?, ?, ?, ?)",
+                )
+                .bind(session.user_id)
+                .bind(change.event)
+                .bind(&message)
+                .bind(&ip)
+                .bind(&ua)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(change.event)
+                .bind(change.severity)
+                .bind(sqlx::types::Json(payload))
+                .bind(format!("{}:{}->{}", change.event, change.before, change.after))
+                .execute(&mut *tx)
+                .await?;
+                Ok::<(), sqlx::Error>(())
+            }
+            .await;
+            if write.is_err() {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+            }
+        }
+        if tx.commit().await.is_err() {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+        }
+    }
 
-/// Enqueue an alert for an arming / mode-flip change so subscribers are emailed.
-/// These are the highest-consequence state changes (they can allow traffic-moving
-/// actions), so they are in `ALWAYS_IMMEDIATE` and page right away. `before`/`after`
-/// and the acting user are rendered by `alerts::body::render_mode_change`.
-async fn enqueue_change_alert(
-    pool: &sqlx::MySqlPool,
-    user_id: u64,
-    event: &str,
-    before: &str,
-    after: &str,
-    severity: &str,
-    message: &str,
-) {
-    let actor = crate::alerts::actor_json(pool, Some(user_id)).await;
-    let payload = json!({
-        "actor": actor,
-        "before": before,
-        "after": after,
-        "message": message,
-    });
-    let dedup_key = format!("{event}:{before}->{after}");
-    if let Err(e) = sqlx::query(
-        "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) VALUES (?, ?, ?, ?)",
-    )
-    .bind(event)
-    .bind(severity)
-    .bind(sqlx::types::Json(&payload))
-    .bind(&dedup_key)
-    .execute(pool)
-    .await
-    {
-        tracing::error!(event_type = "settings_alert_enqueue_failed", change = %event, error = %e, "failed to enqueue settings-change alert");
+    match all_settings(pool).await {
+        Ok(after) => (StatusCode::OK, Json(settings_json(&after, &state.config))),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
 }
 
-/// Upsert one system_settings row, stamping updated_by.
-async fn upsert(
-    pool: &sqlx::MySqlPool,
-    key: &str,
-    value: &str,
-    user_id: u64,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO system_settings (`key`, `value`, updated_by) VALUES (?, ?, ?) \
-         ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_by = VALUES(updated_by)",
-    )
-    .bind(key)
-    .bind(value)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Best-effort audit row for a settings change.
-async fn audit(
+async fn audit_reauth_failure(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     event: &str,
@@ -360,8 +374,9 @@ async fn audit(
     ua: &str,
     message: &str,
 ) {
-    let _ = sqlx::query(
-        "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
+    if let Err(e) = sqlx::query(
+        "INSERT INTO audit_logs \
+         (actor_type, actor_user_id, event_type, message, ip_address, user_agent) \
          VALUES ('user', ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
@@ -370,5 +385,8 @@ async fn audit(
     .bind(ip)
     .bind(ua)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(event_type = "settings_reauth_audit_failed", error = %e, "could not audit failed settings re-authentication");
+    }
 }

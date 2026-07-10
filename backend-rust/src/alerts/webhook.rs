@@ -28,8 +28,8 @@ fn theme_color(severity: &str) -> &'static str {
 }
 
 /// Load every enabled Teams endpoint subscribed to this event_type (a NULL
-/// subscription event_type = all events). URLs are decrypted; an endpoint whose
-/// ciphertext fails to decrypt is skipped (logged by the caller via count).
+/// subscription event_type = all events). URLs are decrypted; any ciphertext
+/// failure aborts resolution so a configured audience is never silently skipped.
 pub async fn load_subscribed(pool: &MySqlPool, event_type: &str) -> Result<Vec<WebhookEndpoint>> {
     let rows = sqlx::query_as::<_, (u64, String, Vec<u8>)>(
         "SELECT DISTINCT e.id, e.name, e.url_encrypted \
@@ -42,14 +42,13 @@ pub async fn load_subscribed(pool: &MySqlPool, event_type: &str) -> Result<Vec<W
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, name, blob)| {
-            crate::crypto::open_str(&blob)
-                .ok()
-                .map(|url| WebhookEndpoint { id, name, url })
+    rows.into_iter()
+        .map(|(id, name, blob)| {
+            let url = crate::crypto::open_str(&blob)
+                .with_context(|| format!("decrypting webhook endpoint {id}"))?;
+            Ok(WebhookEndpoint { id, name, url })
         })
-        .collect())
+        .collect()
 }
 
 /// Load one endpoint (decrypted) by id — used by the test-send endpoint.
@@ -86,6 +85,7 @@ pub async fn post_teams(url: &str, title: &str, severity: &str, text: &str) -> R
     });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP client")?;
     let resp = client

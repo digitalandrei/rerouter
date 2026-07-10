@@ -28,7 +28,8 @@ Controller health (localhost only):
 
 ```bash
 curl -s http://127.0.0.1:9277/api/health
-curl -s http://127.0.0.1:9277/api/status | jq .
+curl -s http://127.0.0.1:9277/api/ready
+# /api/status is authenticated; inspect it from the SPA or with a valid session.
 ```
 
 ## Ops toolbox (CLI)
@@ -45,10 +46,11 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
   preflight the controller runs at startup; clear error, never the password).
 - `--migrate` — apply pending sqlx migrations, then exit (startup also
   migrates/seeds a fresh database automatically).
-- `--seed-templates` — currently equivalent to `--migrate` (seeds ship as idempotent migrations); deliberate re-seeding of deleted templates is a milestone-3 TODO.
-- `--create-admin` — create an admin user (`ADMIN_EMAIL`/`ADMIN_NAME`/
-  `ADMIN_PASSWORD` via flags or interactive prompt; idempotent on email; 2FA
-  enrollment happens at the user's first login).
+- `--seed-templates` — applies pending migrations containing template seeds; it
+  does not restore template rows deleted after their migration ran.
+- `--create-admin` — create/rotate a superadmin (`ADMIN_EMAIL`/`ADMIN_NAME`/
+  `ADMIN_PASSWORD` via flags or interactive prompt; idempotent on email). It
+  prints the separate one-time code required for first-login 2FA enrollment.
 - `--install` — re-run to upgrade the binary and systemd unit; never touches
   an existing `.env`/`config.toml`.
 
@@ -65,10 +67,8 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
 - **Global maintenance lock:** `POST /api/locks/global` (UI button). Blocks every
   reroute until cleared. Use during planned upstream maintenance.
 
-```bash
-curl -X POST http://127.0.0.1:9277/api/locks/global
-curl -X DELETE http://127.0.0.1:9277/api/locks/global
-```
+Use the authenticated Settings UI for lock changes; API calls require a signed,
+fully authenticated session and `manage_locks`.
 
 ## Common incidents
 
@@ -77,20 +77,16 @@ curl -X DELETE http://127.0.0.1:9277/api/locks/global
 Expected if the operating mode is `observe` (the shipped default — the alert
 shows what *would* have run), automatic reroutes are off, the rule's
 `automatic_reroute_enabled` is false, a cooldown is active, or a safety gate
-failed. Check the rule event, the asset's locks/cooldowns, and the controller log
+failed. Check the rule event, the device's locks/cooldowns, and the controller log
 line for the abort reason. In enforce mode, trigger a **manual** reroute from
 `/mitigations/manual` if appropriate.
 
 ### A reroute is stuck `uncertain`
 
-The controller could not prove the outcome (often after a crash). The asset is
+The controller could not prove the outcome (often after a crash). The device is
 locked and automatic reroutes are disabled for it. Verify the real routing state
 on the router (e.g. `show ip route <prefix>` for a Null0, or the neighbor's
-session state), then **acknowledge** from the UI or:
-
-```bash
-curl -X POST http://127.0.0.1:9277/api/reroutes/<id>/acknowledge-uncertain
-```
+session state), then **acknowledge** from the authenticated UI.
 
 Only acknowledge after you have confirmed the real routing state.
 
@@ -98,8 +94,9 @@ Only acknowledge after you have confirmed the real routing state.
 
 Run the template's **rollback** (`null_route_withdraw`, `blackhole_withdraw`, or
 `bgp_session_disable`) from `/mitigations`. Rollbacks are themselves audited and
-verified. There is no auto-expiry: a mitigation stays in effect until you
-explicitly run its rollback.
+verified. In enforce mode the UI first obtains a server-rendered rollback plan,
+then consumes its five-minute one-time preview token. There is no auto-expiry: a
+mitigation stays in effect until you explicitly run its rollback.
 
 ### Telemetry went stale
 
@@ -111,8 +108,10 @@ design). Check device reachability and the SNMP community with `POST
 
 Check `alert_deliveries` for `failed`/`bounced`, the controller's alert-dispatcher
 log lines (`journalctl -u rerouter-controller`), and the `SMTP_*` values in
-`/srv/rerouter/.env`. Remember dedup/rate-limit collapses repeats —
-`uncertain`, `failed`, and security events are never collapsed.
+`/srv/rerouter/.env`. Rate-limited deliveries retry after backoff; transport
+failures retry up to five times and then raise a permanent-delivery meta-alert.
+Uncertain/failed reroutes, arming changes, degradation, and security events bypass
+deduplication and rate limits.
 
 ### Origin reachable directly (bypassing Cloudflare)
 

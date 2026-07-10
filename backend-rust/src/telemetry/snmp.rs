@@ -4,11 +4,11 @@
 //! 64-bit ifXTable interface counters, derives per-interface rates, and persists
 //! current + history. Three operations:
 //!
-//!   * [`test`]     — GET sysDescr/sysName/sysUpTime; parse vendor/model/OS;
-//!   * [`discover`] — walk ifXTable + ifTable; upsert `device_interfaces`
-//!                    (reconciled by ifIndex);
-//!   * [`poll`]     — read counters for monitored interfaces, derive rates vs the
-//!                    previous `interface_metrics_current` baseline, store both.
+//! * [`test`] — GET sysDescr/sysName/sysUpTime; parse vendor/model/OS;
+//! * [`discover`] — walk ifXTable + ifTable; upsert `device_interfaces`
+//!   (reconciled by ifIndex);
+//! * [`poll`] — read counters for monitored interfaces, derive rates vs the
+//!   previous `interface_metrics_current` baseline, store both.
 //!
 //! Pure-Rust async SNMP via the `csnmp` crate (GETBULK table walks, no openssl).
 //! SNMP is read-only, which is exactly what observe mode wants. v3 is a typed
@@ -303,13 +303,18 @@ pub struct DiscoveredInterface {
 pub async fn discover(dev: &DeviceConn) -> Result<Vec<DiscoveredInterface>> {
     let client = connect(dev).await?;
 
-    let if_names = walk_strings(&client, OID_IF_NAME).await?;
+    let if_names_result = walk_strings(&client, OID_IF_NAME).await;
     let if_aliases = walk_strings(&client, OID_IF_ALIAS)
         .await
         .unwrap_or_default();
-    let if_descrs = walk_strings(&client, OID_IF_DESCR)
-        .await
-        .unwrap_or_default();
+    let if_descrs_result = walk_strings(&client, OID_IF_DESCR).await;
+    if if_names_result.is_err() && if_descrs_result.is_err() {
+        return Err(anyhow!(
+            "both ifName and ifDescr walks failed; the interface inventory is unavailable"
+        ));
+    }
+    let if_names = if_names_result.unwrap_or_default();
+    let if_descrs = if_descrs_result.unwrap_or_default();
     let if_high_speed = walk_u64(&client, OID_IF_HIGH_SPEED)
         .await
         .unwrap_or_default();
@@ -369,6 +374,7 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
         }
     };
 
+    let mut tx = pool.begin().await?;
     for (order, ifc) in ifaces.iter().enumerate() {
         sqlx::query(
             "INSERT INTO device_interfaces \
@@ -391,7 +397,7 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
         .bind(&ifc.oper_status)
         .bind(ifc.is_physical as i32)
         .bind(order as i32)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("upserting interface")?;
     }
@@ -399,9 +405,9 @@ pub async fn discover_and_store(pool: &MySqlPool, device_id: u64) -> Result<usiz
     // Discovery proves reachability.
     sqlx::query("UPDATE devices SET reachable = 1, last_error = NULL, last_poll_at = UTC_TIMESTAMP() WHERE id = ?")
         .bind(device_id)
-        .execute(pool)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
 
     Ok(ifaces.len())
 }
@@ -422,9 +428,10 @@ pub async fn discover_bgp_and_store(pool: &MySqlPool, device_id: u64) -> Result<
         .and_then(|v| value_to_u64(&v))
         .filter(|&n| n > 0);
 
-    let states = walk_ip_u64(&client, OID_BGP_PEER_STATE)
-        .await
-        .unwrap_or_default();
+    // State is the authoritative peer set. If that walk fails, preserve the
+    // prior snapshot as stale and report an error instead of treating it as an
+    // empty, successful discovery.
+    let states = walk_ip_u64(&client, OID_BGP_PEER_STATE).await?;
     let admins = walk_ip_u64(&client, OID_BGP_PEER_ADMIN_STATUS)
         .await
         .unwrap_or_default();
@@ -432,11 +439,15 @@ pub async fn discover_bgp_and_store(pool: &MySqlPool, device_id: u64) -> Result<
         .await
         .unwrap_or_default();
 
-    // Union of peer IPs seen across the columns (state is the authoritative set).
-    let mut peers: std::collections::BTreeSet<String> = states.keys().cloned().collect();
-    peers.extend(admins.keys().cloned());
-    peers.extend(remote_as.keys().cloned());
+    // State is the authoritative peer set. Auxiliary columns may be incomplete,
+    // but they must never resurrect an address absent from the state snapshot.
+    let peers: std::collections::BTreeSet<String> = states.keys().cloned().collect();
 
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE device_bgp_peers SET last_polled_at = NULL WHERE device_id = ?")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
     for ip in &peers {
         let state = states.get(ip).map(|&s| bgp_state_str(s));
         let admin = admins.get(ip).map(|&a| bgp_admin_str(a));
@@ -455,12 +466,13 @@ pub async fn discover_bgp_and_store(pool: &MySqlPool, device_id: u64) -> Result<
         .bind(ip)
         .bind(ras)
         .bind(local_as)
-        .bind(&state)
-        .bind(&admin)
-        .execute(pool)
+        .bind(state)
+        .bind(admin)
+        .execute(&mut *tx)
         .await
         .context("upserting BGP peer")?;
     }
+    tx.commit().await?;
 
     Ok(peers.len())
 }
@@ -718,11 +730,16 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
         updated += 1;
     }
 
+    if updated == 0 {
+        let msg = "poll returned no interface with a complete octet and packet counter set";
+        mark_unreachable(pool, device_id, msg).await;
+        return Err(anyhow!(msg));
+    }
+
     sqlx::query("UPDATE devices SET reachable = 1, last_error = NULL, last_poll_at = UTC_TIMESTAMP() WHERE id = ?")
         .bind(device_id)
         .execute(pool)
-        .await
-        .ok();
+        .await?;
 
     Ok(updated)
 }
@@ -818,6 +835,7 @@ async fn store_metrics(
     let sampled_at = counters.sampled_at.naive_utc();
     let valid = rates.valid as i32;
 
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO interface_metrics_current \
             (interface_id, device_id, sampled_at, valid_sample, \
@@ -865,7 +883,7 @@ async fn store_metrics(
     .bind(temp_c)
     .bind(tx_power_dbm)
     .bind(rx_power_dbm)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("upserting interface_metrics_current")?;
 
@@ -896,9 +914,23 @@ async fn store_metrics(
     .bind(temp_c)
     .bind(tx_power_dbm)
     .bind(rx_power_dbm)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("appending interface_samples")?;
+
+    sqlx::query(
+        "UPDATE device_interfaces SET last_seen_at = UTC_TIMESTAMP(), \
+         admin_status = COALESCE(?, admin_status), oper_status = COALESCE(?, oper_status) \
+         WHERE id = ? AND device_id = ?",
+    )
+    .bind(admin_status)
+    .bind(oper_status)
+    .bind(interface_id)
+    .bind(device_id)
+    .execute(&mut *tx)
+    .await
+    .context("refreshing interface inventory timestamp")?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -907,13 +939,16 @@ async fn store_metrics(
 /// never propagates a secondary DB error over the original poll failure.
 async fn mark_unreachable(pool: &MySqlPool, device_id: u64, error: &str) {
     let truncated: String = error.chars().take(1000).collect();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE devices SET reachable = 0, last_error = ?, last_poll_at = UTC_TIMESTAMP() WHERE id = ?",
     )
     .bind(truncated)
     .bind(device_id)
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::error!(event_type = "snmp_unreachable_write_failed", device_id, error = %e, "could not persist the device-unreachable status");
+    }
     tracing::warn!(event_type = "snmp_poll_failed", device_id, error = %error, "SNMP poll failed; device marked unreachable");
 }
 

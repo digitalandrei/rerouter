@@ -27,6 +27,9 @@ pub const ALWAYS_IMMEDIATE: &[&str] = &[
     "operating_mode_changed",
     "automatic_actions_changed",
     "global_lock_changed",
+    "automatic_action_failed",
+    "recovery_degraded",
+    "alert_delivery_permanently_failed",
 ];
 
 /// Resolve an acting user id to a compact `{id, email, name}` object for alert
@@ -37,10 +40,12 @@ pub async fn actor_json(pool: &MySqlPool, user_id: Option<u64>) -> Value {
     let Some(uid) = user_id else {
         return Value::Null;
     };
-    match sqlx::query_as::<_, (String, Option<String>)>("SELECT email, name FROM users WHERE id = ?")
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
+    match sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT email, name FROM users WHERE id = ?",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
     {
         Ok(Some((email, name))) => json!({ "id": uid, "email": email, "name": name }),
         _ => json!({ "id": uid }),
@@ -50,8 +55,22 @@ pub async fn actor_json(pool: &MySqlPool, user_id: Option<u64>) -> Value {
 /// Spawn the alert dispatcher as a long-lived background task.
 pub fn spawn_dispatcher(pool: MySqlPool, cfg: Config) {
     tokio::spawn(async move {
-        if let Err(e) = dispatcher::run(pool, cfg).await {
-            tracing::error!(event_type = "alert_dispatcher_died", error = %e, "alert dispatcher exited");
+        loop {
+            let p = pool.clone();
+            let c = cfg.clone();
+            match tokio::spawn(async move { dispatcher::run(p, c).await }).await {
+                Ok(Ok(())) => tracing::error!(
+                    event_type = "alert_dispatcher_exited",
+                    "alert dispatcher exited unexpectedly; restarting"
+                ),
+                Ok(Err(e)) => {
+                    tracing::error!(event_type = "alert_dispatcher_died", error = %e, "alert dispatcher failed; restarting")
+                }
+                Err(e) => {
+                    tracing::error!(event_type = "alert_dispatcher_panicked", error = %e, "alert dispatcher panicked; restarting")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
 }

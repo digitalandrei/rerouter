@@ -6,16 +6,19 @@
 //! executes. Field names are pinned by the frontend contract
 //! (../../frontend/src/lib/api.ts: Rule).
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{err, AppState};
+use super::{client_ip, err, user_agent, AppState};
 use crate::auth::rbac::{self, markers, RequirePermission};
-use crate::reroute::executor::{self, ActionRequest};
+use crate::reroute::executor::{self, ActionRequest, ActorContext};
 use crate::reroute::flow_target::{self, PreparedAction};
+use crate::reroute::templates::Template;
 
 /// Templates whose `prefix` is a host-route target eligible for flow auto-target.
 /// The IPv6 siblings are swapped in automatically, so only the v4 names are listed.
@@ -150,7 +153,7 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
 
 /// Load a rule's attached actions (template + target router + params) for the
 /// rule JSON. Joins display names so the SPA needn't re-resolve them.
-async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
+async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32, Option<String>)>(
         "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position, ra.auto_target \
          FROM rule_actions ra \
@@ -160,9 +163,9 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
     )
     .bind(rule_id)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    rows.into_iter()
+    .await?;
+    Ok(rows
+        .into_iter()
         .map(
             |(
                 id,
@@ -190,29 +193,28 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<Value> {
                 })
             },
         )
-        .collect()
+        .collect())
 }
 
 /// Member interface ids of a `sum` rule (empty for a single-interface rule).
-async fn load_member_interfaces(pool: &sqlx::MySqlPool, rule_id: u64) -> Vec<u64> {
-    sqlx::query_scalar::<_, u64>(
+async fn load_member_interfaces(pool: &sqlx::MySqlPool, rule_id: u64) -> anyhow::Result<Vec<u64>> {
+    Ok(sqlx::query_scalar::<_, u64>(
         "SELECT interface_id FROM rule_interfaces WHERE rule_id = ? ORDER BY interface_id",
     )
     .bind(rule_id)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default()
+    .await?)
 }
 
 /// Build the full rule JSON (row + its actions + any aggregation members).
-async fn rule_value(pool: &sqlx::MySqlPool, r: &RuleRow) -> Value {
-    let actions = load_actions(pool, r.id).await;
+async fn rule_value(pool: &sqlx::MySqlPool, r: &RuleRow) -> anyhow::Result<Value> {
+    let actions = load_actions(pool, r.id).await?;
     let members = if r.metric_aggregation == "sum" {
-        load_member_interfaces(pool, r.id).await
+        load_member_interfaces(pool, r.id).await?
     } else {
         Vec::new()
     };
-    rule_json(r, actions, members)
+    Ok(rule_json(r, actions, members))
 }
 
 async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
@@ -221,7 +223,7 @@ async fn fetch_rule(pool: &sqlx::MySqlPool, id: u64) -> anyhow::Result<Option<Va
         .fetch_optional(pool)
         .await?;
     match row {
-        Some(r) => Ok(Some(rule_value(pool, &r).await)),
+        Some(r) => Ok(Some(rule_value(pool, &r).await?)),
         None => Ok(None),
     }
 }
@@ -238,7 +240,10 @@ pub async fn list(
         Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for r in &rows {
-                out.push(rule_value(&state.pool, r).await);
+                match rule_value(&state.pool, r).await {
+                    Ok(rule) => out.push(rule),
+                    Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+                }
             }
             (StatusCode::OK, Json(json!(out)))
         }
@@ -268,10 +273,10 @@ pub struct RuleBody {
     flow_port_kind: Option<String>,
     operator: String,
     threshold_value: f64,
-    #[serde(default = "default_duration")]
-    duration_seconds: u32,
-    #[serde(default = "default_consecutive")]
-    consecutive_samples: u32,
+    #[serde(default)]
+    duration_seconds: Option<u32>,
+    #[serde(default)]
+    consecutive_samples: Option<u32>,
     #[serde(default = "default_recovery_mode")]
     recovery_mode: String,
     #[serde(default)]
@@ -293,12 +298,6 @@ pub struct RuleBody {
     reroute_template_id: Option<u64>,
 }
 
-fn default_duration() -> u32 {
-    30
-}
-fn default_consecutive() -> u32 {
-    3
-}
 fn default_severity() -> String {
     "warning".to_string()
 }
@@ -404,6 +403,12 @@ async fn validate(
                 ));
             }
         }
+        if body.flow_protocol.is_some() && body.flow_port.is_none() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "flow_protocol currently requires a flow_port selector".into(),
+            ));
+        }
     } else if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -463,6 +468,17 @@ pub async fn create(
     } else {
         (None, None, None, None)
     };
+    let flow_metric = is_flow_metric(&body.metric);
+    let duration_seconds = body.duration_seconds.unwrap_or(if flow_metric {
+        state.config.detection.default_min_duration_seconds as u32
+    } else {
+        0
+    });
+    let consecutive_samples = body.consecutive_samples.unwrap_or(if flow_metric {
+        0
+    } else {
+        state.config.detection.default_consecutive_samples
+    });
 
     // Recovery threshold + persistence overrides only apply to threshold mode.
     let (recovery_threshold_value, recovery_window_seconds, recovery_consecutive_samples) =
@@ -480,6 +496,11 @@ pub async fn create(
     // A summed rule owns no single interface/device; its members live in
     // rule_interfaces (inserted below).
     let interface_id = if is_sum { None } else { body.interface_id };
+
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
 
     let res = sqlx::query(
         "INSERT INTO rules (name, interface_id, device_id, metric, metric_aggregation, \
@@ -502,8 +523,8 @@ pub async fn create(
     .bind(flow_port_kind)
     .bind(&body.operator)
     .bind(body.threshold_value)
-    .bind(body.duration_seconds)
-    .bind(body.consecutive_samples)
+    .bind(duration_seconds)
+    .bind(consecutive_samples)
     .bind(&body.recovery_mode)
     .bind(recovery_threshold_value)
     .bind(recovery_window_seconds)
@@ -515,7 +536,7 @@ pub async fn create(
     .bind(body.reroute_template_id)
     .bind(g.session.user_id)
     .bind(g.session.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
 
     let rule_id = match res {
@@ -529,20 +550,46 @@ pub async fn create(
             let dev: Option<u64> =
                 sqlx::query_scalar("SELECT device_id FROM device_interfaces WHERE id = ?")
                     .bind(iid)
-                    .fetch_optional(&state.pool)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .unwrap_or(None);
-            let Some(dev) = dev else { continue };
-            let _ = sqlx::query(
+                    .ok()
+                    .flatten();
+            let Some(dev) = dev else {
+                let _ = tx.rollback().await;
+                return err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "sum rule contains an unknown interface",
+                );
+            };
+            if sqlx::query(
                 "INSERT IGNORE INTO rule_interfaces (rule_id, device_id, interface_id) \
                  VALUES (?, ?, ?)",
             )
             .bind(rule_id)
             .bind(dev)
             .bind(iid)
-            .execute(&state.pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            .is_err()
+            {
+                let _ = tx.rollback().await;
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+            }
         }
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "rule_created",
+        "rule",
+        rule_id,
+        "detection rule created",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
 
     match fetch_rule(&state.pool, rule_id).await {
@@ -569,9 +616,9 @@ pub struct RuleUpdate {
     name: Option<String>,
     metric: Option<String>,
     flow_direction: Option<String>,
-    flow_protocol: Option<u16>,
-    flow_port: Option<u16>,
-    flow_port_kind: Option<String>,
+    flow_protocol: Option<Option<u16>>,
+    flow_port: Option<Option<u16>>,
+    flow_port_kind: Option<Option<String>>,
     operator: Option<String>,
     threshold_value: Option<f64>,
     duration_seconds: Option<u32>,
@@ -633,7 +680,7 @@ pub async fn update(
             );
         }
     }
-    if let Some(pk) = &body.flow_port_kind {
+    if let Some(Some(pk)) = &body.flow_port_kind {
         if !matches!(pk.as_str(), "src" | "dst") {
             return err(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -649,6 +696,14 @@ pub async fn update(
             );
         }
     }
+    let final_protocol = body.flow_protocol.unwrap_or(existing.flow_protocol);
+    let final_port = body.flow_port.unwrap_or(existing.flow_port);
+    if final_protocol.is_some() && final_port.is_none() {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "flow_protocol currently requires a flow_port selector",
+        );
+    }
     if let Some(m) = &body.recovery_mode {
         if !valid_recovery_mode(m) {
             return err(
@@ -656,6 +711,46 @@ pub async fn update(
                 "recovery_mode must be auto, threshold, or manual",
             );
         }
+    }
+    if body.automatic_reroute_enabled == Some(true) {
+        let unsafe_actions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rule_actions ra \
+             JOIN reroute_templates t ON t.id = ra.reroute_template_id \
+             WHERE ra.rule_id = ? AND ra.enabled = 1 \
+               AND (t.enabled = 0 OR t.automatic_allowed = 0)",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(i64::MAX);
+        if unsafe_actions > 0 {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "one or more enabled actions are not allowed for automatic execution",
+            );
+        }
+    }
+
+    let condition_changed = body.metric.is_some()
+        || body.operator.is_some()
+        || body.threshold_value.is_some()
+        || body.duration_seconds.is_some()
+        || body.consecutive_samples.is_some()
+        || body.recovery_mode.is_some()
+        || body.recovery_threshold_value.is_some()
+        || body.recovery_window_seconds.is_some()
+        || body.recovery_consecutive_samples.is_some()
+        || body.flow_direction.is_some()
+        || body.flow_protocol.is_some()
+        || body.flow_port.is_some()
+        || body.flow_port_kind.is_some();
+    if existing.current_state.as_deref() == Some("firing")
+        && (condition_changed || body.enabled == Some(false))
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "clear the firing rule and complete its rollback before changing its condition or disabling it",
+        );
     }
 
     let mut sets: Vec<&str> = Vec::new();
@@ -780,28 +875,44 @@ pub async fn update(
     q = q.bind(g.session.user_id);
     q = q.bind(id);
 
-    if q.execute(&state.pool).await.is_err() {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if q.execute(&mut *tx).await.is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
-
-    // Editing the CONDITION invalidates any in-progress match/firing streak — reset
-    // evaluation state so the rule re-evaluates fresh (a pure enable/name change
-    // doesn't). The rule then starts counting from zero against the new condition.
-    let condition_changed = body.metric.is_some()
-        || body.operator.is_some()
-        || body.threshold_value.is_some()
-        || body.duration_seconds.is_some()
-        || body.consecutive_samples.is_some()
-        || body.recovery_mode.is_some()
-        || body.recovery_threshold_value.is_some()
-        || body.recovery_window_seconds.is_some()
-        || body.recovery_consecutive_samples.is_some()
-        || body.flow_direction.is_some()
-        || body.flow_protocol.is_some()
-        || body.flow_port.is_some()
-        || body.flow_port_kind.is_some();
-    if condition_changed {
-        let _ = crate::detection::engine::reset_rule_state(&state.pool, id).await;
+    if condition_changed
+        && sqlx::query(
+            "INSERT INTO rule_states \
+             (rule_id, current_state, consecutive_match_count, last_metric_value, \
+              last_cleared_at, last_evaluated_at) \
+             VALUES (?, 'clear', 0, 0, UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
+             ON DUPLICATE KEY UPDATE current_state = 'clear', first_matched_at = NULL, \
+              recovery_first_at = NULL, recovery_consecutive = 0, \
+              consecutive_match_count = 0, last_metric_value = 0, \
+              last_cleared_at = UTC_TIMESTAMP(), last_evaluated_at = UTC_TIMESTAMP()",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "rule state reset failed");
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "rule_updated",
+        "rule",
+        id,
+        "detection rule updated",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
 
     match fetch_rule(&state.pool, id).await {
@@ -812,16 +923,52 @@ pub async fn update(
 
 /// DELETE /api/rules/{id}.
 pub async fn remove(
-    _g: RequirePermission<markers::EditRules>,
+    g: RequirePermission<markers::EditRules>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let firing = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT current_state FROM rule_states WHERE rule_id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(value) => value.flatten(),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if firing.as_deref() == Some("firing") {
+        return err(
+            StatusCode::CONFLICT,
+            "clear the firing rule and complete its rollback before deleting it",
+        );
+    }
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     match sqlx::query("DELETE FROM rules WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "rule_deleted",
+                "rule",
+                id,
+                "detection rule deleted",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "rule not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }
@@ -840,25 +987,30 @@ pub async fn clear(
     g: RequirePermission<markers::EditRules>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
 ) -> JsonResp {
     let pool = &state.pool;
     // Existence + (is it firing?, is Auto on?) in one query.
-    let row: Option<(Option<String>, bool)> = sqlx::query_as(
+    let row: Option<(Option<String>, bool)> = match sqlx::query_as(
         "SELECT rs.current_state, r.automatic_reroute_enabled \
          FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
-    let Some((current_state, auto_enabled)) = row else {
+    {
+        Ok(row) => row,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let Some((current_state, _auto_enabled)) = row else {
         return err(StatusCode::NOT_FOUND, "rule not found");
     };
 
-    // If clearing would actually roll back actions (firing + Auto + enforce), it
-    // is a reroute-triggering operation and needs the reroute permission too.
+    // A firing rule may own successful automatic reroutes even if its Auto switch
+    // was turned off after it fired. In enforce mode, conservatively require the
+    // reroute permission before attempting a clear/recovery.
     let would_roll_back = current_state.as_deref() == Some("firing")
-        && auto_enabled
         && crate::api::settings::operating_mode(pool, &state.config).await == "enforce";
     if would_roll_back {
         match rbac::has_permission(pool, &g.session, rbac::Permission::TriggerManualReroute).await {
@@ -871,7 +1023,18 @@ pub async fn clear(
         }
     }
 
-    match crate::detection::engine::clear_rule_manual(pool, &state.config, id).await {
+    match crate::detection::engine::clear_rule_manual(
+        pool,
+        &state.config,
+        id,
+        g.session.user_id,
+        ActorContext {
+            ip_address: client_ip(&headers, Some(&socket)),
+            user_agent: user_agent(&headers),
+        },
+    )
+    .await
+    {
         Ok(cleared) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "cleared": cleared })),
@@ -888,6 +1051,23 @@ pub struct ApplyBody {
     /// Render-only preview (even in enforce mode); changes nothing.
     #[serde(default)]
     dry_run: bool,
+    /// One-time token returned by the immediately preceding enforce-mode preview.
+    #[serde(default)]
+    preview_token: Option<String>,
+}
+
+struct ReadyRuleAction {
+    device_id: u64,
+    template: Template,
+    params: Value,
+    action_reason: String,
+    auto_target: Option<String>,
+    auto_target_low_confidence: Option<bool>,
+}
+
+enum RuleApplyAction {
+    Ready(Box<ReadyRuleAction>),
+    Skip { device_id: u64, reason: String },
 }
 
 /// POST /api/rules/{id}/apply — operator manually applies a FIRING rule's
@@ -910,8 +1090,14 @@ pub async fn apply(
     g: RequirePermission<markers::TriggerManualReroute>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
     Json(body): Json<ApplyBody>,
 ) -> JsonResp {
+    let actor_context = ActorContext {
+        ip_address: client_ip(&headers, Some(&socket)),
+        user_agent: user_agent(&headers),
+    };
     let pool = &state.pool;
     // Existence + opt-in flag + live firing state + flow selector in one read.
     #[allow(clippy::type_complexity)]
@@ -924,7 +1110,7 @@ pub async fn apply(
         Option<u16>,
         Option<u16>,
         Option<String>,
-    )> = sqlx::query_as(
+    )> = match sqlx::query_as(
         "SELECT r.manual_apply_enabled, rs.current_state, r.name, \
                 r.interface_id, r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind \
          FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ?",
@@ -932,7 +1118,10 @@ pub async fn apply(
     .bind(id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(row) => row,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let Some((
         manual_apply_enabled,
         current_state,
@@ -961,14 +1150,18 @@ pub async fn apply(
 
     // The rule's enabled actions (template + target router + params [+ auto-target])
     // — the same set the firing alert rendered as would-run, in the same order.
-    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
-        "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
+    let specs =
+        match sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
+            "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
          WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
-    )
-    .bind(id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(specs) => specs,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
     if specs.is_empty() {
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -988,14 +1181,23 @@ pub async fn apply(
         port_kind: flow_port_kind,
     };
 
-    let mut results = Vec::with_capacity(specs.len());
+    // Resolve dynamic flow targets exactly once. The same concrete template and
+    // params are used for the preview hash and, after confirmation, execution.
+    let mut actions = Vec::with_capacity(specs.len());
     for (template_id, device_id, params_json, auto_target) in specs {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
         // Resolve auto-target (flow dst host) here; a manual apply proceeds even on
         // LOW sampling confidence (the operator confirms the resolved IP), unlike
         // automatic execution which suppresses it.
-        match flow_target::prepare_action(pool, &sel, template_id, device_id, params, auto_target.as_deref())
-            .await
+        match flow_target::prepare_action(
+            pool,
+            &sel,
+            template_id,
+            device_id,
+            params,
+            auto_target.as_deref(),
+        )
+        .await
         {
             PreparedAction::Ready {
                 template,
@@ -1006,33 +1208,140 @@ pub async fn apply(
                     Some(a) => format!("{reason}; {}", a.note),
                     None => reason.clone(),
                 };
-                let req = ActionRequest {
+                actions.push(RuleApplyAction::Ready(Box::new(ReadyRuleAction {
                     device_id,
                     template,
                     params,
-                    trigger_type: "manual",
-                    rule_id: Some(id),
-                    user_id: Some(g.session.user_id),
-                    reason: Some(action_reason),
-                };
-                let outcome = executor::execute(pool, &state.config, req, body.dry_run).await;
-                let mut v = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
-                if let (Value::Object(m), Some(a)) = (&mut v, at) {
-                    m.insert("auto_target".into(), json!(a.cidr));
-                    m.insert("auto_target_low_confidence".into(), json!(a.low_confidence));
-                }
-                results.push(v);
+                    action_reason,
+                    auto_target: at.as_ref().map(|a| a.cidr.clone()),
+                    auto_target_low_confidence: at.as_ref().map(|a| a.low_confidence),
+                })));
             }
             PreparedAction::Skip { reason: why } => {
+                actions.push(RuleApplyAction::Skip {
+                    device_id,
+                    reason: why,
+                });
+            }
+        }
+    }
+
+    let mode = crate::api::settings::operating_mode(pool, &state.config).await;
+    if mode == "enforce" && !body.dry_run {
+        let (preview, _) = rule_apply_results(
+            &state,
+            id,
+            g.session.user_id,
+            &actor_context,
+            &actions,
+            true,
+        )
+        .await;
+        let Some(token) = body.preview_token.as_deref() else {
+            return err(StatusCode::CONFLICT, "preview_required");
+        };
+        match super::consume_action_preview(
+            pool,
+            token,
+            g.session.user_id,
+            "rule_apply",
+            Some(id),
+            &json!({ "results": preview, "reason": reason }),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return err(StatusCode::CONFLICT, "preview_expired_or_changed"),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_check_failed"),
+        }
+    }
+
+    let (results, acted_devices) = rule_apply_results(
+        &state,
+        id,
+        g.session.user_id,
+        &actor_context,
+        &actions,
+        body.dry_run,
+    )
+    .await;
+    if let Err(e) = executor::record_cooldowns(pool, &state.config, Some(id), &acted_devices).await
+    {
+        tracing::error!(event_type = "manual_apply_cooldown_persist_failed", rule_id = id, error = %e, "could not persist action cooldown rows");
+    }
+    let preview_token = if mode == "enforce" && body.dry_run {
+        match super::store_action_preview(
+            pool,
+            g.session.user_id,
+            "rule_apply",
+            Some(id),
+            &json!({ "results": results, "reason": reason }),
+        )
+        .await
+        {
+            Ok(token) => Some(token),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_store_failed"),
+        }
+    } else {
+        None
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "results": results, "preview_token": preview_token })),
+    )
+}
+
+async fn rule_apply_results(
+    state: &AppState,
+    rule_id: u64,
+    user_id: u64,
+    actor_context: &ActorContext,
+    actions: &[RuleApplyAction],
+    dry_run: bool,
+) -> (Vec<Value>, Vec<u64>) {
+    let mut results = Vec::with_capacity(actions.len());
+    let mut acted_devices = Vec::new();
+    for action in actions {
+        match action {
+            RuleApplyAction::Ready(action) => {
+                let req = ActionRequest {
+                    device_id: action.device_id,
+                    template: action.template.clone(),
+                    params: action.params.clone(),
+                    trigger_type: "manual",
+                    rule_id: Some(rule_id),
+                    rule_event_id: None,
+                    rollback_of_reroute_id: None,
+                    user_id: Some(user_id),
+                    actor_context: Some(actor_context.clone()),
+                    reason: Some(action.action_reason.clone()),
+                    defer_cooldown: true,
+                };
+                let outcome = executor::execute(&state.pool, &state.config, req, dry_run).await;
+                if outcome.executed {
+                    acted_devices.push(outcome.device_id);
+                }
+                let mut value = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
+                if let Value::Object(map) = &mut value {
+                    if let Some(target) = &action.auto_target {
+                        map.insert("auto_target".into(), json!(target));
+                    }
+                    if let Some(low_confidence) = action.auto_target_low_confidence {
+                        map.insert("auto_target_low_confidence".into(), json!(low_confidence));
+                    }
+                }
+                results.push(value);
+            }
+            RuleApplyAction::Skip { device_id, reason } => {
                 results.push(json!({
                     "device_id": device_id,
                     "executed": false,
-                    "message": why,
+                    "message": reason,
                 }));
             }
         }
     }
-    (StatusCode::OK, Json(json!({ "results": results })))
+    (results, acted_devices)
 }
 
 // ---- Rule action targets (template + router + params) --------------------------
@@ -1055,18 +1364,22 @@ pub struct RuleActionBody {
 /// the template (must be device_cli), the device, and the params against the
 /// template schema, so a malformed action can't be saved. Returns the updated rule.
 pub async fn add_action(
-    _g: RequirePermission<markers::EditRules>,
+    g: RequirePermission<markers::EditRules>,
     State(state): State<AppState>,
     Path(rule_id): Path<u64>,
     Json(body): Json<RuleActionBody>,
 ) -> JsonResp {
-    let rule_row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT metric, flow_direction FROM rules WHERE id = ?")
-            .bind(rule_id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-    let Some((_rule_metric, rule_flow_direction)) = rule_row else {
+    let rule_row: Option<(String, Option<String>, bool)> = match sqlx::query_as(
+        "SELECT metric, flow_direction, automatic_reroute_enabled FROM rules WHERE id = ?",
+    )
+    .bind(rule_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let Some((_rule_metric, rule_flow_direction, rule_automatic)) = rule_row else {
         return err(StatusCode::NOT_FOUND, "rule not found");
     };
 
@@ -1081,12 +1394,34 @@ pub async fn add_action(
             "only device_cli templates can be attached as rule actions",
         );
     }
+    if !template.enabled {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "template is disabled");
+    }
+    if rule_automatic && !template.automatic_allowed {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "template is not allowed for automatic execution",
+        );
+    }
 
     // Auto-target: only on a flow rule + a host-route template. The host (prefix)
     // is resolved at fire/apply time, so validate the OTHER params here against a
     // placeholder prefix; a static action validates the params as given.
-    let auto_target = match body.auto_target.as_deref() {
-        None => None,
+    let (auto_target, canonical_params) = match body.auto_target.as_deref() {
+        None => {
+            let canonical = match crate::reroute::templates::canonicalize_inventory_params(
+                &state.pool,
+                body.device_id,
+                &template,
+                &body.params,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+            };
+            (None, canonical)
+        }
         Some(flow_target::FLOW_DST_HOST) => {
             if rule_flow_direction.is_none() {
                 return err(
@@ -1102,36 +1437,43 @@ pub async fn add_action(
             }
             let mut probe = body.params.as_object().cloned().unwrap_or_default();
             probe.insert("prefix".into(), Value::String("192.0.2.1/32".into()));
-            if let Err(e) = crate::reroute::templates::validate_and_expand(
-                &template.parameter_schema,
+            let mut canonical = match crate::reroute::templates::canonicalize_inventory_params(
+                &state.pool,
+                body.device_id,
+                &template,
                 &Value::Object(probe),
-            ) {
-                return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+            };
+            if let Value::Object(params) = &mut canonical {
+                params.remove("prefix");
             }
-            Some(flow_target::FLOW_DST_HOST)
+            (Some(flow_target::FLOW_DST_HOST), canonical)
         }
         Some(_) => {
             return err(StatusCode::UNPROCESSABLE_ENTITY, "unknown auto_target mode");
         }
     };
 
-    if auto_target.is_none() {
-        if let Err(e) =
-            crate::reroute::templates::validate_and_expand(&template.parameter_schema, &body.params)
-        {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
-        }
-    }
-
-    let device_exists: Option<u64> = sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+    let device_exists: Option<u64> = match sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
         .bind(body.device_id)
         .fetch_optional(&state.pool)
         .await
-        .unwrap_or(None);
+    {
+        Ok(row) => row,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     if device_exists.is_none() {
         return err(StatusCode::UNPROCESSABLE_ENTITY, "device not found");
     }
 
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "INSERT INTO rule_actions (rule_id, reroute_template_id, device_id, params_json, position, auto_target) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -1139,14 +1481,28 @@ pub async fn add_action(
     .bind(rule_id)
     .bind(body.reroute_template_id)
     .bind(body.device_id)
-    .bind(sqlx::types::Json(&body.params))
+    .bind(sqlx::types::Json(&canonical_params))
     .bind(body.position.unwrap_or(0))
     .bind(auto_target)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
 
     if res.is_err() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "rule_action_added",
+        "rule",
+        rule_id,
+        "reroute action attached to rule",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
     match fetch_rule(&state.pool, rule_id).await {
         Ok(Some(v)) => (StatusCode::CREATED, Json(v)),
@@ -1157,20 +1513,40 @@ pub async fn add_action(
 /// DELETE /api/rules/{rule_id}/actions/{action_id} — detach an action. Returns
 /// the updated rule.
 pub async fn remove_action(
-    _g: RequirePermission<markers::EditRules>,
+    g: RequirePermission<markers::EditRules>,
     State(state): State<AppState>,
     Path((rule_id, action_id)): Path<(u64, u64)>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query("DELETE FROM rule_actions WHERE id = ? AND rule_id = ?")
         .bind(action_id)
         .bind(rule_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await;
     match res {
-        Ok(r) if r.rows_affected() > 0 => match fetch_rule(&state.pool, rule_id).await {
-            Ok(Some(v)) => (StatusCode::OK, Json(v)),
-            _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-        },
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "rule_action_removed",
+                "rule",
+                rule_id,
+                &format!("rule action {action_id} removed"),
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            match fetch_rule(&state.pool, rule_id).await {
+                Ok(Some(v)) => (StatusCode::OK, Json(v)),
+                _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            }
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "action not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }

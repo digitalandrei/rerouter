@@ -7,17 +7,19 @@
 //! gate regardless of what the UI showed, and in observe mode returns the
 //! would-run plan instead of executing.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{err, AppState};
+use super::{client_ip, err, user_agent, AppState};
 use crate::auth::rbac::{markers, RequirePermission};
-use crate::reroute::executor::{self, ActionRequest};
-use crate::reroute::{locks, rollback, templates};
+use crate::reroute::executor::{self, ActionRequest, ActorContext};
+use crate::reroute::{rollback, templates};
 
 type JsonResp = (StatusCode, Json<Value>);
 
@@ -106,27 +108,36 @@ pub async fn show(
         return err(StatusCode::NOT_FOUND, "reroute not found");
     };
 
-    let steps = sqlx::query_as::<_, (u32, Option<String>, Option<String>, String)>(
+    let steps = match sqlx::query_as::<_, (u32, Option<String>, Option<String>, String)>(
         "SELECT step_number, description, mode, state FROM reroute_steps WHERE reroute_id = ? ORDER BY step_number",
     )
     .bind(id)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
-    let outputs = sqlx::query_as::<_, (u32, Option<String>, Option<String>, Option<String>)>(
+    {
+        Ok(rows) => rows,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let outputs = match sqlx::query_as::<_, (u32, Option<String>, Option<String>, Option<String>)>(
         "SELECT step_number, request, response, status FROM reroute_outputs WHERE reroute_id = ? ORDER BY id",
     )
     .bind(id)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
-    let verifications = sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(
+    {
+        Ok(rows) => rows,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let verifications = match sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(
         "SELECT method, expected, observed, result FROM reroute_verifications WHERE reroute_id = ? ORDER BY id",
     )
     .bind(id)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
 
     let mut v = reroute_json(&r);
     v["steps"] = json!(steps
@@ -159,6 +170,8 @@ pub struct ManualBody {
     reason: Option<String>,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    preview_token: Option<String>,
 }
 
 /// POST /api/reroutes/manual — plan + execute a template against one or more
@@ -167,8 +180,14 @@ pub struct ManualBody {
 pub async fn manual(
     g: RequirePermission<markers::TriggerManualReroute>,
     State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
     Json(body): Json<ManualBody>,
 ) -> JsonResp {
+    let actor_context = ActorContext {
+        ip_address: client_ip(&headers, Some(&socket)),
+        user_agent: user_agent(&headers),
+    };
     if body.targets.is_empty() {
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -186,113 +205,145 @@ pub async fn manual(
         );
     }
 
-    let is_route_map = matches!(
-        template.name.as_str(),
-        "bgp_route_map_set" | "bgp_route_map_unset"
-    );
+    let mode = crate::api::settings::operating_mode(&state.pool, &state.config).await;
+    if mode == "enforce" && !body.dry_run {
+        let preview = manual_results(
+            &state,
+            &template,
+            &body.targets,
+            &body.reason,
+            g.session.user_id,
+            &actor_context,
+            true,
+        )
+        .await;
+        let Some(token) = body.preview_token.as_deref() else {
+            return err(StatusCode::CONFLICT, "preview_required");
+        };
+        match super::consume_action_preview(
+            &state.pool,
+            token,
+            g.session.user_id,
+            "manual_reroute",
+            None,
+            &json!({ "results": preview, "reason": body.reason }),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return err(StatusCode::CONFLICT, "preview_expired_or_changed"),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_check_failed"),
+        }
+    }
 
-    let mut results = Vec::with_capacity(body.targets.len());
-    for target in &body.targets {
+    let results = manual_results(
+        &state,
+        &template,
+        &body.targets,
+        &body.reason,
+        g.session.user_id,
+        &actor_context,
+        body.dry_run,
+    )
+    .await;
+    let preview_token = if mode == "enforce" && body.dry_run {
+        match super::store_action_preview(
+            &state.pool,
+            g.session.user_id,
+            "manual_reroute",
+            None,
+            &json!({ "results": results, "reason": body.reason }),
+        )
+        .await
+        {
+            Ok(token) => Some(token),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_store_failed"),
+        }
+    } else {
+        None
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "results": results, "preview_token": preview_token })),
+    )
+}
+
+async fn manual_results(
+    state: &AppState,
+    template: &templates::Template,
+    targets: &[ManualTarget],
+    reason: &Option<String>,
+    user_id: u64,
+    actor_context: &ActorContext,
+    dry_run: bool,
+) -> Vec<Value> {
+    let mut results = Vec::with_capacity(targets.len());
+    for target in targets {
         if let Err(e) = templates::validate_and_expand(&template.parameter_schema, &target.params) {
             results.push(json!({ "device_id": target.device_id, "executed": false, "message": e.to_string() }));
             continue;
         }
-        let mut params = target.params.clone();
-
-        // Route-Map Change: the route-map must be one DISCOVERED on the device
-        // (templated-only doctrine — no free-text maps), and for a `set` we
-        // snapshot the neighbor's current map so the change can be reverted.
-        if is_route_map {
-            let rm = params.get("route_map").and_then(Value::as_str).unwrap_or("");
-            if !route_map_known(&state.pool, target.device_id, rm).await {
-                results.push(json!({ "device_id": target.device_id, "executed": false,
-                    "message": format!("route-map '{rm}' was not discovered on this device — run discovery first") }));
-                continue;
-            }
-            if template.name == "bgp_route_map_set" {
-                let neighbor = params.get("neighbor_ip").and_then(Value::as_str).unwrap_or("");
-                let dir = params.get("direction").and_then(Value::as_str).unwrap_or("out");
-                let prior = neighbor_prior_route_map(&state.pool, target.device_id, neighbor, dir)
-                    .await
-                    .unwrap_or_default();
-                if let Value::Object(m) = &mut params {
-                    m.insert("prior_route_map".into(), Value::String(prior));
-                }
-            }
-        }
-
         let req = ActionRequest {
             device_id: target.device_id,
             template: template.clone(),
-            params,
+            params: target.params.clone(),
             trigger_type: "manual",
             rule_id: None,
-            user_id: Some(g.session.user_id),
-            reason: body.reason.clone(),
+            rule_event_id: None,
+            rollback_of_reroute_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(actor_context.clone()),
+            reason: reason.clone(),
+            defer_cooldown: false,
         };
-        let outcome = executor::execute(&state.pool, &state.config, req, body.dry_run).await;
+        let outcome = executor::execute(&state.pool, &state.config, req, dry_run).await;
         results.push(serde_json::to_value(outcome).unwrap_or_else(|_| json!({})));
     }
-    (StatusCode::OK, Json(json!({ "results": results })))
-}
-
-/// True if `name` is a route-map discovered on the device (the Route-Map Change
-/// param must reference a known map, not free text).
-async fn route_map_known(pool: &sqlx::MySqlPool, device_id: u64, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM device_route_maps WHERE device_id = ? AND name = ?",
-    )
-    .bind(device_id)
-    .bind(name)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0)
-        > 0
-}
-
-/// The neighbor's currently-applied route-map in `dir` (in|out), as last
-/// discovered — the prior map snapshotted so a Route-Map Change can be reverted.
-async fn neighbor_prior_route_map(
-    pool: &sqlx::MySqlPool,
-    device_id: u64,
-    neighbor: &str,
-    dir: &str,
-) -> Option<String> {
-    let col = if dir == "in" {
-        "in_route_map"
-    } else {
-        "out_route_map"
-    };
-    sqlx::query_scalar::<_, Option<String>>(&format!(
-        "SELECT {col} FROM device_bgp_peers WHERE device_id = ? AND peer_remote_addr = ?"
-    ))
-    .bind(device_id)
-    .bind(neighbor)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
+    results
 }
 
 /// POST /api/reroutes/{id}/cancel — cancel a still-pending reroute.
 pub async fn cancel(
-    _g: RequirePermission<markers::TriggerManualReroute>,
+    g: RequirePermission<markers::TriggerManualReroute>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "UPDATE reroutes SET state = 'failed', finished_at = UTC_TIMESTAMP(), success = 0, \
          failure_reason = 'cancelled by operator' WHERE id = ? AND state IN ('planned','pending')",
     )
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     match res {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if sqlx::query(
+                "INSERT INTO audit_logs \
+                 (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, \
+                  message, ip_address, user_agent) \
+                 VALUES ('user', ?, 'reroute_cancelled', 'reroute', ?, ?, \
+                         'cancelled before command execution', ?, ?)",
+            )
+            .bind(g.session.user_id)
+            .bind(id)
+            .bind(id)
+            .bind(client_ip(&headers, Some(&socket)))
+            .bind(user_agent(&headers))
+            .execute(&mut *tx)
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(
             StatusCode::CONFLICT,
             "reroute is not in a cancellable state",
@@ -313,16 +364,25 @@ pub async fn acknowledge_uncertain(
     g: RequirePermission<markers::AcknowledgeUncertainReroute>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
     Json(body): Json<AckBody>,
 ) -> JsonResp {
+    let note = body.note.unwrap_or_default();
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let row = sqlx::query_as::<_, (String, Option<u64>)>(
-        "SELECT state, device_id FROM reroutes WHERE id = ?",
+        "SELECT state, device_id FROM reroutes WHERE id = ? FOR UPDATE",
     )
     .bind(id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await;
-    let Ok(Some((rstate, device_id))) = row else {
-        return err(StatusCode::NOT_FOUND, "reroute not found");
+    let (rstate, _device_id) = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "reroute not found"),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
     if rstate != "uncertain" {
         return err(
@@ -330,118 +390,255 @@ pub async fn acknowledge_uncertain(
             "reroute is not in the uncertain state",
         );
     }
-
-    let note = body.note.unwrap_or_default();
-    // Only clear the lock / write the "acknowledged" audit row if the state
-    // transition ACTUALLY landed. The `WHERE state = 'uncertain'` guard also
-    // makes a concurrent double-ack a no-op. Swallowing this write (as before)
-    // could unlock a device while the reroute stayed uncertain.
-    let updated = match sqlx::query(
+    let updated = sqlx::query(
         "UPDATE reroutes SET state = 'failed', verification_status = 'acknowledged', \
          failure_reason = CONCAT(COALESCE(failure_reason,''), ' | acknowledged by admin: ', ?) \
          WHERE id = ? AND state = 'uncertain'",
     )
     .bind(&note)
     .bind(id)
-    .execute(&state.pool)
-    .await
-    {
-        Ok(r) => r.rows_affected(),
-        Err(e) => {
-            tracing::error!(
-                event_type = "ack_uncertain_persist_failed",
-                reroute_id = id,
-                error = %e,
-                "failed to persist uncertain acknowledgement"
-            );
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not record acknowledgement",
-            );
-        }
-    };
-    if updated == 0 {
+    .execute(&mut *tx)
+    .await;
+    if !matches!(updated, Ok(ref r) if r.rows_affected() == 1) {
         return err(
-            StatusCode::CONFLICT,
-            "reroute was not in the uncertain state",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record acknowledgement",
         );
     }
-
-    if let Some(dev) = device_id {
-        if let Err(e) = locks::clear(
-            &state.pool,
-            "device",
-            Some(&dev.to_string()),
-            Some(g.session.user_id),
-        )
-        .await
-        {
-            tracing::error!(
-                event_type = "ack_uncertain_unlock_failed",
-                reroute_id = id,
-                device_id = dev,
-                error = %e,
-                "acknowledged uncertain reroute but failed to clear the device lock"
-            );
-        }
+    if sqlx::query(
+        "UPDATE locks SET cleared_at = UTC_TIMESTAMP(), cleared_by = ? \
+         WHERE cleared_at IS NULL AND \
+           (reroute_id = ? OR (reroute_id IS NULL AND kind IN ('auto_crash','auto_uncertain') \
+             AND reason LIKE CONCAT('reroute #', ?, '%')))",
+    )
+    .bind(g.session.user_id)
+    .bind(id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .is_err()
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not clear reroute lock",
+        );
     }
-    let _ = sqlx::query(
-        "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
-         VALUES ('user', ?, 'reroute_uncertain_acknowledged', 'reroute', ?, ?, ?)",
+    if sqlx::query(
+        "INSERT INTO audit_logs \
+         (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, \
+          message, ip_address, user_agent) \
+         VALUES ('user', ?, 'reroute_uncertain_acknowledged', 'reroute', ?, ?, ?, ?, ?)",
     )
     .bind(g.session.user_id)
     .bind(id)
     .bind(id)
     .bind(format!("acknowledged uncertain reroute: {note}"))
-    .execute(&state.pool)
-    .await;
+    .bind(client_ip(&headers, Some(&socket)))
+    .bind(user_agent(&headers))
+    .execute(&mut *tx)
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
 
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 /// POST /api/reroutes/{id}/rollback — run the template's rollback against the
 /// same device + params as a fresh audited action.
+#[derive(Debug, Deserialize)]
+pub struct RollbackBody {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    preview_token: Option<String>,
+}
+
 pub async fn rollback(
     g: RequirePermission<markers::TriggerManualReroute>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    headers: HeaderMap,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
+    Json(body): Json<RollbackBody>,
 ) -> JsonResp {
-    let row = sqlx::query_as::<_, (Option<u64>, Option<u64>, Option<sqlx::types::Json<Value>>)>(
-        "SELECT device_id, reroute_template_id, parameters_json FROM reroutes WHERE id = ?",
+    type OriginalRow = (
+        Option<u64>,
+        Option<u64>,
+        Option<sqlx::types::Json<Value>>,
+        String,
+        Option<DateTime<Utc>>,
+    );
+    let row = sqlx::query_as::<_, OriginalRow>(
+        "SELECT device_id, reroute_template_id, parameters_json, state, started_at \
+         FROM reroutes WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
     .await;
-    let Ok(Some((Some(device_id), Some(template_id), params_json))) = row else {
-        return err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "reroute has no device/template to roll back",
-        );
+    let (device_id, template_id, params_json, original_state, started_at) = match row {
+        Ok(Some((Some(device_id), Some(template_id), params_json, state, started_at))) => {
+            (device_id, template_id, params_json, state, started_at)
+        }
+        Ok(Some(_)) => {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "reroute has no device/template to roll back",
+            )
+        }
+        Ok(None) => return err(StatusCode::NOT_FOUND, "reroute not found"),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
-
-    // Confirm the template actually has a rollback before executing.
-    match templates::load(&state.pool, template_id).await {
-        Ok(t) if t.rollback_template_id.is_some() => {}
-        Ok(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
-        Err(_) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template not found"),
+    if started_at.is_none()
+        || !matches!(
+            original_state.as_str(),
+            "succeeded" | "failed" | "uncertain"
+        )
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "the original action never reached execution and must not be rolled back",
+        );
+    }
+    let existing: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reroutes WHERE rollback_of_reroute_id = ? \
+         AND state IN ('planned','pending','running','verifying','succeeded')",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(count) => count,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if existing > 0 {
+        return err(
+            StatusCode::CONFLICT,
+            "this action already has an active or successful rollback",
+        );
     }
 
     let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
-    match rollback::rollback_of(
-        &state.pool,
-        &state.config,
+    let actor_context = ActorContext {
+        ip_address: client_ip(&headers, Some(&socket)),
+        user_agent: user_agent(&headers),
+    };
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("manual rollback of reroute #{id}"));
+    let mode = crate::api::settings::operating_mode(&state.pool, &state.config).await;
+
+    if mode == "enforce" && !body.dry_run {
+        let preview = match rollback_attempt(
+            &state,
+            device_id,
+            template_id,
+            &params,
+            id,
+            g.session.user_id,
+            &actor_context,
+            &reason,
+            true,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "rollback_preview_failed"),
+        };
+        let Some(token) = body.preview_token.as_deref() else {
+            return err(StatusCode::CONFLICT, "preview_required");
+        };
+        match super::consume_action_preview(
+            &state.pool,
+            token,
+            g.session.user_id,
+            "reroute_rollback",
+            Some(id),
+            &json!({ "result": preview, "reason": reason }),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return err(StatusCode::CONFLICT, "preview_expired_or_changed"),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_check_failed"),
+        }
+    }
+
+    let outcome = match rollback_attempt(
+        &state,
         device_id,
         template_id,
         &params,
-        Some(g.session.user_id),
-        format!("manual rollback of reroute #{id}"),
+        id,
+        g.session.user_id,
+        &actor_context,
+        &reason,
+        body.dry_run,
     )
     .await
     {
-        Some(outcome) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(outcome).unwrap_or_else(|_| json!({}))),
-        ),
-        None => err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
-    }
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return err(StatusCode::UNPROCESSABLE_ENTITY, "template has no rollback"),
+        Err(e) => return err(StatusCode::CONFLICT, &e.to_string()),
+    };
+    let preview_token = if mode == "enforce" && body.dry_run {
+        match super::store_action_preview(
+            &state.pool,
+            g.session.user_id,
+            "reroute_rollback",
+            Some(id),
+            &json!({ "result": outcome, "reason": reason }),
+        )
+        .await
+        {
+            Ok(token) => Some(token),
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_store_failed"),
+        }
+    } else {
+        None
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "result": outcome, "preview_token": preview_token })),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rollback_attempt(
+    state: &AppState,
+    device_id: u64,
+    template_id: u64,
+    params: &Value,
+    original_id: u64,
+    user_id: u64,
+    actor_context: &ActorContext,
+    reason: &str,
+    dry_run: bool,
+) -> anyhow::Result<Option<executor::ExecOutcome>> {
+    rollback::rollback_of(
+        &state.pool,
+        &state.config,
+        rollback::RollbackRequest {
+            device_id,
+            template_id,
+            params,
+            original_reroute_id: Some(original_id),
+            rule_event_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(actor_context.clone()),
+            reason: reason.to_string(),
+            defer_cooldown: false,
+            dry_run,
+        },
+    )
+    .await
 }

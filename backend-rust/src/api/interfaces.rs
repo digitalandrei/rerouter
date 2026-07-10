@@ -145,7 +145,7 @@ pub async fn show(
 
 #[derive(Debug, Deserialize)]
 pub struct MetricsQuery {
-    /// Window in minutes (default 60). Bounded to the 7-day retention.
+    /// Window in minutes (default 60). Bounded to the 48-hour retention.
     minutes: Option<i64>,
 }
 
@@ -157,15 +157,19 @@ pub async fn metrics(
     Path(id): Path<u64>,
     Query(q): Query<MetricsQuery>,
 ) -> JsonResp {
-    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM device_interfaces WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None);
+    let exists: Option<u64> =
+        match sqlx::query_scalar("SELECT id FROM device_interfaces WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
     if exists.is_none() {
         return err(StatusCode::NOT_FOUND, "interface not found");
     }
-    let minutes = q.minutes.unwrap_or(60).clamp(1, 7 * 24 * 60);
+    let minutes = q.minutes.unwrap_or(60).clamp(1, 48 * 60);
 
     type SampleRow = (
         chrono::DateTime<chrono::Utc>,
@@ -254,21 +258,45 @@ pub struct SetProtected {
 /// Requires `manage_devices`: an admin chooses what the controller may never shut
 /// on itself.
 pub async fn set_protected(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
     Json(body): Json<SetProtected>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query("UPDATE device_interfaces SET protected = ? WHERE id = ?")
         .bind(body.protected as i32)
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await;
     match res {
-        Ok(r) if r.rows_affected() > 0 => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "protected": body.protected })),
-        ),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "interface_protection_changed",
+                "interface",
+                id,
+                if body.protected {
+                    "interface marked protected"
+                } else {
+                    "interface protection cleared"
+                },
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "protected": body.protected })),
+            )
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "interface not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }

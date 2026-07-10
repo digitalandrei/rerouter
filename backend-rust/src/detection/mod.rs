@@ -22,12 +22,7 @@ pub fn is_sustained(consecutive_matches: u32, required: u32) -> bool {
     consecutive_matches >= required
 }
 
-// TODO(milestone 2): load rules, evaluate against AssetMetrics, advance
-// RuleState with hysteresis, write rule_events, enqueue alerts, hand off to the
-// reroute engine (which re-checks every safety gate).
-//
 // OBSERVE MODE: when system_settings.operating_mode == "observe" (the default),
 // a firing rule still records its event and alert, but the alert payload must
-// include the rendered would-run plan from the attached reroute template
-// ("would have executed: blackhole_prefix prefix=… via provider=…") instead of
-// any execution. See ../reroute/executor.rs GATE 0.
+// include the rendered would-run plan from its rule_actions instead of any
+// execution. See ../reroute/executor.rs GATE 0.

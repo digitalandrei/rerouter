@@ -1,5 +1,5 @@
 /**
- * Flows tab — NetFlow/IPFIX read-only telemetry for a device: top talkers,
+ * Flows tab — NetFlow/IPFIX telemetry for a device: top talkers,
  * ports, and per-interface traffic over the last hour, plus exporter health.
  * Counts are sampled; values scaled by the sampling rate are badged "est".
  * See ../../../../docs/flow-telemetry.md.

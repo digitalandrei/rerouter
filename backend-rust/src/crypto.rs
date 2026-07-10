@@ -1,5 +1,6 @@
-//! Encryption at rest for secret material: SNMP community strings and provider
-//! credentials. AES-256-GCM with the key from `SECRETS_KEY` (32 bytes, hex). The
+//! Encryption at rest for secret material: SNMP/SSH credentials, TOTP secrets,
+//! and webhook credentials. AES-256-GCM with the key from `SECRETS_KEY` (32 bytes,
+//! hex). The
 //! on-disk blob is `nonce(12) || ciphertext||tag`; the 96-bit nonce is random
 //! per seal. Plaintext is NEVER logged or echoed.
 //!

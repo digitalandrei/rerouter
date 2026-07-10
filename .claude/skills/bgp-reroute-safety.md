@@ -6,7 +6,7 @@ description: Safe routing-change mitigations for Rerouter — Cisco IOS over SSH
 # Skill: Routing-change reroute safety
 
 Guidance for reroutes that change routing. These are the highest-blast-radius
-actions in Rerouter. Pair with [../docs/reroute-engine.md](../docs/reroute-engine.md)
+actions in Rerouter. Pair with [reroute-engine.md](../../docs/reroute-engine.md)
 and the [reroute-safety-agent](../agents/reroute-safety-agent.md).
 
 > **The controller does NOT speak BGP.** There is no ExaBGP/BGP speaker, no
@@ -56,8 +56,10 @@ The template renderer substitutes only **type-checked** parameter values
 (`ip` / `cidr` / `asn` / `int`); a `cidr` param `X` also exposes `{X_net}` /
 `{X_mask}`. Validated values contain no whitespace or newlines, so no extra
 commands can be smuggled into the line. The device-CLI layer additionally enforces
-a **fail-closed allowlist** — only the exact `Null0` route and `neighbor …
-shutdown` forms pass. Refuse a prefix shorter than your agreed RTBH max so an
+a **fail-closed allowlist** covering only the catalogued `show`, Null0 route,
+BGP neighbor/prefix-list/route-map, and interface command shapes. Variable
+tokens and output-filter syntax are independently constrained. Refuse a prefix
+shorter than your agreed RTBH max so an
 aggregate is never blackholed by mistake (enforce this in the template/parameter
 constraints, not by trusting the operator).
 
@@ -93,8 +95,13 @@ timer.
 - operating mode is `enforce` (observe renders the would-run plan and executes
   nothing) ✔
 - target device not locked, no active cooldown, no running action, no `uncertain` ✔
-- automatic only if global enable **and** per-rule enable are set; manual requires
-  the `trigger_manual_reroute` permission (in-house tool — no typed confirmation /
-  re-auth gate) ✔
+- automatic only if global enable, per-rule enable, and the selected template's
+  `automatic_allowed` policy all permit it; interface shutdown/no-shutdown and
+  route-map changes remain manual-only ✔
+- manual actions, rule applies, and rollbacks require the matching server-issued
+  one-use preview token for the exact rendered plan; manual also requires the
+  `trigger_manual_reroute` permission ✔
+- discovered routing inventory is fresh; the prefix is within an announced
+  prefix, peer parameters match discovery, and RTBH tags match the catalog ✔
 - state persisted before/after each step; read-back verification planned; rollback
   template defined ✔

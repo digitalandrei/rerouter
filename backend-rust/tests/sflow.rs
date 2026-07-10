@@ -311,7 +311,9 @@ fn fuzz_random_bytes_never_panic() {
         let len = (s % 600) as usize;
         let mut dg = Vec::with_capacity(len);
         for _ in 0..len {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             dg.push((s >> 33) as u8);
         }
         // Force a valid version word on some iterations to exercise deeper paths.

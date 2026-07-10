@@ -95,6 +95,10 @@ pub async fn create(
         Err(m) => return err(StatusCode::UNPROCESSABLE_ENTITY, m),
     };
 
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     let res = sqlx::query(
         "INSERT INTO rtbh_communities (label, kind, community, tag, created_by) VALUES (?, ?, ?, ?, ?)",
     )
@@ -103,10 +107,27 @@ pub async fn create(
     .bind(body.community.trim())
     .bind(body.tag)
     .bind(g.session.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     match res {
-        Ok(_) => fetch_list(&state.pool).await,
+        Ok(r) => {
+            let id = r.last_insert_id();
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "rtbh_community_created",
+                "rtbh_community",
+                id,
+                "RTBH community added",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            fetch_list(&state.pool).await
+        }
         Err(e) if matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23000")) => {
             err(StatusCode::CONFLICT, "that route tag is already in use")
         }
@@ -116,16 +137,36 @@ pub async fn create(
 
 /// DELETE /api/rtbh-communities/{id}. `manage_devices` only.
 pub async fn remove(
-    _g: RequirePermission<markers::ManageDevices>,
+    g: RequirePermission<markers::ManageDevices>,
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     match sqlx::query("DELETE FROM rtbh_communities WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
     {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(r) if r.rows_affected() > 0 => {
+            if super::audit_mutation_on(
+                &mut tx,
+                &g.session,
+                "rtbh_community_deleted",
+                "rtbh_community",
+                id,
+                "RTBH community deleted",
+            )
+            .await
+            .is_err()
+                || tx.commit().await.is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+            }
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     }

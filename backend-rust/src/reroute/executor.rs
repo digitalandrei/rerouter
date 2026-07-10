@@ -33,8 +33,21 @@ pub struct ActionRequest {
     /// "manual" | "rollback" | "automatic".
     pub trigger_type: &'static str,
     pub rule_id: Option<u64>,
+    /// The exact `rule_events.id` firing edge that created this action.
+    pub rule_event_id: Option<u64>,
+    /// The original reroute this corrective action reverses.
+    pub rollback_of_reroute_id: Option<u64>,
     pub user_id: Option<u64>,
+    pub actor_context: Option<ActorContext>,
     pub reason: Option<String>,
+    /// Rule action bundles record cooldowns once after the whole ordered batch.
+    pub defer_cooldown: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorContext {
+    pub ip_address: String,
+    pub user_agent: String,
 }
 
 /// Outcome of an `execute` attempt (serialized to the API caller).
@@ -105,11 +118,74 @@ async fn execute_with<S: SshExecutor>(
     pool: &MySqlPool,
     cfg: &Config,
     ssh: &S,
-    req: ActionRequest,
+    mut req: ActionRequest,
     dry_run: bool,
 ) -> ExecOutcome {
     let device_name = device_name(pool, req.device_id).await;
-    let device_ref = req.device_id.to_string();
+
+    if !req.template.enabled {
+        return blocked(&req, device_name, "template is disabled".into());
+    }
+    if req.trigger_type == "automatic" && !req.template.automatic_allowed {
+        return blocked(
+            &req,
+            device_name,
+            "template is not allowed for automatic execution".into(),
+        );
+    }
+    // Rollbacks use the exact typed parameters persisted with the original
+    // action. Fresh inventory may legitimately have changed and must not block
+    // corrective work; every new manual/automatic action is canonicalized.
+    if req.trigger_type != "rollback" {
+        req.params = match crate::reroute::templates::canonicalize_inventory_params(
+            pool,
+            req.device_id,
+            &req.template,
+            &req.params,
+        )
+        .await
+        {
+            Ok(params) => params,
+            Err(e) => {
+                return blocked(
+                    &req,
+                    device_name,
+                    format!("inventory validation failed: {e}"),
+                )
+            }
+        };
+        match crate::reroute::templates::prefix_target_is_contained(
+            pool,
+            req.device_id,
+            &req.template,
+            &req.params,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return blocked(
+                    &req,
+                    device_name,
+                    "prefix target is outside the device's announced space".into(),
+                )
+            }
+            Err(e) => {
+                return blocked(
+                    &req,
+                    device_name,
+                    format!("could not validate prefix containment: {e}"),
+                )
+            }
+        }
+    }
+    if let Err(e) = snapshot_prior_route_map(pool, &mut req).await {
+        return blocked(
+            &req,
+            device_name,
+            format!("could not snapshot rollback state: {e}"),
+        );
+    }
 
     // 1. Render the exact plan (also validates params).
     let plan = match crate::reroute::templates::render(&req.template, &req.params) {
@@ -124,7 +200,8 @@ async fn execute_with<S: SshExecutor>(
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
     if mode != "enforce" || dry_run {
         let would_run_rollback =
-            crate::reroute::rollback::render_rollback_plan(pool, req.template.id, &req.params).await;
+            crate::reroute::rollback::render_rollback_plan(pool, req.template.id, &req.params)
+                .await;
         let message = if mode != "enforce" {
             "observe mode: NOT executed — this is the plan that would run"
         } else {
@@ -181,7 +258,7 @@ async fn execute_with<S: SshExecutor>(
         Ok(id) => id,
         Err(reason) => return blocked(&req, device_name, reason.to_string()),
     };
-    audit(
+    if let Err(e) = audit(
         pool,
         &req,
         reroute_id,
@@ -191,10 +268,31 @@ async fn execute_with<S: SshExecutor>(
             req.template.name, req.device_id
         ),
     )
-    .await;
-    enqueue_alert(pool, &req, reroute_id, "reroute_started", "info", json!({})).await;
+    .await
+    {
+        return abort_reserved(
+            pool,
+            &req,
+            reroute_id,
+            device_name,
+            format!("required pre-action audit could not be persisted: {e}"),
+        )
+        .await;
+    }
+    if let Err(e) =
+        enqueue_alert(pool, &req, reroute_id, "reroute_started", "info", json!({})).await
+    {
+        return abort_reserved(
+            pool,
+            &req,
+            reroute_id,
+            device_name,
+            format!("required pre-action alert could not be persisted: {e}"),
+        )
+        .await;
+    }
 
-    let final_state = run_state_machine(
+    let final_state = match run_state_machine(
         pool,
         ssh,
         &req,
@@ -202,26 +300,55 @@ async fn execute_with<S: SshExecutor>(
         &plan,
         cfg.reroute.require_verification,
     )
-    .await;
+    .await
+    {
+        Ok(state) => state,
+        Err(e) => {
+            // No SSH side effect occurs before run_state_machine's checked
+            // planned->pending->running transitions complete.
+            let aborted = sqlx::query(
+                "UPDATE reroutes SET state = 'failed', finished_at = UTC_TIMESTAMP(), success = 0, \
+                 failure_reason = ? WHERE id = ? AND state IN ('planned','pending')",
+            )
+            .bind(format!("aborted before command execution: {e}"))
+            .bind(reroute_id)
+            .execute(pool)
+            .await;
+            let persisted = matches!(aborted, Ok(ref r) if r.rows_affected() == 1);
+            if !persisted {
+                tracing::error!(event_type = "reroute_abort_persist_failed", reroute_id, error = ?aborted.err(), "could not persist pre-command abort");
+            }
+            if let Err(audit_err) = audit(
+                pool,
+                &req,
+                reroute_id,
+                "reroute_aborted",
+                &format!("reroute #{reroute_id} aborted before SSH: {e}"),
+            )
+            .await
+            {
+                tracing::error!(event_type = "reroute_abort_audit_failed", reroute_id, error = %audit_err, "could not audit the pre-command abort");
+            }
+            return ExecOutcome {
+                executed: false,
+                reroute_id: Some(reroute_id),
+                state: Some(if persisted { "failed" } else { "uncertain" }.into()),
+                message: "reroute aborted before command execution".into(),
+                blocked_reason: Some(e.to_string()),
+                would_run: None,
+                would_run_rollback: None,
+                device_id: req.device_id,
+                device_name,
+            };
+        }
+    };
 
-    // Post-action cooldowns: per-device always, per-rule when rule-triggered.
-    let _ = cooldown::record(
-        pool,
-        "device",
-        &device_ref,
-        cfg.safety.same_device_cooldown_seconds as i64,
-        "post-action device cooldown",
-    )
-    .await;
-    if let Some(rule_id) = req.rule_id {
-        let _ = cooldown::record(
-            pool,
-            "rule",
-            &rule_id.to_string(),
-            cfg.safety.same_rule_cooldown_seconds as i64,
-            "post-action rule cooldown",
-        )
-        .await;
+    // Standalone actions record their cooldown immediately. Ordered rule bundles
+    // defer this until every sibling has had a chance to run.
+    if !req.defer_cooldown {
+        if let Err(e) = record_cooldowns(pool, cfg, req.rule_id, &[req.device_id]).await {
+            tracing::error!(event_type = "reroute_cooldown_persist_failed", reroute_id, error = %e, "could not persist cooldown rows; durable reroute history remains the gate fallback");
+        }
     }
 
     let message = match final_state.as_str() {
@@ -245,6 +372,80 @@ async fn execute_with<S: SshExecutor>(
     }
 }
 
+/// Snapshot a Route-Map Change's current assignment in the request that is
+/// persisted with the reroute. Every execution path then restores the exact prior
+/// map rather than only the standalone manual endpoint doing so.
+async fn snapshot_prior_route_map(pool: &MySqlPool, req: &mut ActionRequest) -> anyhow::Result<()> {
+    if req.template.name != "bgp_route_map_set" || req.params.get("prior_route_map").is_some() {
+        return Ok(());
+    }
+    let Some(neighbor) = req.params.get("neighbor_ip").and_then(Value::as_str) else {
+        anyhow::bail!("route-map action has no neighbor_ip");
+    };
+    let direction = req
+        .params
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("out");
+    let prior: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT CASE WHEN ? = 'in' THEN in_route_map ELSE out_route_map END \
+         FROM device_bgp_peers p WHERE device_id = ? AND peer_remote_addr = ? \
+           AND EXISTS (SELECT 1 FROM device_route_maps r WHERE r.device_id = p.device_id \
+                       AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)) \
+         LIMIT 1",
+    )
+    .bind(direction)
+    .bind(req.device_id)
+    .bind(neighbor)
+    .bind(crate::reroute::templates::ROUTING_INVENTORY_MAX_AGE_HOURS)
+    .fetch_optional(pool)
+    .await?;
+    let prior = prior.ok_or_else(|| anyhow::anyhow!("BGP peer is no longer in inventory"))?;
+    if let Value::Object(params) = &mut req.params {
+        params.insert(
+            "prior_route_map".into(),
+            Value::String(prior.unwrap_or_default()),
+        );
+    }
+    Ok(())
+}
+
+/// Record post-action cooldowns once for an ordered action bundle. Callers pass
+/// only devices on which an executor outcome actually attempted the action.
+pub async fn record_cooldowns(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule_id: Option<u64>,
+    device_ids: &[u64],
+) -> anyhow::Result<()> {
+    let mut unique = std::collections::BTreeSet::new();
+    for device_id in device_ids {
+        if unique.insert(*device_id) {
+            cooldown::record(
+                pool,
+                "device",
+                &device_id.to_string(),
+                cfg.safety.same_device_cooldown_seconds as i64,
+                "post-action device cooldown",
+            )
+            .await?;
+        }
+    }
+    if !unique.is_empty() {
+        if let Some(rule_id) = rule_id {
+            cooldown::record(
+                pool,
+                "rule",
+                &rule_id.to_string(),
+                cfg.safety.same_rule_cooldown_seconds as i64,
+                "post-action rule cooldown",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Push the apply commands, verify the result, finalize the state. Returns the
 /// final state string. Persists before/after each phase.
 async fn run_state_machine<S: SshExecutor>(
@@ -254,22 +455,34 @@ async fn run_state_machine<S: SshExecutor>(
     reroute_id: u64,
     plan: &RenderedPlan,
     require_verification: bool,
-) -> String {
+) -> anyhow::Result<String> {
     // -> pending: committed to act, persisted BEFORE any side effect. Crash
     // recovery treats pending/running/verifying as in-flight (=> uncertain), so
     // a crash from here on locks the device rather than being assumed harmless.
-    let _ = sqlx::query("UPDATE reroutes SET state = 'pending' WHERE id = ?")
-        .bind(reroute_id)
-        .execute(pool)
-        .await;
+    let pending =
+        sqlx::query("UPDATE reroutes SET state = 'pending' WHERE id = ? AND state = 'planned'")
+            .bind(reroute_id)
+            .execute(pool)
+            .await?;
+    anyhow::ensure!(
+        pending.rows_affected() == 1,
+        "planned state was cancelled or changed before execution"
+    );
 
     // -> running: the SSH session is about to push config (the side effect).
-    let _ = sqlx::query(
-        "UPDATE reroutes SET state = 'running', started_at = UTC_TIMESTAMP() WHERE id = ?",
+    let running = sqlx::query(
+        "UPDATE reroutes SET state = 'running', started_at = UTC_TIMESTAMP() \
+         WHERE id = ? AND state = 'pending'",
     )
     .bind(reroute_id)
     .execute(pool)
-    .await;
+    .await?;
+    anyhow::ensure!(
+        running.rows_affected() == 1,
+        "pending state was cancelled or changed before execution"
+    );
+
+    let mut persistence_ok = true;
 
     // Apply over a single SSH session (config mode state must persist across the
     // command sequence, so this cannot be split into per-command sessions).
@@ -277,7 +490,7 @@ async fn run_state_machine<S: SshExecutor>(
     let applied_ok = match &apply {
         Ok(out) => {
             for (i, r) in out.results.iter().enumerate() {
-                persist_output(
+                if let Err(e) = persist_output(
                     pool,
                     reroute_id,
                     (i + 1) as u32,
@@ -285,47 +498,75 @@ async fn run_state_machine<S: SshExecutor>(
                     &r.output,
                     "ok",
                 )
-                .await;
+                .await
+                {
+                    persistence_ok = false;
+                    tracing::error!(event_type = "reroute_output_persist_failed", reroute_id, error = %e, "could not persist command output");
+                }
             }
-            let _ = sqlx::query("UPDATE reroute_steps SET state = 'done' WHERE reroute_id = ?")
-                .bind(reroute_id)
-                .execute(pool)
-                .await;
+            if let Err(e) =
+                sqlx::query("UPDATE reroute_steps SET state = 'done' WHERE reroute_id = ?")
+                    .bind(reroute_id)
+                    .execute(pool)
+                    .await
+            {
+                persistence_ok = false;
+                tracing::error!(event_type = "reroute_step_persist_failed", reroute_id, error = %e, "could not persist completed steps");
+            }
             // SSH just answered — keep the reachability recency window warm so a
             // follow-up reroute in the same storm skips the preflight probe.
-            crate::reroute::reachability::stamp_ssh_ok(pool, req.device_id).await;
+            if let Err(e) = crate::reroute::reachability::stamp_ssh_ok(pool, req.device_id).await {
+                persistence_ok = false;
+                tracing::error!(event_type = "reroute_reachability_persist_failed", reroute_id, error = %e, "could not persist successful SSH contact");
+            }
             true
         }
         Err(e) => {
-            persist_output(pool, reroute_id, 0, "<apply>", &e.to_string(), "error").await;
-            let _ = sqlx::query("UPDATE reroute_steps SET state = 'failed' WHERE reroute_id = ?")
-                .bind(reroute_id)
-                .execute(pool)
-                .await;
+            if persist_output(pool, reroute_id, 0, "<apply>", &e.to_string(), "error")
+                .await
+                .is_err()
+            {
+                persistence_ok = false;
+            }
+            if let Err(err) =
+                sqlx::query("UPDATE reroute_steps SET state = 'failed' WHERE reroute_id = ?")
+                    .bind(reroute_id)
+                    .execute(pool)
+                    .await
+            {
+                persistence_ok = false;
+                tracing::error!(event_type = "reroute_step_persist_failed", reroute_id, error = %err, "could not persist failed steps");
+            }
             false
         }
     };
 
     // -> verifying (read-only confirmation in a separate session)
-    let _ = sqlx::query("UPDATE reroutes SET state = 'verifying' WHERE id = ?")
-        .bind(reroute_id)
-        .execute(pool)
-        .await;
-    let verdict = verify(pool, ssh, req, reroute_id, plan).await;
+    let verifying =
+        sqlx::query("UPDATE reroutes SET state = 'verifying' WHERE id = ? AND state = 'running'")
+            .bind(reroute_id)
+            .execute(pool)
+            .await;
+    if !matches!(verifying, Ok(ref r) if r.rows_affected() == 1) {
+        persistence_ok = false;
+        tracing::error!(
+            event_type = "reroute_transition_persist_failed",
+            reroute_id,
+            "could not persist running->verifying transition"
+        );
+    }
+    let (verdict, verification_persisted) = verify(pool, ssh, req, reroute_id, plan).await;
+    persistence_ok &= verification_persisted;
 
-    let final_state = match verdict {
-        Verdict::Pass => "succeeded",
-        Verdict::Fail => "failed",
-        Verdict::Uncertain => "uncertain",
-        // Template had no verify step. If verification is required we must NOT
-        // claim success — mark uncertain (which locks the device) instead.
-        Verdict::None => final_state_without_verification(applied_ok, require_verification),
-    };
+    let mut final_state = final_state_for(applied_ok, verdict, require_verification);
+    if !persistence_ok {
+        final_state = "uncertain";
+    }
 
-    finalize(pool, req, reroute_id, final_state, applied_ok, verdict).await;
-    final_state.to_string()
+    Ok(finalize(pool, req, reroute_id, final_state, applied_ok, verdict).await)
 }
 
+#[derive(Clone, Copy)]
 enum Verdict {
     Pass,
     Fail,
@@ -333,16 +574,19 @@ enum Verdict {
     None,
 }
 
-/// Pure decision for the no-verify-step case: when verification is required we
-/// must NEVER report success (doctrine: "verify, don't assume") — mark the action
-/// `uncertain` (which locks the device) instead. Unit-tested below.
-fn final_state_without_verification(applied_ok: bool, require_verification: bool) -> &'static str {
+/// Pure terminal-state decision. Any apply error is uncertain because the SSH
+/// transport can fail after a prefix of the command sequence reached the router;
+/// a later text check cannot prove every side effect (such as a soft clear) ran.
+fn final_state_for(applied_ok: bool, verdict: Verdict, require_verification: bool) -> &'static str {
     if !applied_ok {
-        "failed"
-    } else if require_verification {
-        "uncertain"
-    } else {
-        "succeeded"
+        return "uncertain";
+    }
+    match verdict {
+        Verdict::Pass => "succeeded",
+        Verdict::Fail => "failed",
+        Verdict::Uncertain => "uncertain",
+        Verdict::None if require_verification => "uncertain",
+        Verdict::None => "succeeded",
     }
 }
 
@@ -353,37 +597,39 @@ async fn verify<S: SshExecutor>(
     req: &ActionRequest,
     reroute_id: u64,
     plan: &RenderedPlan,
-) -> Verdict {
+) -> (Verdict, bool) {
     let Some(vstep) = plan.verify.as_ref() else {
-        return Verdict::None;
+        return (Verdict::None, true);
     };
     match ssh.verify_read(req.device_id, &vstep.command).await {
         Ok(output) => {
             let pass = judge(&output, vstep);
-            persist_verification(
+            let persisted = persist_verification(
                 pool,
                 reroute_id,
                 vstep,
                 &output,
                 if pass { "pass" } else { "fail" },
             )
-            .await;
+            .await
+            .is_ok();
             if pass {
-                Verdict::Pass
+                (Verdict::Pass, persisted)
             } else {
-                Verdict::Fail
+                (Verdict::Fail, persisted)
             }
         }
         Err(e) => {
-            persist_verification(
+            let persisted = persist_verification(
                 pool,
                 reroute_id,
                 vstep,
                 &format!("verify read failed: {e}"),
                 "uncertain",
             )
-            .await;
-            Verdict::Uncertain
+            .await
+            .is_ok();
+            (Verdict::Uncertain, persisted)
         }
     }
 }
@@ -412,7 +658,7 @@ async fn finalize(
     state: &str,
     applied_ok: bool,
     verdict: Verdict,
-) {
+) -> String {
     let success: Option<bool> = match state {
         "succeeded" => Some(true),
         "failed" => Some(false),
@@ -430,13 +676,19 @@ async fn finalize(
         } else {
             "command push failed and verification did not confirm the change".into()
         }),
-        "uncertain" => Some("could not verify the resulting state after pushing config".into()),
+        "uncertain" => Some(if applied_ok {
+            "could not verify the resulting state after pushing config".into()
+        } else {
+            "the SSH apply ended ambiguously and may have applied only part of the command plan"
+                .into()
+        }),
         _ => None,
     };
 
-    if let Err(e) = sqlx::query(
+    let finalized = match sqlx::query(
         "UPDATE reroutes SET state = ?, finished_at = UTC_TIMESTAMP(), success = ?, \
-         verification_status = ?, failure_reason = ? WHERE id = ?",
+         verification_status = ?, failure_reason = ? \
+         WHERE id = ? AND state IN ('running','verifying')",
     )
     .bind(state)
     .bind(success)
@@ -446,17 +698,48 @@ async fn finalize(
     .execute(pool)
     .await
     {
-        tracing::error!(
+        Ok(r) if r.rows_affected() == 1 => true,
+        Ok(_) => {
+            tracing::error!(
+                event_type = "reroute_finalize_state_conflict",
+                reroute_id,
+                state,
+                "terminal transition did not match an in-flight reroute"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
             event_type = "reroute_finalize_persist_failed",
             reroute_id,
             device_id = req.device_id,
             state,
             error = %e,
             "failed to persist final reroute state — runtime state may be inconsistent"
-        );
+            );
+            false
+        }
+    };
+
+    let effective_state = if finalized { state } else { "uncertain" };
+    if !finalized {
+        // A second, conservative transition may succeed after a transient error.
+        // It never claims success; an in-flight row is forced to uncertain.
+        if let Err(e) = sqlx::query(
+            "UPDATE reroutes SET state = 'uncertain', finished_at = UTC_TIMESTAMP(), \
+             success = NULL, verification_status = 'uncertain', \
+             failure_reason = 'could not durably persist the terminal execution state' \
+             WHERE id = ? AND state IN ('running','verifying')",
+        )
+        .bind(reroute_id)
+        .execute(pool)
+        .await
+        {
+            tracing::error!(event_type = "reroute_uncertain_fallback_failed", reroute_id, error = %e, "could not persist conservative uncertain fallback");
+        }
     }
 
-    if state == "uncertain" {
+    if effective_state == "uncertain" {
         // Lock the device; an admin must acknowledge before reroutes resume. If
         // this write fails the device is NOT actually locked, so make it LOUD:
         // a silently-unlocked device after an unverifiable reroute is exactly the
@@ -465,6 +748,7 @@ async fn finalize(
             pool,
             "device",
             Some(&req.device_id.to_string()),
+            Some(reroute_id),
             "auto_uncertain",
             &format!("reroute #{reroute_id} could not be verified"),
             None,
@@ -484,38 +768,45 @@ async fn finalize(
     // `failed` and `uncertain` are both doctrine-critical (docs/email-alerts.md:
     // they always fan out to the admin tier). Severity drives that fan-out, so
     // `failed` must be `critical`, not `warning`.
-    let severity = match state {
+    let severity = match effective_state {
         "succeeded" => "info",
         "failed" => "critical",
         "uncertain" => "critical",
         _ => "info",
     };
-    enqueue_alert(
+    if let Err(e) = enqueue_alert(
         pool,
         req,
         reroute_id,
-        &format!("reroute_{state}"),
+        &format!("reroute_{effective_state}"),
         severity,
         json!({ "verification": verification_status, "failure_reason": failure_reason }),
     )
-    .await;
-    audit(
+    .await
+    {
+        tracing::error!(event_type = "reroute_alert_enqueue_failed", reroute_id, alert = %format!("reroute_{effective_state}"), error = %e, "failed to enqueue terminal reroute alert");
+    }
+    if let Err(e) = audit(
         pool,
         req,
         reroute_id,
-        &format!("reroute_{state}"),
-        &format!("reroute #{reroute_id} {state}"),
+        &format!("reroute_{effective_state}"),
+        &format!("reroute #{reroute_id} {effective_state}"),
     )
-    .await;
+    .await
+    {
+        tracing::error!(event_type = "reroute_audit_persist_failed", reroute_id, audited = %format!("reroute_{effective_state}"), error = %e, "failed to write terminal reroute audit row");
+    }
 
     tracing::info!(
         event_type = "reroute_finalized",
         reroute_id,
         device_id = req.device_id,
-        state,
+        state = effective_state,
         template = %req.template.name,
         "reroute finalized"
     );
+    effective_state.to_string()
 }
 
 // ---- persistence helpers -------------------------------------------------------
@@ -527,8 +818,8 @@ async fn persist_output(
     request: &str,
     response: &str,
     status: &str,
-) {
-    let _ = sqlx::query(
+) -> anyhow::Result<()> {
+    sqlx::query(
         "INSERT INTO reroute_outputs (reroute_id, step_number, request, response, status, started_at, finished_at) \
          VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())",
     )
@@ -538,7 +829,8 @@ async fn persist_output(
     .bind(response)
     .bind(status)
     .execute(pool)
-    .await;
+    .await?;
+    Ok(())
 }
 
 async fn persist_verification(
@@ -547,13 +839,13 @@ async fn persist_verification(
     v: &VerifyStep,
     observed: &str,
     result: &str,
-) {
+) -> anyhow::Result<()> {
     let expected = format!(
         "expect={} reject={}",
         v.expect.as_deref().unwrap_or("-"),
         v.reject.as_deref().unwrap_or("-")
     );
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO reroute_verifications (reroute_id, method, expected, observed, result, checked_at) \
          VALUES (?, 'ios_show', ?, ?, ?, UTC_TIMESTAMP())",
     )
@@ -562,7 +854,8 @@ async fn persist_verification(
     .bind(observed)
     .bind(result)
     .execute(pool)
-    .await;
+    .await?;
+    Ok(())
 }
 
 async fn enqueue_alert(
@@ -572,7 +865,7 @@ async fn enqueue_alert(
     event_type: &str,
     severity: &str,
     extra: Value,
-) {
+) -> anyhow::Result<()> {
     // Enrich the payload so the email can render the full picture: WHO acted (for
     // manual/rollback), the exact commands run, and the rollback commands to undo
     // it by hand. Rendering is best-effort (params already validated at execution).
@@ -605,7 +898,7 @@ async fn enqueue_alert(
         "detail": extra,
     });
     let dedup_key = format!("{event_type}:reroute:{reroute_id}");
-    if let Err(e) = sqlx::query(
+    sqlx::query(
         "INSERT INTO alerts (event_type, severity, device_id, rule_id, payload_json, dedup_key) \
          VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -616,27 +909,25 @@ async fn enqueue_alert(
     .bind(sqlx::types::Json(&payload))
     .bind(&dedup_key)
     .execute(pool)
-    .await
-    {
-        tracing::error!(
-            event_type = "reroute_alert_enqueue_failed",
-            reroute_id,
-            alert = %event_type,
-            error = %e,
-            "failed to enqueue reroute alert — operators may not be notified"
-        );
-    }
+    .await?;
+    Ok(())
 }
 
-async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &str, message: &str) {
+async fn audit(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    event: &str,
+    message: &str,
+) -> anyhow::Result<()> {
     let actor_type = if req.user_id.is_some() {
         "user"
     } else {
         "controller"
     };
-    if let Err(e) = sqlx::query(
-        "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
-         VALUES (?, ?, ?, 'reroute', ?, ?, ?)",
+    sqlx::query(
+        "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message, ip_address, user_agent) \
+         VALUES (?, ?, ?, 'reroute', ?, ?, ?, ?, ?)",
     )
     .bind(actor_type)
     .bind(req.user_id)
@@ -644,16 +935,42 @@ async fn audit(pool: &MySqlPool, req: &ActionRequest, reroute_id: u64, event: &s
     .bind(reroute_id)
     .bind(reroute_id)
     .bind(message)
+    .bind(req.actor_context.as_ref().map(|c| c.ip_address.as_str()))
+    .bind(req.actor_context.as_ref().map(|c| c.user_agent.as_str()))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A reservation exists but a required pre-action record could not be written.
+/// No SSH has been attempted, so terminate the row and return without executing.
+async fn abort_reserved(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    device_name: Option<String>,
+    reason: String,
+) -> ExecOutcome {
+    let persisted = sqlx::query(
+        "UPDATE reroutes SET state = 'failed', finished_at = UTC_TIMESTAMP(), success = 0, \
+         failure_reason = ? WHERE id = ? AND state = 'planned'",
+    )
+    .bind(&reason)
+    .bind(reroute_id)
     .execute(pool)
     .await
-    {
-        tracing::error!(
-            event_type = "reroute_audit_persist_failed",
-            reroute_id,
-            audited = %event,
-            error = %e,
-            "failed to write reroute audit row"
-        );
+    .is_ok_and(|result| result.rows_affected() == 1);
+    tracing::error!(event_type = "reroute_preaction_record_failed", reroute_id, device_id = req.device_id, persisted, reason = %reason, "reroute aborted before SSH because its durable trail was incomplete");
+    ExecOutcome {
+        executed: false,
+        reroute_id: Some(reroute_id),
+        state: Some(if persisted { "failed" } else { "uncertain" }.into()),
+        message: "reroute aborted before command execution".into(),
+        blocked_reason: Some(reason),
+        would_run: None,
+        would_run_rollback: None,
+        device_id: req.device_id,
+        device_name,
     }
 }
 
@@ -682,23 +999,28 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::final_state_without_verification;
+    use super::{final_state_for, Verdict};
 
     #[test]
     fn no_verify_step_is_uncertain_when_verification_required() {
         // Commands applied but the template carries no verify step: with
         // verification required we must not claim success (doctrine).
-        assert_eq!(final_state_without_verification(true, true), "uncertain");
+        assert_eq!(final_state_for(true, Verdict::None, true), "uncertain");
     }
 
     #[test]
     fn no_verify_step_is_success_when_verification_not_required() {
-        assert_eq!(final_state_without_verification(true, false), "succeeded");
+        assert_eq!(final_state_for(true, Verdict::None, false), "succeeded");
     }
 
     #[test]
-    fn failed_apply_is_failed_regardless_of_verification_flag() {
-        assert_eq!(final_state_without_verification(false, true), "failed");
-        assert_eq!(final_state_without_verification(false, false), "failed");
+    fn failed_apply_is_uncertain_regardless_of_verification_result() {
+        assert_eq!(final_state_for(false, Verdict::Pass, true), "uncertain");
+        assert_eq!(final_state_for(false, Verdict::Fail, true), "uncertain");
+        assert_eq!(
+            final_state_for(false, Verdict::Uncertain, true),
+            "uncertain"
+        );
+        assert_eq!(final_state_for(false, Verdict::None, false), "uncertain");
     }
 }

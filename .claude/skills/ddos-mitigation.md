@@ -26,8 +26,8 @@ actually behave **and** what Rerouter can actually do. Pair with
 
 What you see depends on the source. **SNMP interface polling** (the v1 source)
 gives per-interface **volume** only (bps/pps/util/errors) — not per-source or
-per-port composition. The **read-only NetFlow v9 collector** (second source, off
-by default) adds per-tuple detail: top talkers, top ports/protocols, top source
+per-port composition. The **passive NetFlow v9/sFlow collector** (second source,
+off by default) adds per-tuple detail: top talkers, top ports/protocols, top source
 ASNs — that is where amplification src-ports and attack composition become
 visible.
 
@@ -70,6 +70,8 @@ action.
 - Sustained match (per-rule settle window / consecutive samples for SNMP, a window
   for flow), not a single spike.
 - Correct flow **sampling rate** applied before comparing flow-derived rates.
+- Flow-triggered automation separately enabled and corroborated by fresh,
+  contemporaneous same-interface SNMP volume.
 - Suppress traffic rules while a reroute is already active on that device.
 - Legit traffic surges (launches, flash crowds) look volumetric — observe mode is
   the default, so a fired rule alerts with the would-run plan; prefer manual

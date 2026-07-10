@@ -30,7 +30,9 @@
 //! operator may act during the window, with a UI warning); they still require SSH
 //! reachable via the normal gate.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -51,6 +53,26 @@ pub const STABILITY_WINDOW: Duration = Duration::from_secs(300);
 pub const STATUS_REACHABLE: &str = "reachable";
 pub const STATUS_NO_PRIVILEGE: &str = "no_privilege";
 pub const STATUS_UNREACHABLE: &str = "unreachable";
+
+static PROCESS_SUCCESSES: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+
+fn recent_process_success(device_id: u64) -> bool {
+    let map = PROCESS_SUCCESSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get(&device_id)
+        .is_some_and(|at| at.elapsed() < RECENCY_WINDOW)
+}
+
+fn set_process_success(device_id: u64, reachable: bool) {
+    let map = PROCESS_SUCCESSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reachable {
+        guard.insert(device_id, Instant::now());
+    } else {
+        guard.remove(&device_id);
+    }
+}
 
 /// The reachability decision for a device.
 #[derive(Debug, Clone, Serialize)]
@@ -111,17 +133,25 @@ pub fn recent_enough(last_ssh_ok_at: Option<DateTime<Utc>>, now: DateTime<Utc>) 
 /// on a recent privileged contact, otherwise run a live liveness probe and record
 /// the classified outcome.
 pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reachability {
-    let (last_ssh_ok_at, since): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
-        sqlx::query_as("SELECT last_ssh_ok_at, ssh_reachable_since FROM devices WHERE id = ?")
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or((None, None));
+    let (persisted_status, last_ssh_ok_at, since): (
+        String,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT ssh_status, last_ssh_ok_at, ssh_reachable_since FROM devices WHERE id = ?",
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| (STATUS_UNREACHABLE.into(), None, None));
 
     let now = Utc::now();
-    if recent_enough(last_ssh_ok_at, now) {
+    if persisted_status == STATUS_REACHABLE
+        && recent_enough(last_ssh_ok_at, now)
+        && recent_process_success(device_id)
+    {
         return Reachability {
             ssh_ok: true,
             ssh_status: STATUS_REACHABLE,
@@ -136,7 +166,17 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
     // Live SSH liveness probe (no commands), classified.
     match ssh::ssh_probe(pool, device_id).await {
         SshReach::Privileged => {
-            stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await;
+            if let Err(e) = stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await {
+                return Reachability {
+                    ssh_ok: false,
+                    ssh_status: STATUS_UNREACHABLE,
+                    stable: false,
+                    via_recency: false,
+                    last_ssh_ok_at,
+                    ssh_reachable_since: None,
+                    ssh_error: Some(format!("could not persist SSH reachability: {e}")),
+                };
+            }
             // The stamp sets ssh_reachable_since only if it was NULL; a device that
             // was already reachable keeps its original since (so it can be stable).
             let since_after = since.or(Some(now));
@@ -153,7 +193,10 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
         // Both privilege problems (user-EXEC login, or '#' but a required command
         // denied) land here: SSH works, the account can't do the work → not mitigatable.
         SshReach::UserExec(msg) | SshReach::Restricted(msg) => {
-            stamp_ssh_status(pool, device_id, STATUS_NO_PRIVILEGE, Some(&msg)).await;
+            if let Err(e) = stamp_ssh_status(pool, device_id, STATUS_NO_PRIVILEGE, Some(&msg)).await
+            {
+                tracing::warn!(event_type = "ssh_negative_status_write_failed", device_id, status = STATUS_NO_PRIVILEGE, error = %e, "could not persist negative SSH reachability");
+            }
             Reachability {
                 ssh_ok: false,
                 ssh_status: STATUS_NO_PRIVILEGE,
@@ -165,7 +208,10 @@ pub async fn reachable_for_mitigation(pool: &MySqlPool, device_id: u64) -> Reach
             }
         }
         SshReach::Unreachable(msg) => {
-            stamp_ssh_status(pool, device_id, STATUS_UNREACHABLE, Some(&msg)).await;
+            if let Err(e) = stamp_ssh_status(pool, device_id, STATUS_UNREACHABLE, Some(&msg)).await
+            {
+                tracing::warn!(event_type = "ssh_negative_status_write_failed", device_id, status = STATUS_UNREACHABLE, error = %e, "could not persist negative SSH reachability");
+            }
             Reachability {
                 ssh_ok: false,
                 ssh_status: STATUS_UNREACHABLE,
@@ -190,8 +236,8 @@ pub async fn stamp_ssh_status(
     device_id: u64,
     status: &str,
     err: Option<&str>,
-) {
-    let _ = if status == STATUS_REACHABLE {
+) -> anyhow::Result<()> {
+    if status == STATUS_REACHABLE {
         sqlx::query(
             "UPDATE devices SET ssh_status = ?, last_ssh_error = NULL, last_ssh_ok_at = UTC_TIMESTAMP(), \
              ssh_reachable_since = COALESCE(ssh_reachable_since, UTC_TIMESTAMP()) WHERE id = ?",
@@ -199,8 +245,13 @@ pub async fn stamp_ssh_status(
         .bind(status)
         .bind(device_id)
         .execute(pool)
-        .await
+        .await?;
+        set_process_success(device_id, true);
     } else {
+        // Clear the process-local fast path before attempting persistence. Even
+        // if the DB write fails, a freshly observed negative result can never be
+        // masked by the previous minute's successful contact.
+        set_process_success(device_id, false);
         sqlx::query(
             "UPDATE devices SET ssh_status = ?, last_ssh_error = ?, ssh_reachable_since = NULL WHERE id = ?",
         )
@@ -208,27 +259,32 @@ pub async fn stamp_ssh_status(
         .bind(err)
         .bind(device_id)
         .execute(pool)
-        .await
-    };
+        .await?;
+    }
+    Ok(())
 }
 
 /// Reset every device's stability clock (`ssh_reachable_since = NULL`). Called once
 /// on controller startup so a device must be freshly re-confirmed SSH-reachable for
 /// `STABILITY_WINDOW` before AUTOMATIC mitigations resume after a restart.
-pub async fn reset_stability(pool: &MySqlPool) {
-    if let Err(e) = sqlx::query("UPDATE devices SET ssh_reachable_since = NULL")
-        .execute(pool)
-        .await
-    {
-        tracing::warn!(event_type = "stability_reset_failed", error = %e, "could not reset device stability clocks on startup");
+pub async fn reset_stability(pool: &MySqlPool) -> anyhow::Result<()> {
+    if let Some(cache) = PROCESS_SUCCESSES.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
+    sqlx::query("UPDATE devices SET ssh_reachable_since = NULL")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Record that SSH just answered at privileged EXEC on `device_id` (e.g. a
 /// successful reroute push) — keeps the recency window warm and marks the device
 /// reachable.
-pub async fn stamp_ssh_ok(pool: &MySqlPool, device_id: u64) {
-    stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await;
+pub async fn stamp_ssh_ok(pool: &MySqlPool, device_id: u64) -> anyhow::Result<()> {
+    stamp_ssh_status(pool, device_id, STATUS_REACHABLE, None).await
 }
 
 /// Periodic SSH reachability probe (the poll loop calls this every
@@ -244,7 +300,9 @@ pub async fn probe_ssh_and_store(pool: &MySqlPool, device_id: u64) -> &'static s
         SshReach::UserExec(m) | SshReach::Restricted(m) => (STATUS_NO_PRIVILEGE, Some(m)),
         SshReach::Unreachable(m) => (STATUS_UNREACHABLE, Some(m)),
     };
-    stamp_ssh_status(pool, device_id, status, err.as_deref()).await;
+    if let Err(e) = stamp_ssh_status(pool, device_id, status, err.as_deref()).await {
+        tracing::error!(event_type = "ssh_status_persist_failed", device_id, error = %e, "could not persist SSH probe outcome");
+    }
     status
 }
 
@@ -260,7 +318,10 @@ mod tests {
         assert!(recent_enough(Some(now - ChronoDuration::seconds(30)), now));
         // Exactly at / past the 60s window is NOT recent (re-probe).
         assert!(!recent_enough(Some(now - ChronoDuration::seconds(60)), now));
-        assert!(!recent_enough(Some(now - ChronoDuration::seconds(120)), now));
+        assert!(!recent_enough(
+            Some(now - ChronoDuration::seconds(120)),
+            now
+        ));
         // Never-contacted -> not recent.
         assert!(!recent_enough(None, now));
         // Future timestamp (clock skew) -> treated as not recent (safe: re-probe).

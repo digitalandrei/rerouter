@@ -19,7 +19,7 @@ pub struct ListQuery {
     limit: Option<i64>,
     /// Page offset (default 0).
     offset: Option<i64>,
-    /// Only alerts from the last N days (default 7, capped at 365).
+    /// Only alerts from the last N days (default 2, capped at the 48-hour retention window).
     days: Option<i64>,
 }
 
@@ -41,7 +41,7 @@ struct AlertRow {
     payload_json: Option<sqlx::types::Json<Value>>,
 }
 
-/// GET /api/alerts — most recent first, scoped to the last `days` (default 7),
+/// GET /api/alerts — most recent first, scoped to the last `days` (default 2),
 /// paginated. Returns `{ rows, total, limit, offset }`.
 pub async fn list(
     _g: RequirePermission<markers::ViewDashboard>,
@@ -50,16 +50,19 @@ pub async fn list(
 ) -> JsonResp {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let days = q.days.unwrap_or(2).clamp(1, 2);
 
-    let total: i64 = sqlx::query_scalar(
+    let total: i64 = match sqlx::query_scalar(
         "SELECT COUNT(*) FROM alerts \
          WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)",
     )
     .bind(days)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or(0);
+    {
+        Ok(total) => total,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
 
     let rows = sqlx::query_as::<_, AlertRow>(
         "SELECT a.id, a.event_type, a.severity, a.device_id, a.interface_id, a.rule_id, \

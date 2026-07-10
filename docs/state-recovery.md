@@ -9,7 +9,7 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 - last device reachability and telemetry health;
 - last valid telemetry sample and counter baselines;
 - active detection-rule states and consecutive-match counters;
-- pending / running / verifying reroutes;
+- planned / pending / running / verifying reroutes;
 - last step output and verification status per action;
 - active locks and cooldowns (device-scoped);
 - device + interface inventory and discovered BGP peers/prefixes.
@@ -17,18 +17,21 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 ## Controller startup sequence
 
 ```text
-1. Load device + interface inventory.
-2. Load monitored interfaces and rules.
-3. Load last telemetry baselines.
-4. Load active rule states.
-5. Find reroutes in state pending / running / verifying.
-6. Mark unresolved running reroutes as `uncertain`.
-7. Apply a safety lock to each affected device (`auto_crash`).
-8. Reconnect telemetry + device SSH sessions.
-9. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
+1. Load configuration, preflight the database, and apply migrations.
+2. Find reroutes in state planned / pending / running / verifying.
+3. For each row, atomically mark it `uncertain`, create a linked device lock
+   (`locks.reroute_id`, kind `auto_crash`), enqueue a critical alert, and write an
+   audit row.
+4. If any recovery transaction fails, abort startup. The untouched/rolled-back
+   row is retried on the next start; the service never continues with a partial
+   recovery trail.
+5. Start the supervised alert, telemetry, detection, retention, and API tasks.
+   Inventory, baselines, and rule state remain durable in MariaDB; SSH sessions
+   are opened on demand rather than reconnected at startup.
+6. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
     routing state on recovery is future work; today the controller does not
     re-read the device on startup.
-10. The device stays locked and the reroute stays `uncertain` until an **admin
+7. The device stays locked and the reroute stays `uncertain` until an **admin
     acknowledges** it (`POST /api/reroutes/{id}/acknowledge-uncertain`) — there is
     no automatic clear.
 ```
@@ -43,15 +46,21 @@ For any `uncertain` action:
 
 - show it prominently in the GUI (dashboard + device detail);
 - disable automatic reroutes for the affected device (it stays locked);
-- send an email alert;
+- send an email/Teams alert according to configured subscriptions;
 - require explicit admin acknowledgement (audited) before automatic actions
   resume on that device.
 
-## Verification on recovery
+An SSH apply error is uncertain even when a later text check sees the intended
+configuration. The transport may have failed after only part of the plan,
+including an unverified companion command such as a BGP soft clear, so the
+controller locks the device for review instead of claiming success or a clean
+failure.
 
-Recovery leans on the same verification used during normal execution
-(see [reroute-engine.md](reroute-engine.md)) — an IOS `show` read over SSH,
-judged by expect-present / reject-absent matching:
+## Manual verification after recovery
+
+Automatic startup re-verification is not implemented. The operator should use
+the same IOS `show` evidence used during normal execution
+([reroute-engine.md](reroute-engine.md)):
 
 - `show ip route <prefix>` to confirm the `Null0` route is present (RTBH /
   blackhole) or absent (after a withdrawal);
@@ -59,9 +68,11 @@ judged by expect-present / reject-absent matching:
   reported as administratively shut;
 - compare current device traffic against expectation.
 
-If verification confirms the intended end-state, the action can be resolved to
-`succeeded` (or rolled forward); if it proves the action did not take effect,
-resolve to `failed`. Only genuine ambiguity stays `uncertain`.
+After checking the router, the operator records an acknowledgement. The original
+row becomes `failed` with `verification_status = acknowledged`, and only the lock
+linked to that reroute is cleared; unrelated manual/device locks remain. If the
+configuration must be undone, run the server-previewed rollback after the lock is
+cleared. The controller never claims recovered success from an acknowledgement.
 
 ## Failure modes
 

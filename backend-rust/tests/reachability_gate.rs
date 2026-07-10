@@ -55,8 +55,14 @@ async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
     let r = reachability::reachable_for_mitigation(&pool, device_id).await;
     assert!(!r.ssh_ok, "unreachable SSH must not pass the gate");
     assert_eq!(r.ssh_status, STATUS_UNREACHABLE);
-    assert!(!r.via_recency, "no recent contact -> a live probe was attempted");
-    assert!(r.ssh_error.is_some(), "a probe failure should carry a reason");
+    assert!(
+        !r.via_recency,
+        "no recent contact -> a live probe was attempted"
+    );
+    assert!(
+        r.ssh_error.is_some(),
+        "a probe failure should carry a reason"
+    );
     assert_eq!(ssh_status(pool.clone()).await, STATUS_UNREACHABLE);
 
     // 1b) The periodic probe records the same classified outcome.
@@ -69,7 +75,9 @@ async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
     // 2) Recency short-circuit: stamp a fresh privileged contact, then the decision
     //    passes WITHOUT probing (via_recency) — even though SSH is still unreachable.
     //    This is the "sau în ultimul minut a răspuns" rule + the SSH-throttle guard.
-    reachability::stamp_ssh_ok(&pool, device_id).await;
+    reachability::stamp_ssh_ok(&pool, device_id)
+        .await
+        .expect("persist SSH success");
     assert_eq!(
         ssh_status(pool.clone()).await,
         STATUS_REACHABLE,
@@ -77,18 +85,26 @@ async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
     );
     let r = reachability::reachable_for_mitigation(&pool, device_id).await;
     assert!(r.ssh_ok, "a contact within 60s should satisfy the gate");
-    assert!(r.via_recency, "recent contact must short-circuit the live probe");
+    assert!(
+        r.via_recency,
+        "recent contact must short-circuit the live probe"
+    );
     assert_eq!(r.ssh_status, STATUS_REACHABLE);
 
     // 3) Stability: a just-reachable device is ssh_ok but NOT stable (auto held).
     //    stamp_ssh_ok started ssh_reachable_since = now, so < 5 min -> not stable.
-    assert!(!r.stable, "a device reachable for <5 min is not stable (auto held)");
+    assert!(
+        !r.stable,
+        "a device reachable for <5 min is not stable (auto held)"
+    );
     // Backdate the stability clock past the window -> now stable (auto resumes).
-    sqlx::query("UPDATE devices SET ssh_reachable_since = UTC_TIMESTAMP() - INTERVAL 6 MINUTE WHERE id = ?")
-        .bind(device_id)
-        .execute(&pool)
-        .await
-        .expect("backdate stability clock");
+    sqlx::query(
+        "UPDATE devices SET ssh_reachable_since = UTC_TIMESTAMP() - INTERVAL 6 MINUTE WHERE id = ?",
+    )
+    .bind(device_id)
+    .execute(&pool)
+    .await
+    .expect("backdate stability clock");
     let r = reachability::reachable_for_mitigation(&pool, device_id).await;
     assert!(r.stable, "reachable for >5 min continuous -> stable");
 

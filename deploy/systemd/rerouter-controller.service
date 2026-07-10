@@ -16,7 +16,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/srv/rerouter
+PrivateDevices=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
 LockPersonality=true
 # Sandboxing: the controller needs no privileges (binds only unprivileged ports —
 # loopback 9277, and optional flow UDP 2055/6343) and parses untrusted bytes from
@@ -37,6 +40,7 @@ RestrictRealtime=true
 RemoveIPC=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 UMask=0077
 
 [Install]

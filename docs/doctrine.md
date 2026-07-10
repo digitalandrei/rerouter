@@ -136,9 +136,9 @@ rerouter/
 │   │   ├── db/
 │   │   ├── auth/             (sessions.rs, password.rs, totp.rs, rbac.rs)
 │   │   ├── alerts/           (dispatcher.rs, mailer.rs)
-│   │   ├── telemetry/        (snmp.rs — v1 interface polling; flow/ —
-│   │   │                      NetFlow v9 + sFlow v5 read-only collector, OFF by
-│   │   │                      default; IPFIX planned. bgp/cloudflare de-scoped)
+│   │   ├── telemetry/        (snmp.rs — interface polling; flow/ — passive
+│   │   │                      NetFlow v9 + sFlow v5 collector, OFF by default;
+│   │   │                      flow rules implemented, IPFIX planned)
 │   │   ├── detection/        (condition.rs, cooldown.rs, engine.rs)
 │   │   ├── reroute/          (executor.rs, state_machine.rs, templates.rs,
 │   │   │                      locks.rs, rollback.rs)
@@ -232,16 +232,18 @@ Part of the same binary; owns everything user-facing on the server side:
 
 - **Authentication**: session cookies backed by a DB `sessions` table; Argon2id
   password hashing; TOTP 2FA (RFC 6238, 30s period, 6 digits, issuer
-  `Rerouter`); 8 single-use hashed recovery codes; login throttling and account
-  lockout keyed by email + real client IP.
+  `Rerouter`); separately delivered one-time enrollment credentials; 8
+  single-use hashed recovery codes; short pre-2FA sessions, idle expiry, login
+  throttling, and account lockout keyed by email + real client IP.
 - **RBAC**: explicit `roles`/`permissions`/`role_user`/`permission_role` tables,
   enforced via axum middleware/extractors. Roles: `admin`, `operator`,
-  `viewer`, `auditor`.
+  `superadmin`, `admin`, `operator`, `viewer`, `auditor`.
 - **REST API** under `/api/`: auth, status, device/interface/rule/template
   CRUD, manual reroute triggering, RTBH-community catalog, alerts, audit, locks,
   settings, users. Manual reroutes require the `trigger_manual_reroute`
-  permission and accept an optional free-text reason for the audit log; there is
-  no typed-confirmation or re-auth gate (de-scoped — see §9).
+  permission and accept an optional free-text reason for the audit log. In
+  enforce mode, manual execution and rollback also consume a short-lived,
+  single-use token bound to the exact server-rendered preview.
 - **Email alerts**: an internal async alert dispatcher task reads new `alerts`
   rows, resolves recipients/subscriptions, de-duplicates, rate-limits, sends
   via SMTP, and records deliveries (see §10).
@@ -254,7 +256,7 @@ Part of the same binary; owns everything user-facing on the server side:
 
 ### 5.3 React + Shadcn SPA frontend
 
-A Vite + React 18 + TypeScript + Tailwind + shadcn/ui single-page app, built to
+A Vite + React 19 + TypeScript + Tailwind + shadcn/ui single-page app, built to
 `frontend/dist` and served statically by Nginx. It talks to the API with
 credentialed `fetch` (session cookie) and holds no live state of its own.
 Clean, operational, explicit. Principles:
@@ -271,7 +273,8 @@ Clean, operational, explicit. Principles:
 - support GUI selection of monitored interfaces and rule assignment;
 - show a clear degraded state when the API is unreachable.
 
-Core pages: `/login` (password → TOTP challenge; first-login TOTP enrollment),
+Core pages: `/login` (password -> TOTP challenge; first-login enrollment also
+requires the separate one-time enrollment code),
 `/dashboard`, `/devices`, `/devices/:id`,
 `/devices/:deviceId/interfaces/:ifaceId`, `/rules`, `/templates`,
 `/mitigations` (reroute history), `/mitigations/manual`, `/alerts`, `/audit`,
@@ -379,6 +382,9 @@ order. The live gates are **device-scoped** (in `enforce` mode):
   would-run plan and runs nothing;
 - not a dry-run;
 - no automatic reroute unless explicitly enabled (global **and** per-rule);
+- no automatic reroute unless the template explicitly has
+  `automatic_allowed = true` (route-map changes and interface shutdown remain
+  manual-only);
 - no automatic reroute without an action template;
 - no action under a global maintenance lock;
 - no action if the device is in manual lock mode;
@@ -387,6 +393,11 @@ order. The live gates are **device-scoped** (in `enforce` mode):
 - no repeated action inside the per-device cooldown window;
 - no repeated action from the same rule inside the per-rule cooldown window;
 - no action once the global action rate limit for the window is reached;
+- no new action whose inventory-backed parameters are unknown or stale (SNMP
+  interface/BGP inventory expires after 24h; SSH routing inventory after 48h),
+  and no Null0/RTBH prefix outside recently discovered announced space;
+- no action unless the device answers the privileged SSH capability probe; a
+  first-contact host key must be durably pinned before configuration is sent;
 - **no interface-level disruptive action (`iface_shutdown`, `iface_tcp_adjust_mss`)
   on a protected interface** — the executor resolves the target interface and
   blocks if it is flagged `protected` (the device's management/transit/SSH path).
@@ -395,20 +406,21 @@ order. The live gates are **device-scoped** (in `enforce` mode):
 - (manual triggers additionally require the `trigger_manual_reroute`
   permission, enforced by the API before `execute` is called).
 
-Interface shutdown is the most destructive template in the catalog. Like every
-other action it is blocked entirely in `observe` mode and, in `enforce` mode,
-requires the global automatic switch **and** the per-rule switch before it can
-fire automatically. Never weaken these defaults.
+Interface shutdown is the most destructive template in the catalog. It is
+blocked entirely in `observe`, protected-interface guarded in `enforce`, and
+**manual-only** (`automatic_allowed = false`). Never weaken these defaults.
 
 The per-template "safety level", the provider/asset-reachability gate, the
 telemetry-stale gate, and the newly-discovered-asset gate were **de-scoped** with
 the provider abstraction. The live gates above — **plus the verify-or-refuse gate**
 (an automatic action whose template has no verification step is refused; see
 `reroute/guard.rs`) — are the set for SNMP-driven device-scoped actions.
-Flow-driven automatic actions additionally require non-low **sampling** confidence
-(see [flow-telemetry.md](flow-telemetry.md)); note that this checks sampling math,
-not exporter identity, so flow-driven auto-execution needs source corroboration
-before it can be trusted (see [audit-2026-07.md](audit-2026-07.md) P0-1).
+Flow-driven automatic actions additionally require the off-by-default flow-auto
+config gate, an enrolled source, non-low sampling confidence, and a fresh,
+same-direction SNMP sample on the same interface within the configured ratio
+band. This prevents unauthenticated UDP from acting alone, but source-IP
+allowlisting is not cryptographic identity: production networks must still
+enforce exporter ACL/uRPF controls (see [flow-telemetry.md](flow-telemetry.md)).
 
 Cooldowns / rate limit (all config-driven, `[safety]`, applied to manual and
 automatic actions): per-device cooldown (`same_device_cooldown_seconds`, default
@@ -425,7 +437,7 @@ planned -> pending -> running -> verifying -> succeeded
                              \-> uncertain
 ```
 
-If the process crashes mid-action (any reroute left `pending`/`running`/
+If the process crashes mid-action (any reroute left `planned`/`pending`/`running`/
 `verifying`), the restarted service marks the action `uncertain` and locks the
 **device** until an admin acknowledges. The app prefers doing nothing over doing
 the wrong thing.
@@ -436,16 +448,19 @@ the wrong thing.
 
 Users log in to see data. The controller owns the whole flow: session cookies
 backed by a DB `sessions` table, Argon2id password hashing, and **TOTP 2FA**
-(RFC 6238, enrolled on first login) with 8 single-use hashed recovery codes.
+(RFC 6238, enrolled on first login only after a separately delivered one-time
+enrollment code) with 8 single-use hashed recovery codes.
 Login throttling and account lockout apply per email + real client IP
-(`CF-Connecting-IP`, forwarded by Nginx). Roles: `admin`, `operator`, `viewer`,
-`auditor`, enforced via explicit RBAC tables and axum middleware. Manual
-reroutes require only the `trigger_manual_reroute` permission and accept an
-optional free-text reason for the audit log. The earlier *per-reroute*
+(`CF-Connecting-IP`, forwarded only after Nginx's Cloudflare-source ACL). Roles: `superadmin`, `admin`,
+`operator`, `viewer`, `auditor`, enforced via explicit RBAC tables and axum
+middleware. Manual reroutes require `trigger_manual_reroute`, accept an optional
+audit reason, and in enforce mode require a one-time exact-preview token. The
+earlier *per-reroute*
 re-authentication gate (`POST /api/auth/reauth`, `sessions.reauth_at`, the
-`approve_dangerous_reroute` permission) and typed confirmation were **de-scoped**
-and removed; safety rests on the operating mode, the template/allowlist controls,
-and the device-scoped execution gates (§7, §8). A narrower step-up re-auth (fresh
+`approve_dangerous_reroute` permission) and typed-text confirmation were removed;
+the exact-preview token replaced the former UI-only confirmation. Safety also
+rests on the operating mode, template/allowlist controls, and device-scoped
+execution gates (§7, §8). A narrower step-up re-auth (fresh
 password + TOTP, verified inline — no persisted `reauth_at`) was reintroduced for
 the global **arming** switches only (observe→enforce, automatic-actions-enable),
 per the 2026-07 audit. See
@@ -457,8 +472,10 @@ per the 2026-07 audit. See
 
 Rerouter sends alerts from the controller itself on: rule fired (`rule_fired` —
 carrying the would-run action plan in observe mode), reroute
-started/succeeded/failed, action `uncertain`, device unreachable, telemetry
-stale, and lock created/cleared. There are two delivery channels:
+started/succeeded/failed, action `uncertain`, global arming changes, account
+lockout/recovery-code use, automatic-action/recovery degradation, and permanent
+delivery failure. Device/telemetry staleness is surfaced through status and the
+UI; ordinary lock changes remain audit-only. There are two delivery channels:
 
 - **email** via SMTP (lettre, rustls) — SMTP credentials come from the
   environment (`SMTP_*`); recipients/subscriptions are managed in the DB and via
@@ -473,8 +490,11 @@ recipients/subscriptions per channel, de-duplicates (10-minute window, keyed on
 the `alerts.dedup_key` — for firing alerts `rule_fired:rule:<id>:iface:<id>`),
 rate-limits (20/hr per recipient), sends over each channel, and records
 `alert_deliveries` (`channel` ∈ {`email`, `teams`}). `reroute_uncertain`,
-`reroute_failed`, and security events are always sent immediately and never
-collapsed. No alert payload (email or Teams) ever contains a secret. See
+`reroute_failed`, automatic-action/recovery degradation, arming changes, and
+security events are always sent immediately and never collapsed. Retryable
+delivery failures and rate-limited deliveries remain queued; after five failed
+attempts a durable `alert_delivery_permanently_failed` meta-alert is created. No
+alert payload (email or Teams) ever contains a secret. See
 [email-alerts.md](email-alerts.md).
 
 ---
@@ -489,7 +509,7 @@ device_interfaces (+ encrypted SNMP/SSH credentials, device_bgp_networks,
 device BGP peers), telemetry samples/current, detection rules/states/events
 (+ `rule_actions`), reroute templates/actions/steps/outputs/verifications,
 the global `rtbh_communities` catalog, locks/cooldowns, alerts/alert_deliveries,
-audit logs, system settings. The asset/provider model (`protected_assets`,
+short-lived `action_previews`, audit logs, system settings. The asset/provider model (`protected_assets`,
 `reroute_providers`, and their `asset_*` satellites) was **dropped** — the model
 is devices/interfaces end to end.
 
@@ -514,8 +534,9 @@ execution. The shipped default is `observe` mode (read-only / alert-only — see
 
 1. **Inventory & telemetry (observe mode). [BUILT]** API + SPA login with 2FA,
    device/interface CRUD, encrypted SNMP/SSH credentials, SNMP interface
-   polling, per-interface current metrics, dashboard, device & interface detail,
-   monitored-interface selection. **No reroutes executed.**
+   polling, per-interface current metrics, dashboard, device & interface detail.
+   Every discovered interface is polled; there is no per-interface monitoring
+   toggle. **No reroutes execute while the mode remains observe.**
 2. **Detection engine (observe mode). [BUILT]** Rule CRUD, threshold above/below
    + duration / consecutive-sample firing logic, hysteresis settle on clear,
    rule state + `rule_fired` events, dashboard active matches, email alerts that

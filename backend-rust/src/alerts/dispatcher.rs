@@ -29,18 +29,17 @@ use super::body;
 use crate::config::Config;
 
 pub const DEDUP_WINDOW_SECS: u64 = 600; // 10 minutes per (event_type, asset, rule)
-pub const RATE_LIMIT_PER_HOUR: u32 = 20; // per recipient, digest fallback beyond
+pub const RATE_LIMIT_PER_HOUR: u32 = 20; // per recipient; excess stays retryable
 const POLL_INTERVAL_SECS: u64 = 5;
 const BATCH: i64 = 50;
 /// Delivery retry policy. A transient send failure (SMTP greylisting, a brief
 /// network blip) must NOT permanently lose an alert — the doctrine requires
 /// uncertain/failed/security alerts to always reach an admin. So a failed
 /// (alert, target) is retried up to MAX_DELIVERY_ATTEMPTS times, each separated by
-/// at least RETRY_BACKOFF_SECS; alerts older than MAX_RETRY_AGE_SECS stop being
-/// re-scanned (a backstop — the per-target attempt cap already bounds retries).
+/// at least RETRY_BACKOFF_SECS. The per-target cap bounds work without silently
+/// dropping alerts merely because an outage lasted several hours.
 const MAX_DELIVERY_ATTEMPTS: i64 = 5;
 const RETRY_BACKOFF_SECS: u64 = 300; // 5 min — covers typical greylisting
-const MAX_RETRY_AGE_SECS: u64 = 21_600; // 6 h
 
 /// A new alert awaiting dispatch.
 #[derive(sqlx::FromRow)]
@@ -72,7 +71,14 @@ pub async fn run(pool: MySqlPool, _cfg: Config) -> Result<()> {
         // one Teams webhook exists; otherwise alerts stay queued (so the original
         // "retry email once SMTP comes up" guarantee holds when Teams isn't used).
         let mailer = mailer_from();
-        let have_webhooks = any_enabled_webhook(&pool).await;
+        let have_webhooks = match any_enabled_webhook(&pool).await {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                tracing::warn!(event_type = "webhook_audience_check_failed", error = %e, "could not determine alert audience; leaving alerts queued");
+                tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                continue;
+            }
+        };
         if mailer.is_some() || have_webhooks {
             if let Err(e) = drain_once(&pool, mailer.as_ref()).await {
                 tracing::warn!(event_type = "alert_drain_failed", error = %e, "alert drain pass failed");
@@ -88,13 +94,11 @@ async fn drain_once(pool: &MySqlPool, mailer: Option<&super::mailer::Mailer>) ->
     // Select alerts that still have work: never attempted, OR a target whose
     // latest state is a retryable failure (no later success, under the attempt
     // cap, and its last attempt older than the backoff). dispatch_alert re-checks
-    // each target precisely; this query is the coarse filter. Ancient alerts drop
-    // out via the age backstop.
+    // each target precisely; this query is the coarse filter.
     let pending = sqlx::query_as::<_, PendingAlert>(
         "SELECT a.id, a.event_type, a.severity, a.occurrence_count, a.payload_json, a.created_at \
          FROM alerts a \
-         WHERE a.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
-           AND ( \
+         WHERE ( \
              NOT EXISTS (SELECT 1 FROM alert_deliveries d WHERE d.alert_id = a.id) \
              OR EXISTS ( \
                SELECT 1 FROM alert_deliveries d \
@@ -108,12 +112,21 @@ async fn drain_once(pool: &MySqlPool, mailer: Option<&super::mailer::Mailer>) ->
                        AND ((d.recipient_id IS NOT NULL AND f.recipient_id = d.recipient_id) \
                          OR (d.endpoint_id IS NOT NULL AND f.endpoint_id = d.endpoint_id))) < ? \
              ) \
+             OR EXISTS ( \
+               SELECT 1 FROM alert_deliveries q WHERE q.alert_id = a.id AND q.status = 'queued' \
+                 AND q.error LIKE 'rate limited:%' \
+                 AND q.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+             ) \
+             OR (? = 1 AND NOT EXISTS ( \
+               SELECT 1 FROM alert_deliveries e WHERE e.alert_id = a.id AND e.channel = 'email' \
+             )) \
            ) \
          ORDER BY a.id ASC LIMIT ?",
     )
-    .bind(MAX_RETRY_AGE_SECS as i64)
     .bind(RETRY_BACKOFF_SECS as i64)
     .bind(MAX_DELIVERY_ATTEMPTS)
+    .bind(RETRY_BACKOFF_SECS as i64)
+    .bind(i8::from(mailer.is_some()))
     .bind(BATCH)
     .fetch_all(pool)
     .await?;
@@ -127,12 +140,13 @@ async fn drain_once(pool: &MySqlPool, mailer: Option<&super::mailer::Mailer>) ->
 }
 
 /// True if at least one enabled Teams webhook endpoint exists.
-async fn any_enabled_webhook(pool: &MySqlPool) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM webhook_endpoints WHERE enabled = 1")
-        .fetch_one(pool)
-        .await
-        .map(|n| n > 0)
-        .unwrap_or(false)
+async fn any_enabled_webhook(pool: &MySqlPool) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM webhook_endpoints WHERE enabled = 1")
+            .fetch_one(pool)
+            .await?
+            > 0,
+    )
 }
 
 /// Per-target delivery state derived from the alert_deliveries rows, used to drive
@@ -142,9 +156,18 @@ async fn any_enabled_webhook(pool: &MySqlPool) -> bool {
 struct DeliveryState {
     has_sent: bool,
     settled_queued: bool,
+    retry_queued: bool,
     failed_count: i64,
     secs_since_last: Option<i64>,
 }
+
+type DeliveryCounts = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
 
 async fn email_delivery_state(
     pool: &MySqlPool,
@@ -171,9 +194,10 @@ async fn delivery_state(
 ) -> Result<DeliveryState> {
     // CAST(SUM(..) AS SIGNED) so the boolean sums decode as i64 (raw SUM is DECIMAL);
     // NULL (no rows) -> None -> treated as zero / never-attempted.
-    let (sent, queued, failed, secs): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
-        sqlx::query_as(
-            "SELECT CAST(SUM(status = 'sent') AS SIGNED), CAST(SUM(status = 'queued') AS SIGNED), \
+    let (sent, settled, retry, failed, secs): DeliveryCounts = sqlx::query_as(
+            "SELECT CAST(SUM(status = 'sent') AS SIGNED), \
+                    CAST(SUM(status = 'queued' AND (error IS NULL OR error NOT LIKE 'rate limited:%')) AS SIGNED), \
+                    CAST(SUM(status = 'queued' AND error LIKE 'rate limited:%') AS SIGNED), \
                     CAST(SUM(status = 'failed') AS SIGNED), \
                     TIMESTAMPDIFF(SECOND, MAX(created_at), UTC_TIMESTAMP()) \
              FROM alert_deliveries \
@@ -190,7 +214,8 @@ async fn delivery_state(
         .await?;
     Ok(DeliveryState {
         has_sent: sent.unwrap_or(0) > 0,
-        settled_queued: queued.unwrap_or(0) > 0,
+        settled_queued: settled.unwrap_or(0) > 0,
+        retry_queued: retry.unwrap_or(0) > 0,
         failed_count: failed.unwrap_or(0),
         secs_since_last: secs,
     })
@@ -239,10 +264,9 @@ async fn dispatch_alert(
                 continue;
             }
             if st.failed_count >= MAX_DELIVERY_ATTEMPTS {
-                tracing::error!(event_type = "alert_delivery_gave_up", alert_id = alert.id, recipient_id = r.id, channel = "email", attempts = st.failed_count, "giving up on alert delivery after max attempts");
                 continue;
             }
-            if st.failed_count > 0 {
+            if st.failed_count > 0 || st.retry_queued {
                 if let Some(since) = st.secs_since_last {
                     if since < RETRY_BACKOFF_SECS as i64 {
                         continue; // backoff not elapsed
@@ -250,17 +274,41 @@ async fn dispatch_alert(
                 }
             }
             if !always_immediate && recently_delivered(pool, alert, &r).await? {
-                record_delivery(pool, alert.id, r.id, "queued", Some("suppressed: deduplicated within window")).await?;
+                record_delivery(
+                    pool,
+                    alert.id,
+                    r.id,
+                    "queued",
+                    Some("suppressed: deduplicated within window"),
+                )
+                .await?;
                 continue;
             }
             if !always_immediate && over_rate_limit(pool, r.id).await? {
-                record_delivery(pool, alert.id, r.id, "queued", Some("rate limited: deferred to digest")).await?;
+                record_delivery(
+                    pool,
+                    alert.id,
+                    r.id,
+                    "queued",
+                    Some("rate limited: retry later"),
+                )
+                .await?;
                 continue;
             }
             match mailer.send(&r.email, &subject, text.clone()).await {
                 Ok(()) => record_delivery(pool, alert.id, r.id, "sent", None).await?,
                 Err(e) => {
-                    record_delivery(pool, alert.id, r.id, "failed", Some(&truncate(&e.to_string(), 1000))).await?
+                    record_delivery(
+                        pool,
+                        alert.id,
+                        r.id,
+                        "failed",
+                        Some(&truncate(&e.to_string(), 1000)),
+                    )
+                    .await?;
+                    if st.failed_count + 1 >= MAX_DELIVERY_ATTEMPTS {
+                        record_permanent_failure(pool, alert, "email", Some(r.id), None).await?;
+                    }
                 }
             }
         }
@@ -277,10 +325,9 @@ async fn dispatch_alert(
             continue;
         }
         if st.failed_count >= MAX_DELIVERY_ATTEMPTS {
-            tracing::error!(event_type = "alert_delivery_gave_up", alert_id = alert.id, endpoint_id = e.id, channel = "teams", attempts = st.failed_count, "giving up on alert delivery after max attempts");
             continue;
         }
-        if st.failed_count > 0 {
+        if st.failed_count > 0 || st.retry_queued {
             if let Some(since) = st.secs_since_last {
                 if since < RETRY_BACKOFF_SECS as i64 {
                     continue;
@@ -288,17 +335,41 @@ async fn dispatch_alert(
             }
         }
         if !always_immediate && webhook_recently_delivered(pool, alert, e.id).await? {
-            record_webhook_delivery(pool, alert.id, e.id, "queued", Some("suppressed: deduplicated within window")).await?;
+            record_webhook_delivery(
+                pool,
+                alert.id,
+                e.id,
+                "queued",
+                Some("suppressed: deduplicated within window"),
+            )
+            .await?;
             continue;
         }
         if !always_immediate && webhook_over_rate_limit(pool, e.id).await? {
-            record_webhook_delivery(pool, alert.id, e.id, "queued", Some("rate limited")).await?;
+            record_webhook_delivery(
+                pool,
+                alert.id,
+                e.id,
+                "queued",
+                Some("rate limited: retry later"),
+            )
+            .await?;
             continue;
         }
         match super::webhook::post_teams(&e.url, &subject, alert.severity.as_str(), &text).await {
             Ok(()) => record_webhook_delivery(pool, alert.id, e.id, "sent", None).await?,
             Err(err) => {
-                record_webhook_delivery(pool, alert.id, e.id, "failed", Some(&truncate(&err.to_string(), 1000))).await?
+                record_webhook_delivery(
+                    pool,
+                    alert.id,
+                    e.id,
+                    "failed",
+                    Some(&truncate(&err.to_string(), 1000)),
+                )
+                .await?;
+                if st.failed_count + 1 >= MAX_DELIVERY_ATTEMPTS {
+                    record_permanent_failure(pool, alert, "teams", None, Some(e.id)).await?;
+                }
             }
         }
     }
@@ -307,8 +378,57 @@ async fn dispatch_alert(
     // actually available — otherwise leave queued so email retries once SMTP is up.
     if !had_audience && mailer.is_some() {
         ensure_processed_without_recipient(pool, alert).await?;
-        tracing::info!(event_type = "alert_no_recipients", alert_id = alert.id, "alert had no subscribed recipients");
+        tracing::info!(
+            event_type = "alert_no_recipients",
+            alert_id = alert.id,
+            "alert had no subscribed recipients"
+        );
     }
+    Ok(())
+}
+
+/// Persist a critical meta-alert when a target exhausts retries. It may reach a
+/// different channel/administrator and remains visible in the alert timeline.
+/// Never recurse on the meta-alert itself.
+async fn record_permanent_failure(
+    pool: &MySqlPool,
+    alert: &PendingAlert,
+    channel: &str,
+    recipient_id: Option<u64>,
+    endpoint_id: Option<u64>,
+) -> Result<()> {
+    tracing::error!(
+        event_type = "alert_delivery_gave_up",
+        alert_id = alert.id,
+        channel,
+        recipient_id,
+        endpoint_id,
+        attempts = MAX_DELIVERY_ATTEMPTS,
+        "giving up on alert delivery after max attempts"
+    );
+    if alert.event_type == "alert_delivery_permanently_failed" {
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "original_alert_id": alert.id,
+        "original_event_type": alert.event_type,
+        "channel": channel,
+        "recipient_id": recipient_id,
+        "endpoint_id": endpoint_id,
+        "attempts": MAX_DELIVERY_ATTEMPTS,
+    });
+    let target = recipient_id.or(endpoint_id).unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) \
+         VALUES ('alert_delivery_permanently_failed', 'critical', ?, ?)",
+    )
+    .bind(sqlx::types::Json(payload))
+    .bind(format!(
+        "alert_delivery_permanently_failed:{}:{channel}:{target}",
+        alert.id
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

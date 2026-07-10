@@ -31,16 +31,25 @@ import {
 } from "@/components/ui/card";
 
 export default function Login() {
-  const { stage, enrollment, login, submitTotp } = useAuth();
+  const {
+    stage,
+    enrollment,
+    recoveryCodes,
+    login,
+    submitTotp,
+    finishRecoveryCodes,
+  } = useAuth();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [enrollmentCode, setEnrollmentCode] = useState("");
   const [remember, setRemember] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showQr, setShowQr] = useState(false);
+  const [codesStored, setCodesStored] = useState(false);
 
   if (stage === "authenticated") {
     return <Navigate to="/dashboard" replace />;
@@ -51,7 +60,7 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      await login(email, password, remember);
+      await login(email, password, remember, enrollmentCode.trim() || undefined);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Login failed");
     } finally {
@@ -64,8 +73,10 @@ export default function Login() {
     setError(null);
     setBusy(true);
     try {
-      await submitTotp(code);
-      navigate("/dashboard", { replace: true });
+      const next = await submitTotp(code);
+      if (next === "authenticated") {
+        navigate("/dashboard", { replace: true });
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Invalid code");
     } finally {
@@ -76,7 +87,51 @@ export default function Login() {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4">
       <Card className="w-full max-w-md">
-        {stage !== "totp" ? (
+        {stage === "recovery" ? (
+          <>
+            <CardHeader className="text-center">
+              <CardTitle className="text-2xl">Recovery codes</CardTitle>
+              <CardDescription>
+                These codes are shown once. Store them securely before continuing.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 gap-2 rounded-md border bg-muted p-4 font-mono text-sm">
+                {recoveryCodes.map((recoveryCode) => (
+                  <code key={recoveryCode}>{recoveryCode}</code>
+                ))}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={() => void navigator.clipboard.writeText(recoveryCodes.join("\n"))}
+              >
+                Copy all codes
+              </Button>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border border-input"
+                  checked={codesStored}
+                  onChange={(e) => setCodesStored(e.target.checked)}
+                />
+                I stored these recovery codes securely
+              </label>
+              <Button
+                type="button"
+                className="w-full"
+                disabled={!codesStored}
+                onClick={() => {
+                  finishRecoveryCodes();
+                  navigate("/dashboard", { replace: true });
+                }}
+              >
+                Continue
+              </Button>
+            </CardContent>
+          </>
+        ) : stage !== "totp" ? (
           <>
             <CardHeader className="text-center">
               <CardTitle className="text-2xl">Rerouter</CardTitle>
@@ -94,6 +149,18 @@ export default function Login() {
                     autoComplete="username"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="enrollment-code">
+                    Enrollment code <span className="text-muted-foreground">(first login only)</span>
+                  </Label>
+                  <Input
+                    id="enrollment-code"
+                    type="password"
+                    autoComplete="off"
+                    value={enrollmentCode}
+                    onChange={(e) => setEnrollmentCode(e.target.value)}
                   />
                 </div>
                 <div className="space-y-2">

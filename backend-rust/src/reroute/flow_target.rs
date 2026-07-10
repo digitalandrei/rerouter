@@ -106,12 +106,15 @@ pub async fn resolve_flow_dst_host(
             .ok_or(TargetError::UnknownInterface)?;
 
     // Announced prefixes that bound the target, on the null-route device.
-    let owned: Vec<String> =
-        sqlx::query_scalar("SELECT prefix FROM device_bgp_networks WHERE device_id = ?")
-            .bind(null_route_device_id)
-            .fetch_all(pool)
-            .await
-            .map_err(|_| TargetError::Db)?;
+    let owned: Vec<String> = sqlx::query_scalar(
+        "SELECT prefix FROM device_bgp_networks WHERE device_id = ? \
+           AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)",
+    )
+    .bind(null_route_device_id)
+    .bind(templates::ROUTING_INVENTORY_MAX_AGE_HOURS)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| TargetError::Db)?;
     if owned.is_empty() {
         return Err(TargetError::NoOwnedPrefixes);
     }

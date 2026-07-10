@@ -1,30 +1,13 @@
 //! Traffic telemetry ingestion + normalization. See ../docs/telemetry-model.md.
 //!
-//! v1 telemetry is **SNMP v2c interface polling** (see [`snmp`]). The model is
-//! device (router) + interface: poll 64-bit ifXTable counters, derive per-
-//! interface rates, store current + history, and feed the detection engine.
-//! SNMP is read-only — ideal for observe mode.
+//! The primary source is **SNMP v2c interface polling** (see [`snmp`]); passive
+//! NetFlow v9/sFlow v5 collection is the optional second source. The normalized
+//! model is device (router) + interface.
 
 pub mod flow;
 pub mod snmp;
 
 use chrono::{DateTime, Utc};
-
-/// A normalized per-asset measurement over an interval (flow-source shape; kept
-/// for the future NetFlow path).
-#[derive(Debug, Clone, Default)]
-pub struct AssetMetrics {
-    pub valid_sample: bool,
-    pub sampling_rate: u32,
-    pub rx_bps: f64,
-    pub tx_bps: f64,
-    pub rx_pps: f64,
-    pub tx_pps: f64,
-    pub new_conns_per_sec: f64,
-    pub syn_rate: f64,
-    pub syn_ack_ratio: f64,
-    pub unique_src_count: u64,
-}
 
 /// Derive a rate from a counter pair, handling wrap/reset.
 /// Returns None (invalid sample) when the counter went backwards or no time

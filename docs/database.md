@@ -14,13 +14,16 @@ of schema truth.
 ```text
 auth        users, roles, permissions, role_user, permission_role, sessions
 devices     devices, device_interfaces, interface_metrics_current, interface_samples,
-            device_bgp_peers, device_bgp_networks
+            device_bgp_peers, device_bgp_networks, device_route_maps
+flow        flow_exporters, flow_iface_buckets, flow_port_buckets,
+            flow_talker_buckets, flow_as_buckets
 routing     rtbh_communities
 detection   rules, rule_states, rule_events, rule_actions
 reroute     reroute_templates, reroutes, reroute_steps, reroute_outputs,
             reroute_verifications
-safety      locks, cooldowns
-alerts      alerts, alert_recipients, alert_subscriptions, alert_deliveries
+safety      locks, cooldowns, action_previews
+alerts      alerts, alert_recipients, alert_subscriptions, alert_deliveries,
+            webhook_endpoints, webhook_subscriptions
 core        audit_logs, system_settings
 ```
 
@@ -41,6 +44,8 @@ are described in [authentication.md](authentication.md):
 ```text
 id, name, email, password,
 two_factor_secret, two_factor_recovery_codes, two_factor_confirmed_at,
+two_factor_enrollment_token_hash,
+last_totp_step,
 two_factor_enforced, failed_login_attempts, locked_until,
 last_login_at, last_login_ip, created_at, updated_at
 ```
@@ -62,7 +67,7 @@ was removed along with the `safety_level` classification.)
 ## roles / permissions
 
 Explicit RBAC tables, enforced by the controller's axum middleware/extractors.
-Roles: admin, operator, viewer, auditor.
+Roles: superadmin, admin, operator, viewer, auditor.
 
 ```text
 roles:            id, name, created_at, updated_at
@@ -90,7 +95,7 @@ reachable (default 0), last_poll_at, last_error,
 -- by the API) so the UI can show it for `ip ssh pubkey-chain` enrollment.
 ssh_username, ssh_port (default 22), ssh_auth_method(password|key, nullable),
 ssh_password_encrypted, ssh_private_key_encrypted, ssh_key_passphrase_encrypted,
-ssh_host_fingerprint (reserved), ssh_public_key (TEXT, nullable, plaintext),
+ssh_host_fingerprint (TOFU pin), ssh_public_key (TEXT, nullable, plaintext),
 created_at, updated_at
 ```
 
@@ -119,21 +124,23 @@ wrapped/reset/failed read whose rates detection must not trust.
 interface_id (PK), device_id, sampled_at, valid_sample,
 in_octets, out_octets, in_ucast_pkts, out_ucast_pkts,   -- raw (next baseline)
 rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent,  -- derived
-in_errors, out_errors, in_discards, out_discards,
-admin_status, oper_status, updated_at
+in_errors, out_errors, in_discards, out_discards, in_err_rate, out_err_rate,
+admin_status, oper_status, temp_c, tx_power_dbm, rx_power_dbm, updated_at
 ```
 
 ## interface_samples
 
 Retained per-interface rate history — the raw per-interface sample history that
 backs the detail-page charts (the scheduler prunes it to
-`[retention].traffic_samples_days`, default 7 days; see
+`[retention].traffic_samples_days`, default 2 days (48 hours); see
 [Retention defaults](#retention-defaults)). Only derived rates; raw counters stay
 in `interface_metrics_current`.
 
 ```text
 id, interface_id, device_id, sampled_at, valid_sample,
-rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, created_at
+rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent,
+in_errors, out_errors, in_discards, out_discards,
+temp_c, tx_power_dbm, rx_power_dbm, created_at
 ```
 
 ## device_bgp_peers
@@ -145,7 +152,7 @@ neighbor — e.g. a GRE scrubber session). IPv4 only in v1.
 
 ```text
 id, device_id, peer_remote_addr, peer_remote_as, local_as,
-peer_state, peer_admin_status, label,
+peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map,
 first_seen_at, last_seen_at, last_polled_at, created_at, updated_at
 UNIQUE (device_id, peer_remote_addr)
 ```
@@ -162,6 +169,20 @@ last_discovered_at, created_at, updated_at
 UNIQUE (device_id, prefix)
 ```
 
+Successful prefix/route-map discovery reconciles a complete snapshot in one
+transaction. New actions accept SSH routing inventory only while
+`last_discovered_at` is within 48 hours.
+
+## device_route_maps
+
+Names parsed from `show running-config | section ^route-map`, reconciled with the
+prefix/neighbor routing snapshot and used by the route-map picker.
+
+```text
+id, device_id, name, last_discovered_at, created_at, updated_at
+UNIQUE (device_id, name)
+```
+
 ## rtbh_communities
 
 Global list of blackhole communities (standard `X:Y` or large `X:Y:Z`) plus the
@@ -174,20 +195,31 @@ id, label, kind(standard|large), community, tag (unique),
 created_by, created_at, updated_at
 ```
 
+## flow telemetry
+
+`flow_exporters` is unique by `(source_addr, observation_domain, version)`, so
+NetFlow and sFlow or separate observation domains never share parser/health
+identity. Bucket tables store replacement-safe closed aggregates rather than raw
+flows: interface totals, protocol/port rollups, bounded top talkers, and AS
+rollups. Each row retains raw counts, effective sampling rate, and confidence;
+see [flow-telemetry.md](flow-telemetry.md).
+
 ## rules
 
-The live rule targets a monitored **interface** (`interface_id` + a denormalized
-`device_id`); the evaluator only selects `interface_id IS NOT NULL` rows. (The old
-`asset_id` column was dropped with the asset model.) A rule's mitigation is **not**
-the `reroute_template_id` column (now legacy / unused) — its actions live in
-`rule_actions` (below).
+The live rule targets one interface or an interface group (`rule_interfaces` for
+`metric_aggregation = sum`). Flow metrics add a direction and optional
+protocol+port selector. A rule's mitigation is not the legacy
+`reroute_template_id`; its actions live in `rule_actions`.
 
 ```text
-id, interface_id (nullable), device_id (nullable),
-name, metric, operator, threshold_value, threshold_unit,
-duration_seconds, consecutive_samples, severity, schedule_json,
-enabled, automatic_reroute_enabled (default 0), reroute_template_id (legacy/unused),
-alert_enabled (default 1), cooldown_seconds,
+id, interface_id (nullable), device_id (nullable), name,
+metric, metric_aggregation(single|sum),
+flow_direction, flow_protocol, flow_port, flow_port_kind,
+operator, threshold_value, duration_seconds, consecutive_samples,
+recovery_mode, recovery_threshold_value, recovery_window_seconds,
+recovery_consecutive_samples, severity,
+enabled, automatic_reroute_enabled (default 0), manual_apply_enabled (default 0),
+reroute_template_id (legacy/unused),
 created_by, updated_by, created_at, updated_at
 ```
 
@@ -195,7 +227,8 @@ created_by, updated_by, created_at, updated_at
 
 ```text
 rule_id, current_state, first_matched_at, last_matched_at, last_cleared_at,
-consecutive_match_count, last_metric_value, last_evaluated_at,
+consecutive_match_count, recovery_first_at, recovery_consecutive,
+last_metric_value, last_evaluated_at,
 last_triggered_reroute_id, updated_at
 ```
 
@@ -218,7 +251,7 @@ to the executor (enforce + the rule's auto switch on).
 
 ```text
 id, rule_id, reroute_template_id, device_id, params_json,
-position (default 0), enabled (default 1), created_at, updated_at
+position (default 0), enabled (default 1), auto_target, created_at, updated_at
 KEY (rule_id)
 ```
 
@@ -247,7 +280,7 @@ removed; cooldowns live in the `cooldowns` table keyed on the `device` scope).
 
 ```text
 id, device_id (nullable),
-rule_id, reroute_template_id,
+rule_id, rule_event_id, reroute_template_id, rollback_of_reroute_id,
 trigger_type(automatic|manual|rollback), triggered_by_user_id,
 state(planned|pending|running|verifying|succeeded|failed|uncertain),
 reason, parameters_json, planned_steps_json,
@@ -276,16 +309,36 @@ In practice only **`device`** and **`global`** locks and **`device`**, **`rule`*
 and **`global`** cooldowns are written — the device-CLI engine works at the device
 scope. (The ENUMs still list the older asset/provider/prefix scope values from the
 asset era, but no live path sets them.) A `device` lock is what an
-`uncertain`/failed action or crash recovery sets; the per-device cooldown row is
+`uncertain` action or crash recovery sets; the per-device cooldown row is
 what the 5-min post-action window writes.
 
 ```text
 locks:     id, scope(global|asset|provider|prefix|template|device), scope_ref,
+           reroute_id,
            reason, kind(manual|auto_failed|auto_crash|auto_uncertain),
            created_by, created_at, cleared_by, cleared_at
 cooldowns: id, scope(rule|asset|prefix_provider|global|device), scope_ref,
            until, reason, created_at
 ```
+
+`reroute_id` links safety-induced locks to the exact uncertain action, so
+acknowledgement cannot clear an unrelated manual lock.
+
+## action_previews
+
+Short-lived confirmation records for enforce-mode manual actions, rule applies,
+and rollbacks.
+Only token and plan hashes are stored; a token is user/scope bound, expires after
+five minutes, and is atomically marked used once.
+
+```text
+token_hash (PK), user_id, scope, scope_id, plan_hash,
+expires_at, used_at, created_at
+```
+
+Expired/used previews, expired sessions, and elapsed cooldown rows are pruned by
+the controller's daily runtime cleanup. Audit and reroute history are not part of
+that cleanup.
 
 ## alerts / delivery
 
@@ -300,7 +353,7 @@ alerts:              id, event_type, severity, device_id, interface_id,
 alert_recipients:    id, user_id, email, verified_at, created_at
 alert_subscriptions: id, recipient_id, event_type(null=all),
                      enabled, created_at
-alert_deliveries:    id, alert_id, recipient_id, channel(email|teams),
+alert_deliveries:    id, alert_id, recipient_id, endpoint_id, channel(email|teams),
                      status(queued|sent|failed|bounced), error, sent_at, created_at
 webhook_endpoints:   id, kind, url (AES-256-GCM sealed at rest), enabled, created_at
 webhook_subscriptions: id, endpoint_id, event_type(null=all), enabled, created_at
@@ -335,18 +388,18 @@ All windows below are enforced by `scheduler::retention_cleanup`, a single task
 that runs every 10 minutes and honours the `[retention]` config block.
 
 ```text
-interface_samples:   7 days   ([retention].traffic_samples_days)
-flow_*_buckets:      7 days   ([retention].flow_buckets_days)
-alerts:              7 days   ([retention].alerts_days)
-rule_events:         7 days   ([retention].rule_events_days)
-reroutes/outputs:    365 days ([retention].reroute_logs_days — advisory, see below)
+interface_samples:   2 days   ([retention].traffic_samples_days)
+flow_*_buckets:      2 days   ([retention].flow_buckets_days)
+alerts:              2 days   ([retention].alerts_days)
+rule_events:         2 days   ([retention].rule_events_days)
+reroutes/outputs:    not auto-pruned (365-day advisory; see below)
 alert_deliveries:    follows alerts (ON DELETE CASCADE from the alerts prune)
 audit_logs:          permanent (never auto-deleted without an explicit decision)
 ```
 
 > **Status (2026-07):** the short-term telemetry + protection history —
 > `interface_samples`, the four `flow_*_buckets`, `alerts`, and `rule_events` —
-> are actively pruned by `retention_cleanup` (unified: the flow collector no
+> are actively pruned by `retention_cleanup` after 48 hours by default (unified: the flow collector no
 > longer prunes its own buckets, and the old hardcoded ~70-minute
 > `interface_samples` window is gone). The `reroutes` action log
 > (`reroute_logs_days`) is **advisory and deliberately NOT auto-pruned**: it is a

@@ -7,7 +7,7 @@ description: Patterns for the Rerouter controller — tokio async service, axum 
 
 ## Stack
 
-- `tokio` async runtime; per-asset tasks via the scheduler.
+- `tokio` async runtime; supervised scheduler, alert, and flow-collector tasks.
 - `axum` for the app's REST API (`127.0.0.1:9277`), reached only through the
   Nginx reverse proxy.
 - `sqlx` with the `mysql` feature against MariaDB; compile-time-checked queries
@@ -16,7 +16,7 @@ description: Patterns for the Rerouter controller — tokio async service, axum 
   (see [rust-auth-2fa](rust-auth-2fa.md)).
 - `tracing` + `tracing-subscriber` for structured logs to stdout (journald).
 - `serde`/`serde_json`, `clap`, `chrono`/`time`, `uuid`, `anyhow`/`thiserror`,
-  `reqwest` for the Cloudflare API.
+  `reqwest` for outbound webhook delivery.
 
 ## CLI & bootstrap
 
@@ -52,9 +52,10 @@ The optional `embed-ui` cargo feature (default **off**; `src/ui.rs`,
 - One authenticated REST API under `/api/`; session + RBAC enforced by
   middleware/extractors (see [rust-auth-2fa](rust-auth-2fa.md)).
 - JSON in/out; typed request/response structs with `serde`.
-- Endpoints per [../docs/architecture.md](../docs/architecture.md): auth
-  (`/api/auth/*`), `/api/health` (unauthenticated liveness), `/api/status`,
-  asset/provider/rule CRUD and tests, `/api/reroutes/manual`, lock controls.
+- Endpoints per [architecture.md](../../docs/architecture.md): auth
+  (`/api/auth/*`), `/api/health` (unauthenticated liveness), `/api/ready`
+  (unauthenticated DB readiness), authenticated `/api/status`, device/interface/
+  rule/template CRUD, flow views, reroute preview/execution, and lock controls.
 - Return structured errors (`thiserror`) with stable codes; never panic in a
   handler.
 
@@ -73,16 +74,16 @@ The optional `embed-ui` cargo feature (default **off**; `src/ui.rs`,
 Model `planned -> pending -> running -> verifying -> {succeeded|failed|uncertain}`
 as an explicit enum with persisted transitions. Write **before** the side effect
 (intent) and **after** (outcome). On startup, scan for non-terminal states and
-force them to `uncertain` (see [../docs/state-recovery.md](../docs/state-recovery.md)).
+force them to `uncertain` (see [state-recovery.md](../../docs/state-recovery.md)).
 
 ## Logging fields
 
-Every operational log carries `asset_id`, `provider_id`, `rule_id`,
+Operational logs carry relevant identifiers such as `device_id`, `interface_id`, `rule_id`,
 `reroute_id`, `event_type`, `status`, and `error` where relevant.
 
 ## Testing
 
 Unit-test rate derivation, counter wrap/reset, threshold + duration logic,
 cooldown math, template rendering, and state-recovery transitions. Use fixtures
-under `tests/fixtures/` for flow/Cloudflare/BGP parsing. Parser failures return
+under `tests/fixtures/` for flow/SNMP/SSH parsing. Parser failures return
 structured errors and are asserted, never panics.

@@ -431,13 +431,29 @@ pub async fn run_commands(
 
     // TOFU: persist the fingerprint the first time we see it.
     if dev.expected_fingerprint.is_none() {
-        let _ = sqlx::query(
+        let updated = sqlx::query(
             "UPDATE devices SET ssh_host_fingerprint = ? WHERE id = ? AND ssh_host_fingerprint IS NULL",
         )
         .bind(&outcome.fingerprint)
         .bind(device_id)
         .execute(pool)
-        .await;
+        .await
+        .context("persisting first-seen SSH host key")?;
+        if updated.rows_affected() == 0 {
+            // Another concurrent probe may have won the TOFU race. Accept only
+            // if it pinned the same key; a different winner is a hard mismatch.
+            let pinned: Option<String> =
+                sqlx::query_scalar("SELECT ssh_host_fingerprint FROM devices WHERE id = ?")
+                    .bind(device_id)
+                    .fetch_optional(pool)
+                    .await
+                    .context("checking concurrently pinned SSH host key")?
+                    .flatten();
+            anyhow::ensure!(
+                pinned.as_deref() == Some(outcome.fingerprint.as_str()),
+                "SSH host key changed during first-contact pinning"
+            );
+        }
     }
     Ok(outcome)
 }
@@ -456,91 +472,148 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         .map(|r| r.output.as_str())
         .unwrap_or("");
 
+    if let Some(denied) = cisco_denied(output) {
+        anyhow::bail!("announced-prefix discovery was denied by the device: {denied}");
+    }
     let prefixes = parse_network_statements(output);
-    for prefix in &prefixes {
-        let _ = sqlx::query(
-            "INSERT INTO device_bgp_networks (device_id, prefix, first_seen_at, last_seen_at, last_discovered_at) \
-             VALUES (?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
-             ON DUPLICATE KEY UPDATE last_seen_at = UTC_TIMESTAMP(), last_discovered_at = UTC_TIMESTAMP()",
-        )
-        .bind(device_id)
-        .bind(prefix)
-        .execute(pool)
-        .await;
-    }
-
-    // Auto-label sessions from `neighbor <ip> description <text>`. The router's own
-    // description is authoritative for the friendly name; only fill peers that have
-    // no label yet so a manually-set label is never clobbered.
-    for (addr, description) in parse_neighbor_descriptions(output) {
-        let _ = sqlx::query(
-            "UPDATE device_bgp_peers SET label = ? \
-             WHERE device_id = ? AND peer_remote_addr = ? AND (label IS NULL OR label = '')",
-        )
-        .bind(&description)
-        .bind(device_id)
-        .bind(addr.to_string())
-        .execute(pool)
-        .await;
-    }
+    let descriptions = parse_neighbor_descriptions(output);
 
     // Resolve each peer's OUTBOUND prefix-list (neighbor `route-map NAME out` ->
     // that route-map's `match ip address prefix-list PL`) so the guided picker
     // can offer the correct list per peer for the bgp_advertise_* templates. A
     // best-effort read; failure here never fails the whole discovery.
     let rm_cmd = "show running-config | section ^route-map".to_string();
-    if let Ok(rm_outcome) = run_commands(pool, device_id, std::slice::from_ref(&rm_cmd)).await {
-        let rm_output = rm_outcome
-            .results
-            .first()
-            .map(|r| r.output.as_str())
-            .unwrap_or("");
-        let rm_to_pl = parse_routemap_prefix_lists(rm_output);
-        for (addr, rm) in parse_neighbor_out_routemaps(output) {
-            if let Some(pl) = rm_to_pl.get(&rm) {
-                let _ = sqlx::query(
-                    "UPDATE device_bgp_peers SET out_prefix_list = ? \
-                     WHERE device_id = ? AND peer_remote_addr = ?",
-                )
-                .bind(pl)
-                .bind(device_id)
-                .bind(addr.to_string())
-                .execute(pool)
-                .await;
+    let route_context = match run_commands(pool, device_id, std::slice::from_ref(&rm_cmd)).await {
+        Ok(rm_outcome) => {
+            let rm_output = rm_outcome
+                .results
+                .first()
+                .map(|r| r.output.as_str())
+                .unwrap_or("");
+            if let Some(denied) = cisco_denied(rm_output) {
+                tracing::warn!(event_type = "route_map_discovery_denied", device_id, detail = %denied, "route-map inventory was not refreshed");
+                None
+            } else {
+                let rm_to_pl = parse_routemap_prefix_lists(rm_output);
+                let prefix_links = parse_neighbor_out_routemaps(output)
+                    .into_iter()
+                    .filter_map(|(addr, rm)| rm_to_pl.get(&rm).cloned().map(|pl| (addr, pl)))
+                    .collect::<Vec<_>>();
+                Some((
+                    prefix_links,
+                    parse_route_map_names(rm_output),
+                    parse_neighbor_route_maps(output),
+                ))
             }
         }
+        Err(e) => {
+            tracing::warn!(event_type = "route_map_discovery_failed", device_id, error = %e, "route-map inventory was not refreshed");
+            None
+        }
+    };
 
-        // Catalog route-map NAMES (the Route-Map Change picker source) and record
-        // each neighbor's CURRENT in/out route-map (used to suggest, and to snapshot
-        // the prior map so a Route-Map Change can be reverted).
-        for name in parse_route_map_names(rm_output) {
-            let _ = sqlx::query(
+    // Reconcile the complete successful snapshot atomically. Old prefixes and
+    // route maps must not remain eligible forever after they disappear from the
+    // router, and a partial DB write must never look like a successful refresh.
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE device_bgp_networks SET last_discovered_at = NULL WHERE device_id = ?")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+    for prefix in &prefixes {
+        sqlx::query(
+            "INSERT INTO device_bgp_networks (device_id, prefix, first_seen_at, last_seen_at, last_discovered_at) \
+             VALUES (?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), UTC_TIMESTAMP()) \
+             ON DUPLICATE KEY UPDATE last_seen_at = UTC_TIMESTAMP(), last_discovered_at = UTC_TIMESTAMP()",
+        )
+        .bind(device_id)
+        .bind(prefix)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "DELETE FROM device_bgp_networks WHERE device_id = ? AND last_discovered_at IS NULL",
+    )
+    .bind(device_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // The router's description fills only unlabeled peers, preserving an
+    // operator's explicit label.
+    for (addr, description) in descriptions {
+        sqlx::query(
+            "UPDATE device_bgp_peers SET label = ? \
+             WHERE device_id = ? AND peer_remote_addr = ? AND (label IS NULL OR label = '')",
+        )
+        .bind(description)
+        .bind(device_id)
+        .bind(addr.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some((prefix_links, route_maps, neighbor_maps)) = route_context {
+        // These fields are a snapshot, not append-only hints. Clear assignments
+        // that disappeared before writing the current set.
+        sqlx::query(
+            "UPDATE device_bgp_peers SET out_prefix_list = NULL, in_route_map = NULL, out_route_map = NULL \
+             WHERE device_id = ?",
+        )
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+        for (addr, prefix_list) in prefix_links {
+            sqlx::query(
+                "UPDATE device_bgp_peers SET out_prefix_list = ? \
+                 WHERE device_id = ? AND peer_remote_addr = ?",
+            )
+            .bind(prefix_list)
+            .bind(device_id)
+            .bind(addr.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query("UPDATE device_route_maps SET last_discovered_at = NULL WHERE device_id = ?")
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?;
+        for name in route_maps {
+            sqlx::query(
                 "INSERT INTO device_route_maps (device_id, name, last_discovered_at) \
                  VALUES (?, ?, UTC_TIMESTAMP()) \
                  ON DUPLICATE KEY UPDATE last_discovered_at = UTC_TIMESTAMP()",
             )
             .bind(device_id)
-            .bind(&name)
-            .execute(pool)
-            .await;
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         }
-        for (addr, name, dir) in parse_neighbor_route_maps(output) {
+        sqlx::query(
+            "DELETE FROM device_route_maps WHERE device_id = ? AND last_discovered_at IS NULL",
+        )
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+
+        for (addr, name, dir) in neighbor_maps {
             // `col` is whitelisted (in_route_map / out_route_map), never raw input.
             let col = if dir == "in" {
                 "in_route_map"
             } else {
                 "out_route_map"
             };
-            let _ = sqlx::query(&format!(
+            sqlx::query(&format!(
                 "UPDATE device_bgp_peers SET {col} = ? WHERE device_id = ? AND peer_remote_addr = ?"
             ))
-            .bind(&name)
+            .bind(name)
             .bind(device_id)
             .bind(addr.to_string())
-            .execute(pool)
-            .await;
+            .execute(&mut *tx)
+            .await?;
         }
     }
+    tx.commit().await?;
 
     Ok(prefixes.len())
 }
@@ -829,7 +902,9 @@ fn is_ipv6(tok: &str) -> bool {
 /// IPv6 blackhole/null-route templates (`ipv6 route <cidr> Null0`).
 fn is_cidr6(tok: &str) -> bool {
     match tok.split_once('/') {
-        Some((ip, len)) => ip.parse::<Ipv6Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 128),
+        Some((ip, len)) => {
+            ip.parse::<Ipv6Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 128)
+        }
         None => false,
     }
 }
@@ -844,13 +919,16 @@ fn is_name(tok: &str) -> bool {
 }
 
 /// True if `cmd` is one of the EXACT command shapes Rerouter is designed to send
-/// (every read, the config-mode entry/exit, and the null-route / BGP-session
+/// (every read, the config-mode entry/exit, and the catalogued routing/interface
 /// templates). Variable tokens (IP, mask, ASN, tag) are validated; anything else
 /// — chaining, free-text, other config verbs — is rejected. IOS output filters
 /// (`| include|section|begin|exclude|count`) are permitted on `show` only, since
 /// they filter output and cannot execute anything.
 fn command_allowed(cmd: &str) -> bool {
     let cmd = cmd.trim();
+    if cmd.is_empty() || cmd.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
     // Peel off an optional output filter at the first pipe.
     let (base, filter) = match cmd.split_once('|') {
         Some((b, f)) => (b.trim(), Some(f.trim())),
@@ -862,6 +940,19 @@ fn command_allowed(cmd: &str) -> bool {
         }
         let kw = f.split_whitespace().next().unwrap_or("");
         if !matches!(kw, "include" | "exclude" | "section" | "begin" | "count") {
+            return false;
+        }
+        // IOS output-filter expressions used by the controller need only this
+        // small regex/name alphabet. Refuse command separators and other syntax
+        // even if a future caller bypasses template parameter validation.
+        if !f.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == ' '
+                || matches!(
+                    c,
+                    '(' | ')' | '^' | '|' | '.' | '_' | ':' | '/' | '-' | '=' | '[' | ']' | '$'
+                )
+        }) {
             return false;
         }
     }
@@ -886,7 +977,9 @@ fn command_allowed(cmd: &str) -> bool {
         ["show", "running-config", "interface", n] => is_name(n),
         // null-route (RTBH to Null0), with the optional name / tag the templates use
         ["ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
-        ["ip", "route", net, mask, "Null0", "name", _] => is_ipv4(net) && is_ipv4(mask),
+        ["ip", "route", net, mask, "Null0", "name", name] => {
+            is_ipv4(net) && is_ipv4(mask) && is_name(name)
+        }
         ["ip", "route", net, mask, "Null0", "tag", tag] => {
             is_ipv4(net) && is_ipv4(mask) && is_u32(tag)
         }
@@ -897,7 +990,7 @@ fn command_allowed(cmd: &str) -> bool {
         // IPv6 blackhole/null-route: `ipv6 route <cidr> Null0` (single CIDR token,
         // no dotted mask), with the optional name / tag the templates render.
         ["ipv6", "route", p, "Null0"] => is_cidr6(p),
-        ["ipv6", "route", p, "Null0", "name", _] => is_cidr6(p),
+        ["ipv6", "route", p, "Null0", "name", name] => is_cidr6(p) && is_name(name),
         ["ipv6", "route", p, "Null0", "tag", tag] => is_cidr6(p) && is_u32(tag),
         ["no", "ipv6", "route", p, "Null0"] => is_cidr6(p),
         ["no", "ipv6", "route", p, "Null0", "tag", tag] => is_cidr6(p) && is_u32(tag),
@@ -1292,7 +1385,9 @@ mod tests {
         assert!(is_user_exec_error(m), "user-EXEC message -> privilege case");
         // A plain connect/auth failure is NOT the privilege case.
         assert!(!is_user_exec_error("SSH connect to 10.0.0.1:22 timed out"));
-        assert!(!is_user_exec_error("SSH authentication failed for user 'rerouter'"));
+        assert!(!is_user_exec_error(
+            "SSH authentication failed for user 'rerouter'"
+        ));
     }
 
     #[test]
@@ -1345,6 +1440,7 @@ mod tests {
             "no shutdown",
             "show interfaces GigabitEthernet0/0",
             "show running-config interface GigabitEthernet0/0",
+            "show running-config interface GigabitEthernet0/0 | include ip tcp adjust-mss",
         ] {
             assert!(command_allowed(ok), "should allow: {ok}");
         }
@@ -1361,24 +1457,28 @@ mod tests {
             "no neighbor 198.51.100.7 password secret",
             "router bgp not-a-number",
             "show running-config | append flash:cfg", // filter verb not allowed
+            "show running-config | include route-map; reload", // unsafe filter syntax
+            "show running-config | include route-map\nreload", // control character
             "configure terminal\nreload",
             "do reload",
             "write erase",
             "ip prefix-list PL permit 192.0.2.0/24 ; reload", // chaining / extra tokens
             "ip prefix-list PL deny 192.0.2.0/24",            // only `permit` allowed
             "ip prefix-list PL permit notacidr",
-            "clear ip bgp 198.51.100.7 soft both",         // dir must be in|out
-            "neighbor 198.51.100.7 route-map RM-X both",    // dir must be in|out
+            "clear ip bgp 198.51.100.7 soft both", // dir must be in|out
+            "neighbor 198.51.100.7 route-map RM-X both", // dir must be in|out
             "neighbor 198.51.100.7 route-map bad name out", // route-map name has whitespace
-            "interface Gig 0/0",                 // whitespace in name
+            "interface Gig 0/0",                   // whitespace in name
             "ip tcp adjust-mss notanumber",
-            "ipv6 route 2001:db8::1 Null0",      // needs a /len (CIDR), not a bare addr
-            "ipv6 route 2001:db8::1/128 10::1",  // next-hop, not Null0
-            "ipv6 route gggg::/128 Null0",       // not a valid v6 address
-            "ipv6 route 203.0.113.0/24 Null0",   // v4 in a v6 command
-            "show ipv6 route ; reload",          // chaining / extra tokens
+            "ipv6 route 2001:db8::1 Null0", // needs a /len (CIDR), not a bare addr
+            "ipv6 route 2001:db8::1/128 10::1", // next-hop, not Null0
+            "ipv6 route gggg::/128 Null0",  // not a valid v6 address
+            "ipv6 route 203.0.113.0/24 Null0", // v4 in a v6 command
+            "show ipv6 route ; reload",     // chaining / extra tokens
+            "ip route 203.0.113.0 255.255.255.0 Null0 name RRT;reload",
+            "ipv6 route 2001:db8::1/128 Null0 name RRT;reload",
             // device-destructive verbs are NOT on the allowlist (fail-closed)
-            "no router bgp 65010",               // would delete the BGP process
+            "no router bgp 65010", // would delete the BGP process
             "erase startup-config",
             "copy running-config startup-config", // controller never persists config
             "reload in 5",
@@ -1390,9 +1490,8 @@ mod tests {
 
     #[test]
     fn shutdown_only_in_interface_context() {
-        let ok = |cmds: &[&str]| {
-            sequence_safe(&cmds.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
+        let ok =
+            |cmds: &[&str]| sequence_safe(&cmds.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         // The interface shutdown / no-shutdown templates (interface X first).
         assert!(ok(&["interface GigabitEthernet0/0", "shutdown"]).is_ok());
         assert!(ok(&["interface GigabitEthernet0/0", "no shutdown"]).is_ok());

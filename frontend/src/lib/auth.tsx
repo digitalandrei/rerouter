@@ -23,6 +23,7 @@ export type AuthStage =
   | "loading" // initial "do I have a session?" probe
   | "anonymous" // no session; show password step
   | "totp" // password accepted; TOTP code (or enrollment) required
+  | "recovery" // first enrollment complete; recovery codes must be acknowledged
   | "authenticated";
 
 export interface AuthState {
@@ -30,8 +31,15 @@ export interface AuthState {
   user: SessionUser | null;
   /** Present during the `totp` stage on first login only. */
   enrollment: LoginResponse["totp_enrollment"] | null;
-  login: (email: string, password: string, remember?: boolean) => Promise<void>;
-  submitTotp: (code: string) => Promise<void>;
+  recoveryCodes: string[];
+  login: (
+    email: string,
+    password: string,
+    remember?: boolean,
+    enrollmentCode?: string,
+  ) => Promise<void>;
+  submitTotp: (code: string) => Promise<"recovery" | "authenticated">;
+  finishRecoveryCodes: () => void;
   logout: () => Promise<void>;
   /** Fresh password+TOTP check before high-safety reroutes. */
   hasPermission: (permission: string) => boolean;
@@ -44,6 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [enrollment, setEnrollment] =
     useState<LoginResponse["totp_enrollment"] | null>(null);
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
 
   // Probe for an existing session on mount via GET /api/auth/me.
   // A 200 means the cookie is valid and returns the SessionUser.
@@ -66,16 +75,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const login = useCallback(async (email: string, password: string, remember = false) => {
-    const res = await api.auth.login(email, password, remember);
-    setEnrollment(res.totp_enrollment ?? null);
-    setStage("totp");
-  }, []);
+  const login = useCallback(
+    async (
+      email: string,
+      password: string,
+      remember = false,
+      enrollmentCode?: string,
+    ) => {
+      const res = await api.auth.login(
+        email,
+        password,
+        remember,
+        enrollmentCode,
+      );
+      setEnrollment(res.totp_enrollment ?? null);
+      setStage("totp");
+    },
+    [],
+  );
 
   const submitTotp = useCallback(async (code: string) => {
     const res = await api.auth.totp(code);
     setUser(res.user);
     setEnrollment(null);
+    const codes = res.recovery_codes ?? [];
+    setRecoveryCodes(codes);
+    const next = codes.length > 0 ? "recovery" : "authenticated";
+    setStage(next);
+    return next;
+  }, []);
+
+  const finishRecoveryCodes = useCallback(() => {
+    setRecoveryCodes([]);
     setStage("authenticated");
   }, []);
 
@@ -89,6 +120,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       setUser(null);
       setEnrollment(null);
+      setRecoveryCodes([]);
       setStage("anonymous");
     }
   }, []);
@@ -103,12 +135,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       stage,
       user,
       enrollment,
+      recoveryCodes,
       login,
       submitTotp,
+      finishRecoveryCodes,
       logout,
       hasPermission,
     }),
-    [stage, user, enrollment, login, submitTotp, logout, hasPermission],
+    [
+      stage,
+      user,
+      enrollment,
+      recoveryCodes,
+      login,
+      submitTotp,
+      finishRecoveryCodes,
+      logout,
+      hasPermission,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

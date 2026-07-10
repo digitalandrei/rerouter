@@ -2,7 +2,8 @@
 # file verbatim to /srv/rerouter/config.toml (only if it does not already exist);
 # if the file is missing at startup the controller falls back to built-in
 # defaults that mirror this file exactly.
-# Secrets (DB URL, provider tokens) come from the environment / EnvironmentFile,
+# Unknown keys are rejected so a misspelled safety setting cannot fail silently.
+# Secrets (DB URL, encryption keys, SMTP credentials) come from the environment / EnvironmentFile,
 # not this file. See deploy/env/rerouter.example.env.
 
 [server]
@@ -20,6 +21,10 @@ url_env = "DATABASE_URL"
 session_ttl_hours = 12
 # Session TTL when the user ticks "remember me" at login (default 7 days).
 remember_me_ttl_hours = 168
+# Fully authenticated sessions expire after this much inactivity. Password-only
+# sessions have a much shorter window in which to complete TOTP.
+idle_timeout_minutes = 60
+pre_2fa_ttl_minutes = 10
 # Failed logins (per email + real client IP) before account lockout.
 lockout_threshold = 5
 lockout_minutes = 15
@@ -39,9 +44,10 @@ stale_after_seconds = 90
 jitter_percent = 15
 
 [detection]
+# Defaults used when an API client omits the family-specific persistence value.
+# Flow rules use the duration default; SNMP rules use consecutive samples.
 default_consecutive_samples = 3
 default_min_duration_seconds = 30
-hysteresis_seconds = 30
 
 [safety]
 # Operating mode: "observe" (default) = safe read-only / alert-only — NO reroute
@@ -66,29 +72,39 @@ same_device_cooldown_seconds = 300
 require_verification = true
 
 # Retention windows (days), enforced by the controller's retention cleanup task.
+# The shipped operational policy keeps short-term data for 48 hours (2 days).
 # Short-term telemetry + protection history: traffic_samples, flow_buckets,
 # alerts and rule_events are actively pruned. reroute_logs is advisory and NOT
 # auto-pruned (the reroute action log is a low-volume safety trail whose rows are
 # live state-machine state); audit_logs is likewise never auto-pruned.
 [retention]
 # SNMP interface history (interface_samples).
-traffic_samples_days = 7
+traffic_samples_days = 2
 # NetFlow/sFlow aggregates (flow_*_buckets). Note: per-minute, high-cardinality
 # (esp. top-talker 5-tuples) — raising this materially increases disk use.
-flow_buckets_days = 7
+flow_buckets_days = 2
 # Alert events (alerts). Previously kept indefinitely.
-alerts_days = 7
+alerts_days = 2
 # Detection history (rule_events: matched/fired/cleared).
-rule_events_days = 7
+rule_events_days = 2
 # Advisory only — the reroute action log is NOT auto-pruned (see comment above).
 reroute_logs_days = 365
 
-# NetFlow v9 / IPFIX flow collector — a SECOND, read-only telemetry source giving
+# Expired sessions, consumed/expired action previews, and elapsed cooldown rows
+# are always removed by the same daily cleanup task; they are not audit history.
+
+# NetFlow v9 / sFlow v5 collector — a SECOND, passive telemetry source giving
 # per-tuple composition SNMP cannot (see docs/flow-telemetry.md). OFF by default.
 # Unlike [server].bind (loopback-only), the listener must receive UDP from the
 # router, so bind_addr is operator-chosen — a deliberate, documented exposure.
 [flow]
 enabled = false
+# Separate acknowledgement for using unauthenticated UDP flow data as an
+# automatic-action signal. Keep false unless exporter ingress is isolated and
+# anti-spoofing is enforced on the management network.
+automatic_actions_enabled = false
+# Inert while enabled=false. Replace this with the controller's explicit
+# management-interface address before enabling; wildcard binds are refused.
 bind_addr = "0.0.0.0"
 bind_port = 2055
 # sFlow v5 listener — a SECOND decoder feeding the same buckets. Off by default;
@@ -104,3 +120,8 @@ top_k_talkers = 100
 # Fallback sampling rate when an exporter reports none and no override is set; a
 # sampled-looking exporter that falls through to this is flagged low-confidence.
 default_sampling_rate = 1
+# Flow-derived automatic actions also require a contemporaneous valid SNMP
+# sample. Whole-interface estimates must fit this band; filtered flow selectors
+# must at least stay below the maximum ratio.
+snmp_corroboration_min_ratio = 0.25
+snmp_corroboration_max_ratio = 2.0

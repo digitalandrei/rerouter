@@ -20,6 +20,13 @@ use serde_json::{Map, Value};
 use sqlx::types::Json as SqlxJson;
 use sqlx::MySqlPool;
 
+/// SSH-derived routing inventory is refreshed daily. After two missed refreshes
+/// it is no longer authoritative enough to permit a new destructive action.
+pub const ROUTING_INVENTORY_MAX_AGE_HOURS: i64 = 48;
+/// Interface and BGP inventory is refreshed by the regular SNMP loop. A full day
+/// without a successful observation makes it ineligible for a new action.
+pub const SNMP_INVENTORY_MAX_AGE_HOURS: i64 = 24;
+
 /// A full reroute template loaded from the DB.
 #[derive(Debug, Clone)]
 pub struct Template {
@@ -106,6 +113,226 @@ pub async fn load_all(pool: &MySqlPool) -> Result<Vec<Template>> {
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Validate every schema `source` against inventory on the target device and
+/// return canonical parameters. Source annotations are server policy, not merely
+/// picker hints: an unknown interface, peer, ASN, prefix-list, prefix, or route-map
+/// fails closed.
+pub async fn canonicalize_inventory_params(
+    pool: &MySqlPool,
+    device_id: u64,
+    template: &Template,
+    params: &Value,
+) -> Result<Value> {
+    let schema = template
+        .parameter_schema
+        .as_object()
+        .ok_or_else(|| anyhow!("this template has no parameter schema"))?;
+    let subst = validate_and_expand(&template.parameter_schema, params)?;
+    let mut canonical = params.as_object().cloned().unwrap_or_default();
+    // Internal rollback state is always re-snapshotted by the executor. A caller
+    // must never be able to choose which route-map a later rollback restores.
+    canonical.remove("prior_route_map");
+
+    for (name, spec) in schema {
+        let Some(source) = spec.get("source").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = subst
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing inventory-backed parameter '{name}'"))?;
+
+        let resolved = match source {
+            "interface_name" => {
+                let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT if_name, if_descr FROM device_interfaces \
+                     WHERE device_id = ? AND (if_name = ? OR if_descr = ?) \
+                       AND last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
+                )
+                .bind(device_id)
+                .bind(value)
+                .bind(value)
+                .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?;
+                row.and_then(|(name, descr)| name.or(descr))
+            }
+            "bgp_peer" => sqlx::query_scalar::<_, String>(
+                "SELECT peer_remote_addr FROM device_bgp_peers \
+                 WHERE device_id = ? AND peer_remote_addr = ? \
+                   AND last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
+            )
+            .bind(device_id)
+            .bind(value)
+            .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+            .fetch_optional(pool)
+            .await?,
+            "bgp_local_as" => {
+                let asn = value
+                    .parse::<u32>()
+                    .map_err(|_| anyhow!("parameter '{name}' must be an AS number"))?;
+                sqlx::query_scalar::<_, u32>(
+                    "SELECT local_as FROM device_bgp_peers \
+                     WHERE device_id = ? AND local_as = ? \
+                       AND last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
+                )
+                .bind(device_id)
+                .bind(asn)
+                .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?
+                .map(|v| v.to_string())
+            }
+            "announced_prefix" => sqlx::query_scalar::<_, String>(
+                "SELECT prefix FROM device_bgp_networks \
+                 WHERE device_id = ? AND prefix = ? \
+                   AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
+            )
+            .bind(device_id)
+            .bind(value)
+            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+            .fetch_optional(pool)
+            .await?,
+            "peer_out_prefix_list" => sqlx::query_scalar::<_, String>(
+                "SELECT p.out_prefix_list FROM device_bgp_peers p \
+                 WHERE p.device_id = ? AND p.out_prefix_list = ? \
+                   AND p.last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) \
+                   AND EXISTS (SELECT 1 FROM device_route_maps r \
+                               WHERE r.device_id = p.device_id \
+                                 AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)) \
+                 LIMIT 1",
+            )
+            .bind(device_id)
+            .bind(value)
+            .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+            .fetch_optional(pool)
+            .await?,
+            "route_map" => sqlx::query_scalar::<_, String>(
+                "SELECT name FROM device_route_maps WHERE device_id = ? AND name = ? \
+                   AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
+            )
+            .bind(device_id)
+            .bind(value)
+            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+            .fetch_optional(pool)
+            .await?,
+            // Direction is already constrained by the schema enum.
+            "bgp_direction" => Some(value.to_string()),
+            "rtbh_tag" => {
+                let tag = value
+                    .parse::<u32>()
+                    .map_err(|_| anyhow!("parameter '{name}' must be an RTBH tag"))?;
+                sqlx::query_scalar::<_, u32>(
+                    "SELECT tag FROM rtbh_communities WHERE tag = ? LIMIT 1",
+                )
+                .bind(tag)
+                .fetch_optional(pool)
+                .await?
+                .map(|v| v.to_string())
+            }
+            other => bail!("unsupported inventory source '{other}' on parameter '{name}'"),
+        };
+
+        let resolved = resolved.ok_or_else(|| {
+            anyhow!("parameter '{name}' value '{value}' was not discovered on device {device_id}")
+        })?;
+        canonical.insert(name.clone(), Value::String(resolved));
+    }
+
+    // The newest host-target schemas intentionally allow typed prefix entry, but
+    // RTBH still depends on a router-side route-map keyed by a catalogued tag.
+    // Enforce that relationship even when the schema no longer carries a source
+    // annotation for the tag picker.
+    if matches!(
+        template.name.as_str(),
+        "blackhole_prefix" | "blackhole_withdraw" | "blackhole_prefix_v6" | "blackhole_withdraw_v6"
+    ) {
+        let tag = subst
+            .get("tag")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("blackhole action has no RTBH tag"))?
+            .parse::<u32>()?;
+        let known: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rtbh_communities WHERE tag = ?")
+            .bind(tag)
+            .fetch_one(pool)
+            .await?;
+        if known == 0 {
+            bail!("RTBH tag {tag} is not present in the approved community catalog");
+        }
+        canonical.insert("tag".into(), Value::String(tag.to_string()));
+    }
+
+    if let (Some(peer), Some(prefix_list)) = (
+        canonical.get("neighbor_ip").and_then(Value::as_str),
+        canonical.get("prefix_list_name").and_then(Value::as_str),
+    ) {
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM device_bgp_peers p \
+             WHERE p.device_id = ? AND p.peer_remote_addr = ? AND p.out_prefix_list = ? \
+               AND p.last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) \
+               AND EXISTS (SELECT 1 FROM device_route_maps r \
+                           WHERE r.device_id = p.device_id \
+                             AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR))",
+        )
+        .bind(device_id)
+        .bind(peer)
+        .bind(prefix_list)
+        .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+        .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+        .fetch_one(pool)
+        .await?;
+        if linked == 0 {
+            bail!("prefix-list '{prefix_list}' is not attached to peer {peer}");
+        }
+    }
+
+    Ok(Value::Object(canonical))
+}
+
+/// Null0/RTBH targets must be contained in space the target device currently
+/// advertises. Rollbacks bypass this inventory check in the executor so a stale
+/// discovery cache can never prevent corrective work.
+pub async fn prefix_target_is_contained(
+    pool: &MySqlPool,
+    device_id: u64,
+    template: &Template,
+    params: &Value,
+) -> Result<bool> {
+    if !matches!(
+        template.name.as_str(),
+        "null_route_prefix"
+            | "null_route_withdraw"
+            | "null_route_prefix_v6"
+            | "null_route_withdraw_v6"
+            | "blackhole_prefix"
+            | "blackhole_withdraw"
+            | "blackhole_prefix_v6"
+            | "blackhole_withdraw_v6"
+    ) {
+        return Ok(true);
+    }
+    let subst = validate_and_expand(&template.parameter_schema, params)?;
+    let target = subst
+        .get("prefix")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("automatic prefix action has no prefix"))?;
+    let announced = sqlx::query_scalar::<_, String>(
+        "SELECT prefix FROM device_bgp_networks WHERE device_id = ? \
+           AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)",
+    )
+    .bind(device_id)
+    .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+    .fetch_all(pool)
+    .await?;
+    for parent in announced {
+        if cidr_contains(&parent, target).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The concrete, ready-to-run plan for a device_cli template + parameters.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RenderedPlan {
@@ -136,6 +363,12 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
         .ok_or_else(|| anyhow!("this template has no parameter schema"))?;
     let empty = Map::new();
     let params_obj = params.as_object().unwrap_or(&empty);
+
+    for name in params_obj.keys() {
+        if !schema_obj.contains_key(name) && name != "prior_route_map" {
+            bail!("unknown parameter '{name}'");
+        }
+    }
 
     let mut subst: Map<String, Value> = Map::new();
     for (name, spec) in schema_obj {
@@ -191,7 +424,10 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 // Optional blast-radius bound: the prefix must be /min_len or more
                 // specific (e.g. 8 for v4, 29 for v6). Auto-detected hosts (/32,/128)
                 // always pass; a too-broad manual prefix is refused.
-                let min_len = spec.get("min_len").and_then(Value::as_u64).map(|n| n as u32);
+                let min_len = spec
+                    .get("min_len")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32);
                 if family == "v6" {
                     let (net, len, norm) =
                         parse_cidr_v6(&provided).map_err(|e| anyhow!("parameter '{name}': {e}"))?;
@@ -216,7 +452,10 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 }
                 // Optional closed set (e.g. a BGP direction in|out).
                 if let Some(allowed) = spec.get("enum").and_then(Value::as_array) {
-                    if !allowed.iter().any(|v| v.as_str() == Some(provided.as_str())) {
+                    if !allowed
+                        .iter()
+                        .any(|v| v.as_str() == Some(provided.as_str()))
+                    {
                         let list: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
                         bail!("parameter '{name}' must be one of: {}", list.join(", "));
                     }
@@ -246,7 +485,7 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
 
 /// True if `child` CIDR is equal to or more-specific than (contained in) `parent`.
 /// Cross-family pairs (v4 vs v6) are never contained.
-fn cidr_contains(parent: &str, child: &str) -> Result<bool> {
+pub fn cidr_contains(parent: &str, child: &str) -> Result<bool> {
     let (pnet, plen) = parse_cidr_any(parent)?;
     let (cnet, clen) = parse_cidr_any(child)?;
     if clen < plen || pnet.is_ipv4() != cnet.is_ipv4() {
@@ -328,6 +567,9 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
         .get("apply")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("template plan has no apply commands"))?;
+    if apply.is_empty() {
+        bail!("template plan has an empty apply command list");
+    }
 
     // Optional exec commands that run AFTER the config block closes (privileged
     // EXEC, e.g. `clear ip bgp <peer> soft out`). They are never wrapped in
@@ -362,11 +604,24 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
     // them too. A static substring (no braces) passes through unchanged.
     let verify = match t.verification.as_object() {
         Some(v) => match v.get("command").and_then(Value::as_str) {
-            Some(cmd) => Some(VerifyStep {
-                command: substitute(cmd, &subst)?,
-                expect: subst_opt(v.get("expect"), &subst)?,
-                reject: subst_opt(v.get("reject"), &subst)?,
-            }),
+            Some(cmd) => {
+                let command = substitute(cmd, &subst)?;
+                if !command.trim_start().starts_with("show ") {
+                    bail!("template verification command must be read-only 'show'");
+                }
+                let expect =
+                    subst_opt(v.get("expect"), &subst)?.filter(|value| !value.trim().is_empty());
+                let reject =
+                    subst_opt(v.get("reject"), &subst)?.filter(|value| !value.trim().is_empty());
+                if expect.is_none() && reject.is_none() {
+                    bail!("template verification needs a non-empty expect or reject value");
+                }
+                Some(VerifyStep {
+                    command,
+                    expect,
+                    reject,
+                })
+            }
             None => None,
         },
         None => None,
@@ -509,7 +764,11 @@ mod tests {
         let rp = render(&t, &json!({"prefix": "2001:db8::5/128"})).unwrap();
         assert_eq!(
             rp.commands,
-            vec!["configure terminal", "ipv6 route 2001:db8::5/128 Null0", "end"]
+            vec![
+                "configure terminal",
+                "ipv6 route 2001:db8::5/128 Null0",
+                "end"
+            ]
         );
         assert_eq!(rp.verify.unwrap().command, "show ipv6 route 2001:db8::5");
         // A v4 value in a v6-pinned param is rejected (not mis-rendered).
@@ -535,7 +794,8 @@ mod tests {
     #[test]
     fn enum_param_restricts_values() {
         // A BGP direction param accepts only its closed set.
-        let schema = json!({"direction": {"type": "string", "required": true, "enum": ["in", "out"]}});
+        let schema =
+            json!({"direction": {"type": "string", "required": true, "enum": ["in", "out"]}});
         assert!(validate_and_expand(&schema, &json!({"direction": "out"})).is_ok());
         assert!(validate_and_expand(&schema, &json!({"direction": "in"})).is_ok());
         assert!(validate_and_expand(&schema, &json!({"direction": "both"})).is_err());
@@ -549,7 +809,8 @@ mod tests {
         assert!(validate_and_expand(&v4, &json!({"prefix": "10.0.0.0/8"})).is_ok());
         assert!(validate_and_expand(&v4, &json!({"prefix": "10.0.0.0/7"})).is_err());
         // v6: min_len 29 -> /29..128 allowed, /28 refused; an auto host /128 ok.
-        let v6 = json!({"prefix": {"type": "cidr", "family": "v6", "required": true, "min_len": 29}});
+        let v6 =
+            json!({"prefix": {"type": "cidr", "family": "v6", "required": true, "min_len": 29}});
         assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::1/128"})).is_ok());
         assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::/29"})).is_ok());
         assert!(validate_and_expand(&v6, &json!({"prefix": "2001:db8::/28"})).is_err());
@@ -607,6 +868,23 @@ mod tests {
             v6_sibling_template_id: None,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn render_rejects_empty_apply_and_vacuous_verification() {
+        let empty_apply = tmpl(
+            json!({}),
+            json!({"config_mode": true, "apply": []}),
+            json!({"command": "show clock", "expect": "clock"}),
+        );
+        assert!(render(&empty_apply, &json!({})).is_err());
+
+        let empty_verdict = tmpl(
+            json!({}),
+            json!({"config_mode": false, "apply": ["show clock"]}),
+            json!({"command": "show clock"}),
+        );
+        assert!(render(&empty_verdict, &json!({})).is_err());
     }
 
     #[test]

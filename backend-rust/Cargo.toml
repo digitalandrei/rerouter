@@ -48,7 +48,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # v1 telemetry: SNMP v2c interface polling (pure-Rust async, GETBULK table walks;
 # no openssl). v3 is a typed stub in this milestone.
 csnmp = "0.6"
-# Encryption at rest for device community strings + provider credentials
+# Encryption at rest for device SNMP communities and SSH credentials
 # (AES-256-GCM, key from SECRETS_KEY). Pure Rust — no openssl.
 aes-gcm = "0.10"
 hex = "0.4"

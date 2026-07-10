@@ -1,6 +1,6 @@
 //! RBAC: explicit roles / permissions / role_user / permission_role tables
 //! (see migrations/20260612000100_users_and_auth.sql and ../docs/security.md).
-//! Roles: admin, operator, viewer, auditor. Authorization happens at the API
+//! Roles: superadmin, admin, operator, viewer, auditor. Authorization happens at the API
 //! boundary in this process — there is no other tier to rely on. Deny by default.
 
 use anyhow::{Context, Result};
@@ -17,11 +17,7 @@ use crate::api::AppState;
 pub enum Permission {
     ViewDashboard,
     ViewAsset,
-    EditAsset,
     ManageDevices,
-    EditProvider,
-    EditCredentials,
-    ViewCredentialsMetadata,
     EditRules,
     TriggerManualReroute,
     AcknowledgeUncertainReroute,
@@ -36,11 +32,7 @@ impl Permission {
         match self {
             Permission::ViewDashboard => "view_dashboard",
             Permission::ViewAsset => "view_asset",
-            Permission::EditAsset => "edit_asset",
             Permission::ManageDevices => "manage_devices",
-            Permission::EditProvider => "edit_provider",
-            Permission::EditCredentials => "edit_credentials",
-            Permission::ViewCredentialsMetadata => "view_credentials_metadata",
             Permission::EditRules => "edit_rules",
             Permission::TriggerManualReroute => "trigger_manual_reroute",
             Permission::AcknowledgeUncertainReroute => "acknowledge_uncertain_reroute",
@@ -176,7 +168,6 @@ pub mod markers {
             }
         };
     }
-    marker!(EditAsset => Permission::EditAsset);
     marker!(ManageDevices => Permission::ManageDevices);
     marker!(ViewAsset => Permission::ViewAsset);
     marker!(EditRules => Permission::EditRules);

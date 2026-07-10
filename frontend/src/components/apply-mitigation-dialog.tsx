@@ -9,8 +9,7 @@
  * - In enforce mode the server runs each action through the full safety gate
  *   (locks, cooldowns, etc). A gate block gives executed:false + blocked_reason.
  * - The UI never hides dangerous reroute details: always show the would-run plan.
- * - No typed-confirmation required (see docs/security.md); safety lives in the
- *   observe-by-default + template-only + server-side gating model.
+ * - Execution consumes the server-issued one-use token for the exact preview.
  */
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -136,9 +135,7 @@ interface ApplyMitigationDialogProps {
 }
 
 /**
- * Two-phase dialog:
- *  1. Confirmation + optional reason entry.
- *  2. Results display after the API call.
+ * Three-phase dialog: reason, exact dry-run preview, then execution results.
  */
 export function ApplyMitigationDialog({
   rule,
@@ -146,24 +143,33 @@ export function ApplyMitigationDialog({
   onClose,
   onApplied,
 }: ApplyMitigationDialogProps) {
-  const [phase, setPhase] = useState<"confirm" | "results">("confirm");
+  const [phase, setPhase] = useState<"confirm" | "preview" | "results">("confirm");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState<RerouteResult[] | null>(null);
+  const [previewToken, setPreviewToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const isObserve = operatingMode === "observe";
 
-  async function apply() {
+  async function apply(dryRun: boolean) {
     setBusy(true);
     setError(null);
     try {
       const res = await api.rules.apply(rule.id, {
         reason: reason.trim() || undefined,
+        dry_run: dryRun,
+        preview_token: dryRun ? undefined : previewToken ?? undefined,
       });
       setResults(res.results);
-      setPhase("results");
-      onApplied?.();
+      if (dryRun && res.preview_token) {
+        setPreviewToken(res.preview_token);
+        setPhase("preview");
+      } else {
+        setPreviewToken(null);
+        setPhase("results");
+        if (!dryRun) onApplied?.();
+      }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Request failed");
     } finally {
@@ -211,7 +217,7 @@ export function ApplyMitigationDialog({
               placeholder="Why are you applying this mitigation?"
               onChange={(e) => setReason(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !busy) void apply();
+                if (e.key === "Enter" && !busy) void apply(true);
               }}
             />
           </label>
@@ -227,15 +233,52 @@ export function ApplyMitigationDialog({
             Cancel
           </Button>
           <Button
-            variant={isObserve ? "outline" : "destructive"}
+            variant="outline"
             disabled={busy}
-            onClick={() => void apply()}
+            onClick={() => void apply(true)}
           >
             {busy
-              ? "Applying…"
+              ? "Preparing…"
               : isObserve
                 ? "Preview plan (observe mode)"
-                : "Apply mitigation"}
+                : "Preview exact commands"}
+          </Button>
+        </DialogFooter>
+      </>
+    );
+  } else if (phase === "preview") {
+    body = (
+      <>
+        <DialogHeader>
+          <DialogTitle>Review commands — {rule.name}</DialogTitle>
+          <DialogDescription>
+            These are the exact commands and verification reads prepared by the controller.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="max-h-[60vh] space-y-3 overflow-y-auto">
+          {(results ?? []).map((r, i) => (
+            <ApplyResultRow key={i} r={r} />
+          ))}
+          {error && (
+            <p className="text-sm text-destructive" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            disabled={busy}
+            onClick={() => {
+              setPreviewToken(null);
+              setResults(null);
+              setPhase("confirm");
+            }}
+          >
+            Back
+          </Button>
+          <Button variant="destructive" disabled={busy} onClick={() => void apply(false)}>
+            {busy ? "Applying…" : "Execute reviewed actions"}
           </Button>
         </DialogFooter>
       </>
@@ -247,6 +290,7 @@ export function ApplyMitigationDialog({
       (r) => r.executed && (r.state === "failed" || r.state === "uncertain"),
     ) ?? false;
     const anyBlocked = results?.some((r) => !r.executed && r.blocked_reason) ?? false;
+    const anySkipped = results?.some((r) => !r.executed && !r.would_run) ?? false;
 
     let summaryText: ReactNode;
     if (allObserve) {
@@ -261,7 +305,7 @@ export function ApplyMitigationDialog({
           One or more actions failed or ended in an uncertain state. Check history.
         </span>
       );
-    } else if (anyBlocked) {
+    } else if (anyBlocked || anySkipped) {
       summaryText = (
         <span className="text-amber-700 dark:text-amber-400">
           One or more actions were blocked by a safety gate.

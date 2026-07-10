@@ -1,11 +1,11 @@
 /**
- * /flows — NetFlow/IPFIX flow telemetry (read-only). Two tabs:
+ * /flows — NetFlow/IPFIX flow telemetry. Two tabs:
  *  - Top statistics: per-device top-10 talkers / ports / interface traffic.
  *  - Search: filter flows by device / source / destination / port, with lazy
  *    autocomplete on the source/destination/port fields.
  *
- * Flows are a second, read-only telemetry source (docs/flow-telemetry.md). A
- * later iteration will wire these signals (pps & bps) into rule conditions.
+ * Flow signals can participate in automatic rules only when the independent
+ * flow-action gate, device allowlist, and fresh SNMP corroboration all pass.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Waves } from "lucide-react";

@@ -12,6 +12,7 @@
 //! per-exporter state — a spoofed-source flood cannot grow our tables.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +29,7 @@ use crate::telemetry::snmp;
 /// Which wire protocol a listener decodes. A datagram's protocol is fixed by the
 /// socket it arrived on (NetFlow and sFlow bind separate ports), so the recv loop
 /// never has to sniff the version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Protocol {
     NetflowV9,
     Sflow,
@@ -55,7 +56,7 @@ const ALLOWLIST_INTERVAL: Duration = Duration::from_secs(30);
 /// this tiny, but with `allowlist_enrolled_only = false` a spoofed-source flood
 /// could otherwise grow the map without bound (memory-exhaustion DoS). When full,
 /// a datagram from a *new* source evicts the least-recently-seen exporter.
-const MAX_EXPORTERS: usize = 10_000;
+const MAX_EXPORTERS: usize = 1_024;
 
 /// Running counts for a single aggregation key.
 #[derive(Debug, Default, Clone, Copy)]
@@ -80,6 +81,7 @@ type PortKey = (u32, Direction, u8, PortKind, u16);
 // PortKind is reused as the src/dst discriminator for the AS dimension.
 type AsKey = (u32, Direction, PortKind, u32);
 type TalkerKey = (u32, Direction, IpAddr, IpAddr, Option<u16>, Option<u16>, u8);
+type ExporterKey = (IpAddr, Protocol, u32);
 
 /// Hard cap on distinct talker 5-tuples held per bucket. Under a real spoofed-
 /// source flood (millions of tiny distinct flows — the exact DDoS this tool
@@ -89,6 +91,27 @@ type TalkerKey = (u32, Direction, IpAddr, IpAddr, Option<u16>, Option<u16>, u8);
 /// aggregate signal — only the identity of tail tuples past the cap. Well above
 /// top_k_talkers so the retained top-K stays accurate.
 const MAX_TALKER_KEYS: usize = 65_536;
+const MAX_IFACE_KEYS: usize = 4_096;
+const MAX_PORT_KEYS: usize = 65_536;
+const MAX_AS_KEYS: usize = 65_536;
+
+fn add_bounded<K: Eq + Hash>(
+    map: &mut HashMap<K, Counts>,
+    key: K,
+    pkts: u64,
+    bytes: u64,
+    cap: usize,
+) -> bool {
+    if let Some(counts) = map.get_mut(&key) {
+        counts.add(pkts, bytes);
+        true
+    } else if map.len() < cap {
+        map.entry(key).or_default().add(pkts, bytes);
+        true
+    } else {
+        false
+    }
+}
 
 /// One bucket's aggregation across the reporting dimensions.
 #[derive(Debug, Default)]
@@ -100,6 +123,8 @@ struct Accum {
     /// Distinct talker tuples refused this bucket after hitting MAX_TALKER_KEYS
     /// (surfaced at flush; never silent).
     talker_dropped: u64,
+    /// Interface/port/ASN keys refused after their cardinality caps.
+    rollup_dropped: u64,
 }
 
 impl Accum {
@@ -112,39 +137,64 @@ impl Accum {
             Some(i) => i,
             None => return, // no interface to attribute to.
         };
-        self.iface
-            .entry((ifindex, dir))
-            .or_default()
-            .add(fr.pkts, fr.bytes);
+        if !add_bounded(
+            &mut self.iface,
+            (ifindex, dir),
+            fr.pkts,
+            fr.bytes,
+            MAX_IFACE_KEYS,
+        ) {
+            self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+        }
 
         if fr.has_ports() {
             if let Some(sp) = fr.src_port {
-                self.port
-                    .entry((ifindex, dir, fr.protocol, PortKind::Src, sp))
-                    .or_default()
-                    .add(fr.pkts, fr.bytes);
+                if !add_bounded(
+                    &mut self.port,
+                    (ifindex, dir, fr.protocol, PortKind::Src, sp),
+                    fr.pkts,
+                    fr.bytes,
+                    MAX_PORT_KEYS,
+                ) {
+                    self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                }
             }
             if let Some(dp) = fr.dst_port {
-                self.port
-                    .entry((ifindex, dir, fr.protocol, PortKind::Dst, dp))
-                    .or_default()
-                    .add(fr.pkts, fr.bytes);
+                if !add_bounded(
+                    &mut self.port,
+                    (ifindex, dir, fr.protocol, PortKind::Dst, dp),
+                    fr.pkts,
+                    fr.bytes,
+                    MAX_PORT_KEYS,
+                ) {
+                    self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                }
             }
         }
 
         // AS dimension — only when the exporter collects AS and it's a real ASN
         // (0 = unknown / no BGP route).
         if let Some(asn) = fr.src_as.filter(|a| *a != 0) {
-            self.as_
-                .entry((ifindex, dir, PortKind::Src, asn))
-                .or_default()
-                .add(fr.pkts, fr.bytes);
+            if !add_bounded(
+                &mut self.as_,
+                (ifindex, dir, PortKind::Src, asn),
+                fr.pkts,
+                fr.bytes,
+                MAX_AS_KEYS,
+            ) {
+                self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+            }
         }
         if let Some(asn) = fr.dst_as.filter(|a| *a != 0) {
-            self.as_
-                .entry((ifindex, dir, PortKind::Dst, asn))
-                .or_default()
-                .add(fr.pkts, fr.bytes);
+            if !add_bounded(
+                &mut self.as_,
+                (ifindex, dir, PortKind::Dst, asn),
+                fr.pkts,
+                fr.bytes,
+                MAX_AS_KEYS,
+            ) {
+                self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+            }
         }
 
         // Bounded talker accumulation (see MAX_TALKER_KEYS): always update an
@@ -178,7 +228,7 @@ struct Exporter {
     /// DB `flow_exporters.id`; 0 until first persisted.
     db_id: u64,
     device_id: Option<u64>,
-    /// Wire protocol of the most recent datagram from this source (9 / 5).
+    /// Wire protocol for this exporter identity (9 / 5).
     version: u16,
     observation_domain: u32,
     /// NetFlow-only template cache; unused (always empty) for sFlow exporters.
@@ -200,12 +250,12 @@ struct Exporter {
 }
 
 impl Exporter {
-    fn new(device_id: Option<u64>, version: u16) -> Self {
+    fn new(device_id: Option<u64>, version: u16, observation_domain: u32) -> Self {
         Self {
             db_id: 0,
             device_id,
             version,
-            observation_domain: 0,
+            observation_domain,
             templates: TemplateCache::new(),
             buckets: HashMap::new(),
             reported_rate: None,
@@ -223,8 +273,8 @@ impl Exporter {
 /// Shared collector state. Guarded by a std Mutex — never held across an await.
 #[derive(Default)]
 struct State {
-    /// source IP -> per-exporter state.
-    exporters: HashMap<IpAddr, Exporter>,
+    /// (source IP, wire protocol, observation domain/sub-agent) -> exporter.
+    exporters: HashMap<ExporterKey, Exporter>,
     /// source IP -> enrolled device id (the allowlist).
     allow: HashMap<IpAddr, u64>,
     /// datagrams dropped because the source is not an enrolled device.
@@ -285,22 +335,30 @@ pub async fn run(pool: MySqlPool, cfg: Arc<Config>) {
 
     let state = Arc::new(Mutex::new(State::default()));
 
-    tokio::spawn(refresh_allowlist(pool.clone(), state.clone()));
-    tokio::spawn(flush_loop(pool.clone(), cfg.clone(), state.clone()));
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(refresh_allowlist(pool.clone(), state.clone()));
+    tasks.spawn(flush_loop(pool.clone(), cfg.clone(), state.clone()));
     // Flow-bucket retention is enforced centrally by scheduler::retention_cleanup
     // (unified under [retention].flow_buckets_days), not here.
 
     // Both listeners share the same in-memory State (exporter map, allowlist),
     // so their flows aggregate into the same buckets and exporter-health rows.
     if let Some(sf) = sflow_socket {
-        tokio::spawn(recv_loop(
-            sf,
-            Protocol::Sflow,
-            cfg.clone(),
-            state.clone(),
-        ));
+        tasks.spawn(recv_loop(sf, Protocol::Sflow, cfg.clone(), state.clone()));
     }
-    recv_loop(nf_socket, Protocol::NetflowV9, cfg, state).await;
+    tasks.spawn(recv_loop(nf_socket, Protocol::NetflowV9, cfg, state));
+    if let Some(outcome) = tasks.join_next().await {
+        match outcome {
+            Ok(()) => tracing::error!(
+                event_type = "flow_subtask_exited",
+                "flow collector subtask exited unexpectedly"
+            ),
+            Err(e) => {
+                tracing::error!(event_type = "flow_subtask_panicked", error = %e, "flow collector subtask panicked")
+            }
+        }
+    }
+    tasks.abort_all();
 }
 
 /// The UDP receive loop. Parses each datagram and folds its flows into the
@@ -334,25 +392,44 @@ async fn recv_loop(
         // allocation, so a spoofed flood cannot grow our maps or tables.
         let device_id = st.allow.get(&src_ip).copied();
         if cfg.flow.allowlist_enrolled_only && device_id.is_none() {
-            st.dropped_not_allowlisted += 1;
+            st.dropped_not_allowlisted = st.dropped_not_allowlisted.saturating_add(1);
             continue;
         }
+
+        let Some(observation_domain) = wire_observation_domain(proto, &buf[..len]) else {
+            tracing::debug!(event_type = "flow_header_invalid", source = %src_ip, proto = ?proto, "dropped flow datagram with an invalid protocol header");
+            continue;
+        };
 
         // Bound the exporter map: if this is a new source and we are at capacity,
         // evict the least-recently-seen exporter so a high-entropy spoofed flood
         // cannot grow memory without limit.
-        if !st.exporters.contains_key(&src_ip) && st.exporters.len() >= MAX_EXPORTERS {
+        let exporter_key = (src_ip, proto, observation_domain);
+        if st
+            .exporters
+            .get(&exporter_key)
+            .is_some_and(|exporter| exporter.device_id != device_id)
+        {
+            // An address was reassigned to a different enrolled device (or was
+            // newly mapped). Drop its old templates and open buckets rather than
+            // attributing them across devices.
+            st.exporters.remove(&exporter_key);
+            tracing::warn!(event_type = "flow_exporter_device_changed", source = %src_ip, proto = ?proto, observation_domain, new_device_id = ?device_id, "reset exporter state after its allowlist device mapping changed");
+        }
+        if !st.exporters.contains_key(&exporter_key) && st.exporters.len() >= MAX_EXPORTERS {
             if let Some(victim) = st
                 .exporters
                 .iter()
                 .min_by_key(|(_, ex)| ex.last_seen)
-                .map(|(ip, _)| *ip)
+                .map(|(key, _)| *key)
             {
                 st.exporters.remove(&victim);
-                st.evicted_exporters += 1;
+                st.evicted_exporters = st.evicted_exporters.saturating_add(1);
                 tracing::warn!(
                     event_type = "flow_exporter_evicted",
-                    evicted = %victim,
+                    evicted_source = %victim.0,
+                    evicted_protocol = ?victim.1,
+                    evicted_observation_domain = victim.2,
                     incoming = %src_ip,
                     cap = MAX_EXPORTERS,
                     "exporter map full — evicted least-recently-seen exporter"
@@ -362,14 +439,9 @@ async fn recv_loop(
 
         let exporter = st
             .exporters
-            .entry(src_ip)
-            .or_insert_with(|| Exporter::new(device_id, proto.version()));
-        // Keep the device mapping fresh if the allowlist learned it later.
-        if exporter.device_id.is_none() {
-            exporter.device_id = device_id;
-        }
-        exporter.version = proto.version();
-        exporter.datagrams_total += 1;
+            .entry(exporter_key)
+            .or_insert_with(|| Exporter::new(device_id, proto.version(), observation_domain));
+        exporter.datagrams_total = exporter.datagrams_total.saturating_add(1);
         exporter.last_seen = now;
 
         // Decode against the right wire protocol, normalizing both to the same
@@ -381,16 +453,14 @@ async fn recv_loop(
         let decoded = match proto {
             Protocol::NetflowV9 => v9::decode(&buf[..len], &mut exporter.templates)
                 .map(|d| {
-                    exporter.observation_domain = d.source_id;
-                    exporter.dropped_no_template += d.data_without_template as u64;
+                    exporter.dropped_no_template = exporter
+                        .dropped_no_template
+                        .saturating_add(d.data_without_template as u64);
                     (d.sequence, d.reported_sampling, d.records)
                 })
                 .map_err(|e| e.to_string()),
             Protocol::Sflow => sflow::decode(&buf[..len])
-                .map(|d| {
-                    exporter.observation_domain = d.sub_agent_id;
-                    (d.sequence, d.reported_sampling, d.records)
-                })
+                .map(|d| (d.sequence, d.reported_sampling, d.records))
                 .map_err(|e| e.to_string()),
         };
 
@@ -408,9 +478,36 @@ async fn recv_loop(
                 }
             }
             Err(e) => {
-                exporter.dropped_malformed += 1;
+                exporter.dropped_malformed = exporter.dropped_malformed.saturating_add(1);
                 tracing::debug!(event_type = "flow_decode_failed", source = %src_ip, proto = ?proto, error = %e, "dropped malformed flow datagram");
             }
+        }
+    }
+}
+
+/// Extract the exporter domain from the fixed protocol header before allocating
+/// state. NetFlow template caches and buckets are domain-scoped; sFlow uses its
+/// sub-agent id for the same durable identity.
+fn wire_observation_domain(proto: Protocol, buf: &[u8]) -> Option<u32> {
+    fn u32_at(buf: &[u8], offset: usize) -> Option<u32> {
+        let bytes: [u8; 4] = buf.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
+    match proto {
+        Protocol::NetflowV9 => {
+            let version = u16::from_be_bytes(buf.get(0..2)?.try_into().ok()?);
+            (version == 9).then(|| u32_at(buf, 16)).flatten()
+        }
+        Protocol::Sflow => {
+            if u32_at(buf, 0)? != 5 {
+                return None;
+            }
+            let agent_len = match u32_at(buf, 4)? {
+                1 => 4,
+                2 => 16,
+                _ => return None,
+            };
+            u32_at(buf, 8usize.checked_add(agent_len)?)
         }
     }
 }
@@ -441,8 +538,9 @@ async fn refresh_allowlist(pool: MySqlPool, state: Arc<Mutex<State>>) {
                 tracing::warn!(event_type = "flow_allowlist_load_failed", error = %e, "could not load devices for flow allowlist")
             }
         }
-        if let Ok(mut st) = state.lock() {
-            st.allow = allow;
+        match state.lock() {
+            Ok(mut st) => st.allow = allow,
+            Err(poisoned) => poisoned.into_inner().allow = allow,
         }
         tokio::time::sleep(ALLOWLIST_INTERVAL).await;
     }
@@ -452,6 +550,7 @@ async fn refresh_allowlist(pool: MySqlPool, state: Arc<Mutex<State>>) {
 /// processed without it.
 struct ExporterFlush {
     src_ip: IpAddr,
+    protocol: Protocol,
     device_id: Option<u64>,
     version: u16,
     observation_domain: u32,
@@ -475,8 +574,12 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
         // copy the health counters. A bucket is closed once its window has fully
         // elapsed.
         let mut flushes: Vec<ExporterFlush> = Vec::new();
-        if let Ok(mut st) = state.lock() {
-            for (ip, ex) in st.exporters.iter_mut() {
+        {
+            let mut st = match state.lock() {
+                Ok(st) => st,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for ((ip, protocol, _domain), ex) in st.exporters.iter_mut() {
                 let closed_ts: Vec<i64> = ex
                     .buckets
                     .keys()
@@ -491,6 +594,7 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                 }
                 flushes.push(ExporterFlush {
                     src_ip: *ip,
+                    protocol: *protocol,
                     device_id: ex.device_id,
                     version: ex.version,
                     observation_domain: ex.observation_domain,
@@ -506,27 +610,44 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
             }
         }
 
-        for f in flushes {
-            match flush_exporter(&pool, &cfg, f).await {
-                Ok(Some((ip, db_id, derived, ratio))) => {
+        for mut f in flushes {
+            match flush_exporter(&pool, &cfg, &mut f).await {
+                Ok(Some((ip, protocol, db_id, derived, ratio))) => {
                     // Write back DB id + values derived this flush (carried forward).
-                    if let Ok(mut st) = state.lock() {
-                        if let Some(ex) = st.exporters.get_mut(&ip) {
-                            if ex.db_id == 0 {
-                                ex.db_id = db_id;
-                            }
-                            if derived.is_some() {
-                                ex.snmp_derived_rate = derived;
-                            }
-                            if ratio.is_some() {
-                                ex.snmp_xcal_ratio = ratio;
-                            }
+                    let mut st = match state.lock() {
+                        Ok(st) => st,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some(ex) = st.exporters.get_mut(&(ip, protocol, f.observation_domain)) {
+                        if ex.db_id == 0 {
+                            ex.db_id = db_id;
+                        }
+                        if derived.is_some() {
+                            ex.snmp_derived_rate = derived;
+                        }
+                        if ratio.is_some() {
+                            ex.snmp_xcal_ratio = ratio;
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(event_type = "flow_flush_failed", error = %e, "flushing flow buckets failed")
+                    let retry_count = f.closed.len();
+                    if retry_count > 0 {
+                        let mut st = match state.lock() {
+                            Ok(st) => st,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if let Some(ex) =
+                            st.exporters
+                                .get_mut(&(f.src_ip, f.protocol, f.observation_domain))
+                        {
+                            for (ts, acc) in f.closed.drain(..) {
+                                ex.buckets.entry(ts).or_insert(acc);
+                            }
+                        }
+                    }
+                    tracing::warn!(event_type = "flow_flush_failed", retry_buckets = retry_count, error = %e, "flushing flow buckets failed; uncommitted buckets retained for retry")
                 }
             }
         }
@@ -536,12 +657,12 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
 /// Persist one exporter: upsert its row, resolve its sampling, write any closed
 /// buckets, run SNMP cross-calibration, and update its health. Returns
 /// (ip, db_id, snmp_derived_rate, snmp_xcal_ratio) to write back.
-type FlushBack = (IpAddr, u64, Option<u32>, Option<f64>);
+type FlushBack = (IpAddr, Protocol, u64, Option<u32>, Option<f64>);
 
 async fn flush_exporter(
     pool: &MySqlPool,
     cfg: &Config,
-    f: ExporterFlush,
+    f: &mut ExporterFlush,
 ) -> anyhow::Result<Option<FlushBack>> {
     // Upsert the exporter row and read back operator-set sampling override + id.
     sqlx::query(
@@ -559,10 +680,12 @@ async fn flush_exporter(
     .await?;
 
     let row: Option<(u64, Option<u32>)> = sqlx::query_as(
-        "SELECT id, configured_sampling_rate FROM flow_exporters WHERE source_addr = ? AND observation_domain = ?",
+        "SELECT id, configured_sampling_rate FROM flow_exporters \
+         WHERE source_addr = ? AND observation_domain = ? AND version = ?",
     )
     .bind(f.src_ip.to_string())
     .bind(f.observation_domain)
+    .bind(f.version)
     .fetch_optional(pool)
     .await?;
     let (exporter_id, configured) = match row {
@@ -588,22 +711,27 @@ async fn flush_exporter(
     if let Some(device_id) = f.device_id {
         let mut iface_id_cache: HashMap<u32, Option<u64>> = HashMap::new();
         // newest bucket first, for the cross-cal sample.
-        let mut closed = f.closed;
-        closed.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
-        for (idx, (ts, acc)) in closed.iter().enumerate() {
-            let bucket_ts = Utc.timestamp_opt(*ts, 0).single().unwrap_or_else(Utc::now);
+        f.closed.sort_by_key(|(ts, _)| *ts);
+        let mut newest = true;
+        while let Some((ts, acc)) = f.closed.pop() {
+            let bucket_ts = Utc.timestamp_opt(ts, 0).single().unwrap_or_else(Utc::now);
             let ctx = BucketCtx {
                 exporter_id,
                 device_id,
                 bucket_ts,
             };
-            write_bucket(pool, cfg, &ctx, acc, &sampling, &mut iface_id_cache).await?;
-            if idx == 0 {
+            if let Err(e) =
+                write_bucket(pool, cfg, &ctx, &acc, &sampling, &mut iface_id_cache).await
+            {
+                f.closed.push((ts, acc));
+                return Err(e);
+            }
+            if newest {
                 if let Some((ratio, derived)) = cross_calibrate(
                     pool,
                     cfg,
                     device_id,
-                    acc,
+                    &acc,
                     &sampling,
                     configured,
                     f.reported_rate,
@@ -615,6 +743,7 @@ async fn flush_exporter(
                         snmp_derived = derived;
                     }
                 }
+                newest = false;
             }
         }
     }
@@ -649,29 +778,33 @@ async fn flush_exporter(
     .execute(pool)
     .await?;
 
-    Ok(Some((f.src_ip, exporter_id, snmp_derived, xcal_ratio)))
+    Ok(Some((
+        f.src_ip,
+        f.protocol,
+        exporter_id,
+        snmp_derived,
+        xcal_ratio,
+    )))
 }
 
 /// Resolve an ifIndex to a `device_interfaces.id` (cached per flush).
 async fn resolve_interface_id(
-    pool: &MySqlPool,
+    conn: &mut sqlx::MySqlConnection,
     cache: &mut HashMap<u32, Option<u64>>,
     device_id: u64,
     if_index: u32,
-) -> Option<u64> {
+) -> anyhow::Result<Option<u64>> {
     if let Some(v) = cache.get(&if_index) {
-        return *v;
+        return Ok(*v);
     }
     let id: Option<u64> =
         sqlx::query_scalar("SELECT id FROM device_interfaces WHERE device_id = ? AND if_index = ?")
             .bind(device_id)
             .bind(if_index)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+            .fetch_optional(&mut *conn)
+            .await?;
     cache.insert(if_index, id);
-    id
+    Ok(id)
 }
 
 /// Identifiers naming the bucket being written.
@@ -698,16 +831,26 @@ async fn write_bucket(
     } = *ctx;
     let rate = sampling.rate;
     let conf = sampling.confidence_str();
+    if acc.rollup_dropped > 0 {
+        tracing::warn!(
+            event_type = "flow_rollup_cardinality_capped",
+            exporter_id,
+            device_id,
+            dropped = acc.rollup_dropped,
+            "flow interface/port/ASN cardinality exceeded a bounded bucket cap"
+        );
+    }
     let mut tx = pool.begin().await?;
 
     // Interface totals.
     for ((if_index, dir), c) in &acc.iface {
-        let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
+        let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_iface_buckets \
                 (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = pkts + VALUES(pkts), bytes = bytes + VALUES(bytes), flow_count = flow_count + VALUES(flow_count)",
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(c.pkts).bind(c.bytes).bind(c.flows).bind(rate).bind(conf)
@@ -716,12 +859,13 @@ async fn write_bucket(
 
     // Port rollups.
     for ((if_index, dir, proto, kind, port), c) in &acc.port {
-        let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
+        let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_port_buckets \
                 (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, protocol, port_kind, port, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = pkts + VALUES(pkts), bytes = bytes + VALUES(bytes), flow_count = flow_count + VALUES(flow_count)",
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(*proto).bind(kind.as_str()).bind(*port)
@@ -731,12 +875,13 @@ async fn write_bucket(
 
     // AS rollups (only present when the exporter collects SRC_AS/DST_AS).
     for ((if_index, dir, kind, asn), c) in &acc.as_ {
-        let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
+        let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_as_buckets \
                 (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, as_kind, asn, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = pkts + VALUES(pkts), bytes = bytes + VALUES(bytes), flow_count = flow_count + VALUES(flow_count)",
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(kind.as_str()).bind(*asn)
@@ -767,12 +912,13 @@ async fn write_bucket(
         );
     }
     for ((if_index, dir, src, dst, sport, dport, proto), c) in talkers.into_iter().take(top_k) {
-        let iface_id = resolve_interface_id(pool, iface_cache, device_id, *if_index).await;
+        let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_talker_buckets \
                 (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, src_addr, dst_addr, src_port, dst_port, protocol, pkts, bytes, effective_sampling_rate, sampling_confidence) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = pkts + VALUES(pkts), bytes = bytes + VALUES(bytes)",
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), \
+                effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(src.to_string()).bind(dst.to_string()).bind(*sport).bind(*dport).bind(*proto)
@@ -855,7 +1001,7 @@ async fn cross_calibrate(
 
 #[cfg(test)]
 mod tests {
-    use super::{Accum, FlowRecord, MAX_TALKER_KEYS};
+    use super::{wire_observation_domain, Accum, FlowRecord, Protocol, MAX_TALKER_KEYS};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn rec(src: u32) -> FlowRecord {
@@ -890,5 +1036,37 @@ mod tests {
             "expected >=1000 dropped, got {}",
             acc.talker_dropped
         );
+    }
+
+    #[test]
+    fn netflow_v9_observation_domain_comes_from_source_id() {
+        let mut datagram = [0u8; 20];
+        datagram[0..2].copy_from_slice(&9u16.to_be_bytes());
+        datagram[16..20].copy_from_slice(&0x1020_3040u32.to_be_bytes());
+        assert_eq!(
+            wire_observation_domain(Protocol::NetflowV9, &datagram),
+            Some(0x1020_3040)
+        );
+        datagram[0..2].copy_from_slice(&10u16.to_be_bytes());
+        assert_eq!(
+            wire_observation_domain(Protocol::NetflowV9, &datagram),
+            None
+        );
+    }
+
+    #[test]
+    fn sflow_observation_domain_comes_from_sub_agent_id() {
+        let mut ipv4 = [0u8; 16];
+        ipv4[0..4].copy_from_slice(&5u32.to_be_bytes());
+        ipv4[4..8].copy_from_slice(&1u32.to_be_bytes());
+        ipv4[12..16].copy_from_slice(&77u32.to_be_bytes());
+        assert_eq!(wire_observation_domain(Protocol::Sflow, &ipv4), Some(77));
+
+        let mut ipv6 = [0u8; 28];
+        ipv6[0..4].copy_from_slice(&5u32.to_be_bytes());
+        ipv6[4..8].copy_from_slice(&2u32.to_be_bytes());
+        ipv6[24..28].copy_from_slice(&901u32.to_be_bytes());
+        assert_eq!(wire_observation_domain(Protocol::Sflow, &ipv6), Some(901));
+        assert_eq!(wire_observation_domain(Protocol::Sflow, &ipv6[..20]), None);
     }
 }

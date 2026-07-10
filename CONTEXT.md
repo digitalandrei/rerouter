@@ -38,8 +38,9 @@ _Avoid_: executor (now an internal phase), reroute-service, manager.
 **Gate**:
 A single safety precondition an execution must satisfy — operating mode, the
 global maintenance lock, a device lock, a device/rule cooldown, the global rate
-limit, the automatic master switch, verify-or-refuse, and the protected-interface
-guard. Re-checked at execution time, never trusted from when the action was planned.
+limit, the automatic master switch, verify-or-refuse, fresh inventory,
+reachability, and the protected-interface guard. Re-checked at execution time,
+never trusted from when the action was planned.
 _Avoid_: check, validation, rule (rule means a Detection Rule).
 
 **Reroute Guard**:
@@ -82,6 +83,12 @@ A time window after an action during which the same device or rule will not
 re-fire.
 _Avoid_: debounce, throttle, backoff.
 
+**Preview Token**:
+A short-lived, single-use server credential bound to the exact rendered action
+plan, audit reason, operator, and action scope. Enforce-mode manual actions,
+rule applies, and rollbacks must consume one immediately before execution.
+_Avoid_: confirmation flag, UI confirmation.
+
 **Protected Interface**:
 A management / transit / SSH path flagged so disruptive interface actions on it
 are refused — the controller must not black-hole its own path to the device.
@@ -96,12 +103,14 @@ _Avoid_: drop-route, blackhole (name the method: RTBH or Null0).
 
 **Telemetry Source**:
 An ingestion stack producing per-interface metrics. SNMP v2c interface polling is
-the primary (v1) source; the read-only NetFlow v9 collector is a second source,
-off by default.
+the primary source; the passive NetFlow v9 / sFlow v5 collector is an additive
+source, off by default. Flow rules can alert and, only behind explicit flow-auto
+configuration plus SNMP corroboration, participate in automatic execution.
 _Avoid_: monitor, poller (when you mean the source as a whole).
 
 **Detection Rule**:
 A persisted condition over telemetry that, when it fires (after its persistence
 window / consecutive-sample requirement), raises an alert and — only with the
-global and per-rule enables in enforce mode — triggers a reroute.
+global and per-rule enables in enforce mode, an automatic-capable template, and
+any source-specific confidence gates — triggers a reroute.
 _Avoid_: alarm, trigger, alert (an alert is the *output* of a fired rule).

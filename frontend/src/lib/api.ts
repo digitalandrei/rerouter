@@ -55,6 +55,8 @@ export interface LoginResponse {
 
 export interface TotpResponse {
   user: SessionUser;
+  /** Present exactly once, after first-factor enrollment is confirmed. */
+  recovery_codes?: string[];
 }
 
 /**
@@ -214,7 +216,7 @@ export interface Sample {
   rx_power_dbm: number | null;
 }
 
-// --- Flow telemetry (NetFlow/IPFIX) — read-only second source -------------
+// --- Flow telemetry (NetFlow/IPFIX) ---------------------------------------
 
 /** One ranked row from /api/devices/{id}/flows/top. Fields beyond the common
  *  aggregate vary by dimension (talkers / ports / traffic). Counts are raw
@@ -546,6 +548,13 @@ export interface ManualReroutePayload {
   targets: { device_id: number; params: Record<string, unknown> }[];
   reason?: string;
   dry_run?: boolean;
+  preview_token?: string;
+}
+
+export interface ActionResultsResponse {
+  results: RerouteResult[];
+  /** Present only for an enforce-mode dry run; short-lived and single-use. */
+  preview_token?: string | null;
 }
 
 export interface Lock {
@@ -686,10 +695,20 @@ async function request<T>(
 
 export const api = {
   auth: {
-    login: (email: string, password: string, remember = false) =>
+    login: (
+      email: string,
+      password: string,
+      remember = false,
+      enrollmentCode?: string,
+    ) =>
       request<LoginResponse>("/api/auth/login", {
         method: "POST",
-        body: { email, password, remember },
+        body: {
+          email,
+          password,
+          remember,
+          enrollment_code: enrollmentCode || undefined,
+        },
       }),
     totp: (code: string) =>
       request<TotpResponse>("/api/auth/totp", {
@@ -863,8 +882,11 @@ export const api = {
      *  rule's manual_apply_enabled, the rule to be firing, and (to actually
      *  execute) enforce mode + trigger_manual_reroute. In observe mode each
      *  result carries the would-run plan and nothing executes. */
-    apply: (id: number, body?: { reason?: string; dry_run?: boolean }) =>
-      request<{ results: RerouteResult[] }>(`/api/rules/${id}/apply`, {
+    apply: (
+      id: number,
+      body?: { reason?: string; dry_run?: boolean; preview_token?: string },
+    ) =>
+      request<ActionResultsResponse>(`/api/rules/${id}/apply`, {
         method: "POST",
         body: body ?? {},
       }),
@@ -917,7 +939,7 @@ export const api = {
     list: () => request<Reroute[]>("/api/reroutes"),
     get: (id: number) => request<RerouteDetail>(`/api/reroutes/${id}`),
     manual: (payload: ManualReroutePayload) =>
-      request<{ results: RerouteResult[] }>("/api/reroutes/manual", {
+      request<ActionResultsResponse>("/api/reroutes/manual", {
         method: "POST",
         body: payload,
       }),
@@ -928,8 +950,14 @@ export const api = {
         method: "POST",
         body: { note },
       }),
-    rollback: (id: number) =>
-      request<RerouteResult>(`/api/reroutes/${id}/rollback`, { method: "POST" }),
+    rollback: (
+      id: number,
+      body: { reason?: string; dry_run?: boolean; preview_token?: string },
+    ) =>
+      request<{ result: RerouteResult; preview_token?: string | null }>(
+        `/api/reroutes/${id}/rollback`,
+        { method: "POST", body },
+      ),
   },
 
   users: {
@@ -939,13 +967,20 @@ export const api = {
       name: string;
       role: string;
       password: string;
-    }) => request<User>("/api/users", { method: "POST", body: payload }),
+    }) =>
+      request<User & { enrollment_code: string }>("/api/users", {
+        method: "POST",
+        body: payload,
+      }),
     update: (id: number, payload: { name?: string; role?: string }) =>
       request<User>(`/api/users/${id}`, { method: "PUT", body: payload }),
     remove: (id: number) =>
       request<{ ok: true }>(`/api/users/${id}`, { method: "DELETE" }),
     reset2fa: (id: number) =>
-      request<{ ok: true }>(`/api/users/${id}/reset-2fa`, { method: "POST" }),
+      request<{ ok: true; enrollment_code: string }>(
+        `/api/users/${id}/reset-2fa`,
+        { method: "POST" },
+      ),
   },
 
   audit: {

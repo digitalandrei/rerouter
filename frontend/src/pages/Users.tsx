@@ -40,6 +40,18 @@ const DEFAULT_FORM: AddUserForm = {
   password: "",
 };
 
+const ROLE_OPTIONS = [
+  ["superadmin", "Super admin"],
+  ["admin", "Admin"],
+  ["operator", "Operator"],
+  ["viewer", "Viewer"],
+  ["auditor", "Auditor"],
+] as const;
+
+function roleLabel(role: string): string {
+  return ROLE_OPTIONS.find(([value]) => value === role)?.[1] ?? role;
+}
+
 function roleBadgeVariant(
   role: string,
 ): "default" | "secondary" | "destructive" | "outline" {
@@ -56,6 +68,7 @@ export default function Users() {
   const [form, setForm] = useState<AddUserForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
   const [addBusy, setAddBusy] = useState(false);
+  const [enrollment, setEnrollment] = useState<{ email: string; code: string } | null>(null);
   // Per-row inline error messages: userId -> message
   const [rowError, setRowError] = useState<Record<number, string>>({});
   const [rowBusy, setRowBusy] = useState<Record<number, boolean>>({});
@@ -88,12 +101,13 @@ export default function Users() {
     setAddError(null);
     setAddBusy(true);
     try {
-      await api.users.create({
+      const created = await api.users.create({
         email: form.email.trim(),
         name: form.name.trim(),
         role: form.role,
         password: form.password,
       });
+      setEnrollment({ email: created.email, code: created.enrollment_code });
       setForm(DEFAULT_FORM);
       setShowAdd(false);
       loadUsers();
@@ -140,7 +154,8 @@ export default function Users() {
     clearRowErr(user.id);
     setRowBusyState(user.id, true);
     try {
-      await api.users.reset2fa(user.id);
+      const result = await api.users.reset2fa(user.id);
+      setEnrollment({ email: user.email, code: result.enrollment_code });
       toast.success(`2FA reset for ${user.email}`);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Failed to reset 2FA");
@@ -219,8 +234,9 @@ export default function Users() {
                     value={form.role}
                     onChange={(e) => setField("role", e.target.value)}
                   >
-                    <option value="admin">Admin</option>
-                    <option value="superadmin">Super admin</option>
+                    {ROLE_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
                   </select>
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
@@ -248,6 +264,35 @@ export default function Users() {
         </Card>
       )}
 
+      {enrollment && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg">One-time enrollment code</CardTitle>
+            <CardDescription>
+              Deliver this to {enrollment.email} separately from their temporary password.
+              It will not be shown again.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <code className="block break-all rounded-md border bg-muted p-3 text-sm">
+              {enrollment.code}
+            </code>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void navigator.clipboard.writeText(enrollment.code)}
+              >
+                Copy code
+              </Button>
+              <Button type="button" onClick={() => setEnrollment(null)}>
+                Done
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-lg">All users</CardTitle>
@@ -268,7 +313,7 @@ export default function Users() {
                       {user.name}
                     </span>
                     <Badge variant={roleBadgeVariant(user.role)}>
-                      {user.role === "superadmin" ? "Super admin" : "Admin"}
+                      {roleLabel(user.role)}
                     </Badge>
                     <Badge
                       variant={user.twofa_enrolled ? "default" : "outline"}
@@ -289,8 +334,9 @@ export default function Users() {
                       onChange={(e) => void handleRoleChange(user, e.target.value)}
                       aria-label={`Role for ${user.email}`}
                     >
-                      <option value="admin">Admin</option>
-                      <option value="superadmin">Super admin</option>
+                      {ROLE_OPTIONS.map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
                     </select>
 
                     <Button

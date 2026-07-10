@@ -50,7 +50,3 @@ impl Mailer {
         Ok(())
     }
 }
-
-// TODO(milestone 2): plain-text templates per event type — event + severity,
-// asset/prefix, rule + metric value, reroute state, timestamp, and a deep link
-// to the SPA page. Never include secrets or raw credentials.

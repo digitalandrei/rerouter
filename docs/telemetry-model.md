@@ -6,14 +6,14 @@ fast; actions are slow.
 
 ## Sources
 
-### SNMP interface polling (NetFlow v9 / IPFIX / sFlow) — v1 source
+### SNMP interface polling (primary source)
 
 The v1 telemetry source is **SNMP v2c interface polling** of enrolled devices
 (routers). It is read-only — exactly what observe mode wants — and needs no
 device-side flow configuration. See [device-enrollment.md](device-enrollment.md).
 
-Each poll reads the 64-bit `ifXTable`/`ifTable` counters for every interface with
-`enabled_for_monitoring = 1` and derives, per interface and per interval:
+Each poll reads the 64-bit `ifXTable`/`ifTable` counters for every discovered
+interface and derives, per interface and per interval:
 
 - bits/sec in & out (rx_bps, tx_bps) from `ifHCInOctets` / `ifHCOutOctets`;
 - packets/sec in & out (rx_pps, tx_pps) from `ifHCInUcastPkts` / `ifHCOutUcastPkts`;
@@ -26,9 +26,9 @@ Prefer the 64-bit `ifHC*` counters; they make wrap extremely rare. SNMP gives
 amplification breakdown). For that detail, **flow telemetry** (NetFlow v9 +
 sFlow v5, **implemented**, off by default) is a second source: per-tuple
 visibility, but sampled, so the **sampling rate** must be stored and applied (a
-classic false-trigger cause). The read-only flow-collector — listener, sampling
-resolution, SNMP cross-calibration, bucketed storage — is specified in
-[flow-telemetry.md](flow-telemetry.md). Flow is a second source, not the v1 path.
+classic false-trigger cause). The passive flow collector, sampling resolution,
+SNMP cross-calibration, bucketed storage, and additional automatic-action gates
+are specified in [flow-telemetry.md](flow-telemetry.md).
 
 ### BGP routing context (SNMP + SSH)
 

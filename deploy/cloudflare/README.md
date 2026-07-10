@@ -1,9 +1,8 @@
 # Cloudflare (fronting the app)
 
 The Rerouter web app is served behind Cloudflare at `rerouter.cloudcraft.ro`.
-This directory documents that fronting setup. Cloudflare is *also* usable as a
-reroute provider for protected assets — that is a **separate** concern with a
-**separate** API token (see [../../skills/cloudflare-api.md](../../skills/cloudflare-api.md)).
+This directory documents that fronting setup. Cloudflare is not a reroute
+provider in this codebase; device CLI over SSH is the only actuator.
 
 ## DNS
 
@@ -19,26 +18,27 @@ reroute provider for protected assets — that is a **separate** concern with a
 
 The origin must not be reachable directly (attackers bypass Cloudflare otherwise):
 
-- Firewall: allow inbound 443 only from current Cloudflare IP ranges
-  (https://www.cloudflare.com/ips). Mirror the list into the Nginx
-  `set_real_ip_from` include.
+- Run `./update-origin-ranges.sh` as root to fetch Cloudflare's current IPv4/IPv6
+  lists and atomically write
+  `/etc/nginx/snippets/rerouter-cloudflare-origin-ranges.conf`. Then run
+  `nginx -t && systemctl reload nginx`.
+- Firewall: allow inbound 443 only from the same current Cloudflare IP ranges.
+- Keep the Nginx exact-host guard for `rerouter.cloudcraft.ro`; the source ranges
+  belong to all Cloudflare customers, not only this zone.
 - Consider `cloudflared` tunnel instead of opening 443 at all.
 
 ## Real client IP
 
-Cloudflare sends the true client IP in `CF-Connecting-IP`. Nginx restores it
-(`real_ip_header CF-Connecting-IP`) and forwards it to the Rust controller,
-which trusts it because only Cloudflare can reach Nginx and only Nginx can
-reach the controller (loopback bind) — so login throttling, account lockout,
-and audit logs use the real source. Trust the header only from Cloudflare
-ranges.
+Cloudflare sends the true client IP in `CF-Connecting-IP`. Nginx deliberately
+keeps `$remote_addr` as the connecting Cloudflare proxy so its `allow`/`deny`
+origin ACL remains effective, then forwards Cloudflare's overwritten header to
+the loopback Rust controller for login throttling, account lockout, and audit.
+Do not enable `real_ip_header` in this server block: it would make `allow` test
+the end-client address and reject legitimate proxied requests.
 
 ## Caching / WAF
 
 - Bypass cache for the authenticated app; cache only static assets.
 - Enable Cloudflare WAF managed rules for the app hostname.
 
-## Tokens
-
-Keep the token (if any) used to manage *this* zone separate from the
-provider tokens used to mitigate protected assets. Least-privilege each.
+No Cloudflare API token is required by Rerouter itself.

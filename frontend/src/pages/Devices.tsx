@@ -61,9 +61,9 @@ const DEFAULT_FORM: AddDeviceForm = {
   name: "",
   hostname: "",
   snmp_version: "v2c",
-  community: "public",
+  community: "",
   snmp_port: "161",
-  poll_interval_seconds: "60",
+  poll_interval_seconds: "30",
   ssh_auth_method: "none",
   ssh_key_mode: "generate",
   ssh_username: "",
@@ -250,18 +250,18 @@ export default function Devices() {
                     onChange={(e) => setField("snmp_version", e.target.value)}
                   >
                     <option value="v2c">v2c</option>
-                    <option value="v1">v1</option>
-                    <option value="v3">v3</option>
                   </select>
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
                   Community string
                   <input
+                    type="password"
                     required
                     className={inputClass}
                     value={form.community}
                     onChange={(e) => setField("community", e.target.value)}
-                    placeholder="public"
+                    placeholder="device-specific community"
+                    autoComplete="new-password"
                   />
                 </label>
                 <label className="block space-y-1 text-sm font-medium">
@@ -280,7 +280,8 @@ export default function Devices() {
                   Poll interval (seconds)
                   <input
                     type="number"
-                    min={10}
+                    min={5}
+                    max={86400}
                     required
                     className={inputClass}
                     value={form.poll_interval_seconds}

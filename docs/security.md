@@ -26,16 +26,12 @@ and any pre-existing `admin` is reduced to the narrower scope.
 ## Permissions
 
 The `Permission` enum (`src/auth/rbac.rs`) and the seeded `permissions` table list
-**14** permissions:
+**10** enforced permissions:
 
 ```text
 view_dashboard
-view_asset                  (compat alias — gates DEVICE read endpoints)
-edit_asset                  (compat alias — gates DEVICE write/enroll endpoints)
+view_asset                  compatibility name for DEVICE read endpoints
 manage_devices              superadmin-only: device enrollment/management
-edit_provider               (compat alias — retained, device-scoped)
-edit_credentials
-view_credentials_metadata
 edit_rules
 trigger_manual_reroute
 acknowledge_uncertain_reroute
@@ -45,30 +41,25 @@ view_audit
 manage_users                superadmin-only: user management
 ```
 
-`view_asset` / `edit_asset` / `edit_provider` are **retained compatibility
-aliases**: the names predate the device/interface model but are still the live
-permission strings, and they now gate the **device** endpoints (read / write /
-enroll) rather than any "asset" or "provider" abstraction. There is no
-asset/provider model in v1.
-
-> **Vestigial seed — `approve_dangerous_reroute`.** Migration
-> `20260612000100_users_and_auth.sql` also seeds an `approve_dangerous_reroute`
-> permission, but it exists in **neither** the `Permission` enum **nor** any
-> handler/extractor — nothing checks it. It is a legacy seed slated for removal;
-> do not treat it as a working gate.
+`view_asset` is the one retained compatibility name from the pre-device schema;
+it gates device/interface reads. The inert `edit_asset`, `edit_provider`,
+`edit_credentials`, and `view_credentials_metadata` rows were removed in
+migration `20260710001000_remove_inert_permissions.sql`; device writes use
+`manage_devices`. There is no asset/provider model in v1.
 
 RBAC is implemented with explicit `roles` / `permissions` / `role_user` /
 `permission_role` tables (see [database.md](database.md)) and enforced by axum
 middleware/extractors in the controller. Every `/api/` request is authorized at
 the API boundary: a manual reroute request must carry an authenticated,
-authorized identity (session + permission check) and a reason.
+authorized identity (session + permission check). A reason is optional metadata;
+the enforce-mode exact-preview token is the required execution confirmation.
 
 ## Dangerous actions
 
 Reroutes are device-CLI actions over SSH to Cisco IOS — null-route a prefix to
 `Null0` (RTBH), tagged-`Null0` upstream RTBH (blackhole), and BGP-neighbor
-shut / no-shut. This is an in-house operator tool, so there is **no** typed
-confirmation or per-action re-authentication gate; the safety comes from
+shut / no-shut. This is an in-house operator tool, so there is no typed-text
+confirmation or per-action password/TOTP gate; the safety comes from
 layered, fail-closed controls rather than per-click friction:
 
 - **observe by default** — the shipped operating mode is `observe`
@@ -76,10 +67,22 @@ layered, fail-closed controls rather than per-click friction:
   admin flips to `enforce`;
 - **template-only, allowlisted commands** — actions are rendered from validated
   templates, and the device-CLI layer enforces a fail-closed command allowlist
-  (only the exact `Null0` route and `neighbor … shutdown` forms pass);
+  covering only the catalogued `show`, Null0 route, BGP neighbor/prefix-list/
+  route-map, and interface forms; variable tokens and output-filter syntax are
+  independently constrained;
 - **authorized identity** — a manual reroute must carry an authenticated session
   with the `trigger_manual_reroute` permission and an optional free-text reason
   for the audit log;
+- **server-bound preview** — enforce-mode manual actions and rollbacks consume a
+  five-minute, single-use token bound to the exact server-rendered plan, audit
+  reason, user, and action scope. Request changes, target drift, expiry, and
+  replay are refused;
+- **fresh bounded targets** — inventory-backed values are canonicalized against
+  recent discovery, Null0/RTBH prefixes must remain inside announced space, RTBH
+  tags must be catalogued, and automatic execution requires the template's
+  explicit `automatic_allowed` policy;
+- **pinned device identity** — first-contact SSH host-key persistence is required
+  before config, and every later mismatch fails closed;
 - **device locks and cooldowns** — a locked or cooling-down device refuses new
   actions;
 - **verify, don't assume** — every action confirms the resulting routing state
@@ -100,7 +103,6 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   with the key from the `SECRETS_KEY` env var; the UI never returns them (only
   presence flags + the non-secret SSH public key). In-app-generated SSH keys are
   stored encrypted the same way.
-- File-based keys live under `/etc/rerouter/keys/`, owner `rerouter`, mode `0600`.
 - The controller runs as a dedicated `rerouter` system user.
 - Better later: HashiCorp Vault, per-device credential rotation, never re-expose
   secrets in the UI after creation.
@@ -116,15 +118,30 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   telemetry and **SSH (TCP 22)** for reroute actions/discovery, plus the configured
   SMTP server for alerts. The optional **flow collector** additionally *listens*
   for NetFlow v9 / sFlow v5 UDP (off by default; binds a management address, not
-  loopback — a deliberate, source-IP-allowlisted ingress). There are no
-  BGP-speaker / Cloudflare / scrubber egress paths in v1.
+  loopback — a deliberate, source-IP-allowlisted ingress). Flow auto also needs
+  contemporaneous SNMP corroboration, but deployments must enforce ACL/uRPF
+  anti-spoofing because UDP source addresses are not cryptographic identity.
+- SNMP v2c provides no wire encryption: its community and telemetry traverse the
+  management network in cleartext. Restrict UDP/161 by source/destination ACL,
+  isolate that network, use a unique read-only community per device, and migrate
+  to SNMPv3 before using an untrusted transport.
+- Device SSH supports legacy IOS 15.x and therefore retains SHA-1 KEX/MAC,
+  `ssh-rsa`, and CBC fallbacks. Isolate the router management network, prefer
+  modern router algorithms where available, and treat this compatibility
+  profile as migration debt rather than a general-purpose SSH policy.
+- There are no BGP-speaker / Cloudflare / scrubber egress paths in v1.
 
 ## Authentication hardening
 
-- TOTP 2FA mandatory for all accounts (see [authentication.md](authentication.md)).
+- TOTP 2FA mandatory for all accounts; first enrollment also requires a separate
+  one-time enrollment credential (see [authentication.md](authentication.md)).
 - Lock accounts after repeated failed logins; throttle login + 2FA attempts.
 - Argon2id password hashing; DB-backed sessions rotated on login (fixation
-  protection); secure + httponly + SameSite cookies signed with `SESSION_SECRET`.
+  protection); `Secure` + `HttpOnly` + `SameSite=Strict` cookies signed with
+  `SESSION_SECRET`, plus absolute and idle expiry. Unsafe HTTP methods also
+  reject cross-origin and sibling-site browser requests using Fetch Metadata
+  plus exact `Origin`/`Host` matching; origin-less operational CLI clients remain
+  supported.
 - Trust `CF-Connecting-IP` only via the Cloudflare -> Nginx -> loopback path
   (only Cloudflare can reach Nginx; only Nginx can reach the controller).
 
