@@ -387,6 +387,10 @@ global_maintenance_lock    seeded 'false'
 All windows below are enforced by `scheduler::retention_cleanup`, a single task
 that runs every 10 minutes and honours the `[retention]` config block.
 
+Each pass selects at most 1,000 oldest expired IDs through the table's dedicated
+timestamp index, then deletes those rows by primary key. This keeps routine
+cleanup transactions short under live telemetry ingestion.
+
 ```text
 interface_samples:   2 days   ([retention].traffic_samples_days)
 flow_*_buckets:      2 days   ([retention].flow_buckets_days)

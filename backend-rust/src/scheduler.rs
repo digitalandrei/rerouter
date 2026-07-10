@@ -34,7 +34,7 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 /// Keep each retention delete short enough that a large first 48-hour purge
 /// does not monopolize InnoDB locks or starve telemetry/API queries.
-const RETENTION_DELETE_BATCH: u64 = 10_000;
+const RETENTION_DELETE_BATCH: u64 = 1_000;
 
 /// Spawn the scheduler supervisor + the retention cleanup task; return. Never
 /// blocks the control plane.
@@ -129,11 +129,12 @@ async fn discover_prefixes_daily(pool: MySqlPool) {
 }
 
 /// One day-windowed retention rule: delete rows whose `ts_column` is older than
-/// `days`. `table`/`ts_column` are compile-time constants (never user input), so
-/// they are safe to interpolate into the DELETE.
+/// `days`. Names are compile-time constants (never user input), so they are safe
+/// to interpolate into the DELETE.
 struct RetentionSpec {
     table: &'static str,
     ts_column: &'static str,
+    index: &'static str,
     days: u32,
 }
 
@@ -151,28 +152,32 @@ fn retention_specs(cfg: &Config) -> Vec<RetentionSpec> {
     let mut specs = vec![RetentionSpec {
         table: "interface_samples",
         ts_column: "sampled_at",
+        index: "idx_interface_samples_sampled_at",
         days: r.traffic_samples_days,
     }];
-    for table in [
-        "flow_iface_buckets",
-        "flow_port_buckets",
-        "flow_as_buckets",
-        "flow_talker_buckets",
+    for (table, index) in [
+        ("flow_iface_buckets", "idx_flow_iface_bucket_ts"),
+        ("flow_port_buckets", "idx_flow_port_bucket_ts"),
+        ("flow_as_buckets", "idx_flow_as_bucket_ts"),
+        ("flow_talker_buckets", "idx_flow_talker_bucket_ts"),
     ] {
         specs.push(RetentionSpec {
             table,
             ts_column: "bucket_ts",
+            index,
             days: r.flow_buckets_days,
         });
     }
     specs.push(RetentionSpec {
         table: "alerts",
         ts_column: "created_at",
+        index: "idx_alerts_created",
         days: r.alerts_days,
     });
     specs.push(RetentionSpec {
         table: "rule_events",
         ts_column: "created_at",
+        index: "idx_rule_events_created",
         days: r.rule_events_days,
     });
     specs
@@ -200,8 +205,17 @@ async fn retention_cleanup(pool: MySqlPool, cfg: Arc<Config>) {
                 // SAFETY: table/ts_column are 'static literals from our own code;
                 // the batch size is a compile-time integer constant.
                 let sql = format!(
-                    "DELETE FROM {} WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) LIMIT {}",
-                    spec.table, spec.ts_column, RETENTION_DELETE_BATCH
+                    "DELETE target FROM ( \
+                         SELECT id FROM {} FORCE INDEX ({}) \
+                         WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) \
+                         ORDER BY {} LIMIT {} \
+                     ) AS expired STRAIGHT_JOIN {} AS target ON target.id = expired.id",
+                    spec.table,
+                    spec.index,
+                    spec.ts_column,
+                    spec.ts_column,
+                    RETENTION_DELETE_BATCH,
+                    spec.table
                 );
                 match sqlx::query(&sql).bind(days).execute(&pool).await {
                     Ok(r) => {
@@ -493,6 +507,7 @@ mod tests {
 
         let samples = by_table("interface_samples");
         assert_eq!(samples.ts_column, "sampled_at");
+        assert_eq!(samples.index, "idx_interface_samples_sampled_at");
         assert_eq!(samples.days, 3, "SNMP samples use traffic_samples_days");
 
         for t in [
@@ -503,15 +518,18 @@ mod tests {
         ] {
             let s = by_table(t);
             assert_eq!(s.ts_column, "bucket_ts", "{t} prunes on bucket_ts");
+            assert!(s.index.ends_with("_bucket_ts"));
             assert_eq!(s.days, 5, "{t} uses flow_buckets_days");
         }
 
         let alerts = by_table("alerts");
         assert_eq!(alerts.ts_column, "created_at");
+        assert_eq!(alerts.index, "idx_alerts_created");
         assert_eq!(alerts.days, 9, "alerts use alerts_days");
 
         let rule_events = by_table("rule_events");
         assert_eq!(rule_events.ts_column, "created_at");
+        assert_eq!(rule_events.index, "idx_rule_events_created");
         assert_eq!(rule_events.days, 4, "rule_events use rule_events_days");
     }
 }
