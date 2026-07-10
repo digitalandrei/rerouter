@@ -22,6 +22,10 @@ npm audit
 The Vite dev proxy mirrors Nginx and points `/api` to `127.0.0.1:9277`. Session
 state is owned by the controller in an `HttpOnly` cookie.
 
+Production deployment must set directories under the Nginx document root to
+`0755` and files to `0644`, then verify that `www-data` can read `index.html`.
+See the [deployment runbook](../docs/deployment.md#production-install-order).
+
 ## Layout
 
 - `src/lib/api.ts`: typed API contract and credentialed fetch wrapper.

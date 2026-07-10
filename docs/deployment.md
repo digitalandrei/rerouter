@@ -243,7 +243,19 @@ always wins. Never commit secrets to Git, and never overwrite an operator's
 3. `systemctl start rerouter-controller` — the controller preflights the DB
    and migrates/seeds a fresh database itself.
 4. Frontend: `npm ci && npm run build` in `frontend/`; deploy `frontend/dist`
-   to the Nginx document root.
+   to the Nginx document root, then normalize its modes. Build output may inherit
+   a restrictive umask, and Nginx returns `403` when `www-data` cannot traverse
+   the document root or read `index.html`:
+
+   ```bash
+   WEB_ROOT=/var/www/rerouter/frontend/dist # Use the root from the active vhost.
+   sudo find "$WEB_ROOT" -type d -exec chmod 0755 {} +
+   sudo find "$WEB_ROOT" -type f -exec chmod 0644 {} +
+   sudo -u www-data test -r "$WEB_ROOT/index.html"
+   ```
+
+   Repeat the read check after every frontend deployment and before reloading
+   Nginx.
 5. Nginx + Cloudflare origin cert; restrict origin to Cloudflare IPs.
 6. Create the first superadmin (`--create-admin`); verify SPA login + 2FA works
    end-to-end; `GET /api/health` confirms process liveness and `GET /api/ready`
