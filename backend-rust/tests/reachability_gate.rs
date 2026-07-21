@@ -92,10 +92,11 @@ async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
     assert_eq!(r.ssh_status, STATUS_REACHABLE);
 
     // 3) Stability: a just-reachable device is ssh_ok but NOT stable (auto held).
-    //    stamp_ssh_ok started ssh_reachable_since = now, so < 5 min -> not stable.
+    //    stamp_ssh_ok started ssh_reachable_since = now, so within the stability
+    //    window (1 min) -> not stable.
     assert!(
         !r.stable,
-        "a device reachable for <5 min is not stable (auto held)"
+        "a device reachable for less than the stability window (1 min) is not stable (auto held)"
     );
     // Backdate the stability clock past the window -> now stable (auto resumes).
     sqlx::query(

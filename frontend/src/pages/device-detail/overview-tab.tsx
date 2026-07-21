@@ -138,7 +138,7 @@ export function OverviewTab({ device }: { device: Device }) {
                 })()}
                 <span className="text-xs font-normal text-muted-foreground">
                   {device.ssh_status === "reachable" && !device.automation_stable
-                    ? "auto mitigations resume after 5 min reachable · manual allowed"
+                    ? "auto mitigations resume after 1 min reachable · manual allowed"
                     : device.ssh_status !== "reachable"
                       ? "auto mitigations held until SSH reachable · manual gated too"
                       : "auto + manual mitigations enabled"}

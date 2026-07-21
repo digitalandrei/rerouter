@@ -225,7 +225,7 @@ a router, not an asset/prefix). Any failure aborts and logs:
 - **host identity:** first-contact SSH key pinning must commit successfully before
   a configuration action can run; a concurrent or later mismatch fails closed;
 - **stability (AUTOMATIC only):** a device must have been *continuously*
-  SSH-reachable for the **stability window** (`STABILITY_WINDOW`, 5 min) before
+  SSH-reachable for the **stability window** (`STABILITY_WINDOW`, 1 min) before
   automatic mitigations targeting it resume — so a just-recovered or flapping
   device is not auto-acted upon. `devices.ssh_reachable_since` is set when SSH
   becomes reachable, cleared on any non-reachable probe **and on controller
