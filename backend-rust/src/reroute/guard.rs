@@ -334,7 +334,10 @@ async fn effective_cooldown(
 /// circuit breaker (the count read in `gather` is only an early check; this is the
 /// authoritative one). Then, for every trigger, we take the per-device lock and
 /// re-check the device-scoped guards (already-running / uncertain) and INSERT
-/// atomically. Lock order is ALWAYS global-before-device, so triggers can't deadlock.
+/// atomically. Those re-checks also repeat the global maintenance lock and the
+/// per-device admin lock, so an admin lock set after the lock-free early check
+/// still stops the action at this last gate. Lock order is ALWAYS
+/// global-before-device, so triggers can't deadlock.
 pub async fn reserve_and_persist(
     pool: &MySqlPool,
     cfg: &Config,
@@ -390,7 +393,7 @@ pub async fn reserve_and_persist(
         return Err(BlockReason::GuardBusy);
     }
 
-    let reserved = reserve_slot(&mut conn, req, plan).await;
+    let reserved = reserve_slot(pool, &mut conn, req, plan).await;
 
     let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
         .bind(&lock_name)
@@ -406,10 +409,23 @@ pub async fn reserve_and_persist(
 }
 
 async fn reserve_slot(
+    pool: &MySqlPool,
     conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<u64, BlockReason> {
+    // Authoritative re-check under the advisory lock: an admin lock set after the
+    // lock-free early check must still stop this action (same pattern as the
+    // global rate limit above). Both reads fail closed.
+    if crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await {
+        return Err(BlockReason::MaintenanceLock);
+    }
+    if locks::is_blocked(pool, "device", &req.device_id.to_string())
+        .await
+        .unwrap_or(true)
+    {
+        return Err(BlockReason::DeviceLocked);
+    }
     if running_on_device(conn, req.device_id).await {
         return Err(BlockReason::AlreadyRunning);
     }
