@@ -462,9 +462,22 @@ async fn totp_challenge(
         }
     }
     if !ok {
-        if let Ok(true) = consume_recovery_code(pool, user_id, &body.code).await {
-            ok = true;
-            used_recovery = true;
+        match consume_recovery_code(pool, user_id, &body.code).await {
+            Ok(true) => {
+                ok = true;
+                used_recovery = true;
+            }
+            Ok(false) => {} // wrong/absent code: fall through to the failure path
+            Err(e) => {
+                tracing::error!(event_type = "recovery_code_state_failed", user_id, error = %e, "could not verify and consume recovery code");
+                return (
+                    jar,
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "2fa_verify_failed" })),
+                    ),
+                );
+            }
         }
     }
 
@@ -992,7 +1005,7 @@ async fn enqueue_security_alert(
 
 #[cfg(test)]
 mod tests {
-    use super::consume_totp_step;
+    use super::{consume_recovery_code, consume_totp_step};
 
     #[tokio::test]
     async fn accepted_totp_step_cannot_be_replayed() {
@@ -1032,5 +1045,64 @@ mod tests {
             .execute(&pool)
             .await
             .expect("remove test user");
+    }
+
+    #[tokio::test]
+    async fn consume_recovery_code_reports_state_errors_and_absent_codes() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+        crate::db::migrate_test_schema(&pool)
+            .await
+            .expect("run migrations");
+
+        // Malformed recovery-code JSON must surface as an error, not a silent
+        // failed match (which would count toward account lockout).
+        let bad_email = format!("recovery-bad-{}@example.test", uuid::Uuid::new_v4());
+        let bad_user_id = sqlx::query(
+            "INSERT INTO users (name, email, password, two_factor_recovery_codes) \
+             VALUES ('Recovery bad JSON test', ?, 'unused', 'not-json')",
+        )
+        .bind(&bad_email)
+        .execute(&pool)
+        .await
+        .expect("insert malformed-recovery user")
+        .last_insert_id();
+        assert!(
+            consume_recovery_code(&pool, bad_user_id, "whatever")
+                .await
+                .is_err(),
+            "malformed recovery-code JSON must return Err"
+        );
+
+        // NULL recovery codes are a normal absent-code failed match: Ok(false).
+        let null_email = format!("recovery-null-{}@example.test", uuid::Uuid::new_v4());
+        let null_user_id = sqlx::query(
+            "INSERT INTO users (name, email, password, two_factor_recovery_codes) \
+             VALUES ('Recovery null test', ?, 'unused', NULL)",
+        )
+        .bind(&null_email)
+        .execute(&pool)
+        .await
+        .expect("insert null-recovery user")
+        .last_insert_id();
+        assert!(
+            !consume_recovery_code(&pool, null_user_id, "whatever")
+                .await
+                .expect("absent recovery codes must be Ok(false)"),
+            "NULL recovery codes must return Ok(false)"
+        );
+
+        sqlx::query("DELETE FROM users WHERE id IN (?, ?)")
+            .bind(bad_user_id)
+            .bind(null_user_id)
+            .execute(&pool)
+            .await
+            .expect("remove test users");
     }
 }
