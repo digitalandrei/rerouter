@@ -45,9 +45,9 @@ use crate::ssh::{self, SshReach};
 pub const RECENCY_WINDOW: Duration = Duration::from_secs(60);
 
 /// A device must be continuously SSH-reachable at least this long before AUTOMATIC
-/// mitigations targeting it resume ("up for at least 5 minutes after being
+/// mitigations targeting it resume ("up for at least 1 minute after being
 /// reachable / after app restart").
-pub const STABILITY_WINDOW: Duration = Duration::from_secs(300);
+pub const STABILITY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Persisted SSH reachability states (also the `devices.ssh_status` values).
 pub const STATUS_REACHABLE: &str = "reachable";
@@ -331,21 +331,22 @@ mod tests {
     #[test]
     fn stability_requires_reachable_for_the_full_window() {
         let now = Utc::now();
-        // Reachable for 5 min+ -> stable (auto mitigations resume).
+        let w = STABILITY_WINDOW.as_secs() as i64;
+        // Reachable for the full window (and longer) -> stable (auto mitigations resume).
         assert!(device_stable(
             STATUS_REACHABLE,
-            Some(now - ChronoDuration::seconds(300)),
+            Some(now - ChronoDuration::seconds(w)),
             now
         ));
         assert!(device_stable(
             STATUS_REACHABLE,
-            Some(now - ChronoDuration::seconds(600)),
+            Some(now - ChronoDuration::seconds(w * 2)),
             now
         ));
-        // Reachable but only just (<5 min) -> NOT stable (auto held).
+        // Reachable but one second short of the window -> NOT stable (auto held).
         assert!(!device_stable(
             STATUS_REACHABLE,
-            Some(now - ChronoDuration::seconds(299)),
+            Some(now - ChronoDuration::seconds(w - 1)),
             now
         ));
         assert!(!device_stable(STATUS_REACHABLE, Some(now), now));

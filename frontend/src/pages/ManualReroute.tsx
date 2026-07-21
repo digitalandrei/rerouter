@@ -308,7 +308,7 @@ export default function ManualReroute() {
                     !targetDevice.automation_stable && (
                       <p className="text-xs text-amber-700 dark:text-amber-400">
                         Device only recently became reachable — automatic mitigations are
-                        held for ~5 min, but you can still proceed with this manual reroute.
+                        held for ~1 min, but you can still proceed with this manual reroute.
                       </p>
                     )}
                 </div>

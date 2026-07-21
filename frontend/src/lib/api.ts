@@ -128,7 +128,7 @@ export interface Device {
   last_ssh_error: string | null;
   last_ssh_ok_at: string | null;
   // Automation stability: when SSH became (and stayed) reachable, and whether it
-  // has been reachable long enough (>=5 min) for AUTOMATIC mitigations to resume.
+  // has been reachable long enough (>=1 min) for AUTOMATIC mitigations to resume.
   // While false, auto reroutes targeting this device are held; manual is allowed.
   ssh_reachable_since: string | null;
   automation_stable: boolean;
