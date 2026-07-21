@@ -33,11 +33,11 @@ jobs:
       # Lets the DB-gated tests (e.g. tests/state_recovery.rs) actually run.
       DATABASE_URL: mysql://root:ci@127.0.0.1:3306/rerouter_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262        # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable @ 2026-07-21
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4      # v2.9.1
         with:
           workspaces: backend-rust
       - name: cargo fmt --check
@@ -54,8 +54,8 @@ jobs:
     name: frontend (typecheck + audit + build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262        # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020       # v4.4.0
         with:
           node-version: "20"
           cache: npm
@@ -72,8 +72,8 @@ jobs:
       - name: npm run build
         working-directory: frontend
         run: npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable @ 2026-07-21
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4      # v2.9.1
         with:
           workspaces: backend-rust
       - name: cargo check embedded UI
