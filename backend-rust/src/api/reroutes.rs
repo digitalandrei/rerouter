@@ -409,9 +409,11 @@ pub async fn acknowledge_uncertain(
         "UPDATE locks SET cleared_at = UTC_TIMESTAMP(), cleared_by = ? \
          WHERE cleared_at IS NULL AND \
            (reroute_id = ? OR (reroute_id IS NULL AND kind IN ('auto_crash','auto_uncertain') \
-             AND reason LIKE CONCAT('reroute #', ?, '%')))",
+             AND (reason = CONCAT('reroute #', ?) \
+                  OR reason LIKE CONCAT('reroute #', ?, ' %'))))",
     )
     .bind(g.session.user_id)
+    .bind(id)
     .bind(id)
     .bind(id)
     .execute(&mut *tx)
