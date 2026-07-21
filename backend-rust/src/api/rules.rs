@@ -409,6 +409,16 @@ async fn validate(
                 "flow_protocol currently requires a flow_port selector".into(),
             ));
         }
+        // Flow rules use time-window persistence (duration_seconds); each tick
+        // re-reads the same latest closed bucket, so consecutive_samples would
+        // count poll ticks against unchanged evidence. Reject it here — the
+        // consecutive-samples gate is SNMP-only.
+        if body.consecutive_samples.is_some_and(|n| n > 0) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "flow rules use duration_seconds persistence; consecutive_samples must be 0 or omitted".into(),
+            ));
+        }
     } else if !INTERFACE_METRICS.contains(&body.metric.as_str()) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -702,6 +712,21 @@ pub async fn update(
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "flow_protocol currently requires a flow_port selector",
+        );
+    }
+    // Flow rules use time-window persistence; consecutive_samples is the SNMP-only
+    // gate. Reject when the EFFECTIVE metric is a flow metric and the EFFECTIVE
+    // consecutive_samples (incoming value, else the stored row value) is > 0. This
+    // catches setting the field on a flow rule and switching a rule into a flow
+    // metric without zeroing consecutive_samples.
+    let final_metric = body.metric.as_deref().unwrap_or(&existing.metric);
+    let final_consecutive = body
+        .consecutive_samples
+        .unwrap_or(existing.consecutive_samples);
+    if is_flow_metric(final_metric) && final_consecutive > 0 {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "flow rules use duration_seconds persistence; consecutive_samples must be 0 or omitted",
         );
     }
     if let Some(m) = &body.recovery_mode {

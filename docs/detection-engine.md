@@ -78,7 +78,10 @@ consecutive_samples valid matches
 
 A zero disables that gate. The UI uses a duration window for flow rules and
 consecutive samples for SNMP rules, so only one is normally enabled; API clients
-may require both. While firing, the rule does not re-alert each tick.
+may require both on SNMP rules, but the rules API now **rejects**
+`consecutive_samples > 0` on flow rules (each tick re-reads the same latest
+closed bucket, so it would count poll ticks against unchanged evidence) —
+flow rules are window-only. While firing, the rule does not re-alert each tick.
 
 Track per rule (`rule_states`): `current_state`, `first_matched_at`,
 `last_matched_at`, `last_cleared_at`, `consecutive_match_count`,
