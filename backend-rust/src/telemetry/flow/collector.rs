@@ -95,6 +95,15 @@ const MAX_IFACE_KEYS: usize = 4_096;
 const MAX_PORT_KEYS: usize = 65_536;
 const MAX_AS_KEYS: usize = 65_536;
 
+/// Hard cap on open/unflushed buckets retained per exporter. Normally 1-2 are
+/// open; the map only grows when flushing fails (DB outage) and closed buckets
+/// are re-queued for retry. Each retained `Accum` can hold up to
+/// `MAX_TALKER_KEYS` tuples, so an unbounded backlog is an OOM path during a
+/// sustained outage. When full, the OLDEST bucket is dropped: detection
+/// anchors on the latest closed bucket, so old data is the least valuable,
+/// and the drop is counted and logged.
+const MAX_OPEN_BUCKETS: usize = 120;
+
 fn add_bounded<K: Eq + Hash>(
     map: &mut HashMap<K, Counts>,
     key: K,
@@ -243,6 +252,9 @@ struct Exporter {
     datagrams_total: u64,
     dropped_no_template: u64,
     dropped_malformed: u64,
+    /// Open buckets dropped because the per-exporter backlog hit
+    /// [`MAX_OPEN_BUCKETS`] (evicted-oldest or refused-stale during a DB outage).
+    dropped_bucket_backlog: u64,
     last_sequence: Option<u32>,
     /// Unix seconds of the most recent datagram — drives LRU eviction when the
     /// exporter map hits [`MAX_EXPORTERS`].
@@ -264,9 +276,38 @@ impl Exporter {
             datagrams_total: 0,
             dropped_no_template: 0,
             dropped_malformed: 0,
+            dropped_bucket_backlog: 0,
             last_sequence: None,
             last_seen: 0,
         }
+    }
+
+    /// Insert-or-get the bucket at `ts`, evicting the oldest bucket when the
+    /// backlog cap ([`MAX_OPEN_BUCKETS`]) is reached. Returns `None` only if
+    /// `ts` itself is older than (or equal to) every retained bucket in a full
+    /// map — there is nothing older to evict in its favor, so the incoming
+    /// bucket is refused. Every drop (evicted-oldest or refused-stale) bumps the
+    /// saturating `dropped_bucket_backlog` counter.
+    fn bucket_entry_bounded(&mut self, ts: i64) -> Option<&mut Accum> {
+        if self.buckets.contains_key(&ts) {
+            return self.buckets.get_mut(&ts);
+        }
+        if self.buckets.len() < MAX_OPEN_BUCKETS {
+            return Some(self.buckets.entry(ts).or_default());
+        }
+        // Full and `ts` is not present: make room by dropping the oldest, but
+        // only if `ts` is newer than it — never evict fresher data for staler.
+        let oldest = match self.buckets.keys().copied().min() {
+            Some(o) => o,
+            // Unreachable: a full map (len >= cap >= 1) always has a min key.
+            None => return Some(self.buckets.entry(ts).or_default()),
+        };
+        self.dropped_bucket_backlog = self.dropped_bucket_backlog.saturating_add(1);
+        if ts <= oldest {
+            return None;
+        }
+        self.buckets.remove(&oldest);
+        Some(self.buckets.entry(ts).or_default())
     }
 }
 
@@ -471,9 +512,13 @@ async fn recv_loop(
                     exporter.reported_rate = Some(rate);
                 }
                 if !records.is_empty() {
-                    let accum = exporter.buckets.entry(bucket_ts).or_default();
-                    for fr in &records {
-                        accum.fold(fr);
+                    // `None` means this datagram's bucket lost the backlog-cap
+                    // eviction race during a DB outage; the drop is counted
+                    // inside the helper, so just skip folding.
+                    if let Some(accum) = exporter.bucket_entry_bounded(bucket_ts) {
+                        for fr in &records {
+                            accum.fold(fr);
+                        }
                     }
                 }
             }
@@ -642,8 +687,23 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                             st.exporters
                                 .get_mut(&(f.src_ip, f.protocol, f.observation_domain))
                         {
+                            let dropped_before = ex.dropped_bucket_backlog;
                             for (ts, acc) in f.closed.drain(..) {
-                                ex.buckets.entry(ts).or_insert(acc);
+                                // Preserve or_insert semantics: an already-open
+                                // bucket for this ts wins; the retried copy is
+                                // discarded. Otherwise re-queue under the backlog
+                                // cap, which may evict the oldest or refuse `acc`.
+                                if ex.buckets.contains_key(&ts) {
+                                    continue;
+                                }
+                                if let Some(slot) = ex.bucket_entry_bounded(ts) {
+                                    *slot = acc;
+                                }
+                            }
+                            if ex.dropped_bucket_backlog != dropped_before {
+                                // Once per flush cycle per exporter — a long
+                                // outage must not log-flood.
+                                tracing::warn!(event_type = "flow_bucket_backlog_capped", source = %f.src_ip, proto = ?f.protocol, dropped_bucket_backlog = ex.dropped_bucket_backlog, open_buckets = ex.buckets.len(), "open-bucket backlog cap reached during flush retry; oldest/excess buckets dropped")
                             }
                         }
                     }
@@ -1001,7 +1061,10 @@ async fn cross_calibrate(
 
 #[cfg(test)]
 mod tests {
-    use super::{wire_observation_domain, Accum, FlowRecord, Protocol, MAX_TALKER_KEYS};
+    use super::{
+        wire_observation_domain, Accum, Exporter, FlowRecord, Protocol, MAX_OPEN_BUCKETS,
+        MAX_TALKER_KEYS,
+    };
     use std::net::{IpAddr, Ipv4Addr};
 
     fn rec(src: u32) -> FlowRecord {
@@ -1036,6 +1099,35 @@ mod tests {
             "expected >=1000 dropped, got {}",
             acc.talker_dropped
         );
+    }
+
+    #[test]
+    fn open_bucket_backlog_is_bounded() {
+        // Simulates a sustained DB outage: closed buckets keep getting re-queued
+        // (via the same helper the flush path uses) while the receive loop opens
+        // new ones. The per-exporter open-bucket map must stay capped, retain the
+        // NEWEST buckets, and count every drop — never grow toward OOM.
+        let mut ex = Exporter::new(None, 9, 0);
+        let extra = 50i64;
+        for ts in 0..(MAX_OPEN_BUCKETS as i64 + extra) {
+            assert!(ex.bucket_entry_bounded(ts).is_some());
+        }
+        assert_eq!(ex.buckets.len(), MAX_OPEN_BUCKETS);
+        assert_eq!(ex.dropped_bucket_backlog, extra as u64);
+        // The retained keys are the newest MAX_OPEN_BUCKETS timestamps.
+        let min_kept = *ex.buckets.keys().min().unwrap();
+        let max_kept = *ex.buckets.keys().max().unwrap();
+        assert_eq!(max_kept, MAX_OPEN_BUCKETS as i64 + extra - 1);
+        assert_eq!(min_kept, extra);
+
+        // Inserting a timestamp older than the current minimum into a full map is
+        // refused (returns None) and evicts nothing.
+        let dropped_before = ex.dropped_bucket_backlog;
+        let len_before = ex.buckets.len();
+        assert!(ex.bucket_entry_bounded(min_kept - 1).is_none());
+        assert_eq!(ex.buckets.len(), len_before);
+        assert_eq!(ex.dropped_bucket_backlog, dropped_before + 1);
+        assert!(ex.buckets.contains_key(&min_kept));
     }
 
     #[test]
