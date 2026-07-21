@@ -447,7 +447,9 @@ async fn totp_challenge(
     if let Some(secret_hex) = secret_hex.as_deref() {
         if let Some(secret_b32) = decrypt_secret(secret_hex) {
             match consume_totp_step(pool, user_id, &secret_b32, &body.code, &email).await {
-                Ok(value) => ok = value,
+                // At login a replayed step MUST stay a generic failure: an
+                // unauthenticated caller must not learn a stolen code was valid.
+                Ok(outcome) => ok = matches!(outcome, TotpConsume::Accepted),
                 Err(e) => {
                     tracing::error!(event_type = "totp_replay_state_failed", user_id, error = %e, "could not verify and consume TOTP step");
                     return (
@@ -888,6 +890,16 @@ async fn consume_recovery_code(
     Ok(true)
 }
 
+/// Outcome of verifying + consuming a TOTP code. `ReplayedStep` means the code
+/// itself was valid but its time step was already consumed (e.g. just used to
+/// log in) — callers decide whether that distinction is safe to surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpConsume {
+    Accepted,
+    WrongCode,
+    ReplayedStep,
+}
+
 /// Verify and consume a TOTP time step atomically. A valid code from a step at
 /// or before the last accepted step is a replay and is rejected.
 async fn consume_totp_step(
@@ -896,9 +908,9 @@ async fn consume_totp_step(
     secret_base32: &str,
     code: &str,
     account_email: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<TotpConsume> {
     let Some(step) = totp::matched_step(secret_base32, code, account_email)? else {
-        return Ok(false);
+        return Ok(TotpConsume::WrongCode);
     };
     let mut tx = pool.begin().await?;
     let last: Option<u64> =
@@ -908,7 +920,7 @@ async fn consume_totp_step(
             .await?;
     if last.is_some_and(|last| step <= last) {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(TotpConsume::ReplayedStep);
     }
     let updated = sqlx::query("UPDATE users SET last_totp_step = ? WHERE id = ?")
         .bind(step)
@@ -920,7 +932,17 @@ async fn consume_totp_step(
         "user disappeared while consuming TOTP step"
     );
     tx.commit().await?;
-    Ok(true)
+    Ok(TotpConsume::Accepted)
+}
+
+/// Result of a step-up re-auth. `TotpReplayed` is only reachable AFTER the
+/// password check passes, so it is never revealed to a caller lacking the
+/// password (the distinction stays hidden from an unauthenticated actor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpOutcome {
+    Verified,
+    Rejected,     // wrong password, wrong code, or 2FA not enrolled
+    TotpReplayed, // password OK and code valid, but step already consumed
 }
 
 /// Step-up re-authentication for a high-risk admin action (arming the system):
@@ -928,13 +950,15 @@ async fn consume_totp_step(
 /// so a stolen session alone can't satisfy it. Recovery codes are intentionally
 /// NOT accepted here — arming can wait until the operator has their authenticator,
 /// and a settings toggle shouldn't burn a single-use recovery code.
-/// Returns Ok(false) on any missing factor / mismatch; Err only on a DB error.
+/// Returns `Rejected` on any missing factor / mismatch; `TotpReplayed` when the
+/// password AND code were valid but the code's step was already spent (e.g. just
+/// used to log in); Err only on a DB error.
 pub async fn verify_step_up(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     password: &str,
     totp_code: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<StepUpOutcome> {
     let Some((email, phc, secret_hex)) = sqlx::query_as::<_, (String, String, Option<String>)>(
         "SELECT email, password, two_factor_secret FROM users WHERE id = ?",
     )
@@ -942,18 +966,26 @@ pub async fn verify_step_up(
     .fetch_optional(pool)
     .await?
     else {
-        return Ok(false);
+        return Ok(StepUpOutcome::Rejected);
     };
     if !password::verify(password, &phc).unwrap_or(false) {
-        return Ok(false);
+        return Ok(StepUpOutcome::Rejected);
     }
     let Some(secret_hex) = secret_hex.as_deref() else {
-        return Ok(false); // 2FA not enrolled — cannot step up
+        return Ok(StepUpOutcome::Rejected); // 2FA not enrolled — cannot step up
     };
     let Some(secret_b32) = decrypt_secret(secret_hex) else {
-        return Ok(false);
+        return Ok(StepUpOutcome::Rejected);
     };
-    consume_totp_step(pool, user_id, &secret_b32, totp_code, &email).await
+    // Password already verified above, so distinguishing the replay case here
+    // is safe: only a fully-authenticated actor can reach it.
+    Ok(
+        match consume_totp_step(pool, user_id, &secret_b32, totp_code, &email).await? {
+            TotpConsume::Accepted => StepUpOutcome::Verified,
+            TotpConsume::WrongCode => StepUpOutcome::Rejected,
+            TotpConsume::ReplayedStep => StepUpOutcome::TotpReplayed,
+        },
+    )
 }
 
 /// Insert an audit_logs row (best-effort; auth must not fail because audit did).
@@ -1005,7 +1037,7 @@ async fn enqueue_security_alert(
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_recovery_code, consume_totp_step};
+    use super::{consume_recovery_code, consume_totp_step, StepUpOutcome, TotpConsume};
 
     #[tokio::test]
     async fn accepted_totp_step_cannot_be_replayed() {
@@ -1033,18 +1065,104 @@ mod tests {
         let (secret, _) = super::totp::enroll(&email).expect("create TOTP secret");
         let code = super::totp::current_code(&secret, &email).expect("generate current TOTP");
 
-        assert!(consume_totp_step(&pool, user_id, &secret, &code, &email)
-            .await
-            .expect("consume first TOTP"));
-        assert!(!consume_totp_step(&pool, user_id, &secret, &code, &email)
-            .await
-            .expect("reject replayed TOTP"));
+        assert_eq!(
+            consume_totp_step(&pool, user_id, &secret, &code, &email)
+                .await
+                .expect("consume first TOTP"),
+            TotpConsume::Accepted,
+        );
+        assert_eq!(
+            consume_totp_step(&pool, user_id, &secret, &code, &email)
+                .await
+                .expect("reject replayed TOTP"),
+            TotpConsume::ReplayedStep,
+        );
 
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(user_id)
             .execute(&pool)
             .await
             .expect("remove test user");
+    }
+
+    // The security property behind the new `TotpReplayed` outcome: it must be
+    // reachable ONLY after the password check passes, so an actor without the
+    // password can never learn a code was "valid but used". This is verified on
+    // the two `verify_step_up` paths that return BEFORE any TOTP secret is
+    // decrypted, which keeps the test deterministic and independent of the
+    // process-global `SECRETS_KEY` env var (the crypto module's tests set/remove
+    // that key on other threads, so a test that decrypted a stored secret here
+    // would race them). The `ReplayedStep -> TotpReplayed` mapping itself is the
+    // exhaustive `match` in `verify_step_up`, and that `consume_totp_step`
+    // produces `ReplayedStep` is covered by `accepted_totp_step_cannot_be_replayed`.
+    #[tokio::test]
+    async fn step_up_hides_totp_outcome_until_password_passes() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+        crate::db::migrate_test_schema(&pool)
+            .await
+            .expect("run migrations");
+
+        let password = "correct horse battery staple";
+        let phc = super::password::hash(password).expect("hash password");
+
+        // A user WITH 2FA enrolled. The stored secret is never decrypted on the
+        // wrong-password path (the password check returns first), so a placeholder
+        // is fine and no SECRETS_KEY is needed.
+        let enrolled_email = format!("stepup-enrolled-{}@example.test", uuid::Uuid::new_v4());
+        let enrolled_id = sqlx::query(
+            "INSERT INTO users (name, email, password, two_factor_secret) \
+             VALUES ('Step-up enrolled test', ?, ?, 'placeholder-not-decrypted')",
+        )
+        .bind(&enrolled_email)
+        .bind(&phc)
+        .execute(&pool)
+        .await
+        .expect("insert enrolled user")
+        .last_insert_id();
+
+        // Wrong password -> Rejected, WITHOUT reaching TOTP verification at all.
+        // This is the core guarantee: the replay distinction stays hidden from a
+        // caller who lacks the password.
+        assert_eq!(
+            super::verify_step_up(&pool, enrolled_id, "wrong password", "000000")
+                .await
+                .expect("wrong-password step-up"),
+            StepUpOutcome::Rejected,
+        );
+
+        // A user with the correct password but NO 2FA secret cannot step up:
+        // Rejected (not enrolled). Also decryption-free and deterministic.
+        let bare_email = format!("stepup-bare-{}@example.test", uuid::Uuid::new_v4());
+        let bare_id = sqlx::query(
+            "INSERT INTO users (name, email, password, two_factor_secret) \
+             VALUES ('Step-up not-enrolled test', ?, ?, NULL)",
+        )
+        .bind(&bare_email)
+        .bind(&phc)
+        .execute(&pool)
+        .await
+        .expect("insert not-enrolled user")
+        .last_insert_id();
+        assert_eq!(
+            super::verify_step_up(&pool, bare_id, password, "000000")
+                .await
+                .expect("not-enrolled step-up"),
+            StepUpOutcome::Rejected,
+        );
+
+        sqlx::query("DELETE FROM users WHERE id IN (?, ?)")
+            .bind(enrolled_id)
+            .bind(bare_id)
+            .execute(&pool)
+            .await
+            .expect("remove test users");
     }
 
     #[tokio::test]

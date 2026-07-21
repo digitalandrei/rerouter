@@ -208,9 +208,10 @@ pub async fn update(
         if password.is_empty() || totp_code.is_empty() {
             return err(StatusCode::FORBIDDEN, "reauth_required");
         }
+        use crate::auth::StepUpOutcome;
         match crate::auth::verify_step_up(pool, session.user_id, password, totp_code).await {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(StepUpOutcome::Verified) => {}
+            Ok(StepUpOutcome::Rejected) => {
                 audit_reauth_failure(
                     pool,
                     session.user_id,
@@ -221,6 +222,23 @@ pub async fn update(
                 )
                 .await;
                 return err(StatusCode::FORBIDDEN, "reauth_failed");
+            }
+            Ok(StepUpOutcome::TotpReplayed) => {
+                // Password AND code were valid, but the code's step was already
+                // spent (typically just used to log in). The operator is fully
+                // authenticated, so this is not a brute-force signal: audit it
+                // under a distinct event type that is NOT in ip_throttled's list,
+                // so retrying with the next code doesn't burn throttle budget.
+                audit_reauth_failure(
+                    pool,
+                    session.user_id,
+                    "settings_reauth_totp_reused",
+                    &ip,
+                    &ua,
+                    "step-up re-auth presented an already-used TOTP step",
+                )
+                .await;
+                return err(StatusCode::FORBIDDEN, "reauth_totp_reused");
             }
             Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "authz check failed"),
         }

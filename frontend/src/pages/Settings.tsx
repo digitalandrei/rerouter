@@ -348,7 +348,9 @@ export default function Settings() {
                   ? "Enter your password and authenticator code."
                   : msg === "reauth_failed"
                     ? "Password or authenticator code is incorrect."
-                    : msg,
+                    : msg === "reauth_totp_reused"
+                      ? "That code was just used to sign in. Wait for your authenticator to show the next code, then retry."
+                      : msg,
               );
               return; // keep the dialog open so the operator can retry
             }
