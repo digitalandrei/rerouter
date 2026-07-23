@@ -4,7 +4,8 @@
  * Route map:
  * /login, /dashboard, /devices, /devices/:id,
  * /devices/:deviceId/interfaces/:ifaceId, /rules, /templates, /mitigations,
- * /mitigations/manual, /flows, /alerts, /audit, /settings, /users.
+ * /mitigations/manual, /flows, /alerts, /audit, /settings, /documentation,
+ * /users.
  *
  * Everything except /login sits behind <RequireAuth>; the session itself is
  * an HttpOnly cookie validated server-side on every request, so this gate is
@@ -33,6 +34,7 @@ const ManualReroute = lazy(() => import("@/pages/ManualReroute"));
 const Flows = lazy(() => import("@/pages/Flows"));
 const Audit = lazy(() => import("@/pages/Audit"));
 const Settings = lazy(() => import("@/pages/Settings"));
+const Documentation = lazy(() => import("@/pages/Documentation"));
 const Users = lazy(() => import("@/pages/Users"));
 
 const PageFallback = (
@@ -92,6 +94,7 @@ export default function App() {
               <Route path="/alerts" element={<Navigate to="/mitigations?tab=alerts" replace />} />
               <Route path="/audit" element={<Audit />} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="/documentation" element={<Documentation />} />
               <Route element={<RequirePermission permission="manage_users" />}>
                 <Route path="/users" element={<Users />} />
               </Route>

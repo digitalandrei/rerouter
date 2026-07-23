@@ -8,6 +8,7 @@ import {
   ScrollText,
   Settings,
   Users,
+  BookOpen,
 } from 'lucide-react'
 import type { SidebarData } from '@/components/layout/types'
 
@@ -32,6 +33,12 @@ export const sidebarData: SidebarData = {
         { title: 'Audit', url: '/audit', icon: ScrollText },
         { title: 'Settings', url: '/settings', icon: Settings },
         { title: 'Users', url: '/users', icon: Users, permission: 'manage_users' },
+      ],
+    },
+    {
+      title: 'Help',
+      items: [
+        { title: 'Documentation', url: '/documentation', icon: BookOpen },
       ],
     },
   ],

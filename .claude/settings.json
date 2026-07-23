@@ -1,5 +1,7 @@
 {
   "permissions": {
-    "allow": []
+    "allow": [
+      "Bash(grep -iE \"\\\\.ts$\")"
+    ]
   }
 }

@@ -37,7 +37,7 @@ See the [deployment runbook](../docs/deployment.md#production-install-order).
 
 Routes include `/login`, `/dashboard`, `/devices`, device/interface details,
 `/rules`, `/templates`, `/mitigations`, `/mitigations/manual`, `/audit`,
-`/settings`, and `/users`.
+`/settings`, `/documentation` (the embedded operator handbook), and `/users`.
 
 ## Safety UI
 
