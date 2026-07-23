@@ -110,7 +110,8 @@ _Avoid_: monitor, poller (when you mean the source as a whole).
 
 **Detection Rule**:
 A persisted condition over telemetry that, when it fires (after its persistence
-window / consecutive-sample requirement), raises an alert and — only with the
+requirement — a time window for flow rules, consecutive samples for SNMP rules;
+flow rules are window-only), raises an alert and — only with the
 global and per-rule enables in enforce mode, an automatic-capable template, and
 any source-specific confidence gates — triggers a reroute.
 _Avoid_: alarm, trigger, alert (an alert is the *output* of a fired rule).
