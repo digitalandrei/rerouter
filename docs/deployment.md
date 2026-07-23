@@ -105,6 +105,28 @@ on email) with the `superadmin` role, and prints a separate one-time TOTP
 enrollment code. Deliver that code out of band; the password alone cannot claim
 the first authenticator.
 
+## Release gate (local)
+
+There is **no hosted CI** (owner decision, 2026-07-21). Before every release,
+run the full gate locally and require all five commands to pass:
+
+```bash
+(cd backend-rust && cargo fmt --check)
+(cd backend-rust && cargo clippy --all-targets -- -D warnings)
+(cd backend-rust && DATABASE_URL="mysql://…/rerouter_test" cargo test --all-targets)
+(cd frontend && npm run typecheck)
+(cd frontend && npm run build)
+```
+
+The integration suites under `backend-rust/tests/` **skip silently when
+`DATABASE_URL` is unset** — a green `cargo test` without a MariaDB test
+database has not exercised reroute-guard, state-recovery, reachability, or
+collector behavior. Point `DATABASE_URL` at a disposable MariaDB database
+(the tests run migrations and write to it; never use the production DB).
+
+Run `cargo audit` manually each audit cycle; accepted findings are recorded
+in `plans/README.md`.
+
 ## CLI reference
 
 ```text
