@@ -129,6 +129,9 @@ Git. Test restore into a staging DB periodically.
 
 ## Routine checks
 
+- Before deploying any new build: run the full local release gate — see
+  [Release gate (local)](deployment.md#release-gate-local). There is no hosted
+  CI; nothing passes unless you run it.
 - Confirm `operating_mode` (observe/enforce) and `automatic_actions_enabled`
   match the intended posture.
 - Review open locks and stale cooldowns weekly.
