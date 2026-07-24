@@ -9,6 +9,18 @@ of schema truth.
 > foreign keys with sensible `ON DELETE` behaviour. High-volume sample tables are
 > partition/retention candidates.
 
+## MariaDB vs MySQL compatibility
+
+MariaDB is the primary engine, but at least one deployment (emdd) runs
+**MySQL 8.4** — all SQL must work on both. The one divergence that has bitten
+us in production (2026-07): `sqlx::query(...)` uses the prepared-statement
+protocol, and MySQL 8.x cannot prepare transaction-control statements
+(`PREPARE ... FROM 'START TRANSACTION'` → error 1295) while MariaDB can.
+Transaction control must therefore go through sqlx's `begin()` / `commit()` /
+`rollback()` (text protocol) — never `sqlx::query("START TRANSACTION")`.
+`backend-rust/tests/sql_protocol_lint.rs` enforces this; the local release gate
+runs only against MariaDB, so MySQL-only breakage will not show up in tests.
+
 ## Table groups
 
 ```text

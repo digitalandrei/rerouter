@@ -67,7 +67,10 @@ pub async fn list(
             StatusCode::OK,
             Json(json!(rows.iter().map(user_json).collect::<Vec<_>>())),
         ),
-        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "users_list_failed", error = %e, "listing users failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
+        }
     }
 }
 
@@ -114,7 +117,10 @@ pub async fn create(
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "user_create_failed", error = %e, "begin failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+        }
     };
     let res = sqlx::query(
         "INSERT INTO users \
@@ -135,7 +141,10 @@ pub async fn create(
                 "a user with that email already exists",
             )
         }
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "user_create_failed", error = %e, "inserting user failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+        }
     };
     let role = sqlx::query(
         "INSERT INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = ?",
@@ -144,10 +153,18 @@ pub async fn create(
     .bind(&body.role)
     .execute(&mut *tx)
     .await;
-    if !matches!(role, Ok(ref r) if r.rows_affected() == 1) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "assigning role failed");
+    match role {
+        Ok(ref r) if r.rows_affected() == 1 => {}
+        Ok(_) => {
+            tracing::error!(event_type = "user_create_failed", role = %body.role, "role row not found");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "assigning role failed");
+        }
+        Err(e) => {
+            tracing::error!(event_type = "user_create_failed", error = %e, "assigning role failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "assigning role failed");
+        }
     }
-    if insert_audit(
+    if let Err(e) = insert_audit(
         &mut tx,
         &g.session,
         "user_created",
@@ -155,9 +172,12 @@ pub async fn create(
         &format!("{email} as {}", body.role),
     )
     .await
-    .is_err()
-        || tx.commit().await.is_err()
     {
+        tracing::error!(event_type = "user_create_failed", error = %e, "audit write failed");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!(event_type = "user_create_failed", error = %e, "commit failed");
         return err(StatusCode::INTERNAL_SERVER_ERROR, "audit_write_failed");
     }
 
@@ -166,7 +186,11 @@ pub async fn create(
             v["enrollment_code"] = json!(enrollment_code);
             (StatusCode::CREATED, Json(v))
         }
-        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Ok(None) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "user_create_failed", error = %e, "reloading created user failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
+        }
     }
 }
 
@@ -201,12 +225,19 @@ pub async fn update(
         Ok(Some(true)) => {}
         Ok(Some(false)) => return err(StatusCode::CONFLICT, "cannot demote the last superadmin"),
         Ok(None) => return err(StatusCode::NOT_FOUND, "user not found"),
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "updating user failed"),
+        Err(e) => {
+            tracing::error!(event_type = "user_update_failed", user_id = id, error = %e, "updating user failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "updating user failed");
+        }
     }
 
     match fetch_user(&state.pool, id).await {
         Ok(Some(v)) => (StatusCode::OK, Json(v)),
-        _ => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Ok(None) => err(StatusCode::NOT_FOUND, "user not found"),
+        Err(e) => {
+            tracing::error!(event_type = "user_update_failed", user_id = id, error = %e, "reloading updated user failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
+        }
     }
 }
 
@@ -220,7 +251,10 @@ pub async fn reset_2fa(
     let enrollment_hash = crate::auth::sessions::hash_token(&enrollment_code);
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
-        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "user_2fa_reset_failed", user_id = id, error = %e, "begin failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+        }
     };
     let res = sqlx::query(
         "UPDATE users SET two_factor_secret = NULL, two_factor_recovery_codes = NULL, \
@@ -233,22 +267,25 @@ pub async fn reset_2fa(
     .await;
     match res {
         Ok(r) if r.rows_affected() > 0 => {
-            if sqlx::query("UPDATE sessions SET expires_at = UTC_TIMESTAMP() WHERE user_id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .is_err()
-                || insert_audit(
+            let steps = async {
+                sqlx::query("UPDATE sessions SET expires_at = UTC_TIMESTAMP() WHERE user_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                insert_audit(
                     &mut tx,
                     &g.session,
                     "user_2fa_reset",
                     id,
                     "TOTP cleared; all sessions expired; re-enroll at next login",
                 )
-                .await
-                .is_err()
-                || tx.commit().await.is_err()
-            {
+                .await?;
+                tx.commit().await?;
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(e) = steps {
+                tracing::error!(event_type = "user_2fa_reset_failed", user_id = id, error = %e, "expiring sessions / audit / commit failed");
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
             }
             (
@@ -260,7 +297,8 @@ pub async fn reset_2fa(
             let _ = tx.rollback().await;
             err(StatusCode::NOT_FOUND, "user not found")
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::error!(event_type = "user_2fa_reset_failed", user_id = id, error = %e, "clearing TOTP failed");
             let _ = tx.rollback().await;
             err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
         }
@@ -280,7 +318,10 @@ pub async fn remove(
         Ok(Some(true)) => (StatusCode::OK, Json(json!({ "ok": true }))),
         Ok(Some(false)) => err(StatusCode::CONFLICT, "cannot delete the last superadmin"),
         Ok(None) => err(StatusCode::NOT_FOUND, "user not found"),
-        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        Err(e) => {
+            tracing::error!(event_type = "user_delete_failed", user_id = id, error = %e, "deleting user failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
+        }
     }
 }
 
@@ -307,7 +348,9 @@ async fn is_only_superadmin_on(
 
 /// Serialize superadmin demotion with deletion so two concurrent requests cannot
 /// each observe another superadmin and leave the installation ownerless.
-async fn update_user_safely(
+///
+/// `pub` for the DB integration tests; not part of the HTTP surface.
+pub async fn update_user_safely(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     name: Option<&str>,
@@ -319,78 +362,94 @@ async fn update_user_safely(
         .fetch_one(&mut *conn)
         .await?;
     anyhow::ensure!(got == Some(1), "superadmin guard busy");
-    let result = async {
-        sqlx::query("START TRANSACTION").execute(&mut *conn).await?;
-        let exists: Option<u64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE id = ? FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if exists.is_none() {
-            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-            return Ok(None);
-        }
-        if role.is_some_and(|r| r != "superadmin")
-            && is_only_superadmin_on(&mut conn, user_id).await?
-        {
-            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-            return Ok(Some(false));
-        }
-        if let Some(name) = name {
-            sqlx::query("UPDATE users SET name = ? WHERE id = ?")
-                .bind(name)
-                .bind(user_id)
-                .execute(&mut *conn)
-                .await?;
-            insert_audit(
-                &mut conn,
-                actor,
-                "user_name_changed",
-                user_id,
-                "display name changed",
-            )
-            .await?;
-        }
-        if let Some(role) = role {
-            sqlx::query("DELETE FROM role_user WHERE user_id = ?")
-                .bind(user_id)
-                .execute(&mut *conn)
-                .await?;
-            let inserted = sqlx::query(
-                "INSERT INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = ?",
-            )
+    let result = update_user_locked(&mut conn, user_id, name, role, actor).await;
+    release_superadmin_guard(&mut conn).await;
+    result
+}
+
+/// Body of `update_user_safely`, run while holding the advisory lock.
+///
+/// Transaction control MUST go through sqlx's `begin()` (text-protocol `BEGIN`):
+/// `sqlx::query` always uses the prepared-statement protocol, and MySQL 8.x
+/// cannot prepare `START TRANSACTION` (error 1295) — only MariaDB can. A
+/// `Transaction` dropped on an error path rolls back automatically.
+async fn update_user_locked(
+    conn: &mut sqlx::MySqlConnection,
+    user_id: u64,
+    name: Option<&str>,
+    role: Option<&str>,
+    actor: &crate::auth::sessions::Session,
+) -> anyhow::Result<Option<bool>> {
+    use sqlx::Connection;
+    let mut tx = conn.begin().await?;
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ? FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    if role.is_some_and(|r| r != "superadmin") && is_only_superadmin_on(&mut tx, user_id).await? {
+        tx.rollback().await?;
+        return Ok(Some(false));
+    }
+    if let Some(name) = name {
+        sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+            .bind(name)
             .bind(user_id)
-            .bind(role)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
-            anyhow::ensure!(inserted.rows_affected() == 1, "role not found");
-            insert_audit(
-                &mut conn,
-                actor,
-                "user_role_changed",
-                user_id,
-                &format!("role -> {role}"),
-            )
+        insert_audit(
+            &mut tx,
+            actor,
+            "user_name_changed",
+            user_id,
+            "display name changed",
+        )
+        .await?;
+    }
+    if let Some(role) = role {
+        sqlx::query("DELETE FROM role_user WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
             .await?;
-        }
-        sqlx::query("COMMIT").execute(&mut *conn).await?;
-        Ok(Some(true))
+        let inserted = sqlx::query(
+            "INSERT INTO role_user (role_id, user_id) SELECT id, ? FROM roles WHERE name = ?",
+        )
+        .bind(user_id)
+        .bind(role)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(inserted.rows_affected() == 1, "role not found");
+        insert_audit(
+            &mut tx,
+            actor,
+            "user_role_changed",
+            user_id,
+            &format!("role -> {role}"),
+        )
+        .await?;
     }
-    .await;
-    if result.is_err() {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-    }
+    tx.commit().await?;
+    Ok(Some(true))
+}
+
+/// Release the advisory lock, logging (never propagating) a failure so the
+/// caller's result is preserved.
+async fn release_superadmin_guard(conn: &mut sqlx::MySqlConnection) {
     if let Err(e) = sqlx::query("SELECT RELEASE_LOCK('rrt_superadmin_guard')")
-        .execute(&mut *conn)
+        .execute(conn)
         .await
     {
         tracing::error!(event_type = "superadmin_guard_release_failed", error = %e, "failed to release superadmin advisory lock");
     }
-    result
 }
 
 /// `Some(true)` deleted, `Some(false)` is the last superadmin, `None` not found.
-async fn delete_user_safely(
+///
+/// `pub` for the DB integration tests; not part of the HTTP surface.
+pub async fn delete_user_safely(
     pool: &sqlx::MySqlPool,
     user_id: u64,
     actor: &crate::auth::sessions::Session,
@@ -400,40 +459,39 @@ async fn delete_user_safely(
         .fetch_one(&mut *conn)
         .await?;
     anyhow::ensure!(got == Some(1), "superadmin guard busy");
-    let result = async {
-        sqlx::query("START TRANSACTION").execute(&mut *conn).await?;
-        let exists: Option<u64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE id = ? FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if exists.is_none() {
-            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-            return Ok(None);
-        }
-        if is_only_superadmin_on(&mut conn, user_id).await? {
-            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
-            return Ok(Some(false));
-        }
-        insert_audit(&mut conn, actor, "user_deleted", user_id, "account deleted").await?;
-        let deleted = sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(user_id)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("COMMIT").execute(&mut *conn).await?;
-        Ok((deleted.rows_affected() > 0).then_some(true))
-    }
-    .await;
-    if result.is_err() {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-    }
-    if let Err(e) = sqlx::query("SELECT RELEASE_LOCK('rrt_superadmin_guard')")
-        .execute(&mut *conn)
-        .await
-    {
-        tracing::error!(event_type = "superadmin_guard_release_failed", error = %e, "failed to release superadmin advisory lock");
-    }
+    let result = delete_user_locked(&mut conn, user_id, actor).await;
+    release_superadmin_guard(&mut conn).await;
     result
+}
+
+/// Body of `delete_user_safely`, run while holding the advisory lock. Same
+/// transaction-protocol constraint as [`update_user_locked`].
+async fn delete_user_locked(
+    conn: &mut sqlx::MySqlConnection,
+    user_id: u64,
+    actor: &crate::auth::sessions::Session,
+) -> anyhow::Result<Option<bool>> {
+    use sqlx::Connection;
+    let mut tx = conn.begin().await?;
+    let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ? FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    if is_only_superadmin_on(&mut tx, user_id).await? {
+        tx.rollback().await?;
+        return Ok(Some(false));
+    }
+    insert_audit(&mut tx, actor, "user_deleted", user_id, "account deleted").await?;
+    let deleted = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((deleted.rows_affected() > 0).then_some(true))
 }
 
 async fn insert_audit(
