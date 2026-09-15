@@ -1,6 +1,24 @@
 # Implementation Plans
 
-## Active plans (2026-07-23 audit at `ef14aec`)
+## Active roadmap (2026-09-15 audit at `08126a1`)
+
+The [full-project audit](../docs/audit-2026-09-15.md) covers all 290 baseline
+files, agents/skills, doctrine, runtime data handling, code and deployment assets.
+The documented release gate passed, including 106 Rust tests against disposable
+MariaDB, but additional reproductions identified execution, recovery, alerting
+and operational UI defects. Armed execution needs corrective work before a new
+readiness sign-off; observe-mode monitoring also needs reliable alerts and
+truthful state presentation. Production records and deployment were not inspected.
+
+| Plan | Title | Priority | Effort | Status |
+| --- | --- | --- | --- | --- |
+| [014](014-full-project-review-roadmap.md) | Remediate the full-project audit | P1–P3 | See 17 work items | TODO — audit complete; fixes pending |
+
+Plan 014 gives the dependency order, affected interfaces and acceptance checks.
+The audit produced documentation only; none of its remediation items is marked
+implemented. The earlier verdicts below remain historical snapshots.
+
+## Completed plans (2026-07-23 audit at `ef14aec`)
 
 Full audit of doctrine, docs, skills, instructions, and codebase on 2026-07-23.
 **Verdict: production-ready for the shipped observe-mode posture (GO).** The
