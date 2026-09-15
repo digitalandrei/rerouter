@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -iE \"\\\\.ts$\")"
+      "Bash(grep -iE \"\\\\.ts$\")",
+      "Bash(git clean *)",
+      "Bash(find . -path ./frontend/node_modules -prune -o '\\(' -name *.rs.bk -o -name *.orig -o -name *.rej -o -name incremental -type d '\\)' -print)",
+      "Bash(find . -path ./frontend/node_modules -prune -o '\\(' -name .DS_Store -o -name *.swp -o -name *.swo -o -name *~ -o -name *.log -o -name __pycache__ -type d -o -name .pytest_cache -type d -o -name coverage -type d -o -name *.tmp -o -name graphify-out -type d '\\)' -print)"
     ]
   }
 }
