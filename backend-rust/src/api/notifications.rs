@@ -211,16 +211,26 @@ pub async fn test_recipient(
         Ok(m) => m,
         Err(_) => return err(StatusCode::BAD_GATEWAY, "SMTP is not configured"),
     };
-    match mailer
-        .send(
-            &email,
-            "[Rerouter] Test alert",
-            "This is a test notification from Rerouter. Email delivery is working.".to_string(),
-        )
-        .await
-    {
+    email_test_response(
+        mailer
+            .send(
+                &email,
+                "[Rerouter] Test alert",
+                "This is a test notification from Rerouter. Email delivery is working.".to_string(),
+            )
+            .await,
+    )
+}
+
+fn email_test_response(result: anyhow::Result<()>) -> JsonResp {
+    match result {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
-        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("send failed: {e}")),
+        Err(e) => {
+            // Display alone only returns the outer "smtp send" context.
+            let detail = format!("{e:#}");
+            tracing::warn!(event_type = "test_email_failed", error = %detail, "test email delivery failed");
+            err(StatusCode::BAD_GATEWAY, &format!("send failed: {detail}"))
+        }
     }
 }
 
@@ -500,4 +510,31 @@ async fn replace_subscriptions(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_test_reports_the_smtp_failure_cause() {
+        for cause in [
+            "Connection refused (os error 111)",
+            "invalid peer certificate: UnknownIssuer",
+            "535 5.7.8 Authentication credentials invalid",
+            "454 4.7.0 TLS temporarily unavailable",
+        ] {
+            let failure = anyhow::anyhow!(cause).context("smtp send");
+            let (status, Json(body)) = email_test_response(Err(failure));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["error"], format!("send failed: smtp send: {cause}"));
+        }
+    }
+
+    #[test]
+    fn email_test_reports_success() {
+        let (status, Json(body)) = email_test_response(Ok(()));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "ok": true }));
+    }
 }

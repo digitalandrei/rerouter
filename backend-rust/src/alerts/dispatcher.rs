@@ -303,7 +303,7 @@ async fn dispatch_alert(
                         alert.id,
                         r.id,
                         "failed",
-                        Some(&truncate(&e.to_string(), 1000)),
+                        Some(&truncate(&format!("{e:#}"), 1000)),
                     )
                     .await?;
                     if st.failed_count + 1 >= MAX_DELIVERY_ATTEMPTS {

@@ -109,10 +109,37 @@ Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 - SMTP settings are env vars consumed by the controller
   (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`) — see
   [../deploy/env/rerouter.example.env](../deploy/env/rerouter.example.env).
+- SMTP uses **required STARTTLS**, defaulting to port **587**. `SMTP_PORT` can
+  select another port offering STARTTLS; changing it does not enable implicit
+  TLS (typically port 465). The server must present a valid certificate for
+  `SMTP_HOST`, trusted by the mailer's bundled public CA roots.
+- Restart `rerouter-controller` after editing `/srv/rerouter/.env`; the running
+  process does not reload that file.
 - Email recipients and Teams webhooks (with per-event routing and a test-send)
   are managed from the **Notifications** section of `/settings`
   (`manage_alerts`), backed by `/api/notifications/*`. Webhook URLs are
   write-only (encrypted, never shown again).
+
+### Troubleshooting SMTP
+
+The recipient **Test** reports the SMTP error cause and logs failures with
+`event_type = "test_email_failed"`. Automatic email delivery failures preserve
+the cause in `alert_deliveries.error` (up to 1,000 characters). These details
+distinguish connection, certificate, authentication, and relay-policy failures.
+
+To check connectivity and STARTTLS from the controller host, replace the example
+hostname and port with `SMTP_HOST` and `SMTP_PORT`:
+
+```bash
+timeout 20 openssl s_client -starttls smtp \
+  -connect smtp.example.com:587 -servername smtp.example.com \
+  -verify_hostname smtp.example.com -verify_return_error -brief </dev/null
+```
+
+This does not authenticate or send mail. OpenSSL checks the host's CA store;
+the mailer uses bundled public CA roots, so an OpenSSL success alone does not
+prove that the mailer trusts a private CA. A successful TLS handshake also does
+not confirm the SMTP credentials or permission to send from `SMTP_FROM`.
 
 ## Tables
 
