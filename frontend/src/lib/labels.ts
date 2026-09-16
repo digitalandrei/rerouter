@@ -77,6 +77,23 @@ export function automationStatus(d: {
   return { tone: "bad", label: "auto suspended" };
 }
 
+/** Compact "3h ago" for a server timestamp. undefined = the API build has no
+ *  such field, so we say nothing rather than invent a time; null = never. */
+export function timeAgo(iso: string | null | undefined): string {
+  if (iso === undefined) return "";
+  if (iso === null) return "never";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return "never";
+  if (ms < 0) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 // Thin aliases so call sites read intently (all just humanizeToken today).
 export const eventTypeLabel = humanizeToken;
 export const providerTypeLabel = humanizeToken;

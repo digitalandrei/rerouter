@@ -8,7 +8,7 @@
  * preserved. RBAC: edit_rules permission gates toggle and delete (both
  * roles have it — current behaviour kept).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   SlidersHorizontal,
   Pencil,
@@ -22,11 +22,14 @@ import {
   Plus,
   X,
   Info,
+  AlertTriangle,
+  ShieldAlert,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   api,
   type Rule,
+  type RuleAction,
   type Device,
   type Template,
   type SystemSettings,
@@ -40,7 +43,7 @@ import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
-import { templateLabel, templateLabelFrom, automationStatus } from "@/lib/labels";
+import { templateLabel, templateLabelFrom, automationStatus, timeAgo } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -100,6 +103,37 @@ type PlannedAction = {
   label: string;
 };
 
+/**
+ * Inventory drift: when a router's route-map or outbound prefix-list moves
+ * under a saved action's parameters, the controller marks that action
+ * `drifted` and DISARMS the rule's automatic execution. The rule stays
+ * enabled — it keeps detecting and alerting — and re-arming is deliberately
+ * never automatic: it goes back through the normal arming gate. So everything
+ * below is status, never a control.
+ *
+ * `automatic_reroute_enabled` is the server's authority on whether the rule is
+ * armed right now; a disarm stamp left over from before an operator re-armed
+ * must not be rendered as "disarmed". Fields are absent on API builds that
+ * predate the check — absent reads as "ok" / "not disarmed".
+ */
+function autoDisarm(rule: Rule): { at: string; reason: string | null } | null {
+  if (rule.automatic_reroute_enabled) return null;
+  if (!rule.auto_disarmed_at) return null;
+  return { at: rule.auto_disarmed_at, reason: rule.auto_disarmed_reason ?? null };
+}
+
+/** Attached actions whose saved params no longer validate against discovered
+ *  inventory. Only an explicit "drifted" counts. */
+function driftedActions(rule: Rule): RuleAction[] {
+  return (rule.actions ?? []).filter((a) => a.inventory_state === "drifted");
+}
+
+/** What the disarm actually costs the operator — shown next to every disarm
+ *  badge, because the state alone doesn't say what still works. */
+const DISARM_CONSEQUENCE =
+  "Detection and alerting still run; automatic mitigation does not. " +
+  "Manual execution is still possible but will be refused until the parameters are fixed.";
+
 function RuleActionsDialog({
   rule,
   onClose,
@@ -125,6 +159,10 @@ function RuleActionsDialog({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Set when the operator starts fixing a drifted action: the add form is
+   *  primed with that action's template + router and this says what to re-pick. */
+  const [fixHint, setFixHint] = useState<string | null>(null);
+  const addFormRef = useRef<HTMLDivElement>(null);
   /** What a partially-failed add still owes, pinned to the form it came from.
    *  The API has no batch endpoint and no idempotency key, so re-submitting the
    *  whole routers x prefixes product would duplicate everything that already
@@ -244,6 +282,8 @@ function RuleActionsDialog({
   })();
 
   const actions = current.actions ?? [];
+  /** Server-reported disarm (null once the rule is armed again). */
+  const disarmed = autoDisarm(current);
   /** Next free rank. Order is a safety property — additive actions (advertise)
    *  must be able to run BEFORE destructive ones (withdraw / shutdown) — so new
    *  actions append instead of all collapsing onto position 0. */
@@ -268,8 +308,33 @@ function RuleActionsDialog({
     setValuesByDevice((prev) => ({ ...prev, [id]: next }));
   }
 
+  /** Fixing a drifted action = re-picking its parameters from freshly
+   *  discovered inventory. The API has no PATCH on rule_actions, so the fix is
+   *  "add the corrected action, then remove the drifted one": this primes the
+   *  add form with the same template and router and scrolls to it. The stale
+   *  values are deliberately NOT copied — they are exactly what stopped
+   *  validating, and inventory params are re-derived per router anyway. */
+  function startFix(a: RuleAction) {
+    setPendingRetry(null);
+    setTemplateId(String(a.reroute_template_id));
+    setDeviceIds([a.device_id]);
+    setValuesByDevice({});
+    setSelectedPrefixes([]);
+    setMssBundle(false);
+    setMssIfaceByDevice({});
+    setMssValue("1436");
+    setError(null);
+    setNotice(null);
+    setFixHint(
+      `Re-pick the parameters for “${templateLabelFrom(a.template_display_name, a.template_name)}” ` +
+        `on ${a.device_name} from discovered inventory, add it, then remove the drifted action above.`,
+    );
+    addFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   function resetAddForm() {
     setPendingRetry(null);
+    setFixHint(null);
     setTemplateId("");
     setDeviceIds([]);
     setValuesByDevice({});
@@ -498,6 +563,27 @@ function RuleActionsDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {/* Auto-execution disarmed by the controller (inventory drift). Status
+            only — re-arming uses the normal switch below, which still goes
+            through the arming gate (global enable + step-up re-auth). */}
+        {disarmed && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 dark:border-amber-700 dark:bg-amber-950/30">
+            <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400" />
+            <div className="space-y-1 text-xs text-amber-800 dark:text-amber-300">
+              <div className="font-medium">
+                Automatic execution disarmed by the controller — inventory drift,{" "}
+                {timeAgo(disarmed.at)}
+              </div>
+              {disarmed.reason && <div className="break-words">{disarmed.reason}</div>}
+              <div>{DISARM_CONSEQUENCE}</div>
+              <div>
+                Fix the drifted action's parameters below, then re-arm with the
+                switch — arming still requires the global enable and step-up re-auth.
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Auto vs manual */}
         <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2">
           <div className="text-sm">
@@ -560,101 +646,159 @@ function RuleActionsDialog({
                   re-add) because the API has no position-update endpoint.
                 </p>
               </div>
-              {actions.map((a, i) => (
-                <div
-                  key={a.id}
-                  className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
-                >
-                  <span
-                    className="w-8 shrink-0 text-xs tabular-nums text-muted-foreground"
-                    title={`execution rank ${a.position ?? 0}`}
+              {actions.map((a, i) => {
+                // Only an explicit "drifted" is a problem: the field is absent on
+                // API builds that predate the inventory check.
+                const drifted = a.inventory_state === "drifted";
+                return (
+                  <div
+                    key={a.id}
+                    className={
+                      "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-sm " +
+                      (drifted
+                        ? "border-amber-400 bg-amber-50 dark:border-amber-700 dark:bg-amber-950/30"
+                        : "border-border")
+                    }
                   >
-                    {i + 1}.
-                  </span>
-                  <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
-                  <span className="text-muted-foreground">on</span>
-                  <span className="font-medium">{a.device_name}</span>
-                  {(() => {
-                    const dev = devices.find((d) => d.id === a.device_id);
-                    const auto = dev ? automationStatus(dev) : null;
-                    return auto ? (
+                    <span
+                      className="w-8 shrink-0 text-xs tabular-nums text-muted-foreground"
+                      title={`execution rank ${a.position ?? 0}`}
+                    >
+                      {i + 1}.
+                    </span>
+                    <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
+                    <span className="text-muted-foreground">on</span>
+                    <span className="font-medium">{a.device_name}</span>
+                    {(() => {
+                      const dev = devices.find((d) => d.id === a.device_id);
+                      const auto = dev ? automationStatus(dev) : null;
+                      return auto ? (
+                        <Badge
+                          variant="outline"
+                          className={
+                            auto.tone === "bad"
+                              ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
+                              : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                          }
+                          title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
+                        >
+                          {auto.label}
+                        </Badge>
+                      ) : null;
+                    })()}
+                    {drifted && (
                       <Badge
                         variant="outline"
-                        className={
-                          auto.tone === "bad"
-                            ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
-                            : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                        }
-                        title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
+                        className="gap-1 text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                        title="This action's saved parameters no longer match the router's discovered inventory"
                       >
-                        {auto.label}
+                        <AlertTriangle className="size-3" />
+                        inventory drift
                       </Badge>
-                    ) : null;
-                  })()}
-                  {a.auto_target === "flow_dst_host" ? (
-                    <Badge
-                      variant="outline"
-                      className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                      title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
-                    >
-                      target: attacked dst IP (auto /32·/128)
-                    </Badge>
-                  ) : (
-                    <span className="text-xs text-muted-foreground">
-                      {Object.entries(a.params ?? {})
-                        .map(([k, v]) => `${k}=${String(v)}`)
-                        .join(", ")}
-                    </span>
-                  )}
-                  {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
-                  {a.auto_target === "flow_dst_host" &&
-                    Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
+                    )}
+                    {a.auto_target === "flow_dst_host" ? (
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                        title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
+                      >
+                        target: attacked dst IP (auto /32·/128)
+                      </Badge>
+                    ) : (
                       <span className="text-xs text-muted-foreground">
                         {Object.entries(a.params ?? {})
-                          .filter(([k]) => k !== "prefix")
                           .map(([k, v]) => `${k}=${String(v)}`)
                           .join(", ")}
                       </span>
                     )}
-                  <span className="flex-1" />
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    onClick={() => void move(i, -1)}
-                    disabled={busy || i === 0}
-                    title="Run earlier"
-                  >
-                    <ChevronUp className="size-4" />
-                    <span className="sr-only">Move up</span>
-                  </Button>
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    onClick={() => void move(i, 1)}
-                    disabled={busy || i === actions.length - 1}
-                    title="Run later"
-                  >
-                    <ChevronDown className="size-4" />
-                    <span className="sr-only">Move down</span>
-                  </Button>
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    className="text-destructive hover:text-destructive"
-                    onClick={() => void remove(a.id)}
-                    disabled={busy}
-                    title="Remove action"
-                  >
-                    <X className="size-4" />
-                  </Button>
-                </div>
-              ))}
+                    {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
+                    {a.auto_target === "flow_dst_host" &&
+                      Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
+                        <span className="text-xs text-muted-foreground">
+                          {Object.entries(a.params ?? {})
+                            .filter(([k]) => k !== "prefix")
+                            .map(([k, v]) => `${k}=${String(v)}`)
+                            .join(", ")}
+                        </span>
+                      )}
+                    <span className="flex-1" />
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      onClick={() => void move(i, -1)}
+                      disabled={busy || i === 0}
+                      title="Run earlier"
+                    >
+                      <ChevronUp className="size-4" />
+                      <span className="sr-only">Move up</span>
+                    </Button>
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      onClick={() => void move(i, 1)}
+                      disabled={busy || i === actions.length - 1}
+                      title="Run later"
+                    >
+                      <ChevronDown className="size-4" />
+                      <span className="sr-only">Move down</span>
+                    </Button>
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => void remove(a.id)}
+                      disabled={busy}
+                      title="Remove action"
+                    >
+                      <X className="size-4" />
+                    </Button>
+                    {drifted && (
+                      // The server's reason is the actionable part (it names the
+                      // neighbour / prefix-list that moved), so it is rendered in
+                      // full and verbatim on its own line.
+                      <div className="basis-full space-y-1 border-t border-amber-300 pt-1.5 dark:border-amber-800">
+                        <p className="break-words text-xs text-amber-800 dark:text-amber-300">
+                          {a.inventory_drift_reason ??
+                            "Saved parameters no longer match this router's discovered inventory."}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {/* Empty on an API build without the field: say nothing
+                              rather than claim a check that never ran. */}
+                          {timeAgo(a.inventory_checked_at) && (
+                            <span className="text-[11px] text-muted-foreground">
+                              last checked {timeAgo(a.inventory_checked_at)}
+                            </span>
+                          )}
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[11px]"
+                            onClick={() => startFix(a)}
+                            disabled={busy}
+                            title="Prime the add form with this template and router so you can re-pick the parameters from discovered inventory"
+                          >
+                            Re-pick parameters
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </>
           )}
         </div>
 
         {/* Add actions (bulk: routers x prefixes) */}
-        <div className="space-y-3 rounded-md border border-dashed border-border p-3">
+        <div ref={addFormRef} className="space-y-3 rounded-md border border-dashed border-border p-3">
+          {/* Where a drifted action gets fixed: same template + router, params
+              re-picked from freshly discovered inventory. */}
+          {fixHint && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 dark:border-amber-700 dark:bg-amber-950/30">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400" />
+              <p className="text-xs text-amber-800 dark:text-amber-300">{fixHint}</p>
+            </div>
+          )}
           <label className="block space-y-1 text-sm font-medium">
             Template
             <select
@@ -662,6 +806,7 @@ function RuleActionsDialog({
               value={templateId}
               onChange={(e) => {
                 setTemplateId(e.target.value);
+                setFixHint(null);
                 setValuesByDevice({});
                 setSelectedPrefixes([]);
                 setMssBundle(false);
@@ -1154,172 +1299,232 @@ export default function Rules() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {sorted.map((rule) => (
-                  <TableRow key={rule.id} className="hover:bg-muted/50">
-                    {/* Name + icon */}
-                    <TableCell className="pl-6">
-                      <div className="flex items-center gap-2">
-                        <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
-                        <span className="font-medium">{rule.name}</span>
-                      </div>
-                    </TableCell>
+                {sorted.map((rule) => {
+                  // "The system turned automation off" vs "a human never armed
+                  // it": only a server disarm stamp on a currently-unarmed rule
+                  // is the former. An operator-disabled rule is the Enabled
+                  // switch, a separate column.
+                  const disarmed = autoDisarm(rule);
+                  const drifted = driftedActions(rule);
+                  return (
+                    <TableRow key={rule.id} className="hover:bg-muted/50">
+                      {/* Name + icon */}
+                      <TableCell className="pl-6">
+                        <div className="flex items-center gap-2">
+                          <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
+                          <span className="font-medium">{rule.name}</span>
+                        </div>
+                      </TableCell>
 
-                    {/* Target — interface name (+ device) */}
-                    <TableCell className="text-xs">
-                      <div className="flex flex-col">
-                        <span className="font-mono">
-                          {rule.interface_name ||
-                            (rule.interface_id ? `interface #${rule.interface_id}` : "interface")}
-                        </span>
-                        {rule.device_name && (
-                          <span className="text-[11px] text-muted-foreground">
-                            {rule.device_name}
+                      {/* Target — interface name (+ device) */}
+                      <TableCell className="text-xs">
+                        <div className="flex flex-col">
+                          <span className="font-mono">
+                            {rule.interface_name ||
+                              (rule.interface_id ? `interface #${rule.interface_id}` : "interface")}
                           </span>
-                        )}
-                      </div>
-                    </TableCell>
-
-                    {/* Condition + live above/below status */}
-                    <TableCell>
-                      <div className="flex flex-col gap-1">
-                        <code className="text-xs">{conditionLabel(rule)}</code>
-                        <RuleStatus rule={rule} />
-                      </div>
-                    </TableCell>
-
-                    {/* Persistence (per family) + live progression toward firing */}
-                    <TableCell className="text-xs text-muted-foreground">
-                      <div className="flex flex-col gap-1">
-                        <span>{persistenceLabel(rule)}</span>
-                        <RuleProgress rule={rule} />
-                      </div>
-                    </TableCell>
-
-                    {/* Severity badge */}
-                    <TableCell>
-                      <SeverityBadge severity={rule.severity} />
-                    </TableCell>
-
-                    {/* Enabled — green/check on, red/X off (disabled when read-only) */}
-                    <TableCell onClick={(e) => e.stopPropagation()}>
-                      <Switch
-                        checked={rule.enabled}
-                        onCheckedChange={() => void toggleRule(rule)}
-                        disabled={!canEdit}
-                        aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
-                        title={
-                          canEdit
-                            ? rule.enabled
-                              ? "Enabled — click to disable"
-                              : "Disabled — click to enable"
-                            : rule.enabled
-                              ? "Enabled"
-                              : "Disabled"
-                        }
-                      />
-                    </TableCell>
-
-                    {/* Mitigation — attached reroute actions + auto/manual */}
-                    <TableCell onClick={(e) => e.stopPropagation()}>
-                      <div className="flex items-center gap-1.5">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-7 gap-1.5"
-                          onClick={() => setManageRule(rule)}
-                          disabled={!canEdit}
-                          title={canEdit ? "Manage mitigation actions" : "Requires edit_rules"}
-                        >
-                          <Workflow className="size-3.5 text-muted-foreground" />
-                          {rule.action_count
-                            ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}`
-                            : "none"}
-                        </Button>
-                        {rule.action_count ? (
-                          <>
-                            <Badge
-                              variant={rule.automatic_reroute_enabled ? "destructive" : "outline"}
-                              className="text-[10px]"
-                              title={
-                                rule.automatic_reroute_enabled
-                                  ? "Runs automatically in enforce mode"
-                                  : "Renders a plan only; run manually"
-                              }
-                            >
-                              {rule.automatic_reroute_enabled ? "auto" : "manual"}
-                            </Badge>
-                            {rule.manual_apply_enabled && (
-                              <Badge
-                                variant="outline"
-                                className="text-[10px] text-sky-700 dark:text-sky-400"
-                                title="Operators can manually apply this rule's actions from a firing alert"
-                              >
-                                apply
-                              </Badge>
-                            )}
-                          </>
-                        ) : null}
-                      </div>
-                    </TableCell>
-
-                    {/* Actions */}
-                    <TableCell
-                      className="pr-6 text-right"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="flex items-center justify-end gap-1">
-                        {canApply &&
-                          rule.current_state === "firing" &&
-                          rule.manual_apply_enabled &&
-                          (rule.action_count ?? 0) > 0 && (
-                            <Button
-                              size="sm"
-                              variant="destructive"
-                              className="h-7"
-                              title="Apply this rule's configured actions (exact preview first; observe mode executes nothing)"
-                              onClick={() => setApplyRule(rule)}
-                            >
-                              Mitigate
-                            </Button>
+                          {rule.device_name && (
+                            <span className="text-[11px] text-muted-foreground">
+                              {rule.device_name}
+                            </span>
                           )}
-                        {canEdit && rule.current_state === "firing" && (
+                        </div>
+                      </TableCell>
+
+                      {/* Condition + live above/below status */}
+                      <TableCell>
+                        <div className="flex flex-col gap-1">
+                          <code className="text-xs">{conditionLabel(rule)}</code>
+                          <RuleStatus rule={rule} />
+                        </div>
+                      </TableCell>
+
+                      {/* Persistence (per family) + live progression toward firing */}
+                      <TableCell className="text-xs text-muted-foreground">
+                        <div className="flex flex-col gap-1">
+                          <span>{persistenceLabel(rule)}</span>
+                          <RuleProgress rule={rule} />
+                        </div>
+                      </TableCell>
+
+                      {/* Severity badge */}
+                      <TableCell>
+                        <SeverityBadge severity={rule.severity} />
+                      </TableCell>
+
+                      {/* Enabled — green/check on, red/X off (disabled when read-only) */}
+                      <TableCell onClick={(e) => e.stopPropagation()}>
+                        <Switch
+                          checked={rule.enabled}
+                          onCheckedChange={() => void toggleRule(rule)}
+                          disabled={!canEdit}
+                          aria-label={rule.enabled ? "Disable rule" : "Enable rule"}
+                          title={
+                            canEdit
+                              ? rule.enabled
+                                ? "Enabled — click to disable"
+                                : "Disabled — click to enable"
+                              : rule.enabled
+                                ? "Enabled"
+                                : "Disabled"
+                          }
+                        />
+                      </TableCell>
+
+                      {/* Mitigation — attached reroute actions + auto/manual/disarmed */}
+                      <TableCell onClick={(e) => e.stopPropagation()}>
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-7"
-                            title="Clear this firing rule (resets detection state; executes nothing)"
-                            onClick={() => void clearRule(rule)}
+                            className="h-7 gap-1.5"
+                            onClick={() => setManageRule(rule)}
+                            disabled={!canEdit}
+                            title={canEdit ? "Manage mitigation actions" : "Requires edit_rules"}
                           >
-                            Clear
+                            <Workflow className="size-3.5 text-muted-foreground" />
+                            {rule.action_count
+                              ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}`
+                              : "none"}
                           </Button>
+                          {rule.action_count ? (
+                            <>
+                              {disarmed ? (
+                                // Amber, not the neutral "manual" outline: the
+                                // controller switched this off, an operator did not.
+                                <Badge
+                                  variant="outline"
+                                  className="gap-1 text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                                  title={
+                                    `Disarmed by the controller ${timeAgo(disarmed.at)}` +
+                                    (disarmed.reason ? ` — ${disarmed.reason}` : "") +
+                                    `. ${DISARM_CONSEQUENCE}`
+                                  }
+                                >
+                                  <ShieldAlert className="size-3" />
+                                  auto-execution disarmed
+                                </Badge>
+                              ) : (
+                                <Badge
+                                  variant={rule.automatic_reroute_enabled ? "destructive" : "outline"}
+                                  className="text-[10px]"
+                                  title={
+                                    rule.automatic_reroute_enabled
+                                      ? "Runs automatically in enforce mode"
+                                      : "Renders a plan only; run manually"
+                                  }
+                                >
+                                  {rule.automatic_reroute_enabled ? "auto" : "manual"}
+                                </Badge>
+                              )}
+                              {!disarmed && drifted.length > 0 && (
+                                // Drift on a rule that was never armed: nothing was
+                                // switched off, but the params still won't validate.
+                                <Badge
+                                  variant="outline"
+                                  className="gap-1 text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                                  title={drifted
+                                    .map((a) => a.inventory_drift_reason ?? "parameters no longer match discovered inventory")
+                                    .join(" · ")}
+                                >
+                                  <AlertTriangle className="size-3" />
+                                  {drifted.length} drifted
+                                </Badge>
+                              )}
+                              {rule.manual_apply_enabled && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] text-sky-700 dark:text-sky-400"
+                                  title="Operators can manually apply this rule's actions from a firing alert"
+                                >
+                                  apply
+                                </Badge>
+                              )}
+                            </>
+                          ) : null}
+                        </div>
+                        {disarmed && (
+                          // State + consequence together: a badge alone doesn't
+                          // say what the operator still has.
+                          <div className="mt-1 max-w-[22rem] space-y-0.5 text-[11px] leading-snug">
+                            <p className="break-words text-amber-700 dark:text-amber-400">
+                              {disarmed.reason ?? "An attached action no longer matches discovered inventory."}{" "}
+                              <span className="text-muted-foreground">
+                                (disarmed {timeAgo(disarmed.at)})
+                              </span>
+                            </p>
+                            <p className="text-muted-foreground">{DISARM_CONSEQUENCE}</p>
+                            {drifted.length > 0 && (
+                              <p className="text-muted-foreground">
+                                {drifted.length === 1
+                                  ? "1 action needs"
+                                  : `${drifted.length} actions need`}{" "}
+                                new parameters — open the actions editor to re-pick them.
+                              </p>
+                            )}
+                          </div>
                         )}
-                        {canEdit && (
-                          <>
+                      </TableCell>
+
+                      {/* Actions */}
+                      <TableCell
+                        className="pr-6 text-right"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="flex items-center justify-end gap-1">
+                          {canApply &&
+                            rule.current_state === "firing" &&
+                            rule.manual_apply_enabled &&
+                            (rule.action_count ?? 0) > 0 && (
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                className="h-7"
+                                title="Apply this rule's configured actions (exact preview first; observe mode executes nothing)"
+                                onClick={() => setApplyRule(rule)}
+                              >
+                                Mitigate
+                              </Button>
+                            )}
+                          {canEdit && rule.current_state === "firing" && (
                             <Button
-                              size="icon-sm"
-                              variant="ghost"
-                              title="Edit rule"
-                              onClick={() => setEditRule(rule)}
+                              size="sm"
+                              variant="outline"
+                              className="h-7"
+                              title="Clear this firing rule (resets detection state; executes nothing)"
+                              onClick={() => void clearRule(rule)}
                             >
-                              <Pencil className="size-4" />
-                              <span className="sr-only">Edit</span>
+                              Clear
                             </Button>
-                            <Button
-                              size="icon-sm"
-                              variant="ghost"
-                              title="Delete rule"
-                              className="text-destructive hover:text-destructive"
-                              onClick={() => setDeleteTarget(rule)}
-                            >
-                              <Trash2 className="size-4" />
-                              <span className="sr-only">Delete</span>
-                            </Button>
-                          </>
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                          )}
+                          {canEdit && (
+                            <>
+                              <Button
+                                size="icon-sm"
+                                variant="ghost"
+                                title="Edit rule"
+                                onClick={() => setEditRule(rule)}
+                              >
+                                <Pencil className="size-4" />
+                                <span className="sr-only">Edit</span>
+                              </Button>
+                              <Button
+                                size="icon-sm"
+                                variant="ghost"
+                                title="Delete rule"
+                                className="text-destructive hover:text-destructive"
+                                onClick={() => setDeleteTarget(rule)}
+                              >
+                                <Trash2 className="size-4" />
+                                <span className="sr-only">Delete</span>
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
