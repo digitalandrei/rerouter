@@ -28,9 +28,15 @@
 -- (no new connection, no reconcile, no drift audit).
 --
 -- 20260623000100 is already applied, so its seeds are UPDATEd here rather than
--- edited in place. Templates are matched by their unique `name`. Safety posture
--- is unchanged: both templates stay `automatic_allowed = 0`, manual-only, with
--- the same parameters, verification and rollback pairing.
+-- edited in place. Templates are matched by their unique `name`.
+--
+-- Safety posture is unchanged because this migration does not touch
+-- `automatic_allowed` at all. Note what that value actually is: 20260710000200
+-- (execution policy) deliberately set BOTH advertise templates to
+-- `automatic_allowed = 1`, so they ARE automatic-capable. That remains gated by
+-- enforce mode + the global enable + the per-rule enable, and it is a decision
+-- taken in that migration, not here. Parameters, verification and the rollback
+-- pairing are likewise preserved.
 
 -- bgp_advertise_add: place the permit at a controller-chosen sequence.
 UPDATE reroute_templates
