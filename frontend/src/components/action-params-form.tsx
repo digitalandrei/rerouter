@@ -9,6 +9,9 @@
  *   - source "rtbh_tag"         -> RTBH community dropdown (value = its route tag)
  *   - source "peer_out_prefix_list" -> READ-ONLY display of the prefix-list
  *                                  discovered on the chosen neighbor (never typed)
+ *   - deferred: true            -> READ-ONLY note: resolved by the controller at
+ *                                  apply time (the prefix-list sequence number is
+ *                                  chosen from a read taken in the apply session)
  *   - subprefix_of: "<param>"   -> CIDR textbox scoped to the parent prefix
  *   - otherwise                 -> a plain typed textbox
  * The controlled `values` map is the resolved parameter set the caller submits.
@@ -185,6 +188,24 @@ export function ActionParamsForm({
             {spec.label ?? name} <span className="text-muted-foreground">({spec.type})</span>
           </>
         );
+
+        // Apply-time values are never operator input: the controller picks the
+        // prefix-list sequence from a fresh read inside the session that writes
+        // it, so the list cannot have moved under the decision. Shown, not typed.
+        if (spec.deferred) {
+          return (
+            <label key={name} className="block space-y-1 text-sm font-medium">
+              {label}
+              <div className={derivedClass}>chosen at apply time</div>
+              <p className="text-xs font-normal text-muted-foreground">
+                Picked from a fresh read of the prefix-list in the same SSH session that
+                writes it, so the entry lands before the list&rsquo;s terminating deny and
+                never overwrites an existing one. The preview shows{" "}
+                <code>&lt;auto-seq&gt;</code> in its place.
+              </p>
+            </label>
+          );
+        }
 
         if (spec.source === "bgp_local_as") {
           return (

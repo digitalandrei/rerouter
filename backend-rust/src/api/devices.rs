@@ -849,7 +849,8 @@ pub async fn ssh_test(
                 "ok": true,
                 "fingerprint": outcome.fingerprint,
                 "pinned_now": outcome.pinned_now,
-                "results": outcome.results,
+                // Raw device output going to the SPA: mask secret VALUES first.
+                "results": crate::ssh::redact_results(&outcome.results),
             })),
         ),
         Err(e) => (

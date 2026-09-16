@@ -104,6 +104,18 @@ action: admin-only, audited, and alerted. The shipped default is `observe`
   presence flags + the non-secret SSH public key). In-app-generated SSH keys are
   stored encrypted the same way.
 - The controller runs as a dedicated `rerouter` system user.
+- **Raw device output is redacted before it leaves `ssh::`.** A router's
+  `running-config` carries the router's OWN secrets — `neighbor <ip> password
+  <cleartext>`, `username … secret …`, `snmp-server community …`, OSPF
+  `md5` keys, `key-string` blocks — and those are not ours to display or log.
+  `ssh::redact_device_output` masks the VALUE while keeping the line shape
+  (`neighbor 1.2.3.4 password 7 <redacted>`) so the output stays diagnosable. It
+  is applied at every boundary where raw device text leaves the module: the
+  `--ssh-show` and `--ssh-test` CLI printers and the
+  `POST /api/devices/{id}/ssh-test` handler that returns command output to the
+  SPA. Redaction is deliberately conservative — an unrecognised token after a
+  secret keyword is masked rather than shown — and is pure string handling that
+  cannot panic on any input.
 - Better later: HashiCorp Vault, per-device credential rotation, never re-expose
   secrets in the UI after creation.
 

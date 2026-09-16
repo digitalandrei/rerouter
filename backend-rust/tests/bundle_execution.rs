@@ -100,6 +100,7 @@ fn plan() -> RenderedPlan {
         config_mode: true,
         commands: vec!["ip prefix-list PL permit 192.0.2.0/24".into()],
         verify: None,
+        sequence_pending: false,
     }
 }
 

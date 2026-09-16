@@ -306,7 +306,7 @@ async fn execute_with<S: SshExecutor>(
         .await;
     }
 
-    let final_state = match run_state_machine(
+    let outcome = match run_state_machine(
         pool,
         ssh,
         &req,
@@ -316,7 +316,7 @@ async fn execute_with<S: SshExecutor>(
     )
     .await
     {
-        Ok(state) => state,
+        Ok(result) => result,
         Err(e) => {
             // No SSH side effect occurs before run_state_machine's checked
             // planned->pending->running transitions complete.
@@ -365,8 +365,35 @@ async fn execute_with<S: SshExecutor>(
         }
     }
 
+    let MachineResult {
+        state: final_state,
+        note,
+        refused,
+    } = outcome;
+    // A refusal from the fresh in-session read pushed NOTHING: report it the way
+    // every other fail-closed refusal is reported, with the actionable reason.
+    if refused {
+        return ExecOutcome {
+            executed: false,
+            reroute_id: Some(reroute_id),
+            state: Some(final_state),
+            message: note.clone().unwrap_or_else(|| {
+                "reroute refused after reading the device's current state".into()
+            }),
+            blocked_reason: note,
+            would_run: None,
+            would_run_rollback: None,
+            device_id: req.device_id,
+            device_name,
+        };
+    }
     let message = match final_state.as_str() {
-        "succeeded" => "reroute executed and verified".to_string(),
+        // A no-op is a real success: the router was already in the requested
+        // state, so nothing was pushed and verification still had to confirm it.
+        "succeeded" => note
+            .clone()
+            .map(|n| format!("reroute verified — {n}"))
+            .unwrap_or_else(|| "reroute executed and verified".to_string()),
         "failed" => "reroute failed — verification did not confirm the change".to_string(),
         "uncertain" => {
             "reroute UNCERTAIN — device locked pending admin acknowledgement".to_string()
@@ -460,8 +487,19 @@ pub async fn record_cooldowns(
     Ok(())
 }
 
-/// Push the apply commands, verify the result, finalize the state. Returns the
-/// final state string. Persists before/after each phase.
+/// What one run of the state machine concluded.
+struct MachineResult {
+    /// The terminal reroute state.
+    state: String,
+    /// Operator-facing detail: the refusal reason, or the "already in the
+    /// requested state, nothing pushed" note.
+    note: Option<String>,
+    /// True when a fresh in-session read refused the write. Nothing was pushed.
+    refused: bool,
+}
+
+/// Push the apply commands, verify the result, finalize the state. Persists
+/// before/after each phase.
 async fn run_state_machine<S: SshExecutor>(
     pool: &MySqlPool,
     ssh: &S,
@@ -469,7 +507,7 @@ async fn run_state_machine<S: SshExecutor>(
     reroute_id: u64,
     plan: &RenderedPlan,
     require_verification: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<MachineResult> {
     // -> pending: committed to act, persisted BEFORE any side effect. Crash
     // recovery treats pending/running/verifying as in-flight (=> uncertain), so
     // a crash from here on locks the device rather than being assumed harmless.
@@ -500,7 +538,32 @@ async fn run_state_machine<S: SshExecutor>(
 
     // Apply over a single SSH session (config mode state must persist across the
     // command sequence, so this cannot be split into per-command sessions).
-    let apply = ssh.apply(req.device_id, &plan.commands).await;
+    //
+    // A plan whose prefix-list sequence is still deferred takes the resolving
+    // path: the SAME session first reads the target list, the sequence is chosen
+    // and PERSISTED, and only then is the config pushed. See
+    // `apply_with_sequence_resolution`.
+    let (apply, refusal, skip) = if plan.sequence_pending {
+        match apply_with_sequence_resolution(pool, ssh, req, reroute_id, plan).await {
+            Ok((outcome, decision)) => match decision {
+                crate::ssh::SessionPlan::Refuse(reason) => (Ok(outcome), Some(reason), None),
+                crate::ssh::SessionPlan::Skip(note) => (Ok(outcome), None, Some(note)),
+                crate::ssh::SessionPlan::Push(_) => (Ok(outcome), None, None),
+            },
+            Err(e) => (Err(e), None, None),
+        }
+    } else {
+        (ssh.apply(req.device_id, &plan.commands).await, None, None)
+    };
+    if let Some(note) = &skip {
+        tracing::info!(
+            event_type = "reroute_no_config_change_needed",
+            reroute_id,
+            device_id = req.device_id,
+            note = %note,
+            "the router was already in the requested state; no configuration was pushed"
+        );
+    }
     let applied_ok = match &apply {
         Ok(out) => {
             for (i, r) in out.results.iter().enumerate() {
@@ -555,6 +618,46 @@ async fn run_state_machine<S: SshExecutor>(
         }
     };
 
+    // Fail closed. The fresh in-session read PROVED the planned write must not
+    // happen (no free sequence in the gap, an unreadable list, a broader entry
+    // that would take other prefixes with it). Nothing was pushed, so this is a
+    // known, side-effect-free outcome: `failed` with an actionable reason, NOT
+    // `uncertain` — an operator-fixable configuration problem must not lock the
+    // device. Verification is skipped because there is nothing new to confirm.
+    if let Some(reason) = refusal {
+        // The planned steps never ran; do not leave them marked done.
+        if let Err(e) = sqlx::query(
+            "UPDATE reroute_steps SET state = 'failed' WHERE reroute_id = ? AND step_number > 0",
+        )
+        .bind(reroute_id)
+        .execute(pool)
+        .await
+        {
+            persistence_ok = false;
+            tracing::error!(event_type = "reroute_step_persist_failed", reroute_id, error = %e, "could not mark refused steps");
+        }
+        let state = if persistence_ok {
+            "failed"
+        } else {
+            "uncertain"
+        };
+        let state = finalize(
+            pool,
+            req,
+            reroute_id,
+            state,
+            true,
+            Verdict::None,
+            Some(reason.clone()),
+        )
+        .await;
+        return Ok(MachineResult {
+            state,
+            note: Some(reason),
+            refused: true,
+        });
+    }
+
     // -> verifying (read-only confirmation in a separate session)
     let verifying =
         sqlx::query("UPDATE reroutes SET state = 'verifying' WHERE id = ? AND state = 'running'")
@@ -577,7 +680,218 @@ async fn run_state_machine<S: SshExecutor>(
         final_state = "uncertain";
     }
 
-    Ok(finalize(pool, req, reroute_id, final_state, applied_ok, verdict).await)
+    let state = finalize(
+        pool,
+        req,
+        reroute_id,
+        final_state,
+        applied_ok,
+        verdict,
+        None,
+    )
+    .await;
+    Ok(MachineResult {
+        state,
+        note: skip,
+        refused: false,
+    })
+}
+
+/// Resolve a deferred prefix-list sequence and push, all inside ONE SSH session.
+///
+/// The session runs `show ip prefix-list <name>` first, [`prefix_list`] decides
+/// where the entry belongs from THAT text, the choice is PERSISTED, and only
+/// then does the config go out. The order matters twice over:
+///
+/// * **Freshness.** IOS REPLACES an entry when a write reuses its sequence
+///   number, so the decision may only rest on a read taken moments earlier.
+///   Cached inventory (up to `ROUTING_INVENTORY_MAX_AGE_HOURS` old) could name a
+///   sequence another operator has since used, and the write would silently
+///   overwrite a live filter entry.
+/// * **Persist before the side effect.** The chosen sequence reaches
+///   `reroutes.parameters_json` before the command reaches the router, so a
+///   crash in between leaves an `uncertain` reroute that still names the exact
+///   entry — and the rollback removes exactly that entry, not a content match.
+///
+/// This is ONE extra `show` in a session the executor already opened. It is not
+/// [`crate::ssh::discover_prefixes_and_store`] and it does not run the drift
+/// audit: no second connection, no inventory reconcile, no audit pass. The
+/// prohibition on inline discovery from a trigger path is unchanged.
+async fn apply_with_sequence_resolution<S: SshExecutor>(
+    pool: &MySqlPool,
+    ssh: &S,
+    req: &ActionRequest,
+    reroute_id: u64,
+    plan: &RenderedPlan,
+) -> anyhow::Result<(crate::ssh::SshOutcome, crate::ssh::SessionPlan)> {
+    use crate::reroute::prefix_list;
+
+    // Take the VALIDATED, normalized values — the same ones `render` substituted
+    // into the plan — so the decision and the command can never disagree about
+    // which prefix is being placed.
+    let subst = crate::reroute::templates::validate_and_expand(
+        &req.template.parameter_schema,
+        &req.params,
+    )?;
+    let list = subst
+        .get("prefix_list_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sequenced prefix-list action has no prefix_list_name"))?
+        .to_string();
+    let prefix = subst
+        .get("prefix")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sequenced prefix-list action has no prefix"))?
+        .to_string();
+    // Which direction the template moves the entry in decides which reachability
+    // question we ask of the list.
+    //
+    // The errors in this preamble are internal inconsistencies, not operator
+    // mistakes: `render` already validated the parameters, and only these two
+    // templates can produce a deferred sequence. They surface as an ambiguous
+    // apply (=> `uncertain` + device lock), which is the conservative reading of
+    // "the engine does not understand its own plan" — nothing is pushed either way.
+    let adding = match req.template.name.as_str() {
+        "bgp_advertise_add" => true,
+        "bgp_advertise_remove" => false,
+        other => anyhow::bail!("template '{other}' has no prefix-list sequence resolver"),
+    };
+    let read_command = format!("show ip prefix-list {list}");
+    let (list, prefix) = (list.as_str(), prefix.as_str());
+
+    debug_assert!(plan.sequence_pending, "resolver called on a concrete plan");
+
+    let resolve: crate::ssh::SessionResolver<'_> = Box::new(move |output: String| {
+        Box::pin(async move {
+            let decision = if adding {
+                prefix_list::plan_add(&output, list, prefix)
+            } else {
+                prefix_list::plan_remove(&output, list, prefix)
+            };
+            let (session_plan, concrete) = session_plan_for(decision, &req.template, &req.params)?;
+            // PERSIST BEFORE THE SIDE EFFECT. A failure here aborts the push: an
+            // action whose exact entry we could not record is one we could not
+            // roll back.
+            if let Some((sequence, plan)) = concrete {
+                persist_resolved_sequence(pool, req, reroute_id, sequence, plan.as_ref()).await?;
+            }
+            Ok(session_plan)
+        })
+    });
+    let resolved = ssh
+        .apply_resolved(req.device_id, &read_command, resolve)
+        .await?;
+    Ok((resolved.outcome, resolved.decision))
+}
+
+/// PURE: turn a prefix-list decision into what the open session should do, plus
+/// what has to be persisted before it does.
+///
+/// The second element is `Some((sequence, plan))` when a sequence must be written
+/// to `reroutes.parameters_json`; the inner `plan` is `Some` only when config is
+/// actually being pushed (a no-op records the entry a rollback may name, but has
+/// no new command list). `None` means nothing is persisted and nothing is pushed.
+#[allow(clippy::type_complexity)]
+fn session_plan_for(
+    decision: crate::reroute::prefix_list::SequencePlan,
+    template: &Template,
+    params: &Value,
+) -> anyhow::Result<(crate::ssh::SessionPlan, Option<(u32, Option<RenderedPlan>)>)> {
+    use crate::reroute::prefix_list::SequencePlan;
+    use crate::ssh::SessionPlan;
+
+    match decision {
+        SequencePlan::Refuse(reason) => Ok((SessionPlan::Refuse(reason), None)),
+        SequencePlan::AlreadySatisfied { sequence, note } => {
+            // Nothing to push. When the satisfying entry IS this prefix, record
+            // its sequence so a later rollback removes exactly that entry.
+            Ok((SessionPlan::Skip(note), sequence.map(|s| (s, None))))
+        }
+        SequencePlan::Use(sequence) => {
+            // Re-render through the template so the resolved sequence goes through
+            // the same typed `seq` validation as any other parameter.
+            let (concrete, _) =
+                crate::reroute::templates::render_with_sequence(template, params, sequence)?;
+            Ok((
+                SessionPlan::Push(concrete.commands.clone()),
+                Some((sequence, Some(concrete))),
+            ))
+        }
+    }
+}
+
+/// Write the apply-time sequence (and, when the plan was re-rendered with it,
+/// the concrete command list) into the durable record — BEFORE the commands are
+/// sent. A failure here aborts the push: an action whose exact entry we could
+/// not record is an action we could not roll back.
+async fn persist_resolved_sequence(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+    reroute_id: u64,
+    sequence: u32,
+    plan: Option<&RenderedPlan>,
+) -> anyhow::Result<()> {
+    let mut params = req.params.as_object().cloned().unwrap_or_default();
+    params.insert(
+        crate::reroute::templates::SEQUENCE_PARAM.into(),
+        Value::String(sequence.to_string()),
+    );
+    let params = Value::Object(params);
+
+    match plan {
+        Some(plan) => {
+            let steps = json!({ "commands": plan.commands, "verify": plan.verify });
+            let updated = sqlx::query(
+                "UPDATE reroutes SET parameters_json = ?, planned_steps_json = ? \
+                 WHERE id = ? AND state = 'running'",
+            )
+            .bind(sqlx::types::Json(&params))
+            .bind(sqlx::types::Json(&steps))
+            .bind(reroute_id)
+            .execute(pool)
+            .await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "reroute #{reroute_id} was no longer running when its prefix-list sequence \
+                 was resolved"
+            );
+            for (i, cmd) in plan.commands.iter().enumerate() {
+                sqlx::query(
+                    "UPDATE reroute_steps SET description = ? \
+                     WHERE reroute_id = ? AND step_number = ?",
+                )
+                .bind(cmd)
+                .bind(reroute_id)
+                .bind((i + 1) as u32)
+                .execute(pool)
+                .await?;
+            }
+        }
+        None => {
+            let updated = sqlx::query(
+                "UPDATE reroutes SET parameters_json = ? WHERE id = ? AND state = 'running'",
+            )
+            .bind(sqlx::types::Json(&params))
+            .bind(reroute_id)
+            .execute(pool)
+            .await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "reroute #{reroute_id} was no longer running when its prefix-list entry \
+                 was identified"
+            );
+        }
+    }
+    tracing::info!(
+        event_type = "reroute_prefix_list_sequence_resolved",
+        reroute_id,
+        device_id = req.device_id,
+        template = %req.template.name,
+        sequence,
+        pushed = plan.is_some(),
+        "chose the prefix-list sequence from a fresh in-session read"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -672,6 +986,9 @@ async fn finalize(
     state: &str,
     applied_ok: bool,
     verdict: Verdict,
+    // Overrides the generic failure text with an explicit, actionable reason —
+    // used when a fresh in-session read refused the write outright.
+    refusal: Option<String>,
 ) -> String {
     let success: Option<bool> = match state {
         "succeeded" => Some(true),
@@ -685,6 +1002,7 @@ async fn finalize(
         Verdict::None => "none",
     };
     let failure_reason: Option<String> = match state {
+        _ if refusal.is_some() => refusal,
         "failed" => Some(if applied_ok {
             "commands ran but verification did not confirm the intended state".into()
         } else {
@@ -1013,7 +1331,132 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{final_state_for, Verdict};
+    use super::{final_state_for, session_plan_for, Verdict};
+    use crate::reroute::prefix_list::SequencePlan;
+    use crate::reroute::templates::Template;
+    use crate::ssh::SessionPlan;
+    use serde_json::{json, Value};
+
+    /// `bgp_advertise_add` as migration 20260916000400 seeds it.
+    fn advertise_add() -> Template {
+        Template {
+            id: 1,
+            name: "bgp_advertise_add".into(),
+            display_name: None,
+            description: None,
+            provider_type: "device_cli".into(),
+            mode: "ios_ssh".into(),
+            automatic_allowed: false,
+            parameter_schema: json!({
+                "neighbor_ip": {"type": "ip", "required": true},
+                "prefix": {"type": "cidr", "required": true},
+                "prefix_list_name": {"type": "string", "required": true},
+                "sequence": {"type": "seq", "required": false, "deferred": true},
+            }),
+            plan: json!({
+                "transport": "ios_ssh", "config_mode": true,
+                "apply": ["ip prefix-list {prefix_list_name} seq {sequence} permit {prefix}"],
+                "exec_after": ["clear ip bgp {neighbor_ip} soft out"],
+            }),
+            verification: json!({
+                "command": "show ip bgp neighbors {neighbor_ip} advertised-routes",
+                "expect": "{prefix_net}",
+            }),
+            rollback_template_id: Some(2),
+            v6_sibling_template_id: None,
+            enabled: true,
+        }
+    }
+
+    fn params() -> Value {
+        json!({
+            "neighbor_ip": "23.45.23.197",
+            "prefix": "194.105.143.0/24",
+            "prefix_list_name": "pfx-to-viva",
+        })
+    }
+
+    #[test]
+    fn a_chosen_sequence_is_pushed_and_persisted_before_the_write() {
+        let (plan, persist) =
+            session_plan_for(SequencePlan::Use(7), &advertise_add(), &params()).expect("maps");
+        let SessionPlan::Push(commands) = plan else {
+            panic!("expected a push");
+        };
+        assert_eq!(
+            commands,
+            vec![
+                "configure terminal",
+                "ip prefix-list pfx-to-viva seq 7 permit 194.105.143.0/24",
+                "end",
+                "clear ip bgp 23.45.23.197 soft out",
+            ]
+        );
+        // The sequence AND the concrete plan are handed back for persistence,
+        // which the caller performs before any command leaves the process.
+        let (sequence, concrete) = persist.expect("must persist the chosen sequence");
+        assert_eq!(sequence, 7);
+        assert_eq!(concrete.expect("concrete plan").commands, commands);
+    }
+
+    #[test]
+    fn an_already_satisfied_router_pushes_nothing() {
+        let (plan, persist) = session_plan_for(
+            SequencePlan::AlreadySatisfied {
+                sequence: Some(5),
+                note: "already permitted by seq 5".into(),
+            },
+            &advertise_add(),
+            &params(),
+        )
+        .expect("maps");
+        assert!(matches!(plan, SessionPlan::Skip(_)), "{plan:?}");
+        // The entry that satisfies the intent is recorded (so a rollback removes
+        // exactly it) but there is no new command list.
+        let (sequence, concrete) = persist.expect("records the entry");
+        assert_eq!(sequence, 5);
+        assert!(concrete.is_none(), "a no-op must not claim a command list");
+    }
+
+    #[test]
+    fn an_already_satisfied_router_with_no_nameable_entry_persists_nothing() {
+        let (plan, persist) = session_plan_for(
+            SequencePlan::AlreadySatisfied {
+                sequence: None,
+                note: "a broader entry already covers it".into(),
+            },
+            &advertise_add(),
+            &params(),
+        )
+        .expect("maps");
+        assert!(matches!(plan, SessionPlan::Skip(_)));
+        // Naming someone else's broader entry would have a rollback delete it.
+        assert!(persist.is_none());
+    }
+
+    #[test]
+    fn a_refusal_pushes_nothing_persists_nothing_and_keeps_its_reason() {
+        let reason = "prefix-list 'pfx-to-viva' has no free sequence number between 5 and 6";
+        let (plan, persist) = session_plan_for(
+            SequencePlan::Refuse(reason.into()),
+            &advertise_add(),
+            &params(),
+        )
+        .expect("maps");
+        match plan {
+            SessionPlan::Refuse(r) => assert_eq!(r, reason),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(persist.is_none());
+    }
+
+    #[test]
+    fn a_sequence_the_template_rejects_aborts_instead_of_pushing() {
+        // 0 is outside the IOS range; the typed `seq` parameter refuses it, so no
+        // command is produced at all (the allowlist would be the last line of
+        // defence, but it is never reached).
+        assert!(session_plan_for(SequencePlan::Use(0), &advertise_add(), &params()).is_err());
+    }
 
     #[test]
     fn no_verify_step_is_uncertain_when_verification_required() {

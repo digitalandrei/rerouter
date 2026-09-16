@@ -326,10 +326,23 @@ catalog (the only way a reroute runs) is:
    when a real `ip prefix-list` stanza of that name exists on the device. It is
    never operator-typed: IOS silently creates an unknown list, which would make
    the action report success while advertising nothing.
+   The entry is written at an **explicit sequence number**, chosen by the
+   controller from a read of that list taken inside the SAME SSH session that
+   pushes the config, and placed strictly before the first entry that would
+   shadow the prefix. Without this, IOS auto-assigns `highest + 5` and the permit
+   lands after the list's terminating deny, where it is never reached — success
+   at the CLI, nothing advertised. When the gap holds no free sequence the action
+   **fails closed** and names both sequences: the controller never renumbers the
+   router's list, never guesses, and never reuses an occupied sequence (IOS
+   REPLACES an entry on reuse). See
+   [reroute-engine.md](reroute-engine.md#sequenced-prefix-list-insertion-bgp_advertise_add--_remove).
 8. **`bgp_advertise_remove`** — stop advertising the prefix toward that upstream
-   (remove the prefix-list entry + soft clear; rollback of #7). "Advertise on
-   other peer(s)" is the same `bgp_advertise_add` template fanned out as extra
-   `rule_actions` targeting the other neighbor(s).
+   (remove the prefix-list entry + soft clear; rollback of #7). It removes
+   **exactly** the entry the add wrote, by the sequence persisted with that
+   action's parameters — never a content match, and never a broader entry that
+   would withdraw more than was asked. "Advertise on other peer(s)" is the same
+   `bgp_advertise_add` template fanned out as extra `rule_actions` targeting the
+   other neighbor(s).
 9. **`iface_tcp_adjust_mss`** — set `ip tcp adjust-mss <mss>` (default 1436) on an
    interface when a rule activates (MSS clamp).
 10. **`iface_tcp_adjust_mss_remove`** — remove the MSS clamp (rollback of #9).

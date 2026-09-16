@@ -31,6 +31,17 @@ pub const ROUTING_INVENTORY_MAX_AGE_HOURS: i64 = 48;
 /// without a successful observation makes it ineligible for a new action.
 pub const SNMP_INVENTORY_MAX_AGE_HOURS: i64 = 24;
 
+/// What a `seq`-typed parameter renders as while it is still unresolved.
+///
+/// Some values genuinely cannot be known until the moment of the write: the
+/// prefix-list sequence number for `bgp_advertise_add` / `bgp_advertise_remove`
+/// is chosen from a read taken inside the apply session (see
+/// [`super::prefix_list`]). Rendering that placeholder — rather than inventing a
+/// number or refusing to render — keeps the observe-mode preview honest AND
+/// keeps the plan unsendable: `<auto-seq>` is not a valid token in any allowlist
+/// shape, so a plan that still contains it fails closed at the SSH boundary.
+pub const DEFERRED_SEQUENCE: &str = "<auto-seq>";
+
 /// A full reroute template loaded from the DB.
 #[derive(Debug, Clone)]
 pub struct Template {
@@ -136,6 +147,10 @@ pub async fn canonicalize_inventory_params(
     // Internal rollback state is always re-snapshotted by the executor. A caller
     // must never be able to choose which route-map a later rollback restores.
     canonical.remove("prior_route_map");
+    // Likewise the prefix-list sequence: it is chosen from a fresh in-session
+    // read at apply time. A caller-supplied sequence could REPLACE a live filter
+    // entry (IOS overwrites an occupied sequence), so it is never honoured here.
+    canonical.remove(SEQUENCE_PARAM);
 
     for (name, spec) in schema {
         let Some(source) = spec.get("source").and_then(Value::as_str) else {
@@ -365,7 +380,18 @@ pub struct RenderedPlan {
     /// Full command sequence in order (incl. `configure terminal` / `end`).
     pub commands: Vec<String>,
     pub verify: Option<VerifyStep>,
+    /// True when a command still carries [`DEFERRED_SEQUENCE`] — the plan is a
+    /// faithful preview but NOT sendable. The executor resolves it from a fresh
+    /// in-session read and re-renders before anything reaches the router; the SSH
+    /// allowlist refuses the placeholder if that ever fails to happen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sequence_pending: bool,
 }
+
+/// The parameter every sequenced prefix-list template resolves at apply time.
+/// Never operator-supplied: it is stripped from caller input and written back
+/// only by the executor, from the read it took moments before the write.
+pub const SEQUENCE_PARAM: &str = "sequence";
 
 /// A post-action verification read (a `show` command + substring expectations).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -412,6 +438,12 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
             Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
             Some(Value::Number(n)) => n.to_string(),
             _ => match default {
+                // An apply-time value the caller cannot supply renders as the
+                // unsendable placeholder instead of failing the render.
+                None if ty == "seq" => {
+                    subst.insert(name.clone(), Value::String(DEFERRED_SEQUENCE.into()));
+                    continue;
+                }
                 Some(d) => d,
                 None if required => bail!("missing required parameter '{name}'"),
                 None => continue,
@@ -438,6 +470,22 @@ pub fn validate_and_expand(schema: &Value, params: &Value) -> Result<Map<String,
                 let n: u32 = provided
                     .parse()
                     .map_err(|_| anyhow!("parameter '{name}' must be a non-negative integer"))?;
+                subst.insert(name.clone(), Value::String(n.to_string()));
+            }
+            // An IOS prefix-list sequence number. Bounded to the range the router
+            // accepts so a resolved value can never render a command the SSH
+            // allowlist would then have to reject.
+            "seq" => {
+                let n: u32 = provided.parse().map_err(|_| {
+                    anyhow!("parameter '{name}' must be a prefix-list sequence number")
+                })?;
+                if !(super::prefix_list::MIN_SEQ..=super::prefix_list::MAX_SEQ).contains(&n) {
+                    bail!(
+                        "parameter '{name}' must be between {} and {}",
+                        super::prefix_list::MIN_SEQ,
+                        super::prefix_list::MAX_SEQ
+                    );
+                }
                 subst.insert(name.clone(), Value::String(n.to_string()));
             }
             "cidr" => {
@@ -650,13 +698,38 @@ pub fn render(t: &Template, params: &Value) -> Result<RenderedPlan> {
         None => None,
     };
 
+    let sequence_pending = commands.iter().any(|c| c.contains(DEFERRED_SEQUENCE));
     Ok(RenderedPlan {
         template_id: t.id,
         template_name: t.name.clone(),
         config_mode,
         commands,
         verify,
+        sequence_pending,
     })
+}
+
+/// Re-render `t` with the apply-time sequence resolved to `sequence`. The value
+/// goes through the template's own `seq` validation and the resulting plan must
+/// carry no placeholder left — a plan that still does is refused rather than
+/// sent. Returns the concrete plan AND the parameters to persist with it, so the
+/// rollback can later name exactly the entry this action wrote.
+pub fn render_with_sequence(
+    t: &Template,
+    params: &Value,
+    sequence: u32,
+) -> Result<(RenderedPlan, Value)> {
+    let mut resolved = params.as_object().cloned().unwrap_or_default();
+    resolved.insert(SEQUENCE_PARAM.into(), Value::String(sequence.to_string()));
+    let resolved = Value::Object(resolved);
+    let plan = render(t, &resolved)?;
+    if plan.sequence_pending {
+        bail!(
+            "template '{}' left a prefix-list sequence unresolved",
+            t.name
+        );
+    }
+    Ok((plan, resolved))
 }
 
 /// Replace `{name}` tokens; error if any placeholder is unresolved (so a command
@@ -891,6 +964,125 @@ mod tests {
             v6_sibling_template_id: None,
             enabled: true,
         }
+    }
+
+    /// The two sequenced advertise templates, exactly as migration
+    /// 20260916000400 seeds them. Kept literal so a drift in the migration shows
+    /// up as a failing test rather than as a silently broken template.
+    fn advertise(add: bool) -> Template {
+        let schema = json!({
+            "neighbor_ip": {"type": "ip", "required": true},
+            "prefix": {"type": "cidr", "required": true},
+            "prefix_list_name": {"type": "string", "required": true},
+            "sequence": {"type": "seq", "required": false, "deferred": true},
+        });
+        let verb = if add { "ip" } else { "no ip" };
+        let mut t = tmpl(
+            schema,
+            json!({
+                "transport": "ios_ssh", "config_mode": true,
+                "apply": [format!("{verb} prefix-list {{prefix_list_name}} seq {{sequence}} permit {{prefix}}")],
+                "exec_after": ["clear ip bgp {neighbor_ip} soft out"],
+            }),
+            json!({
+                "command": "show ip bgp neighbors {neighbor_ip} advertised-routes",
+                if add { "expect" } else { "reject" }: "{prefix_net}",
+            }),
+        );
+        t.name = if add {
+            "bgp_advertise_add"
+        } else {
+            "bgp_advertise_remove"
+        }
+        .into();
+        t
+    }
+
+    fn base_params() -> Value {
+        json!({
+            "neighbor_ip": "23.45.23.197",
+            "prefix": "194.105.143.0/24",
+            "prefix_list_name": "pfx-to-viva",
+        })
+    }
+
+    #[test]
+    fn an_unresolved_sequence_renders_a_placeholder_and_flags_the_plan() {
+        let plan = render(&advertise(true), &base_params()).expect("renders");
+        assert!(
+            plan.sequence_pending,
+            "the plan must declare itself unsendable"
+        );
+        assert_eq!(
+            plan.commands,
+            vec![
+                "configure terminal",
+                "ip prefix-list pfx-to-viva seq <auto-seq> permit 194.105.143.0/24",
+                "end",
+                "clear ip bgp 23.45.23.197 soft out",
+            ]
+        );
+        // The preview is honest AND unsendable: the placeholder is not a valid
+        // token in any allowlist shape (asserted in ssh::tests).
+        assert!(plan.commands.iter().any(|c| c.contains(DEFERRED_SEQUENCE)));
+    }
+
+    #[test]
+    fn resolving_the_sequence_produces_the_exact_command_and_clears_the_flag() {
+        let (plan, params) =
+            render_with_sequence(&advertise(true), &base_params(), 7).expect("renders");
+        assert!(!plan.sequence_pending);
+        assert_eq!(
+            plan.commands[1],
+            "ip prefix-list pfx-to-viva seq 7 permit 194.105.143.0/24"
+        );
+        // The resolved sequence is persisted with the action so the rollback can
+        // name exactly this entry.
+        assert_eq!(params[SEQUENCE_PARAM], json!("7"));
+    }
+
+    #[test]
+    fn the_rollback_removes_exactly_the_entry_that_was_added() {
+        let (_, params) =
+            render_with_sequence(&advertise(true), &base_params(), 7).expect("renders");
+        // The rollback template runs against the ORIGINAL action's params, so it
+        // inherits the sequence and never content-matches.
+        let rollback = render(&advertise(false), &params).expect("renders");
+        assert!(!rollback.sequence_pending);
+        assert_eq!(
+            rollback.commands[1],
+            "no ip prefix-list pfx-to-viva seq 7 permit 194.105.143.0/24"
+        );
+    }
+
+    #[test]
+    fn a_sequence_outside_the_ios_range_is_refused_not_clamped() {
+        for bad in ["0", "4294967295", "-1", "seven", "7.5"] {
+            let mut params = base_params();
+            params[SEQUENCE_PARAM] = json!(bad);
+            assert!(
+                render(&advertise(true), &params).is_err(),
+                "accepted sequence {bad:?}"
+            );
+        }
+        assert!(render_with_sequence(&advertise(true), &base_params(), 0).is_err());
+        assert!(render_with_sequence(
+            &advertise(true),
+            &base_params(),
+            super::super::prefix_list::MAX_SEQ
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_plan_with_no_deferred_parameter_is_never_flagged_pending() {
+        let t = tmpl(
+            json!({"prefix": {"type": "cidr", "required": true}}),
+            json!({"config_mode": true, "apply": ["ip route {prefix_net} {prefix_mask} Null0"]}),
+            json!({"command": "show ip route {prefix_net}", "expect": "Null0"}),
+        );
+        let plan = render(&t, &json!({"prefix": "203.0.113.0/24"})).expect("renders");
+        assert!(!plan.sequence_pending);
     }
 
     #[test]
