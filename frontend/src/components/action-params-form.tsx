@@ -7,6 +7,8 @@
  *                                  auto-fills the local-AS param)
  *   - source "announced_prefix" -> prefix dropdown (SSH-discovered networks)
  *   - source "rtbh_tag"         -> RTBH community dropdown (value = its route tag)
+ *   - source "peer_out_prefix_list" -> READ-ONLY display of the prefix-list
+ *                                  discovered on the chosen neighbor (never typed)
  *   - subprefix_of: "<param>"   -> CIDR textbox scoped to the parent prefix
  *   - otherwise                 -> a plain typed textbox
  * The controlled `values` map is the resolved parameter set the caller submits.
@@ -24,6 +26,31 @@ import {
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+/** Derived (non-editable) value: looks like a field, reads as inventory. */
+const derivedClass =
+  "w-full rounded-md border border-input bg-muted px-3 py-2 text-sm text-foreground";
+
+/** Same, for the "nothing discovered" state — the action would be refused. */
+const derivedWarnClass =
+  "w-full rounded-md border border-amber-500 bg-amber-50 px-3 py-2 text-sm " +
+  "text-amber-800 dark:border-amber-400 dark:bg-amber-950/40 dark:text-amber-300";
+
+/** Compact "time ago" for SSH-discovered route context (staleness at a glance). */
+function discoveredAgo(iso: string | null | undefined): string {
+  if (iso === undefined) return ""; // API build without the field: say nothing.
+  if (iso === null) return "never discovered";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return "never discovered";
+  if (ms < 0) return "discovered just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `discovered ${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `discovered ${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `discovered ${h}h ago`;
+  return `discovered ${Math.floor(h / 24)}d ago`;
+}
 
 export function ActionParamsForm({
   schema,
@@ -50,23 +77,82 @@ export function ActionParamsForm({
   }, []);
 
   useEffect(() => {
-    if (!deviceId) {
-      setPeers([]);
-      setNetworks([]);
-      setInterfaces([]);
-      setRouteMaps([]);
-      return;
-    }
-    api.devices.bgpPeers(deviceId).then(setPeers).catch(() => setPeers([]));
-    api.devices.bgpNetworks(deviceId).then(setNetworks).catch(() => setNetworks([]));
-    api.devices.interfaces(deviceId).then(setInterfaces).catch(() => setInterfaces([]));
-    api.devices.routeMaps(deviceId).then(setRouteMaps).catch(() => setRouteMaps([]));
+    // Clear FIRST: `deviceId` mutates on a mounted form (ManualReroute's router
+    // dropdown), so the previous router's peers/prefixes must never stay on
+    // screen while the new ones load — that is how a value from device A gets
+    // picked for device B. The `cancelled` flag drops late responses from a
+    // superseded device for the same reason.
+    setPeers([]);
+    setNetworks([]);
+    setInterfaces([]);
+    setRouteMaps([]);
+    if (!deviceId) return;
+    let cancelled = false;
+    api.devices
+      .bgpPeers(deviceId)
+      .then((v) => {
+        if (!cancelled) setPeers(v);
+      })
+      .catch(() => {
+        if (!cancelled) setPeers([]);
+      });
+    api.devices
+      .bgpNetworks(deviceId)
+      .then((v) => {
+        if (!cancelled) setNetworks(v);
+      })
+      .catch(() => {
+        if (!cancelled) setNetworks([]);
+      });
+    api.devices
+      .interfaces(deviceId)
+      .then((v) => {
+        if (!cancelled) setInterfaces(v);
+      })
+      .catch(() => {
+        if (!cancelled) setInterfaces([]);
+      });
+    api.devices
+      .routeMaps(deviceId)
+      .then((v) => {
+        if (!cancelled) setRouteMaps(v);
+      })
+      .catch(() => {
+        if (!cancelled) setRouteMaps([]);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [deviceId]);
 
   const localAsns = Array.from(
     new Set(peers.map((p) => p.local_as).filter((a): a is number => a != null)),
   );
   const asnParam = Object.entries(schema).find(([, s]) => s.source === "bgp_local_as")?.[0];
+  const neighborParam = Object.entries(schema).find(([, s]) => s.source === "bgp_peer")?.[0];
+  const pfxListParam = Object.entries(schema).find(
+    ([, s]) => s.source === "peer_out_prefix_list",
+  )?.[0];
+
+  /** The peer currently chosen in the neighbor dropdown, resolved against the
+   *  inventory of the CURRENT device (null while it loads, or after a switch). */
+  const selectedPeer =
+    (neighborParam && values[neighborParam]
+      ? peers.find((p) => p.peer_remote_addr === values[neighborParam])
+      : undefined) ?? null;
+
+  /** The outbound prefix-list is derived from that peer — never typed. */
+  const derivedPfxList = selectedPeer?.out_prefix_list ?? "";
+
+  // Keep the submitted value equal to what the neighbor actually has. Without
+  // this, a value left over from a previously selected peer (or from the
+  // previous device) would be submitted and then refused fail-closed by the
+  // validator — which is exactly the "pfx-to-viva" the operator saw.
+  useEffect(() => {
+    if (!pfxListParam) return;
+    if ((values[pfxListParam] ?? "") === derivedPfxList) return;
+    onChange({ ...values, [pfxListParam]: derivedPfxList });
+  }, [pfxListParam, derivedPfxList, values, onChange]);
 
   function set(name: string, value: string) {
     onChange({ ...values, [name]: value });
@@ -76,12 +162,16 @@ export function ActionParamsForm({
     const next = { ...values, [name]: addr };
     const peer = peers.find((p) => p.peer_remote_addr === addr);
     for (const [pname, spec] of Object.entries(schema)) {
-      // Auto-fill params derived from the chosen neighbor.
-      if (spec.source === "bgp_local_as" && peer?.local_as != null) {
-        next[pname] = String(peer.local_as);
+      // Auto-fill is TOTAL: every peer-derived param is (re)assigned on every
+      // neighbor change, and cleared when the new peer has no value or the
+      // neighbor is deselected. A conditional assignment left the previous
+      // peer's value in place, which the device would then apply to the wrong
+      // prefix-list / AS.
+      if (spec.source === "bgp_local_as") {
+        next[pname] = peer?.local_as != null ? String(peer.local_as) : "";
       }
-      if (spec.source === "peer_out_prefix_list" && peer?.out_prefix_list) {
-        next[pname] = peer.out_prefix_list;
+      if (spec.source === "peer_out_prefix_list") {
+        next[pname] = peer?.out_prefix_list ?? "";
       }
     }
     onChange(next);
@@ -120,6 +210,10 @@ export function ActionParamsForm({
         if (spec.source === "bgp_peer") {
           const selectedAsn = asnParam ? values[asnParam] : "";
           const shown = selectedAsn ? peers.filter((p) => String(p.local_as) === selectedAsn) : peers;
+          // `inventory_fresh` is absent on API builds that predate it: only an
+          // explicit `false` means stale, so the picker never blocks on a
+          // backend that has not shipped the field yet.
+          const staleCount = shown.filter((p) => p.inventory_fresh === false).length;
           return (
             <label key={name} className="block space-y-1 text-sm font-medium">
               {label}
@@ -136,14 +230,27 @@ export function ActionParamsForm({
                       ? "Select neighbor…"
                       : "no neighbors discovered"}
                 </option>
-                {shown.map((p) => (
-                  <option key={p.id} value={p.peer_remote_addr}>
-                    {p.peer_remote_addr}
-                    {p.peer_remote_as ? ` · AS${p.peer_remote_as}` : ""}
-                    {p.label ? ` · ${p.label}` : ""}
-                  </option>
-                ))}
+                {shown.map((p) => {
+                  const stale = p.inventory_fresh === false;
+                  return (
+                    // Stale peers stay visible (so the operator sees WHY the
+                    // neighbor is missing) but are not selectable: offering them
+                    // only produces values the validator will reject.
+                    <option key={p.id} value={p.peer_remote_addr} disabled={stale}>
+                      {p.peer_remote_addr}
+                      {p.peer_remote_as ? ` · AS${p.peer_remote_as}` : ""}
+                      {p.label ? ` · ${p.label}` : ""}
+                      {stale ? " · stale inventory" : ""}
+                    </option>
+                  );
+                })}
               </select>
+              {staleCount > 0 && (
+                <span className="text-[11px] font-normal text-amber-700 dark:text-amber-400">
+                  {staleCount} neighbor{staleCount === 1 ? "" : "s"} not selectable — inventory is
+                  stale; re-poll this router
+                </span>
+              )}
             </label>
           );
         }
@@ -226,19 +333,50 @@ export function ActionParamsForm({
         }
 
         if (spec.source === "peer_out_prefix_list") {
-          // Auto-filled from the chosen neighbor (see selectNeighbor); editable.
+          // DERIVED, never typed. The backend treats this name as a closed
+          // allowlist of discovered prefix-lists, and on IOS
+          // `ip prefix-list <NAME> permit <cidr>` SILENTLY CREATES a new list
+          // when the name is wrong — a typo (or a browser autofill, or a value
+          // carried over from another peer) would build a phantom list that
+          // filters nothing. So: read-only display of what discovery found.
+          const discoveredAt = selectedPeer
+            ? discoveredAgo(selectedPeer.route_context_discovered_at)
+            : "";
           return (
             <label key={name} className="block space-y-1 text-sm font-medium">
               {label}
-              <input
-                className={inputClass}
-                value={values[name] ?? ""}
-                placeholder="from neighbor's outbound route-map"
-                onChange={(e) => set(name, e.target.value)}
-              />
-              <span className="text-[11px] font-normal text-muted-foreground">
-                auto-filled from the selected neighbor's outbound prefix-list
-              </span>
+              {!selectedPeer ? (
+                <div className={`${derivedClass} text-muted-foreground`}>
+                  select the upstream neighbor first
+                </div>
+              ) : derivedPfxList ? (
+                <>
+                  <input
+                    className={`${derivedClass} font-mono`}
+                    value={derivedPfxList}
+                    readOnly
+                    autoComplete="off"
+                    tabIndex={-1}
+                    aria-readonly="true"
+                  />
+                  <span className="text-[11px] font-normal text-muted-foreground">
+                    discovered on this neighbor
+                    {discoveredAt ? ` · ${discoveredAt}` : ""}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <div className={derivedWarnClass}>
+                    no outbound prefix-list discovered for this neighbor — run Discover prefixes on
+                    this router; this action would be refused
+                  </div>
+                  {discoveredAt && (
+                    <span className="text-[11px] font-normal text-amber-700 dark:text-amber-400">
+                      route context: {discoveredAt}
+                    </span>
+                  )}
+                </>
+              )}
             </label>
           );
         }
@@ -246,7 +384,6 @@ export function ActionParamsForm({
         if (spec.source === "route_map") {
           // Operator picks the NEW map from discovered ones; we surface the
           // neighbor's CURRENT map (chosen direction) as the prior a revert restores.
-          const neighborParam = Object.entries(schema).find(([, s]) => s.source === "bgp_peer")?.[0];
           const dirParam = Object.entries(schema).find(([, s]) => s.source === "bgp_direction")?.[0];
           const selNeighbor = neighborParam ? values[neighborParam] : "";
           const selDir = (dirParam ? values[dirParam] : "") || "out";

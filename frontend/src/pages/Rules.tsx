@@ -91,6 +91,15 @@ import {
  *   cartesian product sequentially. A mid-sequence failure stops, reports exactly
  *   how many landed, and re-reads the rule (audit finding FE-06).
  */
+type PlannedAction = {
+  reroute_template_id: number;
+  device_id: number;
+  params: Record<string, unknown>;
+  position: number;
+  auto_target?: string | null;
+  label: string;
+};
+
 function RuleActionsDialog({
   rule,
   onClose,
@@ -116,6 +125,14 @@ function RuleActionsDialog({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** What a partially-failed add still owes, pinned to the form it came from.
+   *  The API has no batch endpoint and no idempotency key, so re-submitting the
+   *  whole routers x prefixes product would duplicate everything that already
+   *  landed. The button therefore re-arms as "Retry remaining N" instead. */
+  const [pendingRetry, setPendingRetry] = useState<{
+    items: PlannedAction[];
+    signature: string;
+  } | null>(null);
 
   // BGP + MSS bundle state (only relevant for bgp_advertise_* templates)
   const [mssBundle, setMssBundle] = useState(false);
@@ -234,9 +251,17 @@ function RuleActionsDialog({
     actions.length === 0 ? 0 : Math.max(...actions.map((a) => a.position ?? 0)) + 1;
 
   function toggleDevice(id: number) {
-    setDeviceIds((prev) =>
-      prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id],
-    );
+    if (!deviceIds.includes(id)) {
+      setDeviceIds((prev) => [...prev, id]);
+      return;
+    }
+    // Unchecking a router DROPS its parameter set. Keeping it would let a
+    // re-check silently restore values discovered earlier — e.g. a prefix-list
+    // or neighbor that no longer exists on that router — and those values are
+    // validated per device, so they must be re-derived from live inventory.
+    setDeviceIds((prev) => prev.filter((d) => d !== id));
+    setValuesByDevice(({ [id]: _dropped, ...rest }) => rest);
+    setMssIfaceByDevice(({ [id]: _dropped, ...rest }) => rest);
   }
 
   function setDeviceValues(id: number, next: Record<string, string>) {
@@ -244,6 +269,7 @@ function RuleActionsDialog({
   }
 
   function resetAddForm() {
+    setPendingRetry(null);
     setTemplateId("");
     setDeviceIds([]);
     setValuesByDevice({});
@@ -265,15 +291,6 @@ function RuleActionsDialog({
       onChanged(fallback);
     }
   }
-
-  type PlannedAction = {
-    reroute_template_id: number;
-    device_id: number;
-    params: Record<string, unknown>;
-    position: number;
-    auto_target?: string | null;
-    label: string;
-  };
 
   /** Build the routers x prefixes product for the current form. */
   function buildPlan(): PlannedAction[] | string {
@@ -330,8 +347,12 @@ function RuleActionsDialog({
     return plan;
   }
 
-  async function add() {
-    const plan = buildPlan();
+  async function add(retry?: PlannedAction[]) {
+    // A retry re-sends ONLY what did not land, re-ranked from the current tail
+    // of the (re-read) action list so it cannot collide with what is saved.
+    const plan = retry
+      ? retry.map((item, i) => ({ ...item, position: nextPosition + i }))
+      : buildPlan();
     if (typeof plan === "string") {
       setError(plan);
       return;
@@ -352,16 +373,22 @@ function RuleActionsDialog({
       }
       setCurrent(latest);
       onChanged(latest);
+      setPendingRetry(null);
       resetAddForm();
       setNotice(
         `Added ${plan.length} action${plan.length === 1 ? "" : "s"} at position ${nextPosition}+.`,
       );
     } catch (e) {
       const failed = plan[written];
+      const remaining = plan.slice(written);
+      // Disarm the full plan: pressing Add again must NOT re-send the actions
+      // that already succeeded. Only the remainder stays queued.
+      setPendingRetry({ items: remaining, signature: formSignature });
       setError(
         `Added ${written} of ${plan.length} action(s), then failed on "${failed?.label ?? "next action"}": ` +
           `${e instanceof ApiError ? e.message : "request failed"}. The list above is the real saved state — ` +
-          `the actions already written were NOT rolled back.`,
+          `the actions already written were NOT rolled back. Use "Retry remaining ${remaining.length}" ` +
+          `to finish; editing the form starts a fresh plan.`,
       );
       await reconcile(latest);
     } finally {
@@ -437,6 +464,20 @@ function RuleActionsDialog({
       /* ignore */
     }
   }
+
+  /** Identity of the current add form. A retry is only offered while the form
+   *  is byte-for-byte the one that failed; any edit falls back to a normal add. */
+  const formSignature = JSON.stringify([
+    templateId,
+    deviceIds,
+    valuesByDevice,
+    selectedPrefixes,
+    mssBundle,
+    mssIfaceByDevice,
+    mssValue,
+  ]);
+  const retryItems =
+    pendingRetry && pendingRetry.signature === formSignature ? pendingRetry.items : null;
 
   const plannedCount = (() => {
     if (!template || deviceIds.length === 0) return 0;
@@ -838,9 +879,19 @@ function RuleActionsDialog({
           {notice && !error && (
             <p className="text-sm text-emerald-700 dark:text-emerald-400">{notice}</p>
           )}
-          <Button size="sm" onClick={() => void add()} disabled={busy || plannedCount === 0}>
+          <Button
+            size="sm"
+            onClick={() => void add(retryItems ?? undefined)}
+            disabled={busy || (retryItems === null && plannedCount === 0)}
+          >
             <Plus className="size-4" />
-            {busy ? "Adding…" : plannedCount > 1 ? `Add ${plannedCount} actions` : "Add action"}
+            {busy
+              ? "Adding…"
+              : retryItems
+                ? `Retry remaining ${retryItems.length}`
+                : plannedCount > 1
+                  ? `Add ${plannedCount} actions`
+                  : "Add action"}
           </Button>
         </div>
       </DialogContent>

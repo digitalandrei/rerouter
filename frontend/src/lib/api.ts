@@ -347,6 +347,12 @@ export interface BgpPeer {
   in_route_map: string | null;
   out_route_map: string | null;
   last_polled_at: string | null;
+  /** Peer liveness inside the SNMP freshness window. Absent on API builds that
+   *  predate the field — callers must treat `undefined` as fresh, never stale. */
+  inventory_fresh?: boolean;
+  /** When out_prefix_list / in_route_map / out_route_map were last read over
+   *  SSH; null = never discovered, undefined = API build without the field. */
+  route_context_discovered_at?: string | null;
 }
 
 export interface BgpNetwork {
