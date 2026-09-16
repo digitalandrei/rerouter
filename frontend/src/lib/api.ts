@@ -557,6 +557,105 @@ export interface ActionResultsResponse {
   preview_token?: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Ordered mitigation bundles (plans/015)
+//
+// One authorized activation of one rule's ordered action set. An enforce-mode
+// apply no longer blocks on ~2 SSH sessions per action: the API returns 202 with
+// a bundle id and the run continues server-side. Progress is polled from
+// GET /api/reroute-bundles/{id} until the state is terminal.
+// ---------------------------------------------------------------------------
+
+/** Bundle lifecycle. Terminal: succeeded | aborted | compensated |
+ *  compensation_blocked | failed. */
+export type BundleState =
+  | "planned"
+  | "running"
+  | "succeeded"
+  | "aborted"
+  | "compensating"
+  | "compensated"
+  | "compensation_blocked"
+  | "failed";
+
+const BUNDLE_TERMINAL_STATES: ReadonlySet<string> = new Set([
+  "succeeded",
+  "aborted",
+  "compensated",
+  "compensation_blocked",
+  "failed",
+]);
+
+export function isBundleTerminal(state: string): boolean {
+  return BUNDLE_TERMINAL_STATES.has(state);
+}
+
+export interface RerouteBundleAction {
+  reroute_id: number;
+  /** Execution order within the bundle (rule_actions.position). */
+  position: number | null;
+  device_id: number;
+  device_name: string | null;
+  state: string;
+  failure_reason: string | null;
+  template_display_name: string | null;
+}
+
+export interface RerouteBundle {
+  id: number;
+  rule_id: number | null;
+  trigger_type: string;
+  state: BundleState;
+  failure_policy: string;
+  total_actions: number;
+  completed_actions: number;
+  failure_reason: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  actions: RerouteBundleAction[];
+  /** Siblings that RAN and were NOT reversed. Non-empty means traffic is still
+   *  diverted and a manual rollback is required — never hide this. */
+  still_applied_reroute_ids: number[];
+}
+
+/** 202 from a confirmed enforce-mode rule apply: the bundle runs in background. */
+export interface BundleAcceptedResponse {
+  bundle_id: number;
+  async: true;
+  state: string;
+  total_actions: number;
+  failure_policy: string;
+  /** Actions that could not be resolved to run at all (already skipped). */
+  results: RerouteResult[];
+}
+
+/** A rule apply answers either synchronously (preview / observe mode) or with a
+ *  bundle handle (confirmed enforce-mode execution). */
+export type RuleApplyResponse = ActionResultsResponse | BundleAcceptedResponse;
+
+export function isBundleAccepted(
+  res: RuleApplyResponse,
+): res is BundleAcceptedResponse {
+  return (res as BundleAcceptedResponse).async === true;
+}
+
+/** 409 body when a bundle does not fit the remaining global rate budget.
+ *  All-or-nothing admission: NOTHING was executed. */
+export interface BundleNotAdmitted {
+  error: "bundle_not_admitted";
+  bundle_id: number;
+  detail: string;
+  total_actions: number;
+}
+
+export function asBundleNotAdmitted(body: unknown): BundleNotAdmitted | null {
+  if (typeof body !== "object" || body === null) return null;
+  const b = body as Partial<BundleNotAdmitted>;
+  return b.error === "bundle_not_admitted" && typeof b.bundle_id === "number"
+    ? (b as BundleNotAdmitted)
+    : null;
+}
+
 export interface Lock {
   id: number;
   scope: string;
@@ -886,16 +985,22 @@ export const api = {
       id: number,
       body?: { reason?: string; dry_run?: boolean; preview_token?: string },
     ) =>
-      request<ActionResultsResponse>(`/api/rules/${id}/apply`, {
+      request<RuleApplyResponse>(`/api/rules/${id}/apply`, {
         method: "POST",
         body: body ?? {},
       }),
+    /** Attach one action. `position` is ALWAYS sent explicitly: execution order
+     *  is a safety property (additive actions must be able to run before
+     *  destructive ones), and the server defaults it to 0, which would collapse
+     *  every action onto one rank. */
     addAction: (
       ruleId: number,
       body: {
         reroute_template_id: number;
         device_id: number;
         params: Record<string, unknown>;
+        /** Execution rank; ties break by insertion id (server: ORDER BY position, id). */
+        position: number;
         /** "flow_dst_host" to auto-target the attacked dst IP (flow rules only). */
         auto_target?: string | null;
       },
@@ -904,6 +1009,23 @@ export const api = {
       request<Rule>(`/api/rules/${ruleId}/actions/${actionId}`, {
         method: "DELETE",
       }),
+    /**
+     * Set the execution order of a rule's whole action set in one request.
+     * Order is a safety property — a scrubber bundle must advertise before it
+     * withdraws — so positions are renumbered server-side in one transaction
+     * rather than by deleting and re-adding rows, which can drop an action when
+     * a re-add is refused. `order` must list exactly this rule's action ids.
+     */
+    reorderActions: (ruleId: number, order: number[]) =>
+      request<{ actions: RuleAction[] }>(
+        `/api/rules/${ruleId}/actions/reorder`,
+        { method: "POST", body: { order } },
+      ),
+  },
+
+  /** Progress of an ordered mitigation bundle (async enforce-mode rule apply). */
+  bundles: {
+    get: (id: number) => request<RerouteBundle>(`/api/reroute-bundles/${id}`),
   },
 
   templates: {

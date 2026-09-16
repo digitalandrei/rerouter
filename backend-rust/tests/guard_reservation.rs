@@ -59,6 +59,7 @@ fn manual_request(device_id: u64) -> ActionRequest {
         actor_context: None,
         reason: Some("guard reservation test".into()),
         defer_cooldown: false,
+        bundle: None,
     }
 }
 

@@ -776,10 +776,12 @@ function RerouteDrawer({
   );
 }
 
-function HistoryTab() {
+function HistoryTab({ initialOpenId }: { initialOpenId?: number | null }) {
   const [reroutes, setReroutes] = useState<Reroute[]>([]);
   const [locks, setLocks] = useState<Lock[]>([]);
-  const [openId, setOpenId] = useState<number | null>(null);
+  // ?reroute=<id> deep-links straight to one action (the bundle-progress dialog
+  // links here when a sibling is left applied and needs a manual rollback).
+  const [openId, setOpenId] = useState<number | null>(initialOpenId ?? null);
 
   const load = useCallback(() => {
     api.reroutes.list().then(setReroutes).catch(() => setReroutes([]));
@@ -893,9 +895,18 @@ export default function Mitigations() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
 
-  // Read ?tab= from the URL (for redirect from old /alerts route).
+  // Read ?tab= from the URL (redirect from the old /alerts route, and the
+  // ?tab=history&reroute=<id> deep link used by bundle progress).
   const params = new URLSearchParams(window.location.search);
-  const initialTab = params.get("tab") === "alerts" ? "alerts" : "detections";
+  const tabParam = params.get("tab");
+  const rerouteParam = Number(params.get("reroute"));
+  const initialReroute = Number.isFinite(rerouteParam) && rerouteParam > 0 ? rerouteParam : null;
+  const initialTab =
+    tabParam === "alerts"
+      ? "alerts"
+      : tabParam === "history" || initialReroute !== null
+        ? "history"
+        : "detections";
   const [tab, setTab] = useState(initialTab);
 
   const loadRules = useCallback(() => {
@@ -982,7 +993,7 @@ export default function Mitigations() {
         </TabsContent>
 
         <TabsContent value="history" className="mt-4 space-y-4">
-          <HistoryTab />
+          <HistoryTab initialOpenId={initialReroute} />
         </TabsContent>
       </Tabs>
     </div>

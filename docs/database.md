@@ -31,8 +31,8 @@ flow        flow_exporters, flow_iface_buckets, flow_port_buckets,
             flow_talker_buckets, flow_as_buckets
 routing     rtbh_communities
 detection   rules, rule_states, rule_events, rule_actions
-reroute     reroute_templates, reroutes, reroute_steps, reroute_outputs,
-            reroute_verifications
+reroute     reroute_templates, reroute_bundles, reroutes, reroute_steps,
+            reroute_outputs, reroute_verifications
 safety      locks, cooldowns, action_previews
 alerts      alerts, alert_recipients, alert_subscriptions, alert_deliveries,
             webhook_endpoints, webhook_subscriptions
@@ -267,6 +267,12 @@ position (default 0), enabled (default 1), auto_target, created_at, updated_at
 KEY (rule_id)
 ```
 
+`position` is the **execution order** of the set, not a display preference: the
+runner applies enabled actions in `position, id` order, so additive actions must
+be ordered before destructive ones. `POST /api/rules/{id}/actions/reorder`
+renumbers the whole set in one transaction (see
+[reroute-engine.md](reroute-engine.md#ordered-mitigation-bundles)).
+
 ## reroute_templates
 
 `provider_type` enum is `cloudflare|bgp_rtbh|flowspec|scrubber|device_cli`, but
@@ -282,6 +288,47 @@ parameter_schema_json, plan_json, verification_json,
 rollback_template_id, enabled, created_at, updated_at
 ```
 
+## reroute_bundles
+
+One row per **authorized activation** of one rule's ordered action set: the
+operator previewed N actions and confirmed them once, so the N sibling reroutes
+are one decision, not N independent ones. Created by a confirmed enforce-mode
+`POST /api/rules/{id}/apply`; it is also the async job record the apply endpoint
+returns instead of holding an HTTP request open across ~28 SSH sessions.
+`trigger_type` records which path authorized it: `manual` for a confirmed apply,
+`automatic` for an unattended rule activation. Both form bundles; the value also
+selects which execution gates apply (the `automatic_actions_enabled` master switch
+and verify-or-refuse bind only to `automatic`).
+
+Without this identity the guard's cooldown fallback (`MAX(reroutes.started_at)`
+per rule / per device) counts the bundle's own first sibling as "a recent action"
+and blocks the rest. `bundle_id` lets the guard exclude **only** previously
+authorized siblings of the same bundle while leaving every unrelated device/rule
+cooldown intact.
+
+```text
+id, rule_id (FK rules, ON DELETE SET NULL), rule_event_id,
+trigger_type(automatic|manual), triggered_by_user_id (FK users, SET NULL), reason,
+state(planned|running|succeeded|aborted|compensating|compensated|
+      compensation_blocked|failed)          default 'planned',
+failure_policy(abort_and_compensate|abort|continue)
+                                            default 'abort_and_compensate',
+total_actions, completed_actions, failure_reason,
+started_at, finished_at, created_at, updated_at
+KEY (state), KEY (rule_id, created_at)
+```
+
+- `completed_actions` counts siblings that reached a terminal state, successful
+  or not; `total_actions` is the size reserved at admission. The difference is
+  the capacity an in-flight bundle still holds against the global rate budget.
+- `compensation_blocked` means siblings are **still applied** and an admin must
+  intervene — see [operations-runbook.md](operations-runbook.md).
+- `failed` means the bundle was refused before any sibling executed (e.g. it did
+  not fit the global rate budget).
+
+State semantics and the failure policies are documented in
+[reroute-engine.md](reroute-engine.md#ordered-mitigation-bundles).
+
 ## reroutes (actions)
 
 The target is `device_id` (the router the action ran against). The `asset_id` and
@@ -292,13 +339,23 @@ removed; cooldowns live in the `cooldowns` table keyed on the `device` scope).
 
 ```text
 id, device_id (nullable),
-rule_id, rule_event_id, reroute_template_id, rollback_of_reroute_id,
+rule_id, bundle_id, bundle_position,
+rule_event_id, reroute_template_id, rollback_of_reroute_id,
 trigger_type(automatic|manual|rollback), triggered_by_user_id,
 state(planned|pending|running|verifying|succeeded|failed|uncertain),
 reason, parameters_json, planned_steps_json,
 started_at, finished_at, success, failure_reason, verification_status,
 created_at, updated_at
+KEY idx_reroutes_bundle (bundle_id, bundle_position)
+FK fk_reroutes_bundle (bundle_id) REFERENCES reroute_bundles ON DELETE SET NULL
 ```
+
+`bundle_id` / `bundle_position` are NULL for standalone actions (manual
+single-target reroutes, automatic rule activations, rollbacks). When set, the row
+is a sibling of one authorized activation; `bundle_position` mirrors the
+originating `rule_actions.position` so the durable history records the order
+actually used, independently of later edits to the rule. The index serves the
+guard's bundle-excluding cooldown reads and the compensation lookup.
 
 ## reroute_steps / reroute_outputs
 

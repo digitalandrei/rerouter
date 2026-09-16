@@ -105,7 +105,9 @@ telemetry/   SNMP interface polling -> normalized per-interface metrics (v1
 ssh/         device-CLI executor: fail-closed command allowlist, host-key
              pinning, in-app RSA key generation, BGP peer/prefix discovery
 detection/   stateful rule evaluation, consecutive-sample + duration logic
-reroute/     action templates, two-phase state machine, executor, rollback
+reroute/     action templates, two-phase state machine, executor, rollback,
+             ordered mitigation bundles (one authorized activation of a rule's
+             ordered action set, with compensation)
 api/         loopback-bound axum REST API consumed by the SPA via Nginx
 db/          sqlx access layer + migrations
 scheduler.rs per-device async tasks with jitter

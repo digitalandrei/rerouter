@@ -89,11 +89,18 @@ export function stateTone(state?: string | null): Tone {
       return "good";
     case "failed":
     case "uncertain":
+    // Bundle states (plans/015): the run stopped and siblings may still be
+    // applied on the routers — never render that as neutral.
+    case "aborted":
+    case "compensation_blocked":
       return "bad";
+    case "compensated":
+      return "warn";
     case "planned":
     case "pending":
     case "running":
     case "verifying":
+    case "compensating":
       return "info";
     default:
       return "neutral";

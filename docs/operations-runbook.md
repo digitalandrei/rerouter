@@ -66,6 +66,15 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
   (applies in enforce mode; observe mode already blocks everything).
 - **Global maintenance lock:** `POST /api/locks/global` (UI button). Blocks every
   reroute until cleared. Use during planned upstream maintenance.
+- **Rate budget vs bundle size:** `global_action_rate_limit_count` (default **3**
+  per `global_action_rate_limit_window_seconds`, default 600) is counted **per
+  action**, and an ordered mitigation bundle reserves its whole size up front. A
+  14-action scrubber diversion therefore needs a budget of at least 14 in the
+  window, plus headroom for anything else you expect to run and for the
+  compensating rollbacks' own attempts. If the budget is smaller, the bundle is
+  refused **whole** and nothing executes. Size this deliberately before the first
+  enforce-mode run — the default is intentionally not raised for you, because a
+  larger budget is a larger blast radius per window.
 
 Use the authenticated Settings UI for lock changes; API calls require a signed,
 fully authenticated session and `manage_locks`.
@@ -89,6 +98,55 @@ on the router (e.g. `show ip route <prefix>` for a Null0, or the neighbor's
 session state), then **acknowledge** from the authenticated UI.
 
 Only acknowledge after you have confirmed the real routing state.
+
+### A mitigation bundle ended `compensation_blocked`
+
+**The listed actions are STILL APPLIED on the routers.** The bundle stopped at a
+failed action and tried to roll back the siblings that had already succeeded, but
+one of them could not be reversed — usually because that sibling ended
+`uncertain`, which locks its device, and the controller will not push through a
+safety lock.
+
+What you see: a critical `reroute_bundle_partial` alert and an audit row naming
+the bundle and the reroute ids still in force, the bundle in state
+`compensation_blocked` on `GET /api/reroute-bundles/{id}` with
+`still_applied_reroute_ids`, and the affected device locked.
+
+Resolve in this order:
+
+```text
+1. Read GET /api/reroute-bundles/{id}: note failure_reason, the sibling that
+   failed, and every id in still_applied_reroute_ids.
+2. On each affected router, confirm the REAL state of each listed action
+   (e.g. show ip route <prefix> for a Null0, show ip bgp neighbors <ip>,
+   show running-config | include <network>). Do not trust the UI here.
+3. Acknowledge the uncertain reroute from the UI — only after step 2 — which
+   clears its device lock.
+4. Roll back each still-applied reroute individually from /mitigations
+   (POST /api/reroutes/{id}/rollback), in reverse order of bundle_position:
+   undo the most recent change first.
+5. Re-check the bundle and the device: no uncertain rows, no open locks.
+6. Only then consider re-running the mitigation, after fixing what made the
+   original action fail.
+```
+
+The bundle row is terminal — it is a record, not a job to resume. There is no
+"retry compensation" button by design: the controller does not push config to a
+device whose state it could not read.
+
+### A mitigation bundle was refused whole (`bundle_not_admitted`)
+
+The apply returned `409 {"error":"bundle_not_admitted"}` and **nothing ran** —
+the bundle did not fit the remaining global action-rate budget (its own size,
+plus actions already executed in the window, plus capacity other in-flight
+bundles have reserved). The bundle row is closed as `failed`; `detail` names the
+observed count, window, and limit.
+
+Either wait for the window to roll over, or raise
+`global_action_rate_limit_count` deliberately to fit the bundle (see
+[Global safety switches](#global-safety-switches)). Do not work around it by
+applying the actions one at a time: that reintroduces exactly the half-applied
+mitigation the all-or-nothing admission prevents.
 
 ### A mitigation needs to be lifted
 
@@ -135,6 +193,7 @@ Git. Test restore into a staging DB periodically.
 - Confirm `operating_mode` (observe/enforce) and `automatic_actions_enabled`
   match the intended posture.
 - Review open locks and stale cooldowns weekly.
-- Review `uncertain`/`failed` reroutes and audit logs after any incident.
+- Review `uncertain`/`failed` reroutes and audit logs after any incident, and any
+  bundle left `aborted` / `compensation_blocked`.
 - Verify retention jobs are pruning `interface_samples` and keeping audit logs.
 - Rotate device SNMP communities and SSH credentials on schedule.

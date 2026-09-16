@@ -247,6 +247,7 @@ pub async fn gather(
         req.device_id,
         None,
         cfg.safety.same_device_cooldown_seconds,
+        req.bundle.map(|b| b.bundle_id),
     )
     .await
     .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
@@ -258,6 +259,7 @@ pub async fn gather(
             req.device_id,
             Some(rid),
             cfg.safety.same_rule_cooldown_seconds,
+            req.bundle.map(|b| b.bundle_id),
         )
         .await
         .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?,
@@ -266,7 +268,7 @@ pub async fn gather(
     let rate_limit = cfg.safety.global_action_rate_limit_count;
     let rate_window_secs = cfg.safety.global_action_rate_limit_window_seconds;
     let recent_count = if rate_limit > 0 {
-        recent_reroute_count(pool, rate_window_secs).await
+        recent_reroute_count(pool, rate_window_secs, req.bundle.map(|b| b.bundle_id)).await
     } else {
         0
     };
@@ -290,6 +292,14 @@ pub async fn gather(
 /// Cooldown rows are convenient bookkeeping, but the durable reroute history is
 /// the fallback source of truth. This prevents a post-action cooldown INSERT
 /// failure from permitting an immediate repeat.
+///
+/// `exclude_bundle` names the bundle this action belongs to. Its own earlier
+/// siblings are ONE authorized activation, already previewed and confirmed
+/// together, so they must not throttle each other — otherwise the first sibling's
+/// `started_at` blocks the remaining thirteen (audit SPEC-13). Nothing else is
+/// exempted: unrelated activations on the same rule or device still throttle
+/// normally, and an explicit cooldown row is never bypassed, because a deferred
+/// bundle writes no such row until the whole batch is done.
 async fn effective_cooldown(
     pool: &MySqlPool,
     scope: &str,
@@ -297,27 +307,36 @@ async fn effective_cooldown(
     device_id: u64,
     rule_id: Option<u64>,
     seconds: u64,
+    exclude_bundle: Option<u64>,
 ) -> anyhow::Result<Option<DateTime<Utc>>> {
     if seconds == 0 {
         return Ok(None);
     }
     let explicit = cooldown::active_until(pool, scope, scope_ref).await?;
+    // NULL `exclude_bundle` must not swallow standalone rows, whose `bundle_id`
+    // is also NULL — hence the explicit `? IS NULL` arm rather than `<>`.
     let historical: Option<DateTime<Utc>> = if let Some(rule_id) = rule_id {
         sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT DATE_ADD(MAX(started_at), INTERVAL ? SECOND) FROM reroutes \
-             WHERE rule_id = ? AND started_at IS NOT NULL",
+             WHERE rule_id = ? AND started_at IS NOT NULL \
+               AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
         )
         .bind(seconds as i64)
         .bind(rule_id)
+        .bind(exclude_bundle)
+        .bind(exclude_bundle)
         .fetch_one(pool)
         .await?
     } else {
         sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
             "SELECT DATE_ADD(MAX(started_at), INTERVAL ? SECOND) FROM reroutes \
-             WHERE device_id = ? AND started_at IS NOT NULL",
+             WHERE device_id = ? AND started_at IS NOT NULL \
+               AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
         )
         .bind(seconds as i64)
         .bind(device_id)
+        .bind(exclude_bundle)
+        .bind(exclude_bundle)
         .fetch_one(pool)
         .await?
     };
@@ -326,6 +345,90 @@ async fn effective_cooldown(
         .flatten()
         .filter(|until| *until > Utc::now())
         .max())
+}
+
+/// Admit a whole bundle against the global rate budget, ALL-OR-NOTHING.
+///
+/// The budget is still spent per action — a 14-action bundle costs 14 — but it is
+/// spent atomically before anything runs. Today the budget is consumed mid-bundle,
+/// so a bundle larger than the remaining budget applies part of a mitigation and
+/// is then refused, which for an ISP-withdraw/scrubber-advertise pair is the
+/// black-hole case. Refusing the bundle whole is the safe failure.
+///
+/// Reserved-but-unrun capacity of other in-flight bundles counts too, so two
+/// concurrent bundles cannot both be admitted against the same free budget.
+///
+/// Returns the remaining budget check as a [`BlockReason::RateLimit`] when the
+/// bundle does not fit. A deployment that routinely runs bundles larger than
+/// `global_action_rate_limit_count` must raise that setting deliberately; this
+/// function will not quietly stretch it.
+pub async fn admit_bundle(
+    pool: &MySqlPool,
+    cfg: &Config,
+    bundle_id: u64,
+    size: u32,
+) -> Result<(), BlockReason> {
+    let limit = cfg.safety.global_action_rate_limit_count;
+    if limit == 0 {
+        return Ok(());
+    }
+    let window = cfg.safety.global_action_rate_limit_window_seconds;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+
+    let got: Option<i64> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK('rrt_rate_global', 5)")
+            .fetch_one(&mut *conn)
+            .await
+            .ok()
+            .flatten();
+    if got != Some(1) {
+        return Err(BlockReason::GuardBusy);
+    }
+
+    let already = recent_reroute_count_on(&mut conn, window, Some(bundle_id)).await;
+    let outstanding = outstanding_bundle_actions(&mut conn, window, bundle_id).await;
+    let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+        .execute(&mut *conn)
+        .await;
+
+    let projected = already.saturating_add(outstanding);
+    if projected.saturating_add(size as i64) > limit as i64 {
+        return Err(BlockReason::RateLimit {
+            recent: projected,
+            window_secs: window,
+            max: limit,
+        });
+    }
+    Ok(())
+}
+
+/// Capacity other in-flight bundles have reserved but not yet spent, within the
+/// rate window. Fails closed (large number) on a read error, like the counters.
+async fn outstanding_bundle_actions(
+    conn: &mut MySqlConnection,
+    window_secs: u64,
+    exclude_bundle: u64,
+) -> i64 {
+    // SUM() yields DECIMAL, which does not decode into i64 — without the outer
+    // CAST this read ERRORS as soon as one other bundle is in flight, and the
+    // fail-closed fallback then refuses every bundle while looking like a
+    // legitimate rate-limit refusal. COALESCE keeps the no-rows case at 0.
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(COALESCE(SUM(GREATEST(CAST(total_actions AS SIGNED) \
+                                         - CAST(completed_actions AS SIGNED), 0)), 0) AS SIGNED) \
+           FROM reroute_bundles \
+          WHERE state IN ('planned', 'running') \
+            AND id <> ? \
+            AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(exclude_bundle)
+    .bind(window_secs as i64)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(i64::MAX)
 }
 
 /// Reserve a reroute row under advisory locks. For AUTOMATIC triggers we first
@@ -364,7 +467,8 @@ pub async fn reserve_and_persist(
         if got != Some(1) {
             return Err(BlockReason::GuardBusy);
         }
-        let recent = recent_reroute_count_on(&mut conn, rate_window).await;
+        let recent =
+            recent_reroute_count_on(&mut conn, rate_window, req.bundle.map(|b| b.bundle_id)).await;
         if recent >= rate_limit as i64 {
             let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
                 .execute(&mut *conn)
@@ -520,11 +624,24 @@ async fn has_uncertain(conn: &mut MySqlConnection, device_id: u64) -> bool {
 
 /// Count reroute rows created within the last `window_secs`. On a DB error,
 /// returns a large number so the breaker fails safe (blocks).
-async fn recent_reroute_count(pool: &MySqlPool, window_secs: u64) -> i64 {
+///
+/// A bundle reserves its FULL size against the budget once, at admission
+/// ([`admit_bundle`]), so its siblings must not each re-consume it as they run —
+/// hence `exclude_bundle`. The budget is still spent per action; it is merely
+/// spent atomically up front, which is what stops a bundle from half-running.
+async fn recent_reroute_count(
+    pool: &MySqlPool,
+    window_secs: u64,
+    exclude_bundle: Option<u64>,
+) -> i64 {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM reroutes WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+        "SELECT COUNT(*) FROM reroutes \
+          WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+            AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
     )
     .bind(window_secs as i64)
+    .bind(exclude_bundle)
+    .bind(exclude_bundle)
     .fetch_one(pool)
     .await
     .unwrap_or(i64::MAX)
@@ -532,11 +649,19 @@ async fn recent_reroute_count(pool: &MySqlPool, window_secs: u64) -> i64 {
 
 /// Same fail-closed count, executed on the connection that owns the advisory
 /// lock so the critical section cannot outlive its lock connection.
-async fn recent_reroute_count_on(conn: &mut MySqlConnection, window_secs: u64) -> i64 {
+async fn recent_reroute_count_on(
+    conn: &mut MySqlConnection,
+    window_secs: u64,
+    exclude_bundle: Option<u64>,
+) -> i64 {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM reroutes WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+        "SELECT COUNT(*) FROM reroutes \
+          WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+            AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
     )
     .bind(window_secs as i64)
+    .bind(exclude_bundle)
+    .bind(exclude_bundle)
     .fetch_one(&mut *conn)
     .await
     .unwrap_or(i64::MAX)
@@ -551,12 +676,15 @@ async fn insert_reroute(
     let mut tx = conn.begin().await?;
     let res = sqlx::query(
         "INSERT INTO reroutes \
-            (device_id, rule_id, rule_event_id, reroute_template_id, rollback_of_reroute_id, \
+            (device_id, rule_id, bundle_id, bundle_position, rule_event_id, \
+             reroute_template_id, rollback_of_reroute_id, \
              trigger_type, triggered_by_user_id, state, reason, parameters_json, planned_steps_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
     )
     .bind(req.device_id)
     .bind(req.rule_id)
+    .bind(req.bundle.map(|b| b.bundle_id))
+    .bind(req.bundle.map(|b| b.position))
     .bind(req.rule_event_id)
     .bind(req.template.id)
     .bind(req.rollback_of_reroute_id)

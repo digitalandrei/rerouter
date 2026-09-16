@@ -157,7 +157,9 @@ reference `{params}` (e.g. `{prefix_net}`), substituted at render time.
 
 A **combination** (remove-from-saturated-upstream + advertise-on-others + MSS
 clamp) is expressed as several ordered `rule_actions` on one rule — each its own
-verification and rollback — not a single composite template.
+verification and rollback — not a single composite template. The runtime record
+of one authorized activation of such a set is a **bundle** — see
+[Ordered mitigation bundles](#ordered-mitigation-bundles).
 
 **Protected-interface guard.** `device_interfaces.protected` flags the device's
 management / transit / SSH path. Before executing a template that targets an
@@ -266,6 +268,15 @@ disable that throttle. These apply to manual and automatic actions. Corrective
 rollback bypasses cooldown/rate throttles but still obeys mode, maintenance and
 device locks, reachability, serialization, persistence, and verification.
 
+Inside an **ordered bundle** these throttles are scoped, never waived. The
+cooldown fallback derived from durable history excludes *only* previously
+authorized siblings of the same `bundle_id`, because those are one activation the
+operator previewed and confirmed once; every unrelated device or rule cooldown
+still applies, and an explicit `cooldowns` row is never bypassed. The global rate
+limit keeps per-action accounting, but a bundle reserves its full size up front
+and is refused whole if it does not fit. See
+[Ordered mitigation bundles](#ordered-mitigation-bundles).
+
 ## Locks
 
 Lock scopes: the device-CLI engine uses the `device` scope (and `global`). Locks
@@ -321,7 +332,10 @@ on the firing edge); a rule may enable either, both, or neither.
 
 In enforce mode this path also requires a server-rendered dry run and consumes a
 five-minute one-use preview token bound to the action set, reason, rule, and
-operator before execution.
+operator before execution. A **confirmed enforce-mode apply runs asynchronously
+as one ordered bundle** and returns `202` with a `bundle_id`; the preview and
+observe-mode responses are unchanged. See
+[Ordered mitigation bundles](#ordered-mitigation-bundles).
 
 ### Flow auto-target (derive the host from flow data)
 
@@ -364,6 +378,157 @@ cancelled/pre-command failures cannot be rolled back. A server-rendered dry run
 and one-time preview token are mandatory in enforce mode. Rollbacks are
 serialized per original action, reject an active/already-successful sibling, and
 permit a retry only after a failed rollback.
+
+## Ordered mitigation bundles
+
+A real mitigation is rarely one command. Diverting an attacked prefix to a
+scrubbing provider means advertising it to the scrubber on every border router
+**and** withdrawing it from the saturated upstreams — a dozen-plus actions the
+operator previewed and confirmed once. As above, that combination is the rule's
+ordered `rule_actions` set, never a composite template. A **bundle** is the
+runtime record of one authorized activation of that set: one preview, one
+confirmation, one audited unit of work.
+
+Both paths that activate a rule's whole action set form a bundle: the
+**supervised apply** (a confirmed enforce-mode `POST /api/rules/{id}/apply`) and
+**unattended automatic activation**. An automatic activation is one authorized
+decision too, so it gets the same identity, ordering, all-or-nothing admission and
+compensation — otherwise the first action's cooldown would block the rest of an
+unattended mitigation, and a mid-activation failure would leave the network
+half-diverted with nobody watching.
+
+The bundle's `trigger_type` (`manual` or `automatic`) is what selects which gates
+apply: `guard::decide` enforces the `automatic_actions_enabled` master switch and
+verify-or-refuse **only** for `automatic`. It is threaded through the runner
+explicitly, never defaulted, because running an automatic activation under
+`manual` would silently bypass the master switch. Automatic execution remains
+gated as before — enforce mode, the global switch, and the per-rule enable — and
+`LOW` flow-sampling confidence still suppresses an action before the bundle is
+built.
+
+### Bundle identity
+
+`reroute_bundles` holds one row per activation; every sibling `reroutes` row
+carries `bundle_id` and `bundle_position` (copied from `rule_actions.position`,
+so durable history keeps the order actually used even if the rule is edited
+afterwards).
+
+The identity exists to scope cooldowns. The guard derives a cooldown from
+`MAX(reroutes.started_at)` per rule and per device as a fallback, which counted
+the bundle's own first sibling as "a recent action" and blocked the remaining
+thirteen (audit finding SPEC-13). Cooldown history now excludes **only**
+previously authorized siblings of the same `bundle_id`. Nothing else is exempt:
+an unrelated activation on the same rule or device throttles exactly as before,
+and an explicit `cooldowns` row is never bypassed. A bundle defers its cooldown
+rows until the whole batch is finished, then records one per device it actually
+touched — including devices whose sibling failed, because a failed push may still
+have changed the box.
+
+### Admission is all-or-nothing
+
+The global rate limit keeps **per-action** accounting — a 14-action bundle costs
+14 — but the budget is reserved atomically before anything runs
+(`guard::admit_bundle`, under the global advisory lock). Capacity that other
+in-flight bundles have reserved but not yet spent counts too, so two concurrent
+bundles cannot both be admitted against the same free budget. A bundle that does
+not fit is refused **whole**, with nothing executed — the apply returns
+`409 {"error":"bundle_not_admitted"}` and the bundle row is closed as `failed`.
+Spending the budget mid-bundle is how a mitigation ends up half-applied.
+
+The shipped default `global_action_rate_limit_count = 3` is **not** changed by
+this feature. A deployment that runs bundles larger than the budget must raise it
+deliberately — see [operations-runbook.md](operations-runbook.md).
+
+### Ordered execution and failure policy
+
+Siblings execute sequentially in `position` order. `reroute_bundles.failure_policy`
+decides what happens at the first non-success:
+
+```text
+abort_and_compensate  stop, then roll back the siblings that already succeeded,
+                      in reverse order (default for new operator bundles)
+abort                 stop, leave applied siblings in place for the operator
+continue              historical best-effort fan-out: keep going (preserved for
+                      callers that want independent per-device attempts)
+```
+
+**Execution order is a safety property, not a display preference.** The safe
+order is additive first, destructive last: advertise the prefix to the scrubber
+**before** withdrawing it from the ISP upstreams. Under `abort_and_compensate` a
+failure anywhere in the additive phase then aborts *before* anything is torn
+down, so the black-hole window never opens. The reverse order can withdraw the
+traffic's only remaining path and then fail to provide the new one.
+
+`POST /api/rules/{rule_id}/actions/reorder` (`edit_rules`, body
+`{"order": [action_id, ...]}`) renumbers `position` for the whole set in one
+transaction. The submitted list must be exactly that rule's action set — any
+missing, duplicated, or foreign id is rejected whole — so a stale editor cannot
+silently drop an action, which would silently shorten a mitigation.
+
+### Compensation, and where it stops
+
+Under `abort_and_compensate` the already-succeeded siblings are rolled back in
+reverse order as ordinary `trigger_type = rollback` actions: each one is a fresh
+audited, verified reroute, exempt from cooldown and rate throttles like any
+corrective rollback, and still subject to mode, maintenance, and device locks.
+
+**Compensation does not cross a device lock.** A sibling that ends `uncertain`
+locks its device pending admin acknowledgement, and rolling it back through that
+lock is exactly what doctrine forbids. The bundle then finishes
+`compensation_blocked`: a **critical** `reroute_bundle_partial` alert plus an
+audit row name the exact reroutes that are **still applied**, and an admin
+resolves them by hand (see [operations-runbook.md](operations-runbook.md)). A
+sibling whose template has no rollback, or whose rollback itself fails, ends the
+same way. Reporting a half-applied mitigation loudly beats forcing config onto a
+device whose state could not be read; it is never silently retried.
+
+Bundle states:
+
+```text
+planned              admitted, nothing executed yet
+running              at least one sibling has started
+succeeded            every sibling succeeded
+aborted              stopped at a non-success; applied siblings left in place
+compensating         rolling back applied siblings
+compensated          applied siblings rolled back; nothing left in force
+compensation_blocked a device lock (or a missing/failed rollback) stopped
+                     compensation — siblings REMAIN APPLIED, admin required
+failed               refused before any sibling executed (e.g. not admitted)
+```
+
+### Asynchronous execution
+
+A confirmed enforce-mode `POST /api/rules/{id}/apply` (`dry_run: false`) no
+longer blocks on SSH. It returns `202` and continues in the background:
+
+```json
+{ "bundle_id": 42, "async": true, "state": "running",
+  "total_actions": 14, "failure_policy": "abort_and_compensate",
+  "results": [] }
+```
+
+`results` carries only the actions skipped before admission (unresolvable target,
+aged-out inventory); per-action outcomes are read from the progress endpoint.
+
+`GET /api/reroute-bundles/{id}` (`view_asset`) returns the bundle state,
+`completed_actions` / `total_actions`, `failure_reason`, one row per sibling in
+execution order (position, device, template, state, failure reason), and
+`still_applied_reroute_ids` — derived from durable state, not from the in-memory
+run, so it survives a restart.
+
+Previews (`dry_run: true`) and **everything in observe mode remain synchronous
+and unchanged**: they render the would-run plan without opening an SSH session,
+so the preview → token → execute gate is untouched and observe mode still renders
+all N would-run plans while executing nothing. The hand-off exists because
+holding one HTTP request open across ~28 SSH sessions lets the reverse proxy cut
+the operator off mid-mitigation with the preview token already consumed.
+
+### Restart during a bundle
+
+Existing recovery marks in-flight siblings `uncertain` and locks their devices;
+`bundle::recover_on_startup` then closes every bundle left `planned`, `running`,
+or `compensating` as `aborted`, so the UI never shows a mitigation as still
+progressing after a crash. See [state-recovery.md](state-recovery.md).
 
 ## Verification examples
 

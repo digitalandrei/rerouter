@@ -42,6 +42,20 @@ pub struct ActionRequest {
     pub reason: Option<String>,
     /// Rule action bundles record cooldowns once after the whole ordered batch.
     pub defer_cooldown: bool,
+    /// Set when this action is one sibling of an ordered bundle — one authorized
+    /// activation of a rule's whole action set. The guard excludes the bundle's
+    /// own earlier siblings from cooldown history so a 14-action mitigation does
+    /// not block itself after the first action (plan 015 / audit SPEC-13).
+    pub bundle: Option<BundleMembership>,
+}
+
+/// This action's place in an ordered bundle.
+#[derive(Debug, Clone, Copy)]
+pub struct BundleMembership {
+    pub bundle_id: u64,
+    /// Mirrors the originating `rule_actions.position`, so durable history keeps
+    /// the order actually used even if the rule is edited later.
+    pub position: u32,
 }
 
 #[derive(Debug, Clone)]

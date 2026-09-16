@@ -12,7 +12,8 @@ truthful state presentation. Production records and deployment were not inspecte
 
 | Plan | Title | Priority | Effort | Status |
 | --- | --- | --- | --- | --- |
-| [014](014-full-project-review-roadmap.md) | Remediate the full-project audit | P1–P3 | See 17 work items | TODO — audit complete; fixes pending |
+| [014](014-full-project-review-roadmap.md) | Remediate the full-project audit | P1–P3 | See 17 work items | TODO — audit complete; fixes pending (14.07 delivered by plan 015) |
+| [015](015-ordered-mitigation-bundles.md) | Ordered mitigation bundles (one-click multi-action mitigation) | P1 | L | DONE 2026-09-16 — implements 14.07 / SPEC-13 |
 
 Plan 014 gives the dependency order, affected interfaces and acceptance checks.
 The audit produced documentation only; none of its remediation items is marked

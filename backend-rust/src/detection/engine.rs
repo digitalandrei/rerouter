@@ -1046,9 +1046,19 @@ async fn auto_execute_actions(
     rule: &InterfaceRule,
     rule_event_id: u64,
 ) -> Result<Vec<Value>> {
-    let specs = sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
-        "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
-         WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
+    let specs = sqlx::query_as::<
+        _,
+        (
+            u64,
+            u64,
+            Option<sqlx::types::Json<Value>>,
+            Option<String>,
+            u32,
+        ),
+    >(
+        "SELECT reroute_template_id, device_id, params_json, auto_target, position \
+           FROM rule_actions \
+          WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
     )
     .bind(rule.id)
     .fetch_all(pool)
@@ -1056,8 +1066,10 @@ async fn auto_execute_actions(
 
     let sel = flow_selector(rule);
     let mut out = Vec::with_capacity(specs.len());
-    let mut acted_devices = Vec::new();
-    for (template_id, device_id, params_json, auto_target) in specs {
+    // Resolve every action first, then run the resolved set as ONE ordered bundle.
+    // Resolving up front is what lets the bundle be admitted (or refused) whole.
+    let mut ready: Vec<crate::reroute::bundle::BundleAction> = Vec::new();
+    for (template_id, device_id, params_json, auto_target, position) in specs {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
         match flow_target::prepare_action(
             pool,
@@ -1094,28 +1106,15 @@ async fn auto_execute_actions(
                     Some(a) => format!("automatic: rule '{}' fired; {}", rule.name, a.note),
                     None => format!("automatic: rule '{}' fired", rule.name),
                 };
-                let req = crate::reroute::executor::ActionRequest {
+                ready.push(crate::reroute::bundle::BundleAction {
                     device_id,
                     template,
                     params,
-                    trigger_type: "automatic",
-                    rule_id: Some(rule.id),
-                    rule_event_id: Some(rule_event_id),
-                    rollback_of_reroute_id: None,
-                    user_id: None,
-                    actor_context: None,
-                    reason: Some(reason),
-                    defer_cooldown: true,
-                };
-                let outcome = crate::reroute::executor::execute(pool, cfg, req, false).await;
-                if outcome.executed {
-                    acted_devices.push(outcome.device_id);
-                }
-                let mut v = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-                if let (Value::Object(m), Some(a)) = (&mut v, at) {
-                    m.insert("auto_target".into(), json!(a.cidr));
-                }
-                out.push(v);
+                    reason,
+                    position,
+                    auto_target: at.as_ref().map(|a| a.cidr.clone()),
+                    auto_target_low_confidence: at.as_ref().map(|a| a.low_confidence),
+                });
             }
             PreparedAction::Skip { reason } => {
                 tracing::warn!(
@@ -1129,10 +1128,76 @@ async fn auto_execute_actions(
             }
         }
     }
-    if let Err(e) =
-        crate::reroute::executor::record_cooldowns(pool, cfg, Some(rule.id), &acted_devices).await
-    {
-        tracing::error!(event_type = "rule_cooldown_persist_failed", rule_id = rule.id, error = %e, "could not persist rule action cooldowns; reroute history remains the fallback gate");
+
+    if ready.is_empty() {
+        return Ok(out);
+    }
+
+    // An automatic activation is one authorized decision too, so it gets a bundle:
+    // the guard can then exclude the activation's own earlier siblings from
+    // cooldown history instead of letting action #1 block the rest, and a
+    // mid-activation failure unwinds what it already applied rather than leaving a
+    // half-diverted network unattended.
+    //
+    // `trigger_type: "automatic"` is load-bearing: it is what keeps the
+    // `automatic_actions_enabled` master switch and verify-or-refuse in force.
+    let total = ready.len() as u32;
+    let policy = crate::reroute::bundle::FailurePolicy::AbortAndCompensate;
+    let bundle_id = crate::reroute::bundle::create(
+        pool,
+        Some(rule.id),
+        Some(rule_event_id),
+        "automatic",
+        None,
+        &format!("automatic: rule '{}' fired", rule.name),
+        policy,
+        total,
+    )
+    .await?;
+
+    if let Err(block) = crate::reroute::guard::admit_bundle(pool, cfg, bundle_id, total).await {
+        let message = block.to_string();
+        tracing::warn!(
+            event_type = "auto_bundle_not_admitted",
+            rule_id = rule.id,
+            bundle_id,
+            total,
+            reason = %message,
+            "automatic activation refused whole; nothing executed"
+        );
+        let _ = sqlx::query(
+            "UPDATE reroute_bundles SET state = 'failed', failure_reason = ?, \
+                    finished_at = UTC_TIMESTAMP() WHERE id = ?",
+        )
+        .bind(&message)
+        .bind(bundle_id)
+        .execute(pool)
+        .await;
+        out.push(json!({
+            "executed": false,
+            "bundle_id": bundle_id,
+            "blocked_reason": message,
+            "total_actions": total,
+        }));
+        return Ok(out);
+    }
+
+    let outcome = crate::reroute::bundle::run(
+        pool,
+        cfg,
+        crate::reroute::bundle::BundleRun::automatic(bundle_id, policy, rule.id, rule_event_id),
+        ready,
+    )
+    .await;
+
+    out.extend(outcome.results);
+    if outcome.state != "succeeded" {
+        out.push(json!({
+            "bundle_id": bundle_id,
+            "bundle_state": outcome.state,
+            "still_applied_reroute_ids": outcome.still_applied,
+            "failure_reason": outcome.failure_reason,
+        }));
     }
     Ok(out)
 }

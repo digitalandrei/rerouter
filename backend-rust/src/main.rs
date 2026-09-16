@@ -239,8 +239,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // e. SAFETY: resolve crash-time state before doing anything live.
+    // e. SAFETY: resolve crash-time state before doing anything live. Sibling
+    // reroutes are marked uncertain (and their devices locked) first; closing the
+    // bundle rows afterwards means a bundle is never left looking "in progress"
+    // while its actions are already quarantined.
     reroute::state_machine::recover_on_startup(&pool).await?;
+    reroute::bundle::recover_on_startup(&pool).await?;
 
     // Reset the device stability clocks: after a restart a device must be freshly
     // re-confirmed SSH-reachable for the stability window before AUTOMATIC
