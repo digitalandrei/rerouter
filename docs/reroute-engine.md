@@ -105,10 +105,21 @@ bgp_advertise_add     ip prefix-list {prefix_list_name} permit {prefix}
                       exec_after: clear ip bgp {neighbor_ip} soft out
                       Advertise a prefix toward ONE upstream peer by adding it to
                       that peer's outbound route-map prefix-list, then soft-clear
-                      outbound. The prefix-list name is discovered per peer
-                      (neighbor `route-map NAME out` -> route-map
-                      `match ip address prefix-list PL`) and offered by the
-                      `peer_out_prefix_list` picker.
+                      outbound. The prefix-list name is DISCOVERED per peer and
+                      offered read-only by the `peer_out_prefix_list` picker; it
+                      is never typed (IOS silently CREATES an unknown list, so a
+                      wrong name would advertise nothing yet report success).
+                      Discovery order of precedence:
+                        1. neighbor <ip> prefix-list NAME out
+                        2. neighbor <group> prefix-list NAME out (peer-group)
+                        3. neighbor <ip> route-map RM out -> RM's permit stanza
+                           `match ip address prefix-list PL`
+                        4. neighbor <group> route-map RM out -> same, inherited
+                      Only a name that exists as a real `ip prefix-list` stanza is
+                      stored, and a route-map that does not yield exactly ONE
+                      permit-stanza list (several lists, a `continue`, a deny
+                      stanza keyed on a prefix-list) yields NOTHING. Freshness
+                      comes from `device_bgp_peers.route_context_discovered_at`.
                       verify: show ip bgp neighbors {neighbor_ip} advertised-routes
                               -> expect "{prefix_net}"
                       rollback: bgp_advertise_remove

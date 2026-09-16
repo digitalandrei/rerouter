@@ -318,9 +318,14 @@ catalog (the only way a reroute runs) is:
 6. **`bgp_session_enable`** — bring the neighbor back up (`no … shutdown`;
    rollback of #5).
 7. **`bgp_advertise_add`** — start advertising a prefix toward one upstream BGP
-   peer by adding the prefix to that peer's **outbound route-map's prefix-list**,
-   then `clear ip bgp <neighbor> soft out`. Used for inbound traffic engineering:
-   shift an attacked prefix onto a less-saturated upstream.
+   peer by adding the prefix to that peer's **outbound prefix-list**, then
+   `clear ip bgp <neighbor> soft out`. Used for inbound traffic engineering:
+   shift an attacked prefix onto a less-saturated upstream. The list is the one
+   SSH discovery found for that peer — applied directly, inherited from its
+   peer-group, or matched by its outbound route-map's permit stanza — and only
+   when a real `ip prefix-list` stanza of that name exists on the device. It is
+   never operator-typed: IOS silently creates an unknown list, which would make
+   the action report success while advertising nothing.
 8. **`bgp_advertise_remove`** — stop advertising the prefix toward that upstream
    (remove the prefix-list entry + soft clear; rollback of #7). "Advertise on
    other peer(s)" is the same `bgp_advertise_add` template fanned out as extra

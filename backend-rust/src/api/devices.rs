@@ -1046,10 +1046,23 @@ struct BgpPeerRow {
     in_route_map: Option<String>,
     out_route_map: Option<String>,
     last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    route_context_discovered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 const BGP_PEER_COLS: &str = "id, device_id, peer_remote_addr, peer_remote_as, local_as, \
-     peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map, last_polled_at";
+     peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map, \
+     last_polled_at, route_context_discovered_at";
+
+/// Peer liveness inside the SNMP inventory window — the SAME rule the validator
+/// applies to the `bgp_peer` source, so the picker cannot silently offer a peer
+/// the server will refuse. `None` (never polled) is stale, never fresh.
+fn peer_inventory_fresh(
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let max_age = chrono::Duration::hours(crate::reroute::templates::SNMP_INVENTORY_MAX_AGE_HOURS);
+    last_polled_at.is_some_and(|t| now.signed_duration_since(t) < max_age)
+}
 
 fn bgp_peer_json(r: &BgpPeerRow) -> Value {
     json!({
@@ -1065,6 +1078,12 @@ fn bgp_peer_json(r: &BgpPeerRow) -> Value {
         "in_route_map": r.in_route_map,
         "out_route_map": r.out_route_map,
         "last_polled_at": r.last_polled_at.map(fmt_ts),
+        // The picker needs to see what the validator sees: whether this peer's
+        // SNMP row is inside the freshness window, and when its SSH-discovered
+        // route context (out_prefix_list / in|out route-map) was last read.
+        // null route context = never discovered => bgp_advertise_* is refused.
+        "inventory_fresh": peer_inventory_fresh(r.last_polled_at, chrono::Utc::now()),
+        "route_context_discovered_at": r.route_context_discovered_at.map(fmt_ts),
     })
 }
 
@@ -1264,4 +1283,35 @@ async fn audit_device_request(
 /// True if a sqlx error is a MySQL duplicate-key (1062) violation.
 fn is_dup(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23000"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn peer_inventory_freshness_matches_the_validator_window() {
+        let now = Utc::now();
+        let max = crate::reroute::templates::SNMP_INVENTORY_MAX_AGE_HOURS;
+        // Just inside the window -> fresh; beyond it -> stale (the picker must
+        // not offer a peer the `bgp_peer` source will refuse). The field is
+        // advisory only: the server re-checks every gate at execution time.
+        assert!(peer_inventory_fresh(Some(now - Duration::minutes(5)), now));
+        assert!(peer_inventory_fresh(
+            Some(now - Duration::hours(max) + Duration::minutes(1)),
+            now
+        ));
+        assert!(!peer_inventory_fresh(
+            Some(now - Duration::hours(max + 1)),
+            now
+        ));
+        // The field's real-world case: a peer last polled ~1650h ago.
+        assert!(!peer_inventory_fresh(
+            Some(now - Duration::hours(1650)),
+            now
+        ));
+        // Never polled is stale, never fresh.
+        assert!(!peer_inventory_fresh(None, now));
+    }
 }

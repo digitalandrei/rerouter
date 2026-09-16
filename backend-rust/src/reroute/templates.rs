@@ -157,16 +157,18 @@ pub async fn canonicalize_inventory_params(
                 .await?;
                 row.and_then(|(name, descr)| name.or(descr))
             }
-            "bgp_peer" => sqlx::query_scalar::<_, String>(
-                "SELECT peer_remote_addr FROM device_bgp_peers \
+            "bgp_peer" => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT peer_remote_addr FROM device_bgp_peers \
                  WHERE device_id = ? AND peer_remote_addr = ? \
                    AND last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
-            )
-            .bind(device_id)
-            .bind(value)
-            .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
-            .fetch_optional(pool)
-            .await?,
+                )
+                .bind(device_id)
+                .bind(value)
+                .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?
+            }
             "bgp_local_as" => {
                 let asn = value
                     .parse::<u32>()
@@ -183,40 +185,49 @@ pub async fn canonicalize_inventory_params(
                 .await?
                 .map(|v| v.to_string())
             }
-            "announced_prefix" => sqlx::query_scalar::<_, String>(
-                "SELECT prefix FROM device_bgp_networks \
+            "announced_prefix" => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT prefix FROM device_bgp_networks \
                  WHERE device_id = ? AND prefix = ? \
                    AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
-            )
-            .bind(device_id)
-            .bind(value)
-            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
-            .fetch_optional(pool)
-            .await?,
-            "peer_out_prefix_list" => sqlx::query_scalar::<_, String>(
-                "SELECT p.out_prefix_list FROM device_bgp_peers p \
+                )
+                .bind(device_id)
+                .bind(value)
+                .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?
+            }
+            // The prefix-list is written by SSH route-context discovery, so its
+            // freshness is `route_context_discovered_at` — the marker stamped in
+            // the same transaction as the value. `last_polled_at` (SNMP) says
+            // nothing about when the prefix-list was read, and an EXISTS over
+            // device_route_maps is false forever on a device that legitimately
+            // has no route-maps (`neighbor <ip> prefix-list <NAME> out`).
+            // NULL marker => never discovered => refused.
+            "peer_out_prefix_list" => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT p.out_prefix_list FROM device_bgp_peers p \
                  WHERE p.device_id = ? AND p.out_prefix_list = ? \
-                   AND p.last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) \
-                   AND EXISTS (SELECT 1 FROM device_route_maps r \
-                               WHERE r.device_id = p.device_id \
-                                 AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)) \
+                   AND p.route_context_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) \
                  LIMIT 1",
-            )
-            .bind(device_id)
-            .bind(value)
-            .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
-            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
-            .fetch_optional(pool)
-            .await?,
-            "route_map" => sqlx::query_scalar::<_, String>(
-                "SELECT name FROM device_route_maps WHERE device_id = ? AND name = ? \
+                )
+                .bind(device_id)
+                .bind(value)
+                .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?
+            }
+            "route_map" => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM device_route_maps WHERE device_id = ? AND name = ? \
                    AND last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) LIMIT 1",
-            )
-            .bind(device_id)
-            .bind(value)
-            .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
-            .fetch_optional(pool)
-            .await?,
+                )
+                .bind(device_id)
+                .bind(value)
+                .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+                .fetch_optional(pool)
+                .await?
+            }
             // Direction is already constrained by the schema enum.
             "bgp_direction" => Some(value.to_string()),
             "rtbh_tag" => {
@@ -267,18 +278,17 @@ pub async fn canonicalize_inventory_params(
         canonical.get("neighbor_ip").and_then(Value::as_str),
         canonical.get("prefix_list_name").and_then(Value::as_str),
     ) {
+        // Same freshness source as the `peer_out_prefix_list` lookup above: the
+        // pairing is only trustworthy while the route context that produced it
+        // is inside the routing-inventory window.
         let linked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM device_bgp_peers p \
              WHERE p.device_id = ? AND p.peer_remote_addr = ? AND p.out_prefix_list = ? \
-               AND p.last_polled_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR) \
-               AND EXISTS (SELECT 1 FROM device_route_maps r \
-                           WHERE r.device_id = p.device_id \
-                             AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR))",
+               AND p.route_context_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)",
         )
         .bind(device_id)
         .bind(peer)
         .bind(prefix_list)
-        .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
         .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
         .fetch_one(pool)
         .await?;

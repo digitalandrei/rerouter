@@ -20,7 +20,7 @@
 //! the executor's safety gates (operating_mode, locks, cooldowns, …) own that.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -463,6 +463,12 @@ pub async fn run_commands(
 /// AND auto-label discovered BGP peers from their `neighbor <ip> description`
 /// lines. Returns the prefix count. Requires working SSH; a failure is a
 /// structured error (caller logs it).
+///
+/// The same run also refreshes each peer's ROUTE CONTEXT (outbound prefix-list,
+/// applied in/out route-maps) plus the device's route-map catalog — a
+/// best-effort second read whose failure never fails the announced-prefix
+/// discovery and, per [`resolve_route_context`], never overwrites a previously
+/// good snapshot with an unproven one.
 pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let cmd = "show running-config | section ^router bgp".to_string();
     let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
@@ -478,36 +484,53 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     let prefixes = parse_network_statements(output);
     let descriptions = parse_neighbor_descriptions(output);
 
-    // Resolve each peer's OUTBOUND prefix-list (neighbor `route-map NAME out` ->
-    // that route-map's `match ip address prefix-list PL`) so the guided picker
-    // can offer the correct list per peer for the bgp_advertise_* templates. A
-    // best-effort read; failure here never fails the whole discovery.
+    // Resolve each peer's OUTBOUND prefix-list so the guided picker can offer the
+    // correct list per peer for the bgp_advertise_* templates. Both reads travel
+    // in ONE extra session (the routers throttle rapid reconnects), and the whole
+    // read is best-effort: failure here never fails the announced-prefix
+    // discovery and leaves the previous route-context snapshot untouched.
     let rm_cmd = "show running-config | section ^route-map".to_string();
-    let route_context = match run_commands(pool, device_id, std::slice::from_ref(&rm_cmd)).await {
-        Ok(rm_outcome) => {
-            let rm_output = rm_outcome
-                .results
-                .first()
-                .map(|r| r.output.as_str())
-                .unwrap_or("");
-            if let Some(denied) = cisco_denied(rm_output) {
-                tracing::warn!(event_type = "route_map_discovery_denied", device_id, detail = %denied, "route-map inventory was not refreshed");
-                None
-            } else {
-                let rm_to_pl = parse_routemap_prefix_lists(rm_output);
-                let prefix_links = parse_neighbor_out_routemaps(output)
-                    .into_iter()
-                    .filter_map(|(addr, rm)| rm_to_pl.get(&rm).cloned().map(|pl| (addr, pl)))
-                    .collect::<Vec<_>>();
-                Some((
-                    prefix_links,
-                    parse_route_map_names(rm_output),
-                    parse_neighbor_route_maps(output),
-                ))
+    let pl_cmd = "show running-config | section ^ip prefix-list".to_string();
+    let route_context = match run_commands(pool, device_id, &[rm_cmd, pl_cmd]).await {
+        Ok(rc_outcome) => {
+            match (rc_outcome.results.first(), rc_outcome.results.get(1)) {
+                (Some(rm), Some(pl)) => {
+                    // A denial on EITHER read makes the pair untrustworthy: the
+                    // prefix-list read is what proves a discovered name is real.
+                    if let Some(denied) =
+                        cisco_denied(&rm.output).or_else(|| cisco_denied(&pl.output))
+                    {
+                        tracing::warn!(event_type = "route_map_discovery_denied", device_id, detail = %denied, "routing inventory was not refreshed");
+                        None
+                    } else {
+                        match resolve_route_context(output, &rm.output, &pl.output) {
+                            Ok(snapshot) => {
+                                for name in &snapshot.ambiguous_route_maps {
+                                    tracing::warn!(event_type = "route_map_ambiguous", device_id, route_map = %name, "route-map has no single unambiguous outbound prefix-list — no prefix-list stored for its peers");
+                                }
+                                for (peer, name) in &snapshot.dangling {
+                                    tracing::warn!(event_type = "prefix_list_dangling", device_id, peer = %peer, prefix_list = %name, "referenced prefix-list has no `ip prefix-list` stanza on the device — not stored");
+                                }
+                                for peer in &snapshot.conflicting_peers {
+                                    tracing::warn!(event_type = "peer_prefix_list_ambiguous", device_id, peer = %peer, "peer has several equally-specific outbound prefix-lists — none stored");
+                                }
+                                Some(snapshot)
+                            }
+                            Err(unavailable) => {
+                                tracing::warn!(event_type = unavailable.event, device_id, detail = %unavailable.detail, "routing inventory read was inconclusive — previous snapshot kept");
+                                None
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    tracing::warn!(event_type = "route_map_discovery_incomplete", device_id, "routing inventory read returned fewer outputs than commands — previous snapshot kept");
+                    None
+                }
             }
         }
         Err(e) => {
-            tracing::warn!(event_type = "route_map_discovery_failed", device_id, error = %e, "route-map inventory was not refreshed");
+            tracing::warn!(event_type = "route_map_discovery_failed", device_id, error = %e, "routing inventory was not refreshed");
             None
         }
     };
@@ -552,18 +575,22 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         .await?;
     }
 
-    if let Some((prefix_links, route_maps, neighbor_maps)) = route_context {
+    let mut peers_with_prefix_list: u64 = 0;
+    if let Some(snapshot) = route_context.as_ref() {
         // These fields are a snapshot, not append-only hints. Clear assignments
-        // that disappeared before writing the current set.
+        // that disappeared before writing the current set. `route_context_discovered_at`
+        // is stamped in the SAME statement so the freshness marker can never
+        // outlive — or lag behind — the values it vouches for.
         sqlx::query(
-            "UPDATE device_bgp_peers SET out_prefix_list = NULL, in_route_map = NULL, out_route_map = NULL \
+            "UPDATE device_bgp_peers SET out_prefix_list = NULL, in_route_map = NULL, out_route_map = NULL, \
+                    route_context_discovered_at = UTC_TIMESTAMP() \
              WHERE device_id = ?",
         )
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
-        for (addr, prefix_list) in prefix_links {
-            sqlx::query(
+        for (addr, prefix_list) in &snapshot.prefix_links {
+            let res = sqlx::query(
                 "UPDATE device_bgp_peers SET out_prefix_list = ? \
                  WHERE device_id = ? AND peer_remote_addr = ?",
             )
@@ -572,13 +599,14 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
             .bind(addr.to_string())
             .execute(&mut *tx)
             .await?;
+            peers_with_prefix_list += u64::from(res.rows_affected() > 0);
         }
 
         sqlx::query("UPDATE device_route_maps SET last_discovered_at = NULL WHERE device_id = ?")
             .bind(device_id)
             .execute(&mut *tx)
             .await?;
-        for name in route_maps {
+        for name in &snapshot.route_maps {
             sqlx::query(
                 "INSERT INTO device_route_maps (device_id, name, last_discovered_at) \
                  VALUES (?, ?, UTC_TIMESTAMP()) \
@@ -596,7 +624,7 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         .execute(&mut *tx)
         .await?;
 
-        for (addr, name, dir) in neighbor_maps {
+        for (addr, name, dir) in &snapshot.neighbor_maps {
             // `col` is whitelisted (in_route_map / out_route_map), never raw input.
             let col = if dir == "in" {
                 "in_route_map"
@@ -613,9 +641,219 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
             .await?;
         }
     }
+    let peers_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_bgp_peers WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
 
+    // One line per discovery run at info, so "the picker is empty" is diagnosable
+    // from the journal without raising the service log level.
+    let peers_without = u64::try_from(peers_total)
+        .unwrap_or(0)
+        .saturating_sub(peers_with_prefix_list);
+    tracing::info!(
+        event_type = "route_context_discovered",
+        device_id,
+        prefixes = prefixes.len(),
+        route_context_refreshed = route_context.is_some(),
+        route_maps = route_context
+            .as_ref()
+            .map(|s| s.route_maps.len())
+            .unwrap_or(0),
+        peers_total,
+        peers_with_prefix_list,
+        peers_without,
+        dangling_prefix_lists = route_context
+            .as_ref()
+            .map(|s| s.dangling.len())
+            .unwrap_or(0),
+        ambiguous_route_maps = route_context
+            .as_ref()
+            .map(|s| s.ambiguous_route_maps.len())
+            .unwrap_or(0),
+        "routing inventory discovery finished"
+    );
+
     Ok(prefixes.len())
+}
+
+/// One device's routing context, parsed from a set of config reads that were all
+/// proven trustworthy. Every `prefix_links` name is backed by a real
+/// `ip prefix-list` stanza on the device.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RouteContextSnapshot {
+    /// (peer, outbound prefix-list) for the `peer_out_prefix_list` picker.
+    prefix_links: Vec<(Ipv4Addr, String)>,
+    /// Every route-map name configured on the device (Route-Map Change catalog).
+    route_maps: Vec<String>,
+    /// (peer, route-map, direction) currently applied per neighbor.
+    neighbor_maps: Vec<(Ipv4Addr, String, String)>,
+    /// Names the BGP config references that have NO `ip prefix-list` stanza.
+    /// Not stored: on IOS `ip prefix-list <NAME> permit <cidr>` silently creates
+    /// a new list, so acting on a dangling name would advertise nothing while
+    /// reporting success.
+    dangling: Vec<(Ipv4Addr, String)>,
+    /// Route-maps whose outbound prefix-list is not unambiguous (see
+    /// [`parse_routemap_prefix_lists`]).
+    ambiguous_route_maps: Vec<String>,
+    /// Peers with several equally-specific candidate lists — nothing stored.
+    conflicting_peers: Vec<Ipv4Addr>,
+}
+
+/// Why a routing-config read could not be turned into a trustworthy snapshot.
+/// The caller keeps the PREVIOUS snapshot in this case (fail-closed by ageing
+/// out, never by wiping good inventory).
+#[derive(Debug)]
+struct RouteContextUnavailable {
+    event: &'static str,
+    detail: String,
+}
+
+/// Where a peer's outbound prefix-list came from. Ordering IS the precedence:
+/// direct neighbor config beats peer-group inheritance, and an explicit
+/// `prefix-list ... out` beats one derived from a route-map's `match` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PrefixListSource {
+    /// `neighbor <ip> prefix-list NAME out`
+    Direct,
+    /// `neighbor <group> prefix-list NAME out` + `neighbor <ip> peer-group <group>`
+    PeerGroup,
+    /// `neighbor <ip> route-map RM out` -> RM's `match ip address prefix-list`
+    RouteMap,
+    /// `neighbor <group> route-map RM out` -> RM's `match ip address prefix-list`
+    PeerGroupRouteMap,
+}
+
+/// Turn the three config reads (`router bgp`, `route-map`, `ip prefix-list`)
+/// into a per-peer route-context snapshot, or refuse when the reads cannot be
+/// distinguished from a restricted/truncated view.
+///
+/// Refusals (previous inventory kept):
+///   * the BGP config references route-maps but the route-map read yielded none
+///     (`route_map_inventory_empty`),
+///   * the BGP/route-map config references outbound prefix-lists but the
+///     `ip prefix-list` read yielded none (`prefix_list_inventory_empty`).
+///
+/// A device that genuinely has no route-maps / no prefix-lists — and whose BGP
+/// section references none — is a valid empty snapshot, not a refusal.
+fn resolve_route_context(
+    bgp: &str,
+    route_map_cfg: &str,
+    prefix_list_cfg: &str,
+) -> Result<RouteContextSnapshot, RouteContextUnavailable> {
+    let rm_lists = parse_routemap_prefix_lists(route_map_cfg);
+    let route_maps = parse_route_map_names(route_map_cfg);
+    let neighbor_maps = parse_neighbor_route_maps(bgp);
+    let policy = parse_neighbor_policy(bgp);
+
+    // D5: an empty route-map read is indistinguishable from a restricted parser
+    // view, a paging artifact or a platform whose section filter differs — unless
+    // the `router bgp` section itself proves no route-map is referenced.
+    let references_route_map = !neighbor_maps.is_empty() || !policy.group_route_map_out.is_empty();
+    if route_maps.is_empty() && references_route_map {
+        return Err(RouteContextUnavailable {
+            event: "route_map_inventory_empty",
+            detail: format!(
+                "router bgp references {} neighbor route-map(s) and {} peer-group route-map(s) but the route-map read returned no stanza",
+                neighbor_maps.len(),
+                policy.group_route_map_out.len()
+            ),
+        });
+    }
+
+    // Candidate outbound prefix-list per peer, strongest source wins.
+    let group_prefix_list: HashMap<&str, &str> = policy
+        .group_prefix_list_out
+        .iter()
+        .map(|(g, pl)| (g.as_str(), pl.as_str()))
+        .collect();
+    let group_route_map: HashMap<&str, &str> = policy
+        .group_route_map_out
+        .iter()
+        .map(|(g, rm)| (g.as_str(), rm.as_str()))
+        .collect();
+
+    let mut best: BTreeMap<Ipv4Addr, (PrefixListSource, String)> = BTreeMap::new();
+    let mut conflicting: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    let mut offer = |peer: Ipv4Addr, source: PrefixListSource, name: &str| {
+        if let Some((existing, existing_name)) = best.get(&peer) {
+            // Already answered by a strictly more specific config form.
+            if *existing < source {
+                return;
+            }
+            if *existing == source {
+                // Two equally-specific answers: refuse to guess.
+                if existing_name.as_str() != name {
+                    conflicting.insert(peer);
+                }
+                return;
+            }
+        }
+        conflicting.remove(&peer);
+        best.insert(peer, (source, name.to_string()));
+    };
+
+    for (peer, name) in &policy.peer_prefix_list_out {
+        offer(*peer, PrefixListSource::Direct, name);
+    }
+    for (peer, group) in &policy.groups {
+        if let Some(name) = group_prefix_list.get(group.as_str()) {
+            offer(*peer, PrefixListSource::PeerGroup, name);
+        }
+    }
+    for (peer, rm) in parse_neighbor_out_routemaps(bgp) {
+        if let Some(name) = rm_lists.resolved.get(&rm) {
+            offer(peer, PrefixListSource::RouteMap, name);
+        }
+    }
+    for (peer, group) in &policy.groups {
+        if let Some(rm) = group_route_map.get(group.as_str()) {
+            if let Some(name) = rm_lists.resolved.get(*rm) {
+                offer(*peer, PrefixListSource::PeerGroupRouteMap, name);
+            }
+        }
+    }
+    // The closure borrows `best` / `conflicting` mutably; end that borrow.
+    let _ = offer;
+    for peer in &conflicting {
+        best.remove(peer);
+    }
+
+    // D1: only a name that exists as a real `ip prefix-list` stanza may be stored.
+    let known = parse_prefix_list_names(prefix_list_cfg);
+    let references_prefix_list = !policy.peer_prefix_list_out.is_empty()
+        || !policy.group_prefix_list_out.is_empty()
+        || !best.is_empty();
+    if known.is_empty() && references_prefix_list {
+        return Err(RouteContextUnavailable {
+            event: "prefix_list_inventory_empty",
+            detail: format!(
+                "config references {} outbound prefix-list(s) but the `ip prefix-list` read returned no stanza",
+                best.len().max(policy.peer_prefix_list_out.len())
+            ),
+        });
+    }
+
+    let mut prefix_links = Vec::new();
+    let mut dangling = Vec::new();
+    for (peer, (_source, name)) in best {
+        if known.contains(&name) {
+            prefix_links.push((peer, name));
+        } else {
+            dangling.push((peer, name));
+        }
+    }
+
+    Ok(RouteContextSnapshot {
+        prefix_links,
+        route_maps,
+        neighbor_maps,
+        dangling,
+        ambiguous_route_maps: rm_lists.ambiguous,
+        conflicting_peers: conflicting.into_iter().collect(),
+    })
 }
 
 /// Parse `neighbor A.B.C.D route-map NAME out` lines from a `router bgp` config
@@ -635,6 +873,68 @@ fn parse_neighbor_out_routemaps(config: &str) -> Vec<(Ipv4Addr, String)> {
         }
     }
     out
+}
+
+/// Outbound policy attached to neighbors and to PEER-GROUPS in a `router bgp`
+/// section — the config forms a peer's prefix-list can arrive through besides a
+/// route-map's `match` clause.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NeighborPolicy {
+    /// `neighbor <ip> peer-group <group>`
+    groups: Vec<(Ipv4Addr, String)>,
+    /// `neighbor <ip> prefix-list <NAME> out`
+    peer_prefix_list_out: Vec<(Ipv4Addr, String)>,
+    /// `neighbor <group> prefix-list <NAME> out`
+    group_prefix_list_out: Vec<(String, String)>,
+    /// `neighbor <group> route-map <NAME> out`
+    group_route_map_out: Vec<(String, String)>,
+}
+
+/// True for a token usable as a peer-group name: a plain name that is NOT an IP
+/// literal (an IPv6 neighbor must never be mistaken for a peer-group).
+fn is_peer_group_name(tok: &str) -> bool {
+    is_name(tok) && !is_ipv4(tok) && !is_ipv6(tok) && !is_cidr(tok) && !is_cidr6(tok)
+}
+
+/// Parse the neighbor/peer-group outbound policy lines. IPv4 peers only; lines
+/// that do not match a known shape are ignored (never panics).
+fn parse_neighbor_policy(config: &str) -> NeighborPolicy {
+    let mut policy = NeighborPolicy::default();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("neighbor ") else {
+            continue;
+        };
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        let Some(target) = toks.first().copied() else {
+            continue;
+        };
+        let peer = target.parse::<Ipv4Addr>().ok();
+        match toks.as_slice() {
+            [_, "peer-group", group] => {
+                if let (Some(peer), true) = (peer, is_peer_group_name(group)) {
+                    policy.groups.push((peer, (*group).to_string()));
+                }
+            }
+            [_, "prefix-list", name, "out"] if is_name(name) => match peer {
+                Some(peer) => policy
+                    .peer_prefix_list_out
+                    .push((peer, (*name).to_string())),
+                None if is_peer_group_name(target) => policy
+                    .group_prefix_list_out
+                    .push((target.to_string(), (*name).to_string())),
+                None => {}
+            },
+            [_, "route-map", name, "out"]
+                if is_name(name) && peer.is_none() && is_peer_group_name(target) =>
+            {
+                policy
+                    .group_route_map_out
+                    .push((target.to_string(), (*name).to_string()));
+            }
+            _ => {}
+        }
+    }
+    policy
 }
 
 /// Parse `neighbor A.B.C.D route-map NAME in|out` lines into (addr, name, dir).
@@ -673,23 +973,128 @@ fn parse_route_map_names(config: &str) -> Vec<String> {
     names
 }
 
+/// Names of the `ip prefix-list <NAME> ...` stanzas that actually exist on the
+/// device. A stored outbound prefix-list must appear here: IOS SILENTLY CREATES
+/// a prefix-list when `ip prefix-list <NAME> permit <cidr>` names an unknown
+/// list, so a wrong name yields an action that reports success and advertises
+/// nothing.
+fn parse_prefix_list_names(config: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in config.lines() {
+        let Some(rest) = line.trim().strip_prefix("ip prefix-list ") else {
+            continue;
+        };
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        // `ip prefix-list sequence-number [no-]auto` is a global toggle, not a list.
+        if name == "sequence-number" || !is_name(name) {
+            continue;
+        }
+        names.insert(name.to_string());
+    }
+    names
+}
+
+/// A route-map section resolved into `route-map name -> outbound prefix-list`.
+struct RouteMapPrefixLists {
+    /// Route-maps with exactly ONE candidate list, from permit stanzas only.
+    resolved: HashMap<String, String>,
+    /// Route-maps whose intent cannot be inferred — nothing is stored for them.
+    ambiguous: Vec<String>,
+}
+
 /// Parse a `route-map` config section into `route-map name -> matched outbound
-/// prefix-list` (`match ip address prefix-list PL`). The first prefix-list seen
-/// for a route-map wins (typically the lowest-sequence permit stanza).
-fn parse_routemap_prefix_lists(config: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut current: Option<String> = None;
+/// prefix-list` (`match ip address prefix-list PL`).
+///
+/// Only **permit** stanzas count, and only a route-map that yields exactly one
+/// distinct list resolves. A route-map is AMBIGUOUS — and therefore contributes
+/// nothing — when it has several candidate lists, several lists on one `match`
+/// line, a `continue`, a `deny` stanza keyed on a prefix-list, or a stanza header
+/// this parser cannot classify.
+///
+/// Guessing is unacceptable here: an empty picker is recoverable, whereas the
+/// wrong prefix-list makes `ip prefix-list <PL> permit <attacked prefix>` extend
+/// a BLOCK list — the opposite of the operator's intent.
+fn parse_routemap_prefix_lists(config: &str) -> RouteMapPrefixLists {
+    // route-map name -> distinct candidate lists from its permit stanzas
+    let mut permits: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    // (route-map name, this stanza is a permit stanza)
+    let mut current: Option<(String, bool)> = None;
+
     for line in config.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("route-map ") {
-            current = rest.split_whitespace().next().map(str::to_string);
-        } else if let Some(rest) = trimmed.strip_prefix("match ip address prefix-list ") {
-            if let (Some(rm), Some(pl)) = (current.clone(), rest.split_whitespace().next()) {
-                map.entry(rm).or_insert_with(|| pl.to_string());
+            let mut toks = rest.split_whitespace();
+            let Some(name) = toks.next() else {
+                current = None;
+                continue;
+            };
+            let action = toks.next();
+            let seq_ok = toks
+                .next()
+                .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+            match (action, seq_ok) {
+                (Some("permit"), true) => {
+                    permits.entry(name.to_string()).or_default();
+                    current = Some((name.to_string(), true));
+                }
+                (Some("deny"), true) => current = Some((name.to_string(), false)),
+                // `route-map NAME` with no classifiable permit/deny + sequence:
+                // we cannot tell what the stanza does, so the whole map is out.
+                _ => {
+                    ambiguous.insert(name.to_string());
+                    current = Some((name.to_string(), false));
+                }
+            }
+            continue;
+        }
+        let Some((name, is_permit)) = current.clone() else {
+            continue;
+        };
+        if trimmed == "continue" || trimmed.starts_with("continue ") {
+            // Evaluation falls through to a later stanza: the effective outbound
+            // filter is no longer this stanza's match clause.
+            ambiguous.insert(name);
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("match ip address prefix-list ") {
+            let lists: Vec<&str> = rest.split_whitespace().collect();
+            match lists.as_slice() {
+                [] => {}
+                [one] if is_permit => {
+                    permits.entry(name).or_default().insert((*one).to_string());
+                }
+                // A deny stanza keyed on a prefix-list, or several lists on one
+                // match line: intent cannot be inferred.
+                _ => {
+                    ambiguous.insert(name);
+                }
             }
         }
     }
-    map
+
+    let mut resolved = HashMap::new();
+    for (name, lists) in permits {
+        if ambiguous.contains(&name) {
+            continue;
+        }
+        if lists.len() == 1 {
+            if let Some(list) = lists.into_iter().next() {
+                resolved.insert(name, list);
+            }
+        } else if lists.len() > 1 {
+            ambiguous.insert(name);
+        }
+    }
+    // A route-map that resolved cleanly must never also be reported ambiguous.
+    resolved.retain(|name, _| !ambiguous.contains(name));
+
+    RouteMapPrefixLists {
+        resolved,
+        ambiguous: ambiguous.into_iter().collect(),
+    }
 }
 
 /// Parse `neighbor A.B.C.D description <free text>` lines from a `router bgp`
@@ -1400,6 +1805,8 @@ mod tests {
             "show clock",
             "show version | include (Version|uptime is)",
             "show running-config | section ^router bgp",
+            "show running-config | section ^route-map",
+            "show running-config | section ^ip prefix-list",
             "show ip route summary",
             "show ip route 203.0.113.0",
             "show ip bgp summary",
@@ -1546,5 +1953,198 @@ route-map RM-OUT-A permit 20\n";
             parse_route_map_names(rm),
             vec!["RM-OUT-A".to_string(), "RM-IN-A".to_string()]
         );
+    }
+
+    // ---- Route-context discovery (fixture-driven) -----------------------------
+    //
+    // Fixtures are real-shaped IOS section reads: `show running-config | section
+    // ^router bgp`, `| section ^route-map` and `| section ^ip prefix-list`.
+
+    const BGP_CFG: &str =
+        include_str!("../../tests/fixtures/samples/ios_router_bgp_peer_groups.txt");
+    const ROUTE_MAPS: &str = include_str!("../../tests/fixtures/samples/ios_route_maps.txt");
+    const PREFIX_LISTS: &str = include_str!("../../tests/fixtures/samples/ios_ip_prefix_lists.txt");
+
+    fn links(snap: &RouteContextSnapshot) -> BTreeMap<String, String> {
+        snap.prefix_links
+            .iter()
+            .map(|(peer, list)| (peer.to_string(), list.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn deny_stanza_prefix_list_is_never_selected() {
+        let rm = parse_routemap_prefix_lists(ROUTE_MAPS);
+        // `rm-deny-first` is `deny 5 match PL-BLOCK` BEFORE `permit 10 match
+        // PL-ADVERTISE`. Textual-order parsing picked PL-BLOCK, and the template
+        // would then run `ip prefix-list PL-BLOCK permit <attacked prefix>` —
+        // extending the BLOCK list, the opposite of the operator's intent.
+        assert!(
+            !rm.resolved.contains_key("rm-deny-first"),
+            "a deny stanza's prefix-list must never be stored"
+        );
+        assert!(rm.ambiguous.contains(&"rm-deny-first".to_string()));
+        // A deny stanza keyed on something else does not poison the route-map.
+        assert_eq!(
+            rm.resolved.get("rm-clean").map(String::as_str),
+            Some("PL-ADVERTISE")
+        );
+    }
+
+    #[test]
+    fn ambiguous_route_maps_store_nothing() {
+        let rm = parse_routemap_prefix_lists(ROUTE_MAPS);
+        // several lists on one match line / several permit stanzas / a continue.
+        for name in ["rm-multi", "rm-two-stanzas", "rm-continue", "rm-deny-first"] {
+            assert!(!rm.resolved.contains_key(name), "{name} must not resolve");
+            assert!(
+                rm.ambiguous.contains(&name.to_string()),
+                "{name} must be reported ambiguous"
+            );
+        }
+        // Unambiguous maps still resolve; a map with no prefix-list match (the
+        // field's `prepend-3`) simply contributes nothing.
+        assert_eq!(rm.resolved.get("rm-in").map(String::as_str), Some("PL-IN"));
+        assert!(!rm.resolved.contains_key("prepend-3"));
+        assert!(!rm.ambiguous.contains(&"prepend-3".to_string()));
+    }
+
+    #[test]
+    fn route_map_parser_survives_malformed_input() {
+        for cfg in [
+            "",
+            "route-map",
+            "route-map \n",
+            "route-map RM permit\n match ip address prefix-list PL-A\n",
+            " match ip address prefix-list PL-A\n",
+            "match ip address prefix-list\n",
+            "route-map RM permit ten\n match ip address prefix-list PL-A\n",
+            "route-map RM permit 10\n match ip address prefix-list   \n",
+        ] {
+            let rm = parse_routemap_prefix_lists(cfg);
+            assert!(rm.resolved.is_empty(), "nothing may resolve from {cfg:?}");
+        }
+        // An unclassifiable stanza header is ambiguous, never a guess.
+        let rm =
+            parse_routemap_prefix_lists("route-map RM-WEIRD\n match ip address prefix-list PL-A\n");
+        assert!(rm.ambiguous.contains(&"RM-WEIRD".to_string()));
+    }
+
+    #[test]
+    fn route_context_precedence_direct_then_peer_group_then_route_map() {
+        let snap = resolve_route_context(BGP_CFG, ROUTE_MAPS, PREFIX_LISTS)
+            .unwrap_or_else(|e| panic!("snapshot refused: {}", e.detail));
+        let l = links(&snap);
+        // peer-group inheritance: `neighbor UPSTREAMS prefix-list pfx-to-viva out`
+        assert_eq!(
+            l.get("198.51.100.7").map(String::as_str),
+            Some("pfx-to-viva")
+        );
+        // direct `neighbor <ip> prefix-list ... out` beats the peer-group's.
+        assert_eq!(l.get("203.0.113.9").map(String::as_str), Some("pfx-direct"));
+        // route-map-derived is the weakest source but still resolves.
+        assert_eq!(
+            l.get("192.0.2.30").map(String::as_str),
+            Some("PL-ADVERTISE")
+        );
+        // peer-group route-map `prepend-3` has no prefix-list match -> nothing.
+        assert!(!l.contains_key("192.0.2.44"));
+        // dangling name (referenced, no `ip prefix-list` stanza) -> nothing.
+        assert!(!l.contains_key("192.0.2.55"));
+        assert_eq!(
+            snap.dangling,
+            vec![(
+                "192.0.2.55".parse::<Ipv4Addr>().unwrap(),
+                "pfx-ghost".to_string()
+            )]
+        );
+        // ambiguous route-map -> nothing for its peer.
+        assert!(!l.contains_key("192.0.2.66"));
+        assert!(snap
+            .ambiguous_route_maps
+            .contains(&"rm-deny-first".to_string()));
+        // The route-map catalog and per-peer applied maps still come through.
+        assert!(snap.route_maps.contains(&"prepend-3".to_string()));
+        assert_eq!(snap.neighbor_maps.len(), 3);
+    }
+
+    #[test]
+    fn dangling_prefix_list_name_is_never_stored() {
+        // IOS `ip prefix-list <NAME> permit <cidr>` SILENTLY CREATES an unknown
+        // list: acting on a name with no stanza advertises nothing while
+        // reporting success, so only an inventory-backed name may be stored.
+        let bgp = "router bgp 65010\n neighbor 192.0.2.1 prefix-list pfx-ghost out\n";
+        let pl = "ip prefix-list pfx-real seq 5 permit 192.0.2.0/24\n";
+        let snap = resolve_route_context(bgp, "", pl).expect("no route-map referenced");
+        assert!(snap.prefix_links.is_empty());
+        assert_eq!(snap.dangling.len(), 1);
+    }
+
+    #[test]
+    fn equally_specific_candidates_store_nothing() {
+        let bgp = "router bgp 65010\n neighbor 192.0.2.1 prefix-list PL-A out\n \
+                   neighbor 192.0.2.1 prefix-list PL-B out\n";
+        let pl = "ip prefix-list PL-A seq 5 permit 192.0.2.0/24\n\
+                  ip prefix-list PL-B seq 5 permit 198.51.100.0/24\n";
+        let snap = resolve_route_context(bgp, "", pl).expect("no route-map referenced");
+        assert!(
+            snap.prefix_links.is_empty(),
+            "two answers -> refuse to guess"
+        );
+        assert_eq!(
+            snap.conflicting_peers,
+            vec!["192.0.2.1".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn empty_route_map_read_never_wipes_inventory() {
+        // The BGP section references route-maps, so an empty route-map read is a
+        // restricted view / paging artifact — indistinguishable from "none
+        // configured" and therefore NOT a snapshot.
+        let refused = resolve_route_context(BGP_CFG, "", PREFIX_LISTS)
+            .expect_err("empty read with references must be refused");
+        assert_eq!(refused.event, "route_map_inventory_empty");
+        // A device whose BGP section proves no route-map is referenced is a
+        // legitimate empty snapshot.
+        let bgp = "router bgp 65010\n neighbor 192.0.2.1 remote-as 64500\n";
+        let snap = resolve_route_context(bgp, "", "").expect("nothing referenced");
+        assert!(snap.prefix_links.is_empty() && snap.route_maps.is_empty());
+    }
+
+    #[test]
+    fn empty_prefix_list_read_never_wipes_inventory() {
+        let refused = resolve_route_context(BGP_CFG, ROUTE_MAPS, "")
+            .expect_err("empty prefix-list read with references must be refused");
+        assert_eq!(refused.event, "prefix_list_inventory_empty");
+    }
+
+    #[test]
+    fn prefix_list_names_come_from_real_stanzas_only() {
+        let names = parse_prefix_list_names(PREFIX_LISTS);
+        assert!(names.contains("pfx-to-viva") && names.contains("PL-BLOCK"));
+        // `ip prefix-list sequence-number` is a global toggle, not a list.
+        assert!(!names.contains("sequence-number"));
+        assert!(parse_prefix_list_names("").is_empty());
+        assert!(parse_prefix_list_names("ip prefix-list\nip prefix-list \n").is_empty());
+    }
+
+    #[test]
+    fn neighbor_policy_never_mistakes_an_ipv6_peer_for_a_peer_group() {
+        let policy = parse_neighbor_policy(BGP_CFG);
+        assert!(policy
+            .group_prefix_list_out
+            .contains(&("UPSTREAMS".to_string(), "pfx-to-viva".to_string())));
+        assert!(policy
+            .group_route_map_out
+            .contains(&("SCRUBBERS".to_string(), "prepend-3".to_string())));
+        // `neighbor 2001:db8::1 prefix-list pfx-v6 out` is an IPv6 PEER (v1 is
+        // IPv4-only), never a peer-group name.
+        assert!(!policy
+            .group_prefix_list_out
+            .iter()
+            .any(|(g, _)| g.contains(':')));
+        assert_eq!(policy.groups.len(), 3);
+        assert_eq!(policy.peer_prefix_list_out.len(), 2);
     }
 }

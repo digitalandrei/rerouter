@@ -165,9 +165,21 @@ neighbor — e.g. a GRE scrubber session). IPv4 only in v1.
 ```text
 id, device_id, peer_remote_addr, peer_remote_as, local_as,
 peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map,
+route_context_discovered_at,
 first_seen_at, last_seen_at, last_polled_at, created_at, updated_at
 UNIQUE (device_id, peer_remote_addr)
 ```
+
+Two different freshness clocks live on this row and must not be confused:
+
+* `last_polled_at` — written by SNMP polling. Peer LIVENESS; gates the
+  `bgp_peer` / `bgp_local_as` sources (`SNMP_INVENTORY_MAX_AGE_HOURS`, 24h) and is
+  reported to the SPA as `inventory_fresh`.
+* `route_context_discovered_at` — written by SSH route-context discovery in the
+  SAME transaction as `out_prefix_list` / `in_route_map` / `out_route_map`, and
+  therefore the only honest age of those three. Gates the
+  `peer_out_prefix_list` source and the peer<->prefix-list cross-check
+  (`ROUTING_INVENTORY_MAX_AGE_HOURS`, 48h). NULL = never discovered = refused.
 
 ## device_bgp_networks
 
@@ -184,6 +196,13 @@ UNIQUE (device_id, prefix)
 Successful prefix/route-map discovery reconciles a complete snapshot in one
 transaction. New actions accept SSH routing inventory only while
 `last_discovered_at` is within 48 hours.
+
+A read that cannot be proven complete is NOT a snapshot: a denied, failed or
+inconclusive routing read (e.g. an empty `| section ^route-map` output on a
+device whose BGP config references route-maps) leaves the previous rows
+untouched and is logged (`route_map_inventory_empty`,
+`prefix_list_inventory_empty`, `route_map_discovery_denied`). Inventory then
+fails closed by AGEING OUT, never by being wiped on a bad read.
 
 ## device_route_maps
 
