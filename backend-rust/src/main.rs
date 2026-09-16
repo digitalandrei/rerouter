@@ -104,6 +104,21 @@ struct Cli {
     /// /api/devices/{id}/ssh-capabilities endpoint for headless diagnosis.
     #[arg(long)]
     ssh_caps: Option<u64>,
+
+    /// Debug: run ONE read-only `show` command against a device (by id, using
+    /// its stored creds), print the raw output, and exit. Intended for
+    /// diagnosing discovery gaps (e.g. which form a peer's outbound
+    /// prefix-list is configured in). Not a general execution path: the
+    /// command must start with `show ` AND still passes the same fail-closed
+    /// `command_allowed` allowlist every other SSH caller goes through, so it
+    /// can never reach a config verb. Requires shell access on the controller
+    /// host, exactly like --ssh-test / --ssh-caps.
+    #[arg(long)]
+    ssh_show: Option<u64>,
+
+    /// The `show` command for --ssh-show.
+    #[arg(long, default_value = "show running-config | section ^router bgp")]
+    show: String,
 }
 
 #[tokio::main]
@@ -167,6 +182,29 @@ async fn main() -> Result<()> {
     // system_settings incl. operating_mode=observe); otherwise this is an
     // idempotent upgrade / "schema up to date" no-op. The controller owns the
     // schema — this runs before startup recovery.
+    // Read-only device diagnostic. Deliberately handled BEFORE db::migrate so a
+    // binary built from a work-in-progress branch can read a router without
+    // applying that branch's unreviewed schema changes to the database it points at.
+    if let Some(dev_id) = cli.ssh_show {
+        let cmd = cli.show.trim().to_string();
+        if !cmd.starts_with("show ") {
+            eprintln!("--ssh-show only runs `show` commands (got {cmd:?})");
+            std::process::exit(2);
+        }
+        match rerouter_controller::ssh::run_commands(&pool, dev_id, &[cmd]).await {
+            Ok(outcome) => {
+                for r in &outcome.results {
+                    println!("$ {}\n{}", r.command, r.output);
+                }
+            }
+            Err(e) => {
+                eprintln!("read FAILED (device {dev_id}): {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     db::migrate(&pool).await?;
 
     if cli.migrate {
