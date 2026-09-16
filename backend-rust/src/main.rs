@@ -193,7 +193,10 @@ async fn main() -> Result<()> {
         }
         match rerouter_controller::ssh::run_commands(&pool, dev_id, &[cmd]).await {
             Ok(outcome) => {
-                for r in &outcome.results {
+                // Raw device text leaving the module: mask secret VALUES first.
+                // `show running-config | section ^router bgp` carries
+                // `neighbor <ip> password <cleartext>`.
+                for r in &rerouter_controller::ssh::redact_results(&outcome.results) {
                     println!("$ {}\n{}", r.command, r.output);
                 }
             }
@@ -242,7 +245,7 @@ async fn main() -> Result<()> {
                         "matches pinned"
                     }
                 );
-                for r in &outcome.results {
+                for r in &rerouter_controller::ssh::redact_results(&outcome.results) {
                     println!("\n$ {}\n{}", r.command, r.output);
                 }
             }

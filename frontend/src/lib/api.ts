@@ -692,9 +692,13 @@ export interface Lock {
 // ---------------------------------------------------------------------------
 
 export interface TemplateParamSpec {
-  type: string; // "ip" | "cidr" | "asn" | "int" | "string"
+  type: string; // "ip" | "cidr" | "asn" | "int" | "seq" | "string"
   label?: string;
   required?: boolean;
+  // Resolved by the controller at apply time, never entered by an operator (the
+  // prefix-list sequence is chosen from a read taken inside the apply session).
+  // Rendered read-only; the preview shows "<auto-seq>" in its place.
+  deferred?: boolean;
   // UI prefill hint: "bgp_local_as" | "bgp_peer" | "announced_prefix" | "rtbh_tag"
   //   | "interface_name" | "peer_out_prefix_list" | "route_map" | "bgp_direction"
   source?: string;
@@ -725,6 +729,10 @@ export interface RenderedPlan {
   config_mode: boolean;
   commands: string[];
   verify: { command: string; expect: string | null; reject: string | null } | null;
+  // A command still carries the "<auto-seq>" placeholder: the plan is a faithful
+  // preview but not sendable as-is. The controller resolves the prefix-list
+  // sequence from a fresh in-session read and re-renders before anything is sent.
+  sequence_pending?: boolean;
 }
 
 export interface RenderResult {

@@ -101,11 +101,15 @@ bgp_session_disable   router bgp {local_asn} ; neighbor {neighbor_ip} shutdown
                       verify: show ip bgp neighbors {neighbor_ip}
                               -> expect "Administratively shut"
 
-bgp_advertise_add     ip prefix-list {prefix_list_name} permit {prefix}
+bgp_advertise_add     ip prefix-list {prefix_list_name} seq {sequence}
+                                    permit {prefix}
                       exec_after: clear ip bgp {neighbor_ip} soft out
                       Advertise a prefix toward ONE upstream peer by adding it to
-                      that peer's outbound route-map prefix-list, then soft-clear
-                      outbound. The prefix-list name is DISCOVERED per peer and
+                      that peer's outbound route-map prefix-list at an EXPLICIT
+                      sequence number, then soft-clear outbound. See "Sequenced
+                      prefix-list insertion" below — {sequence} is resolved at
+                      apply time and is never operator input.
+                      The prefix-list name is DISCOVERED per peer and
                       offered read-only by the `peer_out_prefix_list` picker; it
                       is never typed (IOS silently CREATES an unknown list, so a
                       wrong name would advertise nothing yet report success).
@@ -124,8 +128,12 @@ bgp_advertise_add     ip prefix-list {prefix_list_name} permit {prefix}
                               -> expect "{prefix_net}"
                       rollback: bgp_advertise_remove
 
-bgp_advertise_remove  no ip prefix-list {prefix_list_name} permit {prefix}
+bgp_advertise_remove  no ip prefix-list {prefix_list_name} seq {sequence}
+                                       permit {prefix}
                       exec_after: clear ip bgp {neighbor_ip} soft out
+                      Removes EXACTLY one entry. As a rollback it inherits the
+                      sequence the add persisted; run standalone it resolves the
+                      entry from a fresh read like the add does.
                       verify: show ip bgp neighbors {neighbor_ip} advertised-routes
                               -> reject "{prefix_net}"
 
@@ -184,6 +192,100 @@ above is also gated by the fail-closed `ssh::command_allowed` allowlist.
 Disruptive templates are paired with their inverse via `rollback_template_id`.
 The old `cloudflare_under_attack` / `flowspec_drop` / `divert_to_scrubber`
 templates were removed when their providers were de-scoped.
+
+### Sequenced prefix-list insertion (`bgp_advertise_add` / `_remove`)
+
+Every outbound prefix-list on a real edge router ends with a terminating deny:
+
+```text
+ip prefix-list no-export   seq 10 deny 0.0.0.0/0 le 32
+ip prefix-list pfx-to-viva seq  5 permit 194.105.142.0/24
+ip prefix-list pfx-to-viva seq 10 deny 0.0.0.0/0 le 32
+```
+
+`ip prefix-list <name> permit <cidr>` with no sequence number makes IOS
+auto-assign `highest + 5`, so the new permit lands **after** that deny and is
+never reached. The CLI reports success, the router advertises nothing, and only
+the post-apply verification catches it — fail-safe, but the feature does not
+work. Migration `20260916000400` therefore renders an EXPLICIT sequence.
+
+**How the sequence is chosen** (`reroute::prefix_list`, pure + unit-tested).
+The target list is read fresh, at apply time, **inside the SAME SSH session that
+pushes the config** (`show ip prefix-list <name>`). From that text:
+
+1. Walk the entries in sequence order and stop at the first one that MATCHES the
+   prefix — network bits equal for the entry's length, and the prefix length
+   inside the entry's `ge`/`le` range (no qualifiers = exactly that length; `ge`
+   alone opens the top to /32; `le` alone opens the bottom to the entry's own
+   length).
+2. A matching **permit** means the prefix is already advertised through this
+   list: **no configuration change**, go straight to verification. If that entry
+   is exactly this prefix its sequence is persisted so a rollback can remove
+   precisely it; if it is a broader covering entry, no sequence is persisted
+   (naming it would have a rollback withdraw more than was asked).
+3. A matching **deny** is the shadowing entry. The new permit goes at the
+   midpoint of the open interval between the preceding entry's sequence and that
+   deny's — e.g. `(5, 10)` → **7**. The midpoint, not `low + 1`, so repeated
+   insertions halve the gap instead of exhausting one end.
+4. If that interval holds **no free integer** (`seq 5` then `seq 6`, or a
+   shadowing deny at `seq 1`), the action **fails closed**: nothing is pushed,
+   and the reason names both sequences and tells the operator to renumber the
+   prefix-list. Rerouter never renumbers the router's list, never guesses, and
+   never falls back to the bare append that caused the original no-op.
+5. With **no** shadowing entry the permit still gets an explicit sequence
+   (`last + 5`) rather than IOS auto-assignment — determinism the rollback needs.
+6. A read that is empty, truncated, denied, malformed, or shows a duplicate
+   sequence is a **refusal**, never an assumption that the list is empty.
+7. The chosen sequence is checked against the occupied set one last time before
+   it is emitted. **On IOS a write that reuses an existing sequence REPLACES that
+   entry**, so an occupied number would silently overwrite a live filter entry.
+
+`bgp_advertise_remove` mirrors this: a matching deny (or no match) is a no-op; a
+permit that is exactly the prefix is removed by its sequence; a **broader**
+permit is refused, because removing it would withdraw prefixes nobody asked
+about.
+
+**Why not cached inventory.** The IOS replace-on-reuse behaviour is exactly why
+an hour-old snapshot is not good enough: the sequence it names may have been
+taken since, and the write would overwrite a live entry. Only a read taken
+moments before the write can rule that out.
+
+**Why this is not a discovery run.** It is ONE extra `show` in a session that is
+already open — no second connection, no database reconcile, no drift audit.
+`discover_prefixes_and_store` and `reroute::inventory_audit` stay off every
+trigger path (the lint in `inventory_audit` enforces that), so nothing here can
+stall a mitigation behind another SSH handshake during a flood.
+
+**The read is part of the durable record.** `reroute_outputs` stores the
+`show ip prefix-list <name>` response as the session's first step, so a
+post-incident review can see the list exactly as it looked when the sequence was
+chosen.
+
+**Persist before the side effect.** The resolved sequence reaches
+`reroutes.parameters_json` (and the re-rendered `planned_steps_json` /
+`reroute_steps`) BEFORE the command reaches the router. A crash in between leaves
+an `uncertain` reroute that still names the exact entry, and startup recovery
+locks the device as usual.
+
+**Rollback is exact, not content-matched.** The rollback inherits the persisted
+`sequence` and renders `no ip prefix-list {name} seq {n} permit {cidr}` — full
+content included, so IOS refuses it if the entry is not what we wrote. Rollbacks
+continue to bypass fresh-inventory validation by design; when the original
+persisted no sequence (the broader-entry no-op, or a reroute from before this
+change), the rollback simply resolves from its own fresh read, which is always
+safe.
+
+**The preview is honest and unsendable.** Until it is resolved, `{sequence}`
+renders as the literal `<auto-seq>` and the plan carries `sequence_pending:
+true`. That is what an observe-mode preview and the manual-reroute UI show. It is
+also not a valid token in any `command_allowed` shape, so a plan that somehow
+reached the transport unresolved fails closed at the SSH boundary.
+
+**The read itself is allowlisted and probed.** `show ip prefix-list [<name>]` is
+on the `ssh::command_allowed` read set, granted by the RRT parser view
+(`deploy/cisco/rerouter-view.ios` and the copy in the device Settings tab), and
+checked by the SSH capability probe ("Read prefix-lists") so an
+under-privileged account shows up before an incident rather than during one.
 
 ## Two-phase state machine
 

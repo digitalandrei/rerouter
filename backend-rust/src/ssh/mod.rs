@@ -227,6 +227,145 @@ pub struct SshOutcome {
     pub pinned_now: bool,
 }
 
+// ---- Secret redaction ----------------------------------------------------------
+
+/// What a redacted secret is replaced with. A fixed marker (never a length hint).
+pub const REDACTED: &str = "<redacted>";
+
+/// Keywords whose value — and everything after it on the line — is secret.
+/// `key` is handled separately (see [`KEY_NOT_SECRET_NEXT`]).
+const SECRET_REST_OF_LINE: [&str; 7] = [
+    "password",
+    "secret",
+    "key-string",
+    "md5",
+    "pre-shared-key",
+    "passphrase",
+    "psk",
+];
+
+/// Keywords after which exactly ONE token is secret; the rest of the line is
+/// kept because it is diagnostic, not secret (`snmp-server community X RO 42`).
+const SECRET_ONE_TOKEN: [&str; 1] = ["community"];
+
+/// A bare `key` is a secret in `authentication key X`, `crypto isakmp key X`,
+/// `key <string>` inside a key chain… but NOT in these shapes, where redacting
+/// would only destroy diagnosable context.
+const KEY_NOT_SECRET_NEXT: [&str; 5] =
+    ["chain", "generate", "zeroize", "config-key", "pubkey-chain"];
+
+/// Cisco encryption-type markers (`password 7 …`, `secret 5 …`) — a single digit
+/// that is safe (and useful) to keep between the keyword and the redaction.
+fn is_encryption_type(tok: &str) -> bool {
+    tok.len() == 1 && tok.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Mask secret VALUES in raw device output while keeping the line shape, so the
+/// output stays diagnosable: `neighbor 1.2.3.4 password 7 <redacted>`.
+///
+/// Why: `--ssh-show 'show running-config | section ^router bgp'` printed
+/// `neighbor <ip> password <cleartext>` straight to the console, and the
+/// `ssh-test` API returns raw command output to the SPA. Everything that leaves
+/// this module as raw device text goes through here first.
+///
+/// Deliberately CONSERVATIVE: an unrecognised token following a secret keyword
+/// is redacted rather than shown, a `key-string` starts a redacted block that
+/// runs until `exit`/`quit`/`!` or the next unindented line, and the function is
+/// pure string handling that cannot panic on any input (including invalid
+/// UTF-8 already lossily decoded, control characters, or empty text).
+pub fn redact_device_output(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_key_block = false;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&redact_line(line, &mut in_key_block));
+    }
+    out
+}
+
+/// Redact every command's output in an SSH outcome, returning copies. Used at
+/// the module boundary (CLI printers, API handlers) so no caller has to remember.
+pub fn redact_results(results: &[CommandResult]) -> Vec<CommandResult> {
+    results
+        .iter()
+        .map(|r| CommandResult {
+            command: r.command.clone(),
+            output: redact_device_output(&r.output),
+        })
+        .collect()
+}
+
+fn redact_line(line: &str, in_key_block: &mut bool) -> String {
+    let trimmed = line.trim();
+    let indent = &line[..line.len() - line.trim_start().len()];
+
+    if *in_key_block {
+        // The block ends at its terminator or at the next top-level command;
+        // everything inside it is treated as key material.
+        let ends = matches!(trimmed, "exit" | "quit" | "!" | "end");
+        if ends || (!trimmed.is_empty() && indent.is_empty()) {
+            *in_key_block = false;
+            if ends {
+                return line.to_string();
+            }
+        } else {
+            return if trimmed.is_empty() {
+                line.to_string()
+            } else {
+                format!("{indent}{REDACTED}")
+            };
+        }
+    }
+
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut redacted_anything = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        let next = toks.get(i + 1).copied();
+        let rest_of_line_is_secret = SECRET_REST_OF_LINE.contains(&tok)
+            || (tok == "key" && next.is_some_and(|n| !KEY_NOT_SECRET_NEXT.contains(&n)));
+
+        if tok == "key-string" {
+            *in_key_block = true;
+        }
+        if rest_of_line_is_secret {
+            kept.push(tok);
+            i += 1;
+            // Keep a Cisco encryption-type digit (`password 7 …`) for context.
+            if let Some(ty) = toks.get(i) {
+                if is_encryption_type(ty) {
+                    kept.push(ty);
+                    i += 1;
+                }
+            }
+            if i < toks.len() {
+                kept.push(REDACTED);
+                redacted_anything = true;
+            }
+            break;
+        }
+        if SECRET_ONE_TOKEN.contains(&tok) && next.is_some() {
+            kept.push(tok);
+            kept.push(REDACTED);
+            redacted_anything = true;
+            i += 2;
+            continue;
+        }
+        kept.push(tok);
+        i += 1;
+    }
+    // Untouched lines are returned VERBATIM: re-joining tokens would collapse the
+    // column alignment that makes `show` output readable.
+    if !redacted_anything {
+        return line.to_string();
+    }
+    format!("{indent}{}", kept.join(" "))
+}
+
 // ---- Executor port (seam) ------------------------------------------------------
 
 /// The seam the reroute `Rerouter` depends on to talk to a device. Two methods
@@ -249,6 +388,46 @@ pub trait SshExecutor: Send + Sync {
         device_id: u64,
         command: &str,
     ) -> impl std::future::Future<Output = Result<String>> + Send;
+
+    /// Run one read-only `show` and then, in the SAME session, push the config
+    /// commands `resolve` derives from its output. See [`run_on_resolved`].
+    fn apply_resolved<'a>(
+        &'a self,
+        device_id: u64,
+        read_command: &'a str,
+        resolve: SessionResolver<'a>,
+    ) -> impl std::future::Future<Output = Result<ResolvedApply>> + Send + 'a;
+}
+
+/// The in-session resolver: given the read's cleaned output, decide what (if
+/// anything) to push. Boxed rather than generic so the seam stays `dyn`-friendly
+/// and the resulting futures keep simple, non-higher-ranked `Send` bounds.
+pub type SessionResolver<'a> =
+    Box<dyn FnOnce(String) -> BoxFuture<'a, Result<SessionPlan>> + Send + 'a>;
+
+/// A boxed, `Send` future — the resolver's return type.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// What an in-session resolver decided after reading the device's current state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPlan {
+    /// Push exactly these config commands, in this session.
+    Push(Vec<String>),
+    /// The device is already in the requested state — push NOTHING and go on to
+    /// verification. The string is the operator-facing explanation.
+    Skip(String),
+    /// Fail closed: push nothing, and do not guess. The string is the
+    /// operator-facing, actionable reason.
+    Refuse(String),
+}
+
+/// The result of an [`SshExecutor::apply_resolved`] run.
+#[derive(Debug, Clone)]
+pub struct ResolvedApply {
+    /// Every command actually run in the session, the read first, in order.
+    pub outcome: SshOutcome,
+    /// What the resolver decided (`Push` echoes back the commands that ran).
+    pub decision: SessionPlan,
 }
 
 /// The production adapter: real russh over the wire (credential decrypt, host-key
@@ -268,6 +447,18 @@ impl RusshExecutor {
 impl SshExecutor for RusshExecutor {
     async fn apply(&self, device_id: u64, commands: &[String]) -> Result<SshOutcome> {
         run_commands(&self.pool, device_id, commands).await
+    }
+
+    async fn apply_resolved<'a>(
+        &'a self,
+        device_id: u64,
+        read_command: &'a str,
+        resolve: SessionResolver<'a>,
+    ) -> Result<ResolvedApply> {
+        let dev = load_device_ssh(&self.pool, device_id).await?;
+        let resolved = run_on_resolved(&dev, read_command, resolve).await?;
+        persist_tofu(&self.pool, device_id, &dev, &resolved.outcome).await?;
+        Ok(resolved)
     }
 
     async fn verify_read(&self, device_id: u64, command: &str) -> Result<String> {
@@ -428,34 +619,45 @@ pub async fn run_commands(
 ) -> Result<SshOutcome> {
     let dev = load_device_ssh(pool, device_id).await?;
     let outcome = run_on(&dev, commands).await?;
-
-    // TOFU: persist the fingerprint the first time we see it.
-    if dev.expected_fingerprint.is_none() {
-        let updated = sqlx::query(
-            "UPDATE devices SET ssh_host_fingerprint = ? WHERE id = ? AND ssh_host_fingerprint IS NULL",
-        )
-        .bind(&outcome.fingerprint)
-        .bind(device_id)
-        .execute(pool)
-        .await
-        .context("persisting first-seen SSH host key")?;
-        if updated.rows_affected() == 0 {
-            // Another concurrent probe may have won the TOFU race. Accept only
-            // if it pinned the same key; a different winner is a hard mismatch.
-            let pinned: Option<String> =
-                sqlx::query_scalar("SELECT ssh_host_fingerprint FROM devices WHERE id = ?")
-                    .bind(device_id)
-                    .fetch_optional(pool)
-                    .await
-                    .context("checking concurrently pinned SSH host key")?
-                    .flatten();
-            anyhow::ensure!(
-                pinned.as_deref() == Some(outcome.fingerprint.as_str()),
-                "SSH host key changed during first-contact pinning"
-            );
-        }
-    }
+    persist_tofu(pool, device_id, &dev, &outcome).await?;
     Ok(outcome)
+}
+
+/// TOFU: persist the host-key fingerprint the first time we see it. Shared by
+/// every session-opening path so none of them can skip the pinning.
+async fn persist_tofu(
+    pool: &MySqlPool,
+    device_id: u64,
+    dev: &DeviceSsh,
+    outcome: &SshOutcome,
+) -> Result<()> {
+    if dev.expected_fingerprint.is_some() {
+        return Ok(());
+    }
+    let updated = sqlx::query(
+        "UPDATE devices SET ssh_host_fingerprint = ? WHERE id = ? AND ssh_host_fingerprint IS NULL",
+    )
+    .bind(&outcome.fingerprint)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .context("persisting first-seen SSH host key")?;
+    if updated.rows_affected() == 0 {
+        // Another concurrent probe may have won the TOFU race. Accept only
+        // if it pinned the same key; a different winner is a hard mismatch.
+        let pinned: Option<String> =
+            sqlx::query_scalar("SELECT ssh_host_fingerprint FROM devices WHERE id = ?")
+                .bind(device_id)
+                .fetch_optional(pool)
+                .await
+                .context("checking concurrently pinned SSH host key")?
+                .flatten();
+        anyhow::ensure!(
+            pinned.as_deref() == Some(outcome.fingerprint.as_str()),
+            "SSH host key changed during first-contact pinning"
+        );
+    }
+    Ok(())
 }
 
 /// Discover routing context from the `router bgp` config section over SSH:
@@ -1206,7 +1408,7 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
     // router / interface + sub-commands) can't be probed without side effects, so
     // they aren't executed here — the controller allowlist + the installed parser
     // view are the enforcing controls for those.
-    let probes: [(&str, &str); 6] = [
+    let probes: [(&str, &str); 7] = [
         (
             "Read running-config",
             "show running-config | section ^router bgp",
@@ -1215,6 +1417,10 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
         ("Read IPv6 routing table", "show ipv6 route summary"),
         ("Read BGP table", "show ip bgp summary"),
         ("Read interfaces", "show interfaces summary"),
+        // The sequenced advertise templates read the target prefix-list in the
+        // SAME session as the config push. If the account cannot run this, the
+        // add/remove fails closed at apply time — so surface it here instead.
+        ("Read prefix-lists", "show ip prefix-list"),
         ("Enter configuration mode", "configure terminal"),
     ];
     // We deliberately do NOT append a trailing `end` to leave config mode. If
@@ -1356,6 +1562,13 @@ fn is_cidr6(tok: &str) -> bool {
         None => false,
     }
 }
+/// A prefix-list sequence number, bounded to the range IOS accepts. Rendered by
+/// the sequenced advertise templates; see [`crate::reroute::prefix_list`].
+fn is_prefix_list_seq(tok: &str) -> bool {
+    tok.parse::<u32>().is_ok_and(|n| {
+        (crate::reroute::prefix_list::MIN_SEQ..=crate::reroute::prefix_list::MAX_SEQ).contains(&n)
+    })
+}
 /// A bare config name token (interface name, prefix-list name): non-empty and
 /// restricted to `[A-Za-z0-9/._:-]` so it can never smuggle a second command or
 /// whitespace. Template params are already whitespace-free; this is defense in depth.
@@ -1423,6 +1636,13 @@ fn command_allowed(cmd: &str) -> bool {
         ["show", "ip", "bgp", "neighbors", a, "advertised-routes"] => is_ipv4(a),
         ["show", "interfaces", n] => is_name(n),
         ["show", "running-config", "interface", n] => is_name(n),
+        // Fresh, in-session read of an outbound prefix-list. The sequenced
+        // advertise templates need the list's CURRENT entries to place a new
+        // permit before the terminating deny — and to be sure the sequence they
+        // write is not already occupied (IOS REPLACES an occupied sequence).
+        // Read-only; the bare form is what the capability probe sends.
+        ["show", "ip", "prefix-list"] => true,
+        ["show", "ip", "prefix-list", name] => is_name(name),
         // null-route (RTBH to Null0), with the optional name / tag the templates use
         ["ip", "route", net, mask, "Null0"] => is_ipv4(net) && is_ipv4(mask),
         ["ip", "route", net, mask, "Null0", "name", name] => {
@@ -1446,7 +1666,19 @@ fn command_allowed(cmd: &str) -> bool {
         ["router", "bgp", asn] => is_u32(asn),
         ["neighbor", ip, "shutdown"] => is_ipv4(ip),
         ["no", "neighbor", ip, "shutdown"] => is_ipv4(ip),
-        // BGP per-peer advertisement via outbound prefix-list (+ soft clear)
+        // BGP per-peer advertisement via outbound prefix-list (+ soft clear).
+        // SEQUENCED form — what the templates render today: the controller picks
+        // the sequence from a fresh in-session read so the permit lands BEFORE the
+        // list's terminating deny (an auto-assigned `highest + 5` lands after it
+        // and is never reached) and so a rollback can remove exactly that entry.
+        ["ip", "prefix-list", name, "seq", seq, "permit", cidr] => {
+            is_name(name) && is_prefix_list_seq(seq) && is_cidr(cidr)
+        }
+        ["no", "ip", "prefix-list", name, "seq", seq, "permit", cidr] => {
+            is_name(name) && is_prefix_list_seq(seq) && is_cidr(cidr)
+        }
+        // BARE form — kept allowed ONLY so reroutes persisted before the
+        // sequenced templates shipped stay rollback-able. Nothing renders it now.
         ["ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
         ["no", "ip", "prefix-list", name, "permit", cidr] => is_name(name) && is_cidr(cidr),
         ["clear", "ip", "bgp", ip, "soft", dir] => is_ipv4(ip) && matches!(*dir, "in" | "out"),
@@ -1494,13 +1726,12 @@ fn sequence_safe(commands: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Lower-level: run commands against already-loaded credentials. Used by
-/// [`run_commands`]; broken out so the executor can reuse one decrypt.
-pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> {
-    // Fail-closed allowlist: refuse to open a session if ANY command is outside the
-    // exact set Rerouter is designed to send. Defense-in-depth behind template
-    // rendering — even a malformed template or future caller cannot push an
-    // unexpected command to a router. We validate before connecting.
+/// Fail-closed allowlist gate: refuse to open a session (or to send anything
+/// further inside an open one) if ANY command is outside the exact set Rerouter
+/// is designed to send. Defense-in-depth behind template rendering — even a
+/// malformed template or a future caller cannot push an unexpected command to a
+/// router. Always applied BEFORE the bytes leave the process.
+fn check_allowed(commands: &[String]) -> Result<()> {
     for c in commands {
         if !command_allowed(c) {
             return Err(anyhow!(
@@ -1509,158 +1740,282 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
         }
     }
     // Plan-level guard: a bare `shutdown` is only safe in interface config.
-    sequence_safe(commands)?;
+    sequence_safe(commands)
+}
 
-    let observed = Arc::new(Mutex::new(None::<String>));
-    let handler = TofuHandler {
-        expected: dev.expected_fingerprint.clone(),
-        observed: observed.clone(),
-    };
+/// One authenticated, paging-disabled IOS shell. Owns the russh handle (dropping
+/// it tears the connection down), the channel, and the prompt anchor, so both the
+/// plain and the resolving execution paths drive exactly the same session.
+struct IosSession {
+    /// Kept alive for the lifetime of the channel; never used directly again.
+    _handle: client::Handle<TofuHandler>,
+    channel: russh::Channel<client::Msg>,
+    hostname: String,
+    started: Instant,
+    fingerprint: String,
+    pinned_now: bool,
+}
 
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(60)),
-        preferred: ios_preferred(),
-        ..Default::default()
-    });
+impl IosSession {
+    /// Connect, authenticate, pin/verify the host key, open an interactive shell,
+    /// prove we landed in privileged EXEC, and disable paging.
+    async fn open(dev: &DeviceSsh) -> Result<Self> {
+        let observed = Arc::new(Mutex::new(None::<String>));
+        let handler = TofuHandler {
+            expected: dev.expected_fingerprint.clone(),
+            observed: observed.clone(),
+        };
 
-    let connect = client::connect(config, (dev.host.as_str(), dev.port), handler);
-    let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            // A host-key mismatch surfaces as a rejected key during the handshake.
-            if dev.expected_fingerprint.is_some() {
-                if let Some(seen) = observed.lock().await.clone() {
-                    if Some(&seen) != dev.expected_fingerprint.as_ref() {
-                        return Err(anyhow!(
-                            "SSH host key changed (pinned {}, server offered {}) — refusing to connect",
-                            dev.expected_fingerprint.as_deref().unwrap_or("?"),
-                            seen
-                        ));
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(Duration::from_secs(60)),
+            preferred: ios_preferred(),
+            ..Default::default()
+        });
+
+        let connect = client::connect(config, (dev.host.as_str(), dev.port), handler);
+        let mut session = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                // A host-key mismatch surfaces as a rejected key during the handshake.
+                if dev.expected_fingerprint.is_some() {
+                    if let Some(seen) = observed.lock().await.clone() {
+                        if Some(&seen) != dev.expected_fingerprint.as_ref() {
+                            return Err(anyhow!(
+                                "SSH host key changed (pinned {}, server offered {}) — refusing to connect",
+                                dev.expected_fingerprint.as_deref().unwrap_or("?"),
+                                seen
+                            ));
+                        }
                     }
                 }
+                return Err(anyhow!(
+                    "SSH connect to {}:{} failed: {e}",
+                    dev.host,
+                    dev.port
+                ));
             }
+            Err(_) => {
+                return Err(anyhow!(
+                    "SSH connect to {}:{} timed out",
+                    dev.host,
+                    dev.port
+                ))
+            }
+        };
+
+        // Authenticate (password XOR key).
+        let authed = match &dev.auth {
+            SshAuth::Password(pw) => session
+                .authenticate_password(dev.username.clone(), pw.clone())
+                .await
+                .context("SSH password authentication")?,
+            SshAuth::Key {
+                private_key_pem,
+                passphrase,
+            } => {
+                let key = decode_secret_key(private_key_pem, passphrase.as_deref())
+                    .context("parsing SSH private key")?;
+                let rsa_hash = session
+                    .best_supported_rsa_hash()
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+                let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
+                session
+                    .authenticate_publickey(dev.username.clone(), key)
+                    .await
+                    .context("SSH public-key authentication")?
+            }
+        };
+        if !authed.success() {
             return Err(anyhow!(
-                "SSH connect to {}:{} failed: {e}",
-                dev.host,
-                dev.port
+                "SSH authentication failed for user '{}'",
+                dev.username
             ));
         }
-        Err(_) => {
-            return Err(anyhow!(
-                "SSH connect to {}:{} timed out",
-                dev.host,
-                dev.port
-            ))
-        }
-    };
 
-    // Authenticate (password XOR key).
-    let authed = match &dev.auth {
-        SshAuth::Password(pw) => session
-            .authenticate_password(dev.username.clone(), pw.clone())
+        let fingerprint = observed
+            .lock()
             .await
-            .context("SSH password authentication")?,
-        SshAuth::Key {
-            private_key_pem,
-            passphrase,
-        } => {
-            let key = decode_secret_key(private_key_pem, passphrase.as_deref())
-                .context("parsing SSH private key")?;
-            let rsa_hash = session
-                .best_supported_rsa_hash()
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-            let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
-            session
-                .authenticate_publickey(dev.username.clone(), key)
-                .await
-                .context("SSH public-key authentication")?
+            .clone()
+            .ok_or_else(|| anyhow!("internal: no host key observed during handshake"))?;
+
+        // Open an interactive shell (IOS commonly disables the bare `exec` channel).
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .context("opening SSH channel")?;
+        channel
+            .request_pty(false, "vt100", 200, 512, 0, 0, &[])
+            .await
+            .context("requesting PTY")?;
+        channel
+            .request_shell(false)
+            .await
+            .context("requesting interactive shell")?;
+
+        let started = Instant::now();
+
+        // Read the login banner up to the first prompt; derive the device hostname so
+        // subsequent prompt detection is anchored to THIS device (not stray output).
+        let banner =
+            read_until(&mut channel, &mut |buf| tail_prompt(buf).is_some(), started).await?;
+        let base_prompt = tail_prompt(&banner).unwrap_or_default();
+        let hostname = prompt_hostname(&base_prompt);
+
+        // The account must log straight into privileged EXEC ("name#"). A user-EXEC
+        // session ("name>") can't run the controller's privileged commands (show
+        // running-config, configure terminal, the reroute templates) and we can't
+        // answer an `enable` password prompt on a non-interactive session — fail fast
+        // with an actionable message instead of stalling on the first denied command.
+        if base_prompt.ends_with('>') {
+            return Err(anyhow!(
+                "SSH account logged in at user-EXEC ('{base_prompt}'), not enable mode ('#'). \
+                 Rerouter needs privileged EXEC and cannot supply an enable password on a \
+                 non-interactive session — give the account privilege 15 so it logs straight \
+                 into '#' (e.g. `username <user> privilege 15 …`)."
+            ));
         }
-    };
-    if !authed.success() {
-        return Err(anyhow!(
-            "SSH authentication failed for user '{}'",
-            dev.username
-        ));
+
+        // Disable paging so long `show` output isn't broken by "--More--".
+        send_line(&mut channel, "terminal length 0").await?;
+        let _ = read_until(&mut channel, &mut prompt_matcher(&hostname), started).await?;
+
+        Ok(IosSession {
+            _handle: session,
+            channel,
+            hostname,
+            started,
+            fingerprint,
+            pinned_now: dev.expected_fingerprint.is_none(),
+        })
     }
 
-    let fingerprint = observed
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| anyhow!("internal: no host key observed during handshake"))?;
-
-    // Open an interactive shell (IOS commonly disables the bare `exec` channel).
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .context("opening SSH channel")?;
-    channel
-        .request_pty(false, "vt100", 200, 512, 0, 0, &[])
-        .await
-        .context("requesting PTY")?;
-    channel
-        .request_shell(false)
-        .await
-        .context("requesting interactive shell")?;
-
-    let session_start = Instant::now();
-
-    // Read the login banner up to the first prompt; derive the device hostname so
-    // subsequent prompt detection is anchored to THIS device (not stray output).
-    let banner = read_until(
-        &mut channel,
-        &mut |buf| tail_prompt(buf).is_some(),
-        session_start,
-    )
-    .await?;
-    let base_prompt = tail_prompt(&banner).unwrap_or_default();
-    let hostname = prompt_hostname(&base_prompt);
-
-    // The account must log straight into privileged EXEC ("name#"). A user-EXEC
-    // session ("name>") can't run the controller's privileged commands (show
-    // running-config, configure terminal, the reroute templates) and we can't
-    // answer an `enable` password prompt on a non-interactive session — fail fast
-    // with an actionable message instead of stalling on the first denied command.
-    if base_prompt.ends_with('>') {
-        return Err(anyhow!(
-            "SSH account logged in at user-EXEC ('{base_prompt}'), not enable mode ('#'). \
-             Rerouter needs privileged EXEC and cannot supply an enable password on a \
-             non-interactive session — give the account privilege 15 so it logs straight \
-             into '#' (e.g. `username <user> privilege 15 …`)."
-        ));
-    }
-
-    // Disable paging so long `show` output isn't broken by "--More--".
-    send_line(&mut channel, "terminal length 0").await?;
-    let _ = read_until(&mut channel, &mut prompt_matcher(&hostname), session_start).await?;
-
-    let mut results = Vec::with_capacity(commands.len());
-    for command in commands {
-        if session_start.elapsed() > SESSION_BUDGET {
+    /// Send one command and read back its cleaned output.
+    async fn run(&mut self, command: &str) -> Result<CommandResult> {
+        if self.started.elapsed() > SESSION_BUDGET {
             return Err(anyhow!(
                 "SSH session exceeded its time budget before '{command}'"
             ));
         }
-        send_line(&mut channel, command).await?;
-        let raw = read_until(&mut channel, &mut prompt_matcher(&hostname), session_start).await?;
-        results.push(CommandResult {
-            command: command.clone(),
+        send_line(&mut self.channel, command).await?;
+        let raw = read_until(
+            &mut self.channel,
+            &mut prompt_matcher(&self.hostname),
+            self.started,
+        )
+        .await?;
+        Ok(CommandResult {
+            command: command.to_string(),
             output: clean_output(&raw, command),
-        });
+        })
     }
 
-    // Best-effort clean exit; ignore errors (we already have the results).
-    let _ = send_line(&mut channel, "exit").await;
-    let _ = channel.close().await;
+    /// Best-effort clean exit; errors are ignored (we already have the results).
+    async fn close(mut self) {
+        let _ = send_line(&mut self.channel, "exit").await;
+        let _ = self.channel.close().await;
+    }
 
-    Ok(SshOutcome {
-        results,
-        fingerprint,
-        pinned_now: dev.expected_fingerprint.is_none(),
-    })
+    fn outcome(&self, results: Vec<CommandResult>) -> SshOutcome {
+        SshOutcome {
+            results,
+            fingerprint: self.fingerprint.clone(),
+            pinned_now: self.pinned_now,
+        }
+    }
+}
+
+/// Lower-level: run commands against already-loaded credentials. Used by
+/// [`run_commands`]; broken out so the executor can reuse one decrypt.
+pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> {
+    // Validate before connecting.
+    check_allowed(commands)?;
+
+    let mut session = IosSession::open(dev).await?;
+    let mut results = Vec::with_capacity(commands.len());
+    for command in commands {
+        results.push(session.run(command).await?);
+    }
+    let outcome = session.outcome(results);
+    session.close().await;
+    Ok(outcome)
+}
+
+/// Run ONE read-only `show`, hand its output to `resolve`, and — in the SAME
+/// session — push whatever config commands the resolver derives from it.
+///
+/// This is the transport half of the sequenced prefix-list insertion (see
+/// [`crate::reroute::prefix_list`]). It is deliberately NOT an inventory
+/// discovery run: one extra `show` inside a session that is already open, no
+/// second connection, no database reconcile, no drift audit.
+///
+/// The resolver's commands go through the SAME fail-closed allowlist and
+/// `sequence_safe` guard as any other push, re-checked here after resolution —
+/// a resolver cannot widen what may reach the router.
+pub async fn run_on_resolved(
+    dev: &DeviceSsh,
+    read_command: &str,
+    resolve: SessionResolver<'_>,
+) -> Result<ResolvedApply> {
+    let read = read_command.trim().to_string();
+    if !read.starts_with("show ") {
+        return Err(anyhow!(
+            "the in-session resolver read must be a `show` command, got {read:?}"
+        ));
+    }
+    check_allowed(std::slice::from_ref(&read))?;
+
+    let mut session = IosSession::open(dev).await?;
+    let read_result = match session.run(&read).await {
+        Ok(r) => r,
+        Err(e) => {
+            // The read is the FIRST command in the session, so a failure here
+            // provably pushed nothing. Report it as a fail-closed refusal rather
+            // than an error: an ambiguous-apply error would quarantine the device
+            // for something that demonstrably had no effect on it.
+            let outcome = session.outcome(Vec::new());
+            session.close().await;
+            return Ok(ResolvedApply {
+                outcome,
+                decision: SessionPlan::Refuse(format!(
+                    "could not read the device state this action depends on (`{read}`): {e}"
+                )),
+            });
+        }
+    };
+    let read_output = read_result.output.clone();
+    let mut results = vec![read_result];
+
+    let decision = match resolve(read_output).await {
+        Ok(d) => d,
+        Err(e) => {
+            session.close().await;
+            return Err(e);
+        }
+    };
+
+    if let SessionPlan::Push(commands) = &decision {
+        // Re-check AFTER resolution: the allowlist is what bounds the router side.
+        if let Err(e) = check_allowed(commands) {
+            session.close().await;
+            return Err(e);
+        }
+        for command in commands {
+            match session.run(command).await {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    session.close().await;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    let outcome = session.outcome(results);
+    session.close().await;
+    Ok(ResolvedApply { outcome, decision })
 }
 
 // ---- Shell I/O helpers ---------------------------------------------------------
@@ -1825,6 +2180,190 @@ mod tests {
         assert!(caps_denied_summary(&[]).is_none());
     }
 
+    // ---- secret redaction ----------------------------------------------------
+
+    /// Assert the secret is gone and the line is still recognisable.
+    fn assert_masked(input: &str, secret: &str, must_keep: &[&str]) {
+        let out = redact_device_output(input);
+        assert!(
+            !out.contains(secret),
+            "secret {secret:?} survived redaction:\n{out}"
+        );
+        assert!(out.contains(REDACTED), "no redaction marker in:\n{out}");
+        for keep in must_keep {
+            assert!(out.contains(keep), "lost context {keep:?} from:\n{out}");
+        }
+    }
+
+    #[test]
+    fn masks_a_bgp_neighbor_password() {
+        // The exact line `--ssh-show 'show running-config | section ^router bgp'`
+        // printed to the console.
+        assert_masked(
+            " neighbor 23.45.23.197 password Sup3rSecret!",
+            "Sup3rSecret!",
+            &["neighbor 23.45.23.197 password"],
+        );
+        // Cleartext with no encryption type, and the type-7 form.
+        assert_masked(
+            " neighbor 1.2.3.4 password 7 070C285F4D061A33",
+            "070C285F4D061A33",
+            &["neighbor 1.2.3.4 password 7"],
+        );
+    }
+
+    #[test]
+    fn masks_username_secret_and_password_forms() {
+        assert_masked(
+            "username rerouter privilege 15 secret 5 $1$mERr$abcdefghij",
+            "$1$mERr$abcdefghij",
+            &["username rerouter privilege 15 secret 5"],
+        );
+        assert_masked(
+            "username ops password 0 letmein",
+            "letmein",
+            &["username ops password 0"],
+        );
+        assert_masked(
+            "enable secret 9 $9$abc$def",
+            "$9$abc$def",
+            &["enable secret 9"],
+        );
+    }
+
+    #[test]
+    fn masks_snmp_community_but_keeps_the_access_mode() {
+        let out = redact_device_output("snmp-server community s3cr3t RO 99");
+        assert!(!out.contains("s3cr3t"), "{out}");
+        // RO / the ACL number are diagnostic, not secret.
+        assert!(
+            out.contains("snmp-server community <redacted> RO 99"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn masks_ospf_message_digest_keys_and_authentication_keys() {
+        assert_masked(
+            " ip ospf message-digest-key 1 md5 7 14141B180F0B",
+            "14141B180F0B",
+            &["ip ospf message-digest-key 1 md5 7"],
+        );
+        assert_masked(
+            " ip ospf message-digest-key 2 md5 plaintextkey",
+            "plaintextkey",
+            &["message-digest-key 2 md5"],
+        );
+        assert_masked(
+            "  authentication key MyRouterKey",
+            "MyRouterKey",
+            &["authentication key"],
+        );
+    }
+
+    #[test]
+    fn masks_a_whole_key_string_block() {
+        let cfg = "\
+ip ssh pubkey-chain
+  username rerouter
+   key-string
+   AAAAB3NzaC1yc2EAAAADAQABAAABgQDsecretkeymaterial
+   MoreBase64KeyMaterialHere
+   exit
+  exit
+interface GigabitEthernet0/0
+ description uplink";
+        let out = redact_device_output(cfg);
+        assert!(
+            !out.contains("AAAAB3NzaC1yc2EAAAADAQABAAABgQDsecretkeymaterial"),
+            "{out}"
+        );
+        assert!(!out.contains("MoreBase64KeyMaterialHere"), "{out}");
+        // The block terminator and everything after it stay readable.
+        assert!(out.contains("   exit"), "{out}");
+        assert!(out.contains("interface GigabitEthernet0/0"), "{out}");
+        assert!(out.contains(" description uplink"), "{out}");
+    }
+
+    #[test]
+    fn masks_pre_shared_and_isakmp_keys() {
+        assert_masked(
+            "crypto isakmp key MySharedKey address 198.51.100.1",
+            "MySharedKey",
+            &["crypto isakmp key"],
+        );
+        assert_masked(
+            " pre-shared-key local TopSecretPsk",
+            "TopSecretPsk",
+            &["pre-shared-key"],
+        );
+    }
+
+    #[test]
+    fn keeps_non_secret_lines_byte_for_byte() {
+        // Column alignment in `show` output must survive untouched.
+        let cfg = "\
+router bgp 65010
+ bgp log-neighbor-changes
+ neighbor 23.45.23.197 remote-as 65020
+ neighbor 23.45.23.197 description AKAMAI
+ network 194.105.142.0 mask 255.255.255.0
+!
+service password-encryption
+crypto key generate rsa modulus 2048
+key chain RRT-CHAIN
+Interface              IHQ   IQD  OHQ  OQD  RXBS RXPS";
+        assert_eq!(redact_device_output(cfg), cfg);
+    }
+
+    #[test]
+    fn redaction_never_panics_and_always_terminates() {
+        for junk in [
+            "",
+            "\n\n\n",
+            "password",
+            " password ",
+            "secret",
+            "key",
+            "key-string",
+            "community",
+            "md5",
+            "\u{0}\u{7}password \u{1}",
+            "é password é",
+            " authentication key",
+            "neighbor 1.2.3.4 password",
+        ] {
+            let out = redact_device_output(junk);
+            // Nothing after a trailing keyword means nothing to redact.
+            assert!(out.len() <= junk.len() + REDACTED.len() + 1, "{out:?}");
+        }
+        // A key-string block that never terminates still ends at the next
+        // top-level line rather than swallowing the rest of the output.
+        let out = redact_device_output("   key-string\n   AAAA\nrouter bgp 65010");
+        assert!(!out.contains("AAAA"), "{out}");
+        assert!(out.contains("router bgp 65010"), "{out}");
+    }
+
+    #[test]
+    fn redact_results_masks_every_command_output() {
+        let results = vec![
+            CommandResult {
+                command: "show running-config | section ^router bgp".into(),
+                output: " neighbor 1.2.3.4 password hunter2".into(),
+            },
+            CommandResult {
+                command: "show clock".into(),
+                output: "12:00:00.000 UTC Tue Sep 16 2026".into(),
+            },
+        ];
+        let masked = redact_results(&results);
+        assert!(!masked[0].output.contains("hunter2"));
+        assert!(masked[0].output.contains(REDACTED));
+        // Commands are not output and are never rewritten.
+        assert_eq!(masked[0].command, results[0].command);
+        assert_eq!(masked[1].output, results[1].output);
+    }
+
     #[test]
     fn classifies_user_exec_privilege_error() {
         // The exact message run_on emits when the account lands at user-EXEC.
@@ -1872,6 +2411,15 @@ mod tests {
             "neighbor 198.51.100.7 shutdown",
             "no neighbor 198.51.100.7 shutdown",
             // BGP per-peer advertisement (prefix-list + soft clear + verify read)
+            // Sequenced form — what the templates render now.
+            "ip prefix-list PL-UPSTREAM-A seq 7 permit 192.0.2.0/24",
+            "no ip prefix-list PL-UPSTREAM-A seq 7 permit 192.0.2.0/24",
+            "ip prefix-list PL-UPSTREAM-A seq 1 permit 192.0.2.0/24",
+            "ip prefix-list PL-UPSTREAM-A seq 4294967294 permit 192.0.2.0/24",
+            // The in-session read that picks that sequence.
+            "show ip prefix-list",
+            "show ip prefix-list PL-UPSTREAM-A",
+            // Bare form — kept ONLY so pre-sequencing reroutes stay rollback-able.
             "ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
             "no ip prefix-list PL-UPSTREAM-A permit 192.0.2.0/24",
             "clear ip bgp 198.51.100.7 soft out",
@@ -1915,6 +2463,19 @@ mod tests {
             "ip prefix-list PL permit 192.0.2.0/24 ; reload", // chaining / extra tokens
             "ip prefix-list PL deny 192.0.2.0/24",            // only `permit` allowed
             "ip prefix-list PL permit notacidr",
+            // Sequenced form: the sequence is bounded to the IOS-valid range and
+            // the action verb is still `permit` only.
+            "ip prefix-list PL seq 0 permit 192.0.2.0/24",
+            "ip prefix-list PL seq 4294967295 permit 192.0.2.0/24",
+            "ip prefix-list PL seq -1 permit 192.0.2.0/24",
+            "ip prefix-list PL seq notanumber permit 192.0.2.0/24",
+            "ip prefix-list PL seq 7 deny 192.0.2.0/24",
+            "ip prefix-list PL seq 7 permit notacidr",
+            "ip prefix-list PL seq 7 permit 2001:db8::/32",
+            // The unresolved placeholder must NEVER be sendable.
+            "ip prefix-list PL seq <auto-seq> permit 192.0.2.0/24",
+            "no ip prefix-list PL seq <auto-seq> permit 192.0.2.0/24",
+            "show ip prefix-list PL ; reload",
             "clear ip bgp 198.51.100.7 soft both", // dir must be in|out
             "neighbor 198.51.100.7 route-map RM-X both", // dir must be in|out
             "neighbor 198.51.100.7 route-map bad name out", // route-map name has whitespace

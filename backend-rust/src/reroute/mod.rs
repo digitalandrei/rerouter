@@ -8,6 +8,7 @@ pub mod flow_target;
 pub mod guard;
 pub mod inventory_audit;
 pub mod locks;
+pub mod prefix_list;
 pub mod reachability;
 pub mod rollback;
 pub mod state_machine;

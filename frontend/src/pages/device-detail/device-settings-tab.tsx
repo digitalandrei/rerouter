@@ -83,6 +83,7 @@ const RRT_VIEW_BODY = ` ! reads: connectivity, template verification + discovery
  commands exec include show ip route
  commands exec include show ipv6 route
  commands exec include show ip bgp
+ commands exec include show ip prefix-list
  commands exec include show interfaces
  commands exec include show running-config
  ! BGP soft-clear (activate advertise / route-map change)
@@ -94,7 +95,7 @@ const RRT_VIEW_BODY = ` ! reads: connectivity, template verification + discovery
  commands configure include no ip route
  commands configure include ipv6 route
  commands configure include no ipv6 route
- ! BGP advertise via outbound prefix-list
+ ! BGP advertise via outbound prefix-list (sequenced: 'seq <n> permit <cidr>')
  commands configure include ip prefix-list
  commands configure include no ip prefix-list
  ! BGP session shut/no-shut + route-map change

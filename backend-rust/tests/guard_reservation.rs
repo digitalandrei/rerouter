@@ -70,6 +70,7 @@ fn plan() -> RenderedPlan {
         config_mode: true,
         commands: vec!["ip route 192.0.2.1 255.255.255.255 Null0".into()],
         verify: None,
+        sequence_pending: false,
     }
 }
 

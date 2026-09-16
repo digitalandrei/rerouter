@@ -5,13 +5,14 @@
 !  the commands Rerouter actually issues:
 !
 !     reads      : show running-config, show ip route, show ipv6 route,
-!                  show ip bgp, show interfaces, show version, show clock,
-!                  terminal length
+!                  show ip bgp, show ip prefix-list, show interfaces,
+!                  show version, show clock, terminal length
 !     blackhole  : [no] ip route <net> <mask> Null0        (RTBH to Null0, IPv4)
 !                  [no] ipv6 route <cidr> Null0            (RTBH to Null0, IPv6)
 !     bgp session: router bgp <asn> ; [no] neighbor <ip> shutdown
 !     bgp policy : router bgp <asn> ; [no] neighbor <ip> route-map <name> in|out
-!                  [no] ip prefix-list <name> permit <cidr> ; clear ip bgp <ip> soft in|out
+!                  [no] ip prefix-list <name> seq <n> permit <cidr>
+!                  clear ip bgp <ip> soft in|out
 !     interface  : interface <if> ; [no] ip tcp adjust-mss <n> ; [no] shutdown
 !
 !  Everything else is denied by the view (fail-closed). This is defense-in-depth:
@@ -47,6 +48,7 @@ parser view RRT
  commands exec include show ip route
  commands exec include show ipv6 route
  commands exec include show ip bgp
+ commands exec include show ip prefix-list
  commands exec include show interfaces
  commands exec include show running-config
  !
@@ -138,7 +140,12 @@ write memory
 !    `[no] shutdown` and `[no] ip tcp adjust-mss <n>` on ANY interface; the
 !    controller only emits these against the interface named in the template.
 !  * `commands configure include ip prefix-list` permits any prefix-list entry;
-!    the controller only emits `[no] ip prefix-list <name> permit <cidr>`.
+!    the controller only emits `[no] ip prefix-list <name> seq <n> permit <cidr>`,
+!    with <n> chosen from a `show ip prefix-list <name>` taken in the SAME session
+!    moments earlier (so the entry lands before the list's terminating deny, and
+!    never reuses an occupied sequence — IOS REPLACES an entry on reuse).
+!  * `commands exec include show ip prefix-list` is a READ; the sequenced
+!    advertise templates fail closed without it.
 !  Pinning to the exact full command line (variable tokens included) is the job of
 !  the in-app allowlist, not a local parser view.
 ! ----------------------------------------------------------------------------
