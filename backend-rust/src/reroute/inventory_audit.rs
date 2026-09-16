@@ -238,16 +238,18 @@ pub async fn audit_device(
                     tracing::warn!(event_type = "inventory_drift_write_failed", device_id, rule_action_id = action.id, error = %e, "could not record a clean inventory audit; nothing changed");
                 }
             },
-            Verdict::Drifted(reason) => match record_drift(pool, device_id, action, &reason).await {
-                Ok((marked, disarmed)) => {
-                    summary.newly_drifted += usize::from(marked);
-                    summary.rules_disarmed += usize::from(disarmed);
+            Verdict::Drifted(reason) => {
+                match record_drift(pool, device_id, action, &reason).await {
+                    Ok((marked, disarmed)) => {
+                        summary.newly_drifted += usize::from(marked);
+                        summary.rules_disarmed += usize::from(disarmed);
+                    }
+                    Err(e) => {
+                        summary.indeterminate += 1;
+                        tracing::error!(event_type = "inventory_drift_write_failed", device_id, rule_action_id = action.id, error = %e, "CONFIRMED drift could not be persisted; the rule is unchanged and still armed");
+                    }
                 }
-                Err(e) => {
-                    summary.indeterminate += 1;
-                    tracing::error!(event_type = "inventory_drift_write_failed", device_id, rule_action_id = action.id, error = %e, "CONFIRMED drift could not be persisted; the rule is unchanged and still armed");
-                }
-            },
+            }
             Verdict::Indeterminate(detail) => {
                 summary.indeterminate += 1;
                 tracing::warn!(event_type = "inventory_drift_indeterminate", device_id, rule_action_id = action.id, rule_id = action.rule_id, detail = %detail, "could not establish an inventory verdict — no drift concluded, nothing changed");
@@ -354,10 +356,7 @@ async fn record_drift(
     // ONLY automatic execution. `rules.enabled` is untouched on purpose: the rule
     // must keep detecting and alerting, and manual execution stays available.
     let disarm_reason = clip(
-        &format!(
-            "routing inventory drift on action #{}: {reason}",
-            action.id
-        ),
+        &format!("routing inventory drift on action #{}: {reason}", action.id),
         REASON_MAX,
     );
     let disarmed = sqlx::query(
@@ -391,8 +390,8 @@ async fn record_drift(
         "automatic_reroute_disarmed": disarmed,
         "rule_still_enabled": action.rule_enabled,
         "operator_action": "the stored parameter no longer matches the router's configuration; \
-fix the action (or the router) and re-arm automatic execution by hand — the rule keeps detecting \
-and alerting, and manual execution remains available",
+    fix the action (or the router) and re-arm automatic execution by hand — the rule keeps detecting \
+    and alerting, and manual execution remains available",
     });
     let (event_type, severity) = if disarmed {
         ("rule_auto_disarmed", "critical")
@@ -563,8 +562,10 @@ async fn alert_on_expired_inventory(pool: &MySqlPool, device_id: u64) -> Result<
         if !sources.contains(*source) {
             continue;
         }
-        let discovered_at: Option<chrono::DateTime<chrono::Utc>> =
-            sqlx::query_scalar(sql).bind(device_id).fetch_one(pool).await?;
+        let discovered_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(sql)
+            .bind(device_id)
+            .fetch_one(pool)
+            .await?;
         let age_hours = discovered_at
             .map(|t| (chrono::Utc::now() - t).num_hours())
             .unwrap_or(i64::MAX);
@@ -598,8 +599,8 @@ async fn alert_on_expired_inventory(pool: &MySqlPool, device_id: u64) -> Result<
         "dependent_rule_ids": rules.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
         "dependent_rules": rule_names,
         "operator_action": "SSH discovery has not succeeded for this device inside the validator \
-window; dependent reroute actions will be refused at fire time. Check device reachability and the \
-router account's read access, then re-run Discover prefixes.",
+    window; dependent reroute actions will be refused at fire time. Check device reachability and the \
+    router account's read access, then re-run Discover prefixes.",
     });
     sqlx::query(
         "INSERT INTO alerts (event_type, severity, device_id, payload_json, dedup_key) \
@@ -697,7 +698,8 @@ mod tests {
         let db = anyhow::Error::new(sqlx::Error::PoolClosed).context("loading reroute template");
         assert!(is_infrastructure(&db));
 
-        let router = anyhow::anyhow!("prefix-list 'pfx-to-viva' is not attached to peer 23.45.23.197");
+        let router =
+            anyhow::anyhow!("prefix-list 'pfx-to-viva' is not attached to peer 23.45.23.197");
         assert!(!is_infrastructure(&router));
     }
 

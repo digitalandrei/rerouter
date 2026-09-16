@@ -495,9 +495,11 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     // from exactly such an output. The reconcile keeps that fail-closed behaviour
     // (an emptied inventory REFUSES actions), but nothing may be CONCLUDED from
     // it: an empty read must never be allowed to disarm a rule.
-    let announced_prefixes_proven = output
-        .lines()
-        .any(|l| l.trim_start().to_ascii_lowercase().starts_with("router bgp"));
+    let announced_prefixes_proven = output.lines().any(|l| {
+        l.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("router bgp")
+    });
 
     // Resolve each peer's OUTBOUND prefix-list so the guided picker can offer the
     // correct list per peer for the bgp_advertise_* templates. Both reads travel
@@ -506,8 +508,13 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     // discovery and leaves the previous route-context snapshot untouched.
     let rm_cmd = "show running-config | section ^route-map".to_string();
     let pl_cmd = "show running-config | section ^ip prefix-list".to_string();
-    let route_context: std::result::Result<RouteContextSnapshot, &'static str> =
-        match run_commands(pool, device_id, &[rm_cmd, pl_cmd]).await {
+    let route_context: std::result::Result<RouteContextSnapshot, &'static str> = match run_commands(
+        pool,
+        device_id,
+        &[rm_cmd, pl_cmd],
+    )
+    .await
+    {
         Ok(rc_outcome) => {
             match (rc_outcome.results.first(), rc_outcome.results.get(1)) {
                 (Some(rm), Some(pl)) => {

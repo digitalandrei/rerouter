@@ -127,8 +127,14 @@ async fn seed(pool: &MySqlPool, tag: &str, target_peer: &str) -> Fixture {
 
 async fn cleanup(pool: &MySqlPool, f: &Fixture) {
     for (sql, id) in [
-        ("DELETE FROM audit_logs WHERE entity_type = 'rule_action' AND entity_id = ?", f.action_id),
-        ("DELETE FROM audit_logs WHERE entity_type = 'rule' AND entity_id = ?", f.rule_id),
+        (
+            "DELETE FROM audit_logs WHERE entity_type = 'rule_action' AND entity_id = ?",
+            f.action_id,
+        ),
+        (
+            "DELETE FROM audit_logs WHERE entity_type = 'rule' AND entity_id = ?",
+            f.rule_id,
+        ),
         ("DELETE FROM alerts WHERE rule_id = ?", f.rule_id),
         ("DELETE FROM alerts WHERE device_id = ?", f.device_id),
         ("DELETE FROM rules WHERE id = ?", f.rule_id),
@@ -140,7 +146,14 @@ async fn cleanup(pool: &MySqlPool, f: &Fixture) {
 
 /// (inventory_state, inventory_drift_reason, inventory_checked_at IS NOT NULL)
 async fn action_state(pool: &MySqlPool, action_id: u64) -> (String, Option<String>, bool) {
-    sqlx::query_as::<_, (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
         "SELECT inventory_state, inventory_drift_reason, inventory_checked_at \
            FROM rule_actions WHERE id = ?",
     )
@@ -152,11 +165,17 @@ async fn action_state(pool: &MySqlPool, action_id: u64) -> (String, Option<Strin
 }
 
 /// (enabled, automatic_reroute_enabled, alert_enabled, auto_disarmed_at IS NOT NULL, reason)
-async fn rule_state(
-    pool: &MySqlPool,
-    rule_id: u64,
-) -> (bool, bool, bool, bool, Option<String>) {
-    sqlx::query_as::<_, (bool, bool, bool, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+async fn rule_state(pool: &MySqlPool, rule_id: u64) -> (bool, bool, bool, bool, Option<String>) {
+    sqlx::query_as::<
+        _,
+        (
+            bool,
+            bool,
+            bool,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ),
+    >(
         "SELECT enabled, automatic_reroute_enabled, alert_enabled, auto_disarmed_at, \
                 auto_disarmed_reason FROM rules WHERE id = ?",
     )
@@ -333,7 +352,10 @@ async fn recovery_clears_the_drift_marker_but_never_re_arms() {
         !rule.1,
         "automatic execution must stay OFF until a human re-arms it"
     );
-    assert!(rule.3, "the auto-disarm record must survive as the audit trail");
+    assert!(
+        rule.3,
+        "the auto-disarm record must survive as the audit trail"
+    );
     assert_eq!(recovered_audit, 1, "the recovery must be audited");
 }
 
