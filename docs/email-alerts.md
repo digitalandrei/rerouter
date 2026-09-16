@@ -23,6 +23,10 @@ An alert (an `alerts` row) is generated on:
   undo the action by hand. `rollback` runs are reroute events with
   `trigger_type = rollback`;
 - `reroute_uncertain` — action left ambiguous (see [state-recovery.md](state-recovery.md));
+- `reroute_bundle_partial` — **critical**: an ordered mitigation bundle stopped
+  and could not roll back everything it had already applied; the payload names
+  the bundle and the `still_applied_reroute_ids` that are **still in force** (see
+  [operations-runbook.md](operations-runbook.md));
 - **arming / mode flips** — `operating_mode_changed`, `automatic_actions_changed`,
   `global_lock_changed`: the highest-consequence state changes (they can allow
   traffic-moving actions), so they are emitted as alerts with the **actor** and the

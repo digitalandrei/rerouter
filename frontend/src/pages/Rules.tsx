@@ -15,6 +15,8 @@ import {
   Trash2,
   ArrowUp,
   ArrowDown,
+  ChevronUp,
+  ChevronDown,
   ChevronsUpDown,
   Workflow,
   Plus,
@@ -27,11 +29,13 @@ import {
   type Rule,
   type Device,
   type Template,
+  type SystemSettings,
   ApiError,
 } from "@/lib/api";
 import { Label } from "@/components/ui/label";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
 import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
@@ -75,7 +79,17 @@ import {
  *   forced (auto_target: "flow_dst_host"); no prefix input is shown.
  * - blackhole_prefix / null_route_prefix on a non-flow rule: normal prefix input
  *   with helper text ("Manual target: a prefix you choose ...").
- * - bgp_advertise_add / bgp_advertise_remove: optional MSS-clamp bundle checkbox.
+ * - bgp_advertise_add / bgp_advertise_remove: optional MSS-clamp bundle checkbox
+ *   (one clamp per selected router, right after that router's BGP actions).
+ *
+ * Ordering and bulk add (plans/015):
+ * - `position` is always sent explicitly (max existing + 1). Execution order is a
+ *   safety property: additive actions must be able to run before destructive ones.
+ * - Up/down controls rewrite the affected suffix via delete + re-add; the API has
+ *   no PATCH on rule_actions.
+ * - Routers and announced prefixes are multi-selects; submitting posts the
+ *   cartesian product sequentially. A mid-sequence failure stops, reports exactly
+ *   how many landed, and re-reads the rule (audit finding FE-06).
  */
 function RuleActionsDialog({
   rule,
@@ -90,16 +104,26 @@ function RuleActionsDialog({
   const [allTemplates, setAllTemplates] = useState<Template[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [templateId, setTemplateId] = useState<string>("");
-  const [deviceId, setDeviceId] = useState<string>("");
-  const [values, setValues] = useState<Record<string, string>>({});
+  /** Bulk add: every checked router gets the same action set. */
+  const [deviceIds, setDeviceIds] = useState<number[]>([]);
+  /** Inventory params are validated per device, so each router keeps its own
+   *  value set (different upstream neighbours, prefix-lists, interfaces). */
+  const [valuesByDevice, setValuesByDevice] = useState<Record<number, Record<string, string>>>({});
+  /** Bulk add: the announced-prefix parameter takes a multi-selection; the
+   *  submitted action set is routers x prefixes. */
+  const [selectedPrefixes, setSelectedPrefixes] = useState<string[]>([]);
+  const [networksByDevice, setNetworksByDevice] = useState<Record<number, string[]>>({});
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   // BGP + MSS bundle state (only relevant for bgp_advertise_* templates)
   const [mssBundle, setMssBundle] = useState(false);
-  const [mssInterface, setMssInterface] = useState<string>("");
+  const [mssIfaceByDevice, setMssIfaceByDevice] = useState<Record<number, string>>({});
   const [mssValue, setMssValue] = useState<string>("1436");
-  const [deviceInterfaces, setDeviceInterfaces] = useState<Array<{ id: number; if_name: string; if_alias: string | null }>>([]);
+  const [ifacesByDevice, setIfacesByDevice] = useState<
+    Record<number, Array<{ id: number; if_name: string; if_alias: string | null }>>
+  >({});
 
   const isFlowRule = Boolean(current.flow_direction);
 
@@ -122,17 +146,36 @@ function RuleActionsDialog({
       .catch(() => setDevices([]));
   }, []);
 
-  // Fetch interfaces when device changes (needed for MSS bundle selector).
+  // Per-device inventory needed by the bulk form: announced prefixes (the
+  // multi-select) and interfaces (the MSS bundle selector).
   useEffect(() => {
-    if (!deviceId) {
-      setDeviceInterfaces([]);
-      return;
+    let cancelled = false;
+    for (const id of deviceIds) {
+      api.devices
+        .bgpNetworks(id)
+        .then((ns) => {
+          if (!cancelled) setNetworksByDevice((p) => ({ ...p, [id]: ns.map((n) => n.prefix) }));
+        })
+        .catch(() => {
+          if (!cancelled) setNetworksByDevice((p) => ({ ...p, [id]: [] }));
+        });
+      api.devices
+        .interfaces(id)
+        .then((ifs) => {
+          if (!cancelled)
+            setIfacesByDevice((p) => ({
+              ...p,
+              [id]: ifs.map((i) => ({ id: i.id, if_name: i.if_name, if_alias: i.if_alias })),
+            }));
+        })
+        .catch(() => {
+          if (!cancelled) setIfacesByDevice((p) => ({ ...p, [id]: [] }));
+        });
     }
-    api.devices
-      .interfaces(parseInt(deviceId, 10))
-      .then((ifaces) => setDeviceInterfaces(ifaces.map((i) => ({ id: i.id, if_name: i.if_name, if_alias: i.if_alias }))))
-      .catch(() => setDeviceInterfaces([]));
-  }, [deviceId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceIds]);
 
   // Templates shown in the dropdown: hide MSS templates (they're only used via the bundle).
   const visibleTemplates = allTemplates.filter((t) => !MSS_TEMPLATE_NAMES.includes(t.name));
@@ -152,69 +195,175 @@ function RuleActionsDialog({
   // For host-targeting templates on a flow rule: always auto-detect (no prefix input).
   const autoDetectMode = isHostTargetTemplate && isFlowRule;
 
-  // For the params form: omit "prefix" param when in auto-detect mode.
-  const omitForAutoDetect = autoDetectMode ? new Set(["prefix"]) : undefined;
+  /** The one parameter fed from the router's announced prefixes; it becomes the
+   *  multi-select that drives the routers x prefixes product. */
+  const prefixParam =
+    Object.entries(schema).find(([, spec]) => spec.source === "announced_prefix")?.[0] ?? null;
+  const bulkPrefixParam = autoDetectMode ? null : prefixParam;
+
+  // Params rendered by the shared schema form: skip the auto-target prefix and
+  // the bulk-selected prefix (both are handled here).
+  const omitFromParamsForm = new Set<string>();
+  if (autoDetectMode) omitFromParamsForm.add("prefix");
+  if (bulkPrefixParam) omitFromParamsForm.add(bulkPrefixParam);
+
+  /** Union of announced prefixes across the selected routers, with the routers
+   *  that did NOT announce each one — the backend validates per device, so a
+   *  prefix missing on one router makes that action fail. */
+  const prefixChoices = (() => {
+    const seen = new Map<string, number[]>();
+    for (const id of deviceIds) {
+      for (const p of networksByDevice[id] ?? []) {
+        if (!seen.has(p)) seen.set(p, []);
+        seen.get(p)!.push(id);
+      }
+    }
+    return Array.from(seen.entries())
+      .map(([prefix, onDevices]) => ({
+        prefix,
+        missingOn: deviceIds.filter((d) => !onDevices.includes(d)),
+      }))
+      .sort((a, b) => a.prefix.localeCompare(b.prefix));
+  })();
+
+  const actions = current.actions ?? [];
+  /** Next free rank. Order is a safety property — additive actions (advertise)
+   *  must be able to run BEFORE destructive ones (withdraw / shutdown) — so new
+   *  actions append instead of all collapsing onto position 0. */
+  const nextPosition =
+    actions.length === 0 ? 0 : Math.max(...actions.map((a) => a.position ?? 0)) + 1;
+
+  function toggleDevice(id: number) {
+    setDeviceIds((prev) =>
+      prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id],
+    );
+  }
+
+  function setDeviceValues(id: number, next: Record<string, string>) {
+    setValuesByDevice((prev) => ({ ...prev, [id]: next }));
+  }
 
   function resetAddForm() {
     setTemplateId("");
-    setDeviceId("");
-    setValues({});
+    setDeviceIds([]);
+    setValuesByDevice({});
+    setSelectedPrefixes([]);
     setMssBundle(false);
-    setMssInterface("");
+    setMssIfaceByDevice({});
     setMssValue("1436");
   }
 
+  /** Re-read the rule so the list always shows what is really persisted, never
+   *  what this component hoped happened (audit finding FE-06). */
+  async function reconcile(fallback: Rule) {
+    try {
+      const fresh = await api.rules.get(current.id);
+      setCurrent(fresh);
+      onChanged(fresh);
+    } catch {
+      setCurrent(fallback);
+      onChanged(fallback);
+    }
+  }
+
+  type PlannedAction = {
+    reroute_template_id: number;
+    device_id: number;
+    params: Record<string, unknown>;
+    position: number;
+    auto_target?: string | null;
+    label: string;
+  };
+
+  /** Build the routers x prefixes product for the current form. */
+  function buildPlan(): PlannedAction[] | string {
+    if (!template) return "Pick a template and at least one target router.";
+    if (deviceIds.length === 0) return "Pick at least one target router.";
+    if (bulkPrefixParam && selectedPrefixes.length === 0)
+      return "Pick at least one prefix (each selected prefix becomes its own action).";
+
+    const mssTemplateName =
+      template.name === BGP_ADVERTISE_ADD
+        ? "iface_tcp_adjust_mss"
+        : "iface_tcp_adjust_mss_remove";
+    const mssTemplate = allTemplates.find((t) => t.name === mssTemplateName) ?? null;
+    if (isBgpAdvertise && mssBundle && !mssTemplate)
+      return `MSS template "${mssTemplateName}" not found. Enable it in Templates.`;
+
+    const plan: PlannedAction[] = [];
+    let pos = nextPosition;
+    for (const deviceId of deviceIds) {
+      const deviceName = devices.find((d) => d.id === deviceId)?.name ?? `device ${deviceId}`;
+      const base: Record<string, unknown> = {};
+      const raw = valuesByDevice[deviceId] ?? {};
+      for (const name of Object.keys(schema)) {
+        if (omitFromParamsForm.has(name)) continue;
+        if (raw[name]) base[name] = raw[name];
+      }
+      const prefixes: (string | null)[] = bulkPrefixParam ? selectedPrefixes : [null];
+      for (const prefix of prefixes) {
+        const params = { ...base };
+        if (bulkPrefixParam && prefix !== null) params[bulkPrefixParam] = prefix;
+        plan.push({
+          reroute_template_id: template.id,
+          device_id: deviceId,
+          params,
+          position: pos++,
+          ...(autoDetectMode ? { auto_target: "flow_dst_host" } : {}),
+          label: `${templateLabel(template)} on ${deviceName}${prefix ? ` · ${prefix}` : ""}`,
+        });
+      }
+      // The MSS clamp is an interface-level action, so it is attached ONCE per
+      // router, right after that router's BGP actions.
+      if (isBgpAdvertise && mssBundle && mssTemplate) {
+        const mssParams: Record<string, unknown> = { interface: mssIfaceByDevice[deviceId] ?? "" };
+        if (template.name === BGP_ADVERTISE_ADD && mssValue) mssParams.mss = mssValue;
+        plan.push({
+          reroute_template_id: mssTemplate.id,
+          device_id: deviceId,
+          params: mssParams,
+          position: pos++,
+          label: `${templateLabel(mssTemplate)} on ${deviceName}`,
+        });
+      }
+    }
+    return plan;
+  }
+
   async function add() {
-    if (!template || !deviceId) {
-      setError("Pick a template and a target router.");
+    const plan = buildPlan();
+    if (typeof plan === "string") {
+      setError(plan);
       return;
     }
     setBusy(true);
     setError(null);
+    setNotice(null);
+    let written = 0;
+    let latest = current;
     try {
-      const params: Record<string, unknown> = {};
-      for (const name of Object.keys(schema)) {
-        if (autoDetectMode && name === "prefix") continue;
-        if (values[name]) params[name] = values[name];
+      // Sequential, one commit each: the API has no batch endpoint. If one write
+      // fails we stop immediately and report exactly how many landed — a silent
+      // partial rule is how a mitigation ends up half-configured.
+      for (const item of plan) {
+        const { label: _label, ...body } = item;
+        latest = await api.rules.addAction(current.id, body);
+        written++;
       }
-
-      // First action: the selected template
-      const updated = await api.rules.addAction(current.id, {
-        reroute_template_id: template.id,
-        device_id: parseInt(deviceId, 10),
-        params,
-        ...(autoDetectMode ? { auto_target: "flow_dst_host" } : {}),
-      });
-
-      // Second action (BGP bundle): attach an MSS action if the checkbox is on.
-      let finalUpdated = updated;
-      if (isBgpAdvertise && mssBundle) {
-        const mssTemplateName =
-          template.name === BGP_ADVERTISE_ADD
-            ? "iface_tcp_adjust_mss"
-            : "iface_tcp_adjust_mss_remove";
-        const mssTemplate = allTemplates.find((t) => t.name === mssTemplateName);
-        if (!mssTemplate) {
-          setError(`MSS template "${mssTemplateName}" not found. Enable it in Templates.`);
-          setCurrent(updated);
-          onChanged(updated);
-          resetAddForm();
-          return;
-        }
-        const mssParams: Record<string, unknown> = { interface: mssInterface };
-        if (template.name === BGP_ADVERTISE_ADD && mssValue) mssParams.mss = mssValue;
-        finalUpdated = await api.rules.addAction(current.id, {
-          reroute_template_id: mssTemplate.id,
-          device_id: parseInt(deviceId, 10),
-          params: mssParams,
-        });
-      }
-
-      setCurrent(finalUpdated);
-      onChanged(finalUpdated);
+      setCurrent(latest);
+      onChanged(latest);
       resetAddForm();
+      setNotice(
+        `Added ${plan.length} action${plan.length === 1 ? "" : "s"} at position ${nextPosition}+.`,
+      );
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to add action");
+      const failed = plan[written];
+      setError(
+        `Added ${written} of ${plan.length} action(s), then failed on "${failed?.label ?? "next action"}": ` +
+          `${e instanceof ApiError ? e.message : "request failed"}. The list above is the real saved state — ` +
+          `the actions already written were NOT rolled back.`,
+      );
+      await reconcile(latest);
     } finally {
       setBusy(false);
     }
@@ -227,6 +376,41 @@ function RuleActionsDialog({
       onChanged(updated);
     } catch {
       /* ignore */
+    }
+  }
+
+  /**
+   * Move one action up/down. The whole order is renumbered server-side in one
+   * transaction, so a reorder cannot lose an action the way a delete-and-re-add
+   * could. On failure the rule is re-read, so the list is always the persisted
+   * truth rather than an optimistic guess.
+   */
+  async function move(index: number, delta: -1 | 1) {
+    const target = index + delta;
+    if (target < 0 || target >= actions.length || busy) return;
+    const desired = [...actions];
+    const [moved] = desired.splice(index, 1);
+    desired.splice(target, 0, moved);
+
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.rules.reorderActions(
+        current.id,
+        desired.map((a) => a.id),
+      );
+      const latest = await api.rules.get(current.id);
+      setCurrent(latest);
+      onChanged(latest);
+    } catch (e) {
+      setError(
+        `Reorder failed: ${e instanceof ApiError ? e.message : "request failed"}. ` +
+          `The list above is the real saved state.`,
+      );
+      await reconcile(current);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -254,16 +438,22 @@ function RuleActionsDialog({
     }
   }
 
-  const actions = current.actions ?? [];
+  const plannedCount = (() => {
+    if (!template || deviceIds.length === 0) return 0;
+    const prefixes = bulkPrefixParam ? selectedPrefixes.length : 1;
+    if (prefixes === 0) return 0;
+    return deviceIds.length * prefixes + (isBgpAdvertise && mssBundle ? deviceIds.length : 0);
+  })();
 
   return (
-    <Dialog open onOpenChange={(v) => !v && onClose()}>
+    <Dialog open onOpenChange={(v) => !v && !busy && onClose()}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Mitigation actions — {current.name}</DialogTitle>
           <DialogDescription>
             When this rule fires (its sliding window holds), these mitigations run
-            on the selected routers. Observe mode always renders a plan only.
+            on the selected routers, <strong>in the order shown</strong>. Observe
+            mode always renders a plan only.
           </DialogDescription>
         </DialogHeader>
 
@@ -313,119 +503,165 @@ function RuleActionsDialog({
           />
         </div>
 
-        {/* Existing actions */}
+        {/* Existing actions, in execution order */}
         <div className="space-y-2">
           {actions.length === 0 ? (
             <p className="text-sm text-muted-foreground">No actions attached yet.</p>
           ) : (
-            actions.map((a) => (
-              <div
-                key={a.id}
-                className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
-              >
-                <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
-                <span className="text-muted-foreground">on</span>
-                <span className="font-medium">{a.device_name}</span>
-                {(() => {
-                  const dev = devices.find((d) => d.id === a.device_id);
-                  const auto = dev ? automationStatus(dev) : null;
-                  return auto ? (
+            <>
+              <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+                <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <p className="text-xs text-muted-foreground">
+                  Execution order matters: put additive actions (advertise to a
+                  scrubber) <strong>before</strong> destructive ones (withdraw from
+                  an upstream, shut an interface), so an abort never leaves a
+                  black-hole. Reordering rewrites the affected actions (delete +
+                  re-add) because the API has no position-update endpoint.
+                </p>
+              </div>
+              {actions.map((a, i) => (
+                <div
+                  key={a.id}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
+                >
+                  <span
+                    className="w-8 shrink-0 text-xs tabular-nums text-muted-foreground"
+                    title={`execution rank ${a.position ?? 0}`}
+                  >
+                    {i + 1}.
+                  </span>
+                  <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
+                  <span className="text-muted-foreground">on</span>
+                  <span className="font-medium">{a.device_name}</span>
+                  {(() => {
+                    const dev = devices.find((d) => d.id === a.device_id);
+                    const auto = dev ? automationStatus(dev) : null;
+                    return auto ? (
+                      <Badge
+                        variant="outline"
+                        className={
+                          auto.tone === "bad"
+                            ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
+                            : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                        }
+                        title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
+                      >
+                        {auto.label}
+                      </Badge>
+                    ) : null;
+                  })()}
+                  {a.auto_target === "flow_dst_host" ? (
                     <Badge
                       variant="outline"
-                      className={
-                        auto.tone === "bad"
-                          ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
-                          : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                      }
-                      title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
+                      className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
+                      title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
                     >
-                      {auto.label}
+                      target: attacked dst IP (auto /32·/128)
                     </Badge>
-                  ) : null;
-                })()}
-                {a.auto_target === "flow_dst_host" ? (
-                  <Badge
-                    variant="outline"
-                    className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                    title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
-                  >
-                    target: attacked dst IP (auto /32·/128)
-                  </Badge>
-                ) : (
-                  <span className="text-xs text-muted-foreground">
-                    {Object.entries(a.params ?? {})
-                      .map(([k, v]) => `${k}=${String(v)}`)
-                      .join(", ")}
-                  </span>
-                )}
-                {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
-                {a.auto_target === "flow_dst_host" &&
-                  Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
+                  ) : (
                     <span className="text-xs text-muted-foreground">
                       {Object.entries(a.params ?? {})
-                        .filter(([k]) => k !== "prefix")
                         .map(([k, v]) => `${k}=${String(v)}`)
                         .join(", ")}
                     </span>
                   )}
-                <span className="flex-1" />
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  className="text-destructive hover:text-destructive"
-                  onClick={() => void remove(a.id)}
-                  title="Remove action"
-                >
-                  <X className="size-4" />
-                </Button>
-              </div>
-            ))
+                  {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
+                  {a.auto_target === "flow_dst_host" &&
+                    Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
+                      <span className="text-xs text-muted-foreground">
+                        {Object.entries(a.params ?? {})
+                          .filter(([k]) => k !== "prefix")
+                          .map(([k, v]) => `${k}=${String(v)}`)
+                          .join(", ")}
+                      </span>
+                    )}
+                  <span className="flex-1" />
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={() => void move(i, -1)}
+                    disabled={busy || i === 0}
+                    title="Run earlier"
+                  >
+                    <ChevronUp className="size-4" />
+                    <span className="sr-only">Move up</span>
+                  </Button>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={() => void move(i, 1)}
+                    disabled={busy || i === actions.length - 1}
+                    title="Run later"
+                  >
+                    <ChevronDown className="size-4" />
+                    <span className="sr-only">Move down</span>
+                  </Button>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive"
+                    onClick={() => void remove(a.id)}
+                    disabled={busy}
+                    title="Remove action"
+                  >
+                    <X className="size-4" />
+                  </Button>
+                </div>
+              ))}
+            </>
           )}
         </div>
 
-        {/* Add an action */}
+        {/* Add actions (bulk: routers x prefixes) */}
         <div className="space-y-3 rounded-md border border-dashed border-border p-3">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block space-y-1 text-sm font-medium">
-              Template
-              <select
-                className={inputClass}
-                value={templateId}
-                onChange={(e) => {
-                  setTemplateId(e.target.value);
-                  setValues({});
-                  setMssBundle(false);
-                  setMssInterface("");
-                  setMssValue("1436");
-                }}
-              >
-                <option value="">Select template…</option>
-                {visibleTemplates.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {templateLabel(t)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="block space-y-1 text-sm font-medium">
-              Target router
-              <select
-                className={inputClass}
-                value={deviceId}
-                onChange={(e) => {
-                  setDeviceId(e.target.value);
-                  setValues({});
-                  setMssInterface("");
-                }}
-              >
-                <option value="">Select router…</option>
-                {devices.map((d) => (
-                  <option key={d.id} value={d.id}>
+          <label className="block space-y-1 text-sm font-medium">
+            Template
+            <select
+              className={inputClass}
+              value={templateId}
+              onChange={(e) => {
+                setTemplateId(e.target.value);
+                setValuesByDevice({});
+                setSelectedPrefixes([]);
+                setMssBundle(false);
+                setMssIfaceByDevice({});
+                setMssValue("1436");
+              }}
+            >
+              <option value="">Select template…</option>
+              {visibleTemplates.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {templateLabel(t)}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {/* Target routers — multi-select */}
+          <div className="space-y-1 text-sm font-medium">
+            Target routers
+            <div className="max-h-36 space-y-1 overflow-y-auto rounded-md border border-input p-2">
+              {devices.length === 0 ? (
+                <p className="text-xs font-normal text-muted-foreground">No devices enrolled.</p>
+              ) : (
+                devices.map((d) => (
+                  <label key={d.id} className="flex items-center gap-2 text-sm font-normal">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-border"
+                      checked={deviceIds.includes(d.id)}
+                      onChange={() => toggleDevice(d.id)}
+                    />
                     {d.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+                  </label>
+                ))
+              )}
+            </div>
+            <p className="text-xs font-normal text-muted-foreground">
+              Every checked router gets the same action set. Neighbour,
+              prefix-list and interface values are discovered per router, so they
+              are asked for once per router below.
+            </p>
           </div>
 
           {/* Auto-detect note for flow-rule host-targeting templates */}
@@ -447,18 +683,100 @@ function RuleActionsDialog({
             </p>
           )}
 
-          {template && (
-            <ActionParamsForm
-              schema={schema}
-              deviceId={deviceId ? parseInt(deviceId, 10) : null}
-              values={values}
-              onChange={setValues}
-              omitParams={omitForAutoDetect}
-            />
+          {/* Announced prefixes — multi-select, one action per prefix per router */}
+          {template && bulkPrefixParam && (
+            <div className="space-y-1 text-sm font-medium">
+              {schema[bulkPrefixParam]?.label ?? bulkPrefixParam}{" "}
+              <span className="font-normal text-muted-foreground">
+                (multi-select — one action per prefix, per router)
+              </span>
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-md border border-input p-2">
+                {deviceIds.length === 0 ? (
+                  <p className="text-xs font-normal text-muted-foreground">Pick a router first.</p>
+                ) : prefixChoices.length === 0 ? (
+                  <p className="text-xs font-normal text-muted-foreground">
+                    No prefixes discovered on the selected router(s).
+                  </p>
+                ) : (
+                  prefixChoices.map((c) => (
+                    <label key={c.prefix} className="flex items-center gap-2 text-sm font-normal">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-border"
+                        checked={selectedPrefixes.includes(c.prefix)}
+                        onChange={() =>
+                          setSelectedPrefixes((prev) =>
+                            prev.includes(c.prefix)
+                              ? prev.filter((p) => p !== c.prefix)
+                              : [...prev, c.prefix],
+                          )
+                        }
+                      />
+                      <span className="font-mono text-xs">{c.prefix}</span>
+                      {c.missingOn.length > 0 && (
+                        <span className="text-[11px] text-amber-700 dark:text-amber-400">
+                          not announced on{" "}
+                          {c.missingOn
+                            .map((id) => devices.find((d) => d.id === id)?.name ?? `#${id}`)
+                            .join(", ")}{" "}
+                          — that action will be refused
+                        </span>
+                      )}
+                    </label>
+                  ))
+                )}
+              </div>
+            </div>
           )}
 
+          {/* Per-router parameters (inventory is validated per device) */}
+          {template &&
+            deviceIds.map((id) => {
+              const dev = devices.find((d) => d.id === id);
+              const hasFormParams = Object.keys(schema).some((n) => !omitFromParamsForm.has(n));
+              if (!hasFormParams && !(isBgpAdvertise && mssBundle)) return null;
+              return (
+                <div key={id} className="space-y-2 rounded-md border border-border p-3">
+                  <div className="text-sm font-medium">{dev?.name ?? `device ${id}`}</div>
+                  {hasFormParams && (
+                    <ActionParamsForm
+                      schema={schema}
+                      deviceId={id}
+                      values={valuesByDevice[id] ?? {}}
+                      onChange={(next) => setDeviceValues(id, next)}
+                      omitParams={omitFromParamsForm}
+                    />
+                  )}
+                  {isBgpAdvertise && mssBundle && (
+                    <label className="block space-y-1 text-sm font-medium">
+                      MSS-clamp interface
+                      <select
+                        className={inputClass}
+                        value={mssIfaceByDevice[id] ?? ""}
+                        onChange={(e) =>
+                          setMssIfaceByDevice((p) => ({ ...p, [id]: e.target.value }))
+                        }
+                      >
+                        <option value="">
+                          {(ifacesByDevice[id] ?? []).length
+                            ? "Select interface…"
+                            : "no interfaces discovered"}
+                        </option>
+                        {(ifacesByDevice[id] ?? []).map((i) => (
+                          <option key={i.id} value={i.if_name}>
+                            {i.if_name}
+                            {i.if_alias ? ` · ${i.if_alias}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </div>
+              );
+            })}
+
           {/* BGP Advertise MSS-clamp bundle (rule editor only) */}
-          {isBgpAdvertise && (
+          {isBgpAdvertise && template && (
             <div className="space-y-2 rounded-md border border-border bg-muted/30 px-3 py-2">
               <div className="flex items-center gap-3">
                 <input
@@ -468,7 +786,7 @@ function RuleActionsDialog({
                   onChange={(e) => {
                     setMssBundle(e.target.checked);
                     if (!e.target.checked) {
-                      setMssInterface("");
+                      setMssIfaceByDevice({});
                       setMssValue("1436");
                     }
                   }}
@@ -480,29 +798,6 @@ function RuleActionsDialog({
               </div>
               {mssBundle && (
                 <div className="grid gap-3 pl-7 sm:grid-cols-2">
-                  <label className="block space-y-1 text-sm font-medium">
-                    Interface
-                    <select
-                      className={inputClass}
-                      value={mssInterface}
-                      onChange={(e) => setMssInterface(e.target.value)}
-                      disabled={!deviceId}
-                    >
-                      <option value="">
-                        {!deviceId
-                          ? "Pick a router first"
-                          : deviceInterfaces.length
-                            ? "Select interface…"
-                            : "no interfaces discovered"}
-                      </option>
-                      {deviceInterfaces.map((i) => (
-                        <option key={i.id} value={i.if_name}>
-                          {i.if_name}
-                          {i.if_alias ? ` · ${i.if_alias}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
                   {template.name === BGP_ADVERTISE_ADD && (
                     <label className="block space-y-1 text-sm font-medium">
                       MSS value (bytes)
@@ -517,14 +812,15 @@ function RuleActionsDialog({
                       />
                     </label>
                   )}
-                  <p className="col-span-2 text-xs text-muted-foreground pl-0">
-                    Attaches a second action:{" "}
+                  <p className="col-span-2 pl-0 text-xs text-muted-foreground">
+                    Attaches one{" "}
                     <strong>
                       {template.name === BGP_ADVERTISE_ADD
                         ? "TCP MSS clamp"
                         : "TCP MSS clamp remove"}
                     </strong>{" "}
-                    on the same router immediately after the BGP action.
+                    action per selected router, immediately after that router's BGP
+                    actions. Pick the interface in each router's block above.
                   </p>
                 </div>
               )}
@@ -532,13 +828,19 @@ function RuleActionsDialog({
           )}
 
           {error && (
-            <p className="text-sm text-destructive" role="alert">
+            <div
+              className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive"
+              role="alert"
+            >
               {error}
-            </p>
+            </div>
           )}
-          <Button size="sm" onClick={() => void add()} disabled={busy}>
+          {notice && !error && (
+            <p className="text-sm text-emerald-700 dark:text-emerald-400">{notice}</p>
+          )}
+          <Button size="sm" onClick={() => void add()} disabled={busy || plannedCount === 0}>
             <Plus className="size-4" />
-            {busy ? "Adding…" : "Add action"}
+            {busy ? "Adding…" : plannedCount > 1 ? `Add ${plannedCount} actions` : "Add action"}
           </Button>
         </div>
       </DialogContent>
@@ -659,14 +961,19 @@ type SortDir = "asc" | "desc";
 export default function Rules() {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("edit_rules");
+  const canApply = hasPermission("trigger_manual_reroute");
 
   const [rules, setRules] = useState<Rule[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [manageRule, setManageRule] = useState<Rule | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
   const [editRule, setEditRule] = useState<Rule | null>(null);
+  // Firing rule the operator chose to mitigate from this page (same guarded
+  // preview -> token -> execute dialog as Dashboard and Mitigations).
+  const [applyRule, setApplyRule] = useState<Rule | null>(null);
 
   const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
@@ -685,6 +992,11 @@ export default function Rules() {
       .list()
       .then(setDevices)
       .catch(() => setDevices([]));
+    // Operating mode drives the mitigation dialog's copy (observe = nothing runs).
+    api.settings
+      .get()
+      .then(setSettings)
+      .catch(() => setSettings(null));
   }, []);
 
   // Quietly refresh the live above/below status every 20s (no loading flicker).
@@ -905,6 +1217,20 @@ export default function Rules() {
                       onClick={(e) => e.stopPropagation()}
                     >
                       <div className="flex items-center justify-end gap-1">
+                        {canApply &&
+                          rule.current_state === "firing" &&
+                          rule.manual_apply_enabled &&
+                          (rule.action_count ?? 0) > 0 && (
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              className="h-7"
+                              title="Apply this rule's configured actions (exact preview first; observe mode executes nothing)"
+                              onClick={() => setApplyRule(rule)}
+                            >
+                              Mitigate
+                            </Button>
+                          )}
                         {canEdit && rule.current_state === "firing" && (
                           <Button
                             size="sm"
@@ -948,6 +1274,15 @@ export default function Rules() {
           )}
         </CardContent>
       </Card>
+
+      {applyRule && (
+        <ApplyMitigationDialog
+          rule={applyRule}
+          operatingMode={settings?.operating_mode ?? "observe"}
+          onClose={() => setApplyRule(null)}
+          onApplied={() => loadRules()}
+        />
+      )}
 
       {manageRule && (
         <RuleActionsDialog

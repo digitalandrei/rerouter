@@ -10,6 +10,7 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 - last valid telemetry sample and counter baselines;
 - active detection-rule states and consecutive-match counters;
 - planned / pending / running / verifying reroutes;
+- in-flight mitigation bundles and each sibling's bundle membership + order;
 - last step output and verification status per action;
 - active locks and cooldowns (device-scoped);
 - device + interface inventory and discovered BGP peers/prefixes.
@@ -25,13 +26,20 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 4. If any recovery transaction fails, abort startup. The untouched/rolled-back
    row is retried on the next start; the service never continues with a partial
    recovery trail.
-5. Start the supervised alert, telemetry, detection, retention, and API tasks.
+5. Close any mitigation bundle left `planned` / `running` / `compensating` as
+   `aborted`, with the restart recorded as its `failure_reason`. This runs
+   *after* step 3, so a bundle is never left looking "in progress" while its
+   siblings are already quarantined. A bundle is a record, not a resumable job:
+   the controller does not continue or compensate it after a restart — the
+   quarantined siblings are resolved through the uncertain path below
+   ([reroute-engine.md](reroute-engine.md#ordered-mitigation-bundles)).
+6. Start the supervised alert, telemetry, detection, retention, and API tasks.
    Inventory, baselines, and rule state remain durable in MariaDB; SSH sessions
    are opened on demand rather than reconnected at startup.
-6. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
+7. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
     routing state on recovery is future work; today the controller does not
     re-read the device on startup.
-7. The device stays locked and the reroute stays `uncertain` until an **admin
+8. The device stays locked and the reroute stays `uncertain` until an **admin
     acknowledges** it (`POST /api/reroutes/{id}/acknowledge-uncertain`) — there is
     no automatic clear.
 ```

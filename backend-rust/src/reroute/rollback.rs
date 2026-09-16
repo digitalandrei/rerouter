@@ -121,6 +121,7 @@ pub async fn rollback_of(
         actor_context: req.actor_context,
         reason: Some(req.reason),
         defer_cooldown: req.defer_cooldown,
+        bundle: None,
     };
     let outcome = executor::execute(pool, cfg, action, req.dry_run).await;
     if let (Some(mut conn), Some(name)) = (lock_conn, lock_name) {

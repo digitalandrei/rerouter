@@ -372,6 +372,12 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             "/api/rules/{rule_id}/actions/{action_id}",
             delete(rules::remove_action),
         )
+        // Execution order is a safety property — renumber in place, never
+        // delete-and-re-add (that can silently drop an action).
+        .route(
+            "/api/rules/{rule_id}/actions/reorder",
+            post(rules::reorder_actions),
+        )
         // reroute template catalog (read-only) + render/preview
         .route("/api/templates", get(templates::list))
         .route("/api/templates/{id}", get(templates::show))
@@ -389,6 +395,8 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(reroutes::acknowledge_uncertain),
         )
         .route("/api/reroutes/{id}/rollback", post(reroutes::rollback))
+        // Progress of an ordered mitigation bundle (async rule apply).
+        .route("/api/reroute-bundles/{id}", get(reroutes::bundle_show))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))
         .route("/api/audit", get(audit::list))

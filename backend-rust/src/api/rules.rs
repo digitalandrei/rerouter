@@ -16,8 +16,10 @@ use serde_json::{json, Value};
 
 use super::{client_ip, err, user_agent, AppState};
 use crate::auth::rbac::{self, markers, RequirePermission};
+use crate::reroute::bundle;
 use crate::reroute::executor::{self, ActionRequest, ActorContext};
 use crate::reroute::flow_target::{self, PreparedAction};
+use crate::reroute::guard;
 use crate::reroute::templates::Template;
 
 /// Templates whose `prefix` is a host-route target eligible for flow auto-target.
@@ -1088,6 +1090,10 @@ struct ReadyRuleAction {
     action_reason: String,
     auto_target: Option<String>,
     auto_target_low_confidence: Option<bool>,
+    /// `rule_actions.position` — the operator-chosen execution order. It is
+    /// recorded on the sibling reroute so durable history keeps the order
+    /// actually used, and it identifies the action in a stop/abort message.
+    position: u32,
 }
 
 enum RuleApplyAction {
@@ -1175,18 +1181,27 @@ pub async fn apply(
 
     // The rule's enabled actions (template + target router + params [+ auto-target])
     // — the same set the firing alert rendered as would-run, in the same order.
-    let specs =
-        match sqlx::query_as::<_, (u64, u64, Option<sqlx::types::Json<Value>>, Option<String>)>(
-            "SELECT reroute_template_id, device_id, params_json, auto_target FROM rule_actions \
-         WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await
-        {
-            Ok(specs) => specs,
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
-        };
+    let specs = match sqlx::query_as::<
+        _,
+        (
+            u64,
+            u64,
+            Option<sqlx::types::Json<Value>>,
+            Option<String>,
+            u32,
+        ),
+    >(
+        "SELECT reroute_template_id, device_id, params_json, auto_target, position \
+           FROM rule_actions \
+          WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(specs) => specs,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
     if specs.is_empty() {
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1209,7 +1224,7 @@ pub async fn apply(
     // Resolve dynamic flow targets exactly once. The same concrete template and
     // params are used for the preview hash and, after confirmation, execution.
     let mut actions = Vec::with_capacity(specs.len());
-    for (template_id, device_id, params_json, auto_target) in specs {
+    for (template_id, device_id, params_json, auto_target, position) in specs {
         let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
         // Resolve auto-target (flow dst host) here; a manual apply proceeds even on
         // LOW sampling confidence (the operator confirms the resolved IP), unlike
@@ -1240,6 +1255,7 @@ pub async fn apply(
                     action_reason,
                     auto_target: at.as_ref().map(|a| a.cidr.clone()),
                     auto_target_low_confidence: at.as_ref().map(|a| a.low_confidence),
+                    position,
                 })));
             }
             PreparedAction::Skip { reason: why } => {
@@ -1281,38 +1297,162 @@ pub async fn apply(
         }
     }
 
-    let (results, acted_devices) = rule_apply_results(
-        &state,
-        id,
-        g.session.user_id,
-        &actor_context,
-        &actions,
-        body.dry_run,
-    )
-    .await;
-    if let Err(e) = executor::record_cooldowns(pool, &state.config, Some(id), &acted_devices).await
-    {
-        tracing::error!(event_type = "manual_apply_cooldown_persist_failed", rule_id = id, error = %e, "could not persist action cooldown rows");
-    }
-    let preview_token = if mode == "enforce" && body.dry_run {
-        match super::store_action_preview(
-            pool,
+    // A preview, and anything in observe mode, renders the would-run plan without
+    // opening an SSH session — so it stays synchronous and its response shape is
+    // unchanged. Only a confirmed enforce-mode apply actually pushes config.
+    if body.dry_run || mode != "enforce" {
+        let (results, acted_devices) = rule_apply_results(
+            &state,
+            id,
             g.session.user_id,
-            "rule_apply",
-            Some(id),
-            &json!({ "results": results, "reason": reason }),
+            &actor_context,
+            &actions,
+            body.dry_run,
         )
-        .await
+        .await;
+        if let Err(e) =
+            executor::record_cooldowns(pool, &state.config, Some(id), &acted_devices).await
         {
-            Ok(token) => Some(token),
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_store_failed"),
+            tracing::error!(event_type = "manual_apply_cooldown_persist_failed", rule_id = id, error = %e, "could not persist action cooldown rows");
         }
-    } else {
-        None
+        let preview_token = if mode == "enforce" && body.dry_run {
+            match super::store_action_preview(
+                pool,
+                g.session.user_id,
+                "rule_apply",
+                Some(id),
+                &json!({ "results": results, "reason": reason }),
+            )
+            .await
+            {
+                Ok(token) => Some(token),
+                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "preview_store_failed"),
+            }
+        } else {
+            None
+        };
+        return (
+            StatusCode::OK,
+            Json(json!({ "results": results, "preview_token": preview_token })),
+        );
+    }
+
+    // ---- confirmed enforce-mode apply: run as one ordered bundle -------------
+    //
+    // A real mitigation is a dozen-plus actions over several routers, each needing
+    // two SSH sessions. Holding the HTTP request open across all of them means the
+    // reverse proxy cuts the operator off mid-mitigation with the preview token
+    // already consumed. So the request returns a bundle id and the work continues
+    // in the background; progress is read from GET /api/reroute-bundles/{id}.
+    let mut ready: Vec<bundle::BundleAction> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for action in actions {
+        match action {
+            RuleApplyAction::Ready(a) => ready.push(bundle::BundleAction {
+                device_id: a.device_id,
+                template: a.template,
+                params: a.params,
+                reason: a.action_reason,
+                position: a.position,
+                auto_target: a.auto_target,
+                auto_target_low_confidence: a.auto_target_low_confidence,
+            }),
+            RuleApplyAction::Skip { device_id, reason } => skipped.push(json!({
+                "executed": false,
+                "device_id": device_id,
+                "blocked_reason": reason,
+            })),
+        }
+    }
+    if ready.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "no action could be resolved to run", "results": skipped })),
+        );
+    }
+
+    let total = ready.len() as u32;
+    let policy = bundle::FailurePolicy::AbortAndCompensate;
+    let bundle_id = match bundle::create(
+        pool,
+        Some(id),
+        None,
+        "manual",
+        Some(g.session.user_id),
+        &reason,
+        policy,
+        total,
+    )
+    .await
+    {
+        Ok(bundle_id) => bundle_id,
+        Err(e) => {
+            tracing::error!(event_type = "bundle_create_failed", rule_id = id, error = %e, "could not create mitigation bundle");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "bundle_create_failed");
+        }
     };
+
+    // All-or-nothing admission against the global rate budget. A bundle that does
+    // not fit is refused WHOLE — a half-spent budget is how a mitigation ends up
+    // half-applied.
+    if let Err(block) = guard::admit_bundle(pool, &state.config, bundle_id, total).await {
+        let message = block.to_string();
+        let _ = sqlx::query(
+            "UPDATE reroute_bundles SET state = 'failed', failure_reason = ?, \
+                    finished_at = UTC_TIMESTAMP() WHERE id = ?",
+        )
+        .bind(&message)
+        .bind(bundle_id)
+        .execute(pool)
+        .await;
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "bundle_not_admitted",
+                "bundle_id": bundle_id,
+                "detail": message,
+                "total_actions": total,
+            })),
+        );
+    }
+
+    if let Err(e) = super::audit_mutation(
+        pool,
+        &g.session,
+        "reroute_bundle_started",
+        "reroute_bundle",
+        bundle_id,
+        &format!("manual apply of rule #{id} as bundle #{bundle_id} ({total} action(s)): {reason}"),
+    )
+    .await
+    {
+        tracing::error!(event_type = "bundle_audit_failed", bundle_id, error = %e, "could not audit bundle start");
+    }
+
+    let task_pool = pool.clone();
+    let task_cfg = state.config.clone();
+    let task_actor = actor_context.clone();
+    let user_id = g.session.user_id;
+    tokio::spawn(async move {
+        bundle::run(
+            &task_pool,
+            &task_cfg,
+            bundle::BundleRun::manual(bundle_id, policy, Some(id), user_id, task_actor),
+            ready,
+        )
+        .await;
+    });
+
     (
-        StatusCode::OK,
-        Json(json!({ "results": results, "preview_token": preview_token })),
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "bundle_id": bundle_id,
+            "async": true,
+            "state": "running",
+            "total_actions": total,
+            "failure_policy": policy.as_str(),
+            "results": skipped,
+        })),
     )
 }
 
@@ -1341,6 +1481,8 @@ async fn rule_apply_results(
                     actor_context: Some(actor_context.clone()),
                     reason: Some(action.action_reason.clone()),
                     defer_cooldown: true,
+                    // Render-only: previews and observe mode never join a bundle.
+                    bundle: None,
                 };
                 let outcome = executor::execute(&state.pool, &state.config, req, dry_run).await;
                 if outcome.executed {
@@ -1574,5 +1716,101 @@ pub async fn remove_action(
         }
         Ok(_) => err(StatusCode::NOT_FOUND, "action not found"),
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderBody {
+    /// Every enabled-or-disabled action id of this rule, in the intended
+    /// execution order.
+    order: Vec<u64>,
+}
+
+/// POST /api/rules/{id}/actions/reorder — set `rule_actions.position` for the
+/// whole set in one transaction.
+///
+/// Order is a SAFETY property, not a display preference: a scrubber-diversion
+/// bundle must advertise to the scrubber BEFORE it withdraws from the upstream,
+/// so that a failure aborts while traffic still has a path. Reordering by
+/// deleting and re-adding rows risks losing an action when a re-add is refused
+/// (aged-out inventory, a template since disabled), which silently shortens a
+/// mitigation. Renumbering in place cannot lose one.
+///
+/// The submitted list must be exactly this rule's action set — any missing or
+/// foreign id is rejected whole, so a stale UI cannot drop actions it never saw.
+pub async fn reorder_actions(
+    g: RequirePermission<markers::EditRules>,
+    State(state): State<AppState>,
+    Path(rule_id): Path<u64>,
+    Json(body): Json<ReorderBody>,
+) -> JsonResp {
+    let pool = &state.pool;
+
+    let existing: Vec<u64> =
+        match sqlx::query_scalar("SELECT id FROM rule_actions WHERE rule_id = ? ORDER BY id")
+            .bind(rule_id)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
+    if existing.is_empty() {
+        return err(StatusCode::NOT_FOUND, "rule has no actions to reorder");
+    }
+
+    let mut submitted = body.order.clone();
+    submitted.sort_unstable();
+    submitted.dedup();
+    let mut known = existing.clone();
+    known.sort_unstable();
+    if submitted.len() != body.order.len() {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "duplicate action id");
+    }
+    if submitted != known {
+        return err(
+            StatusCode::CONFLICT,
+            "the submitted order must list exactly this rule's actions; reload and retry",
+        );
+    }
+
+    // MySQL cannot prepare START TRANSACTION, so use the pool's begin()/commit()
+    // (see docs/database.md — the MySQL 8.x text-protocol transaction rule).
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    for (position, action_id) in body.order.iter().enumerate() {
+        if sqlx::query("UPDATE rule_actions SET position = ? WHERE id = ? AND rule_id = ?")
+            .bind(position as u32)
+            .bind(action_id)
+            .bind(rule_id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+        }
+    }
+    if tx.commit().await.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
+    }
+
+    if let Err(e) = super::audit_mutation(
+        pool,
+        &g.session,
+        "rule_actions_reordered",
+        "rule",
+        rule_id,
+        &format!("reordered {} action(s)", body.order.len()),
+    )
+    .await
+    {
+        tracing::error!(event_type = "reorder_audit_failed", rule_id, error = %e, "could not audit action reorder");
+    }
+
+    match load_actions(pool, rule_id).await {
+        Ok(actions) => (StatusCode::OK, Json(json!({ "actions": actions }))),
+        Err(_) => (StatusCode::OK, Json(json!({ "actions": [] }))),
     }
 }

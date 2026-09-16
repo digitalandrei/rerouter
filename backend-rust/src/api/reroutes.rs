@@ -295,6 +295,7 @@ async fn manual_results(
             actor_context: Some(actor_context.clone()),
             reason: reason.clone(),
             defer_cooldown: false,
+            bundle: None,
         };
         let outcome = executor::execute(&state.pool, &state.config, req, dry_run).await;
         results.push(serde_json::to_value(outcome).unwrap_or_else(|_| json!({})));
@@ -643,4 +644,135 @@ async fn rollback_attempt(
         },
     )
     .await
+}
+
+/// GET /api/reroute-bundles/{id} — progress of one ordered mitigation bundle.
+///
+/// A confirmed enforce-mode rule apply returns immediately with a bundle id and
+/// keeps pushing config in the background, so this is how the SPA follows it. It
+/// reports the bundle's terminal state, per-sibling outcomes in execution order,
+/// and — the part an operator must not miss — which siblings are STILL APPLIED
+/// when compensation could not finish.
+pub async fn bundle_show(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        Option<u64>,
+        String,
+        String,
+        String,
+        u32,
+        u32,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = match sqlx::query_as(
+        "SELECT rule_id, trigger_type, state, failure_policy, total_actions, \
+                completed_actions, failure_reason, started_at, finished_at \
+           FROM reroute_bundles WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let Some((
+        rule_id,
+        trigger_type,
+        bundle_state,
+        failure_policy,
+        total_actions,
+        completed_actions,
+        failure_reason,
+        started_at,
+        finished_at,
+    )) = row
+    else {
+        return err(StatusCode::NOT_FOUND, "bundle not found");
+    };
+
+    // Siblings in execution order, with enough per-action detail for the progress
+    // UI to name what ran where without a second round-trip.
+    #[allow(clippy::type_complexity)]
+    let siblings: Vec<(
+        u64,
+        Option<u32>,
+        u64,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT r.id, r.bundle_position, r.device_id, d.name, r.state, \
+                r.failure_reason, t.display_name \
+           FROM reroutes r \
+           LEFT JOIN devices d ON d.id = r.device_id \
+           LEFT JOIN reroute_templates t ON t.id = r.reroute_template_id \
+          WHERE r.bundle_id = ? \
+          ORDER BY r.bundle_position, r.id",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let actions: Vec<Value> = siblings
+        .into_iter()
+        .map(
+            |(rid, position, device_id, device_name, st, reason, template)| {
+                json!({
+                    "reroute_id": rid,
+                    "position": position,
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "state": st,
+                    "failure_reason": reason,
+                    "template_display_name": template,
+                })
+            },
+        )
+        .collect();
+
+    // Anything that ran but was not reversed after an abort. Derived from durable
+    // state rather than the in-memory run, so it survives a restart.
+    let still_applied: Vec<u64> =
+        if matches!(bundle_state.as_str(), "aborted" | "compensation_blocked") {
+            sqlx::query_scalar::<_, u64>(
+                "SELECT r.id FROM reroutes r \
+              WHERE r.bundle_id = ? AND r.state = 'succeeded' \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM reroutes b \
+                     WHERE b.rollback_of_reroute_id = r.id AND b.state = 'succeeded') \
+              ORDER BY r.bundle_position, r.id",
+            )
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": id,
+            "rule_id": rule_id,
+            "trigger_type": trigger_type,
+            "state": bundle_state,
+            "failure_policy": failure_policy,
+            "total_actions": total_actions,
+            "completed_actions": completed_actions,
+            "failure_reason": failure_reason,
+            "started_at": started_at.map(|t| t.to_rfc3339()),
+            "finished_at": finished_at.map(|t| t.to_rfc3339()),
+            "actions": actions,
+            "still_applied_reroute_ids": still_applied,
+        })),
+    )
 }

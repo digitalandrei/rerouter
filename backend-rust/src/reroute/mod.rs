@@ -2,6 +2,7 @@
 //! THE most dangerous part of the system. See ../docs/reroute-engine.md and
 //! ../agents/reroute-safety-agent.md.
 
+pub mod bundle;
 pub mod executor;
 pub mod flow_target;
 pub mod guard;
