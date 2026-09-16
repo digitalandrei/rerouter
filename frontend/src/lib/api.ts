@@ -347,6 +347,12 @@ export interface BgpPeer {
   in_route_map: string | null;
   out_route_map: string | null;
   last_polled_at: string | null;
+  /** Peer liveness inside the SNMP freshness window. Absent on API builds that
+   *  predate the field — callers must treat `undefined` as fresh, never stale. */
+  inventory_fresh?: boolean;
+  /** When out_prefix_list / in_route_map / out_route_map were last read over
+   *  SSH; null = never discovered, undefined = API build without the field. */
+  route_context_discovered_at?: string | null;
 }
 
 export interface BgpNetwork {
@@ -397,6 +403,16 @@ export interface RuleAction {
   /** "flow_dst_host" = resolve the null-route/blackhole host (/32 or /128) from
    *  the rule's flows at fire/apply time; null/absent = static prefix in params. */
   auto_target?: string | null;
+  /** Do these saved params still validate against freshly discovered inventory?
+   *  "drifted" = the router's route-map / prefix-list / neighbour moved under
+   *  them. Absent on API builds that predate the check — read as "ok". */
+  inventory_state?: "ok" | "drifted";
+  /** Concrete, operator-actionable reason for the drift (names the neighbour /
+   *  prefix-list to re-pick). Rendered verbatim — never paraphrased. */
+  inventory_drift_reason?: string | null;
+  /** When the drift check last ran; null = never checked, undefined = API build
+   *  without the field. */
+  inventory_checked_at?: string | null;
 }
 
 /** Comparison operators accepted by the rules API (backend rules.rs validation). */
@@ -444,6 +460,12 @@ export interface Rule {
   // Live progression toward firing (from rule_states).
   consecutive_match_count?: number | null;
   first_matched_at?: string | null;
+  /** Set by the controller when inventory drift on an attached action forced
+   *  `automatic_reroute_enabled` to 0. The rule keeps detecting and alerting;
+   *  only unattended execution was switched off. Re-arming is never automatic —
+   *  it goes back through the normal arming gate. null/absent = not disarmed. */
+  auto_disarmed_at?: string | null;
+  auto_disarmed_reason?: string | null;
 }
 
 export interface Alert {

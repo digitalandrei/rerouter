@@ -1,0 +1,32 @@
+route-map rm-deny-first deny 5
+ match ip address prefix-list PL-BLOCK
+route-map rm-deny-first permit 10
+ match ip address prefix-list PL-ADVERTISE
+!
+route-map rm-clean deny 5
+ match community 100
+route-map rm-clean permit 10
+ match ip address prefix-list PL-ADVERTISE
+ set metric 100
+!
+route-map rm-multi permit 10
+ match ip address prefix-list PL-A PL-B
+!
+route-map rm-two-stanzas permit 10
+ match ip address prefix-list PL-A
+route-map rm-two-stanzas permit 20
+ match ip address prefix-list PL-B
+!
+route-map rm-continue permit 10
+ match ip address prefix-list PL-A
+ continue 20
+route-map rm-continue permit 20
+ set metric 50
+!
+route-map prepend-3 permit 10
+ set as-path prepend 65010 65010 65010
+!
+route-map rm-in permit 10
+ match ip address prefix-list PL-IN
+!
+end

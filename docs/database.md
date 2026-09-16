@@ -165,14 +165,26 @@ neighbor — e.g. a GRE scrubber session). IPv4 only in v1.
 ```text
 id, device_id, peer_remote_addr, peer_remote_as, local_as,
 peer_state, peer_admin_status, label, out_prefix_list, in_route_map, out_route_map,
+route_context_discovered_at,
 first_seen_at, last_seen_at, last_polled_at, created_at, updated_at
 UNIQUE (device_id, peer_remote_addr)
 ```
 
+Two different freshness clocks live on this row and must not be confused:
+
+* `last_polled_at` — written by SNMP polling. Peer LIVENESS; gates the
+  `bgp_peer` / `bgp_local_as` sources (`SNMP_INVENTORY_MAX_AGE_HOURS`, 24h) and is
+  reported to the SPA as `inventory_fresh`.
+* `route_context_discovered_at` — written by SSH route-context discovery in the
+  SAME transaction as `out_prefix_list` / `in_route_map` / `out_route_map`, and
+  therefore the only honest age of those three. Gates the
+  `peer_out_prefix_list` source and the peer<->prefix-list cross-check
+  (`ROUTING_INVENTORY_MAX_AGE_HOURS`, 48h). NULL = never discovered = refused.
+
 ## device_bgp_networks
 
 Per-device announced prefixes (BGP `network` statements), discovered from config
-over SSH and revalidated daily/manually. Backs the "announced prefix" picker for
+over SSH and revalidated hourly/manually. Backs the "announced prefix" picker for
 the `blackhole_*` / `null_route_*` templates.
 
 ```text
@@ -184,6 +196,13 @@ UNIQUE (device_id, prefix)
 Successful prefix/route-map discovery reconciles a complete snapshot in one
 transaction. New actions accept SSH routing inventory only while
 `last_discovered_at` is within 48 hours.
+
+A read that cannot be proven complete is NOT a snapshot: a denied, failed or
+inconclusive routing read (e.g. an empty `| section ^route-map` output on a
+device whose BGP config references route-maps) leaves the previous rows
+untouched and is logged (`route_map_inventory_empty`,
+`prefix_list_inventory_empty`, `route_map_discovery_denied`). Inventory then
+fails closed by AGEING OUT, never by being wiped on a bad read.
 
 ## device_route_maps
 
@@ -232,8 +251,18 @@ recovery_mode, recovery_threshold_value, recovery_window_seconds,
 recovery_consecutive_samples, severity,
 enabled, automatic_reroute_enabled (default 0), manual_apply_enabled (default 0),
 reroute_template_id (legacy/unused),
+auto_disarmed_at, auto_disarmed_reason,
 created_by, updated_by, created_at, updated_at
 ```
+
+`auto_disarmed_at` / `auto_disarmed_reason` record an **inventory-drift
+auto-disarm**: the post-discovery audit cleared `automatic_reroute_enabled`
+because a stored action parameter no longer matches the router. `enabled` and
+`alert_enabled` are deliberately untouched — the rule keeps detecting and
+alerting, and manual execution stays available. The pair is NOT cleared when the
+action validates again: the audit never re-arms, so the record stays until a human
+re-arms through the normal gate (global enable + step-up re-auth). See
+[reroute-engine.md](reroute-engine.md#inventory-drift-detection--auto-disarm).
 
 ## rule_states
 
@@ -263,9 +292,20 @@ to the executor (enforce + the rule's auto switch on).
 
 ```text
 id, rule_id, reroute_template_id, device_id, params_json,
-position (default 0), enabled (default 1), auto_target, created_at, updated_at
-KEY (rule_id)
+position (default 0), enabled (default 1), auto_target,
+inventory_state ENUM('ok','drifted') default 'ok',
+inventory_drift_reason VARCHAR(500), inventory_checked_at DATETIME,
+created_at, updated_at
+KEY (rule_id), KEY (device_id, enabled)
 ```
+
+`inventory_state` / `inventory_drift_reason` / `inventory_checked_at` are written
+only by the post-discovery drift audit. `inventory_checked_at` is stamped whether
+the check passed or failed, so "never audited" (NULL) is distinguishable from
+"audited and clean". `inventory_drift_reason` holds the concrete validator message
+(e.g. `prefix-list 'pfx-to-viva' is not attached to peer 198.51.100.8`), never a
+generic string. They are advisory for the UI: the executor re-validates at
+execution time regardless of what these say.
 
 `position` is the **execution order** of the set, not a display preference: the
 runner applies enabled actions in `position, id` order, so additive actions must

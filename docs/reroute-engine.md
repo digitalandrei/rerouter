@@ -105,10 +105,21 @@ bgp_advertise_add     ip prefix-list {prefix_list_name} permit {prefix}
                       exec_after: clear ip bgp {neighbor_ip} soft out
                       Advertise a prefix toward ONE upstream peer by adding it to
                       that peer's outbound route-map prefix-list, then soft-clear
-                      outbound. The prefix-list name is discovered per peer
-                      (neighbor `route-map NAME out` -> route-map
-                      `match ip address prefix-list PL`) and offered by the
-                      `peer_out_prefix_list` picker.
+                      outbound. The prefix-list name is DISCOVERED per peer and
+                      offered read-only by the `peer_out_prefix_list` picker; it
+                      is never typed (IOS silently CREATES an unknown list, so a
+                      wrong name would advertise nothing yet report success).
+                      Discovery order of precedence:
+                        1. neighbor <ip> prefix-list NAME out
+                        2. neighbor <group> prefix-list NAME out (peer-group)
+                        3. neighbor <ip> route-map RM out -> RM's permit stanza
+                           `match ip address prefix-list PL`
+                        4. neighbor <group> route-map RM out -> same, inherited
+                      Only a name that exists as a real `ip prefix-list` stanza is
+                      stored, and a route-map that does not yield exactly ONE
+                      permit-stanza list (several lists, a `continue`, a deny
+                      stanza keyed on a prefix-list) yields NOTHING. Freshness
+                      comes from `device_bgp_peers.route_context_discovered_at`.
                       verify: show ip bgp neighbors {neighbor_ip} advertised-routes
                               -> expect "{prefix_net}"
                       rollback: bgp_advertise_remove
@@ -247,6 +258,117 @@ the global switch, rule switch, and template `automatic_allowed` policy are all
 on. Prefix containment and fresh inventory are hard gates. Per-action password/
 TOTP re-auth and typed-text confirmation remain de-scoped; global arming requires
 step-up authentication and manual execution requires the exact-preview token.
+
+## Inventory drift detection & auto-disarm
+
+The gates above catch a router-side change — a prefix-list renamed, a route-map
+rewritten, a `network` statement withdrawn — but only *at fire time*, i.e. during
+an actual attack. Until then the rule looks healthy and stays armed, and the
+operator finds out their mitigation is unusable at the worst possible moment.
+
+A **drift audit** closes that window. Every SSH routing-inventory discovery run
+(`ssh::discover_prefixes_and_store`) finishes by re-running the same **read-only**
+validators — `templates::canonicalize_inventory_params` and
+`templates::prefix_target_is_contained` — over the stored `params_json` of every
+enabled `rule_actions` row bound to that device. It executes nothing.
+
+### The rule that governs the whole feature
+
+Auto-disarm may fire **only on a positive, confirmed drift signal**:
+
+1. the discovery read for that device was **conclusive** — every read succeeded,
+   none was denied, and the snapshot it produced was reconciled in that run; **and**
+2. the stored parameter genuinely no longer validates against the inventory that
+   run just reconciled.
+
+It must never fire on an inconclusive, denied, failed or empty-but-unproven read,
+on a stale-but-unrefreshed snapshot, or on a database error. This is an
+adversarial requirement, not tidiness: anyone who can make a router return an
+empty or failing read would otherwise be able to switch off the operator's
+automatic mitigations right before a flood.
+
+The conclusive/inconclusive distinction is therefore **threaded out of the
+discovery run** as `reroute::inventory_audit::InventoryRead`, never re-derived
+from the database — after an inconclusive run the database deliberately looks
+exactly as it does after a clean one (the previous snapshot is kept). A read
+counts as conclusive only when *both* the `router bgp` section read contained a
+`router bgp` stanza *and* the route-map / `ip prefix-list` pair produced a
+trustworthy snapshot. A `sqlx` error anywhere in a validator's error chain is
+classified `Indeterminate` and decides nothing.
+
+### It never runs on an incident path
+
+Two structural interlocks, both fail-safe:
+
+- **Discovery is never run inline before firing.** The only callers of
+  `discover_prefixes_and_store` are the background loop and the operator's
+  explicit "Discover prefixes" button. Refreshing inventory just before a
+  mitigation would spend incident time on the one resource a volumetric attack
+  saturates — the router control plane — where SSH is the first thing to go slow
+  (russh inactivity timeout 60 s). Liveness is already covered more cheaply and
+  more strictly by the reachability probe and `STABILITY_WINDOW` (above).
+- **A device or rule that is mid-incident is skipped entirely.** The audit refuses
+  to look at a device with a reroute in flight (`reroutes.state IN
+  ('planned','pending','running','verifying')` — the same set the executor's own
+  "already running on this device" gate uses), and skips any action whose rule's
+  `rule_states.current_state` is not `clear` (i.e. `matching` or `firing`). A
+  discovery run that lands while a rule is mitigating therefore cannot disarm the
+  rule that is mitigating. It defers and re-checks next run.
+
+### On confirmed drift
+
+In one transaction:
+
+1. `rule_actions.inventory_state = 'drifted'`, `inventory_drift_reason` = the
+   concrete validator message, `inventory_checked_at = UTC_TIMESTAMP()`;
+2. `rules.automatic_reroute_enabled = 0` plus `auto_disarmed_at` /
+   `auto_disarmed_reason`. **Only automatic execution.** `rules.enabled` and
+   `alert_enabled` are untouched, so the rule keeps detecting and alerting, and
+   manual operator-triggered execution stays available (it still goes through
+   preview and the fire-time validation, which refuses it with the same visible
+   reason);
+3. an audit row (`rule_action_inventory_drift`, plus `rule_auto_disarmed` when a
+   rule was actually disarmed) and an alert (`rule_auto_disarmed`, critical and
+   always-immediate, or `rule_action_inventory_drift` when the rule was not armed
+   in the first place).
+
+Logs: `warn!(event_type = "rule_action_inventory_drift", …)` and
+`warn!(event_type = "rule_auto_disarmed", …)`. A repeat audit that finds the same
+drift refreshes `inventory_checked_at` but does not re-alert.
+
+### Self-heal, but only halfway
+
+When a later conclusive audit finds the action validates again, `inventory_state`
+returns to `'ok'` and the reason is cleared (audited as
+`rule_action_inventory_recovered`). **Automatic execution is never re-armed.**
+`automatic_reroute_enabled` stays 0 and the `auto_disarmed_*` record stays as the
+explanation until a human re-arms it through the normal gate — global enable plus
+step-up re-authentication. `PATCH /api/rules/{id}` additionally **refuses** to
+re-arm a rule while any of its enabled actions is still marked `drifted` (the
+executor would refuse them anyway): fix the action or the router, then let the
+hourly run — or the "Discover prefixes" button, which runs the same audit
+immediately — clear the marker. A successful re-arm clears `auto_disarmed_at` /
+`auto_disarmed_reason`.
+
+### Silent expiry
+
+`ROUTING_INVENTORY_MAX_AGE_HOURS` is 48 h. Discovery therefore runs **hourly**
+(`scheduler::PREFIX_DISCOVERY_INTERVAL`, plus a random per-device delay of up to 5
+minutes so a fleet does not open SSH to every router in the same second, and the
+existing 2-minute post-boot settle delay). At the old daily cadence **two**
+consecutive failed runs silently aged the route context out and every dependent
+action started being refused at fire time with nobody told; hourly it takes ~48,
+and the expiry alert has many chances to page first.
+
+Independently of the drift audit — and deliberately **also on an inconclusive
+read**, which is exactly the case that matters — each run checks the freshness
+marker each dependent source is actually gated on
+(`device_bgp_peers.route_context_discovered_at`,
+`device_route_maps.last_discovered_at`, `device_bgp_networks.last_discovered_at`)
+against that window, for the sources this device's enabled rules really use. If
+any has aged out it raises a critical `routing_inventory_expired` alert naming the
+device, the expired markers and the dependent rules. Expiry **never disarms**: the
+router never said anything, so nothing may be concluded from it.
 
 ## Cooldowns & rate limit
 

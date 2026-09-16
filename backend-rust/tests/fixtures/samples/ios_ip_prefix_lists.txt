@@ -1,0 +1,12 @@
+ip prefix-list sequence-number
+ip prefix-list pfx-to-viva description advertised to Viva
+ip prefix-list pfx-to-viva seq 5 permit 203.0.113.0/24
+ip prefix-list pfx-to-viva seq 10 permit 198.18.0.0/15 le 24
+ip prefix-list pfx-direct seq 5 permit 203.0.113.0/24
+ip prefix-list PL-ADVERTISE seq 5 permit 203.0.113.0/24
+ip prefix-list PL-BLOCK seq 5 permit 10.0.0.0/8
+ip prefix-list PL-A seq 5 permit 192.0.2.0/24
+ip prefix-list PL-B seq 5 permit 198.51.100.0/24
+ip prefix-list PL-IN seq 5 permit 0.0.0.0/0 le 24
+!
+end

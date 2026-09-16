@@ -95,6 +95,10 @@ struct RuleRow {
     // Live progression toward firing (from rule_states).
     consecutive_match_count: Option<u32>,
     first_matched_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Why the drift audit switched automatic execution off. Kept until a human
+    // re-arms, so the reason survives a self-heal that clears the action marker.
+    auto_disarmed_at: Option<chrono::DateTime<chrono::Utc>>,
+    auto_disarmed_reason: Option<String>,
 }
 
 /// Rule columns + resolved target names + the latest evaluation snapshot
@@ -106,6 +110,7 @@ const RULE_SELECT: &str = "SELECT r.id, r.name, r.interface_id, r.device_id, r.m
      r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, \
      r.recovery_consecutive_samples, r.severity, r.enabled, \
      r.automatic_reroute_enabled, r.manual_apply_enabled, r.reroute_template_id, \
+     r.auto_disarmed_at, r.auto_disarmed_reason, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
      rs.consecutive_match_count, rs.first_matched_at \
@@ -139,6 +144,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
+        "auto_disarmed_at": r.auto_disarmed_at.map(|t| t.to_rfc3339()),
+        "auto_disarmed_reason": r.auto_disarmed_reason,
         "manual_apply_enabled": r.manual_apply_enabled,
         "reroute_template_id": r.reroute_template_id,
         "interface_name": r.interface_name,
@@ -156,8 +163,9 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
 /// Load a rule's attached actions (template + target router + params) for the
 /// rule JSON. Joins display names so the SPA needn't re-resolve them.
 async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32, Option<String>)>(
-        "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position, ra.auto_target \
+    let rows = sqlx::query_as::<_, (u64, u64, String, Option<String>, u64, String, Option<sqlx::types::Json<Value>>, bool, u32, Option<String>, String, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT ra.id, ra.reroute_template_id, t.name, t.display_name, ra.device_id, d.name, ra.params_json, ra.enabled, ra.position, ra.auto_target, \
+                ra.inventory_state, ra.inventory_drift_reason, ra.inventory_checked_at \
          FROM rule_actions ra \
          JOIN reroute_templates t ON t.id = ra.reroute_template_id \
          JOIN devices d ON d.id = ra.device_id \
@@ -180,6 +188,9 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> anyhow::Result<Ve
                 enabled,
                 position,
                 auto_target,
+                inventory_state,
+                inventory_drift_reason,
+                inventory_checked_at,
             )| {
                 json!({
                     "id": id,
@@ -192,6 +203,11 @@ async fn load_actions(pool: &sqlx::MySqlPool, rule_id: u64) -> anyhow::Result<Ve
                     "enabled": enabled,
                     "position": position,
                     "auto_target": auto_target,
+                    // Drift audit (reroute::inventory_audit). Advisory for the UI
+                    // only — the executor re-validates at fire time regardless.
+                    "inventory_state": inventory_state,
+                    "inventory_drift_reason": inventory_drift_reason,
+                    "inventory_checked_at": inventory_checked_at.map(|t| t.to_rfc3339()),
                 })
             },
         )
@@ -756,6 +772,22 @@ pub async fn update(
                 "one or more enabled actions are not allowed for automatic execution",
             );
         }
+        // Re-arming into KNOWN-drifted inventory would arm a mitigation the
+        // executor will refuse anyway. The drift marker is cleared by the next
+        // conclusive discovery run, or immediately by "Discover prefixes".
+        let drifted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rule_actions              WHERE rule_id = ? AND enabled = 1 AND inventory_state = 'drifted'",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(i64::MAX);
+        if drifted > 0 {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "one or more enabled actions no longer match the router's inventory;                  fix the action (or the router) and re-run device inventory discovery first",
+            );
+        }
     }
 
     let condition_changed = body.metric.is_some()
@@ -831,6 +863,12 @@ pub async fn update(
     }
     if body.automatic_reroute_enabled.is_some() {
         sets.push("automatic_reroute_enabled = ?");
+    }
+    if body.automatic_reroute_enabled == Some(true) {
+        // A human re-armed it through the normal gate, so the auto-disarm record
+        // has served its purpose. (The drift audit itself NEVER re-arms.)
+        sets.push("auto_disarmed_at = NULL");
+        sets.push("auto_disarmed_reason = NULL");
     }
     if body.manual_apply_enabled.is_some() {
         sets.push("manual_apply_enabled = ?");

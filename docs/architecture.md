@@ -129,5 +129,9 @@ device task (one per enabled device)
 ```
 
 Intervals: SNMP poll at the device's `poll_interval_seconds` (default 30), BGP
-state each poll, interface and SSH routing inventory daily. Per-device jitter
-avoids synchronized polling.
+state each poll, interface inventory daily, and SSH routing inventory hourly
+(each device after its own random delay of up to 5 minutes, so a fleet does not
+open SSH to every router at once). Per-device jitter avoids synchronized polling.
+The hourly routing read is also what drives inventory drift detection — see
+[reroute-engine.md](reroute-engine.md#inventory-drift-detection--auto-disarm); it
+is strictly a background loop and is never run inline on a mitigation path.

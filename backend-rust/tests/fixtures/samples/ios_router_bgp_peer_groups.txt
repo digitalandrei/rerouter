@@ -1,0 +1,31 @@
+Building configuration...
+
+Current configuration : 1873 bytes
+!
+router bgp 65010
+ bgp log-neighbor-changes
+ network 203.0.113.0 mask 255.255.255.0
+ neighbor UPSTREAMS peer-group
+ neighbor UPSTREAMS description transit peer-group
+ neighbor UPSTREAMS prefix-list pfx-to-viva out
+ neighbor SCRUBBERS peer-group
+ neighbor SCRUBBERS route-map prepend-3 out
+ neighbor 198.51.100.7 remote-as 64500
+ neighbor 198.51.100.7 description Viva transit
+ neighbor 198.51.100.7 peer-group UPSTREAMS
+ neighbor 203.0.113.9 remote-as 64510
+ neighbor 203.0.113.9 peer-group UPSTREAMS
+ neighbor 203.0.113.9 prefix-list pfx-direct out
+ neighbor 192.0.2.30 remote-as 64520
+ neighbor 192.0.2.30 route-map rm-clean out
+ neighbor 192.0.2.30 route-map rm-in in
+ neighbor 192.0.2.44 remote-as 64530
+ neighbor 192.0.2.44 peer-group SCRUBBERS
+ neighbor 192.0.2.55 remote-as 64540
+ neighbor 192.0.2.55 prefix-list pfx-ghost out
+ neighbor 192.0.2.66 remote-as 64560
+ neighbor 192.0.2.66 route-map rm-deny-first out
+ neighbor 2001:db8::1 remote-as 64550
+ neighbor 2001:db8::1 prefix-list pfx-v6 out
+!
+end

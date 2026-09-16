@@ -32,6 +32,17 @@ An alert (an `alerts` row) is generated on:
   traffic-moving actions), so they are emitted as alerts with the **actor** and the
   before → after values, and are in `ALWAYS_IMMEDIATE` (page right away). They are
   still audited too;
+- **inventory drift** — `rule_auto_disarmed` (**critical**, in `ALWAYS_IMMEDIATE`):
+  the post-discovery drift audit switched a rule's **automatic** execution off
+  because a stored action parameter no longer matches the router. The payload names
+  the rule, the device, the action and the concrete validator reason, and states
+  that the rule is still enabled (detection and alerting continue) and that manual
+  execution remains available. `rule_action_inventory_drift` is the same finding on
+  a rule that was not armed in the first place (warning);
+- `routing_inventory_expired` — **critical**: this device's SSH-discovered routing
+  inventory has aged past the validator window while enabled rules depend on it, so
+  those actions will be refused at fire time. Alerts only; it never disarms
+  anything (see [reroute-engine.md](reroute-engine.md#inventory-drift-detection--auto-disarm));
 - security events: `2fa_recovery_used`, `account_locked`;
 - controller degradation: `automatic_action_failed`, `recovery_degraded`, and
   `alert_delivery_permanently_failed`.
