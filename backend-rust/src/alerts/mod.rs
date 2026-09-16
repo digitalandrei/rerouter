@@ -29,6 +29,9 @@ pub const ALWAYS_IMMEDIATE: &[&str] = &[
     "global_lock_changed",
     "automatic_action_failed",
     "recovery_degraded",
+    // Automatic mitigation just stopped being armed for a rule: the operator's
+    // protection silently shrank, so it pages immediately and is never collapsed.
+    "rule_auto_disarmed",
     "alert_delivery_permanently_failed",
 ];
 

@@ -90,17 +90,19 @@ async fn seed(
         .await
         .expect("insert device")
         .last_insert_id();
+    // The ages are computed here and bound as plain timestamps. Binding a NULL
+    // into `INTERVAL ? HOUR` makes MariaDB 11.4 reject the prepared execute
+    // (error 1210), and "never polled / never discovered" is exactly the case
+    // these tests need.
+    let ago = |hours: Option<i64>| hours.map(|h| chrono::Utc::now() - chrono::Duration::hours(h));
     sqlx::query(
         "INSERT INTO device_bgp_peers \
              (device_id, peer_remote_addr, out_prefix_list, last_polled_at, route_context_discovered_at) \
-         VALUES (?, '198.51.100.7', 'pfx-to-viva', \
-                 IF(? IS NULL, NULL, DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)), \
-                 IF(? IS NULL, NULL, DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)))",
+         VALUES (?, '198.51.100.7', 'pfx-to-viva', ?, ?)",
     )
-    .bind(polled_hours_ago)
-    .bind(polled_hours_ago.unwrap_or(0))
-    .bind(discovered_hours_ago)
-    .bind(discovered_hours_ago.unwrap_or(0))
+    .bind(device_id)
+    .bind(ago(polled_hours_ago))
+    .bind(ago(discovered_hours_ago))
     .execute(pool)
     .await
     .expect("insert bgp peer");

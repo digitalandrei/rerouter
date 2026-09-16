@@ -469,6 +469,11 @@ pub async fn run_commands(
 /// best-effort second read whose failure never fails the announced-prefix
 /// discovery and, per [`resolve_route_context`], never overwrites a previously
 /// good snapshot with an unproven one.
+///
+/// When — and ONLY when — every read proved the router's current configuration,
+/// the run finishes by auditing this device's enabled rule actions against the
+/// inventory it just reconciled ([`crate::reroute::inventory_audit`]), which may
+/// disarm automatic execution on a rule whose stored parameters have drifted.
 pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let cmd = "show running-config | section ^router bgp".to_string();
     let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
@@ -484,6 +489,16 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     let prefixes = parse_network_statements(output);
     let descriptions = parse_neighbor_descriptions(output);
 
+    // Did this read actually PROVE the device's announced space? An output with
+    // no `router bgp` stanza is indistinguishable from a truncated, filtered or
+    // paging-mangled read — and the reconcile below clears `device_bgp_networks`
+    // from exactly such an output. The reconcile keeps that fail-closed behaviour
+    // (an emptied inventory REFUSES actions), but nothing may be CONCLUDED from
+    // it: an empty read must never be allowed to disarm a rule.
+    let announced_prefixes_proven = output
+        .lines()
+        .any(|l| l.trim_start().to_ascii_lowercase().starts_with("router bgp"));
+
     // Resolve each peer's OUTBOUND prefix-list so the guided picker can offer the
     // correct list per peer for the bgp_advertise_* templates. Both reads travel
     // in ONE extra session (the routers throttle rapid reconnects), and the whole
@@ -491,7 +506,8 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     // discovery and leaves the previous route-context snapshot untouched.
     let rm_cmd = "show running-config | section ^route-map".to_string();
     let pl_cmd = "show running-config | section ^ip prefix-list".to_string();
-    let route_context = match run_commands(pool, device_id, &[rm_cmd, pl_cmd]).await {
+    let route_context: std::result::Result<RouteContextSnapshot, &'static str> =
+        match run_commands(pool, device_id, &[rm_cmd, pl_cmd]).await {
         Ok(rc_outcome) => {
             match (rc_outcome.results.first(), rc_outcome.results.get(1)) {
                 (Some(rm), Some(pl)) => {
@@ -501,7 +517,7 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
                         cisco_denied(&rm.output).or_else(|| cisco_denied(&pl.output))
                     {
                         tracing::warn!(event_type = "route_map_discovery_denied", device_id, detail = %denied, "routing inventory was not refreshed");
-                        None
+                        Err("route_map_discovery_denied")
                     } else {
                         match resolve_route_context(output, &rm.output, &pl.output) {
                             Ok(snapshot) => {
@@ -514,24 +530,24 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
                                 for peer in &snapshot.conflicting_peers {
                                     tracing::warn!(event_type = "peer_prefix_list_ambiguous", device_id, peer = %peer, "peer has several equally-specific outbound prefix-lists — none stored");
                                 }
-                                Some(snapshot)
+                                Ok(snapshot)
                             }
                             Err(unavailable) => {
                                 tracing::warn!(event_type = unavailable.event, device_id, detail = %unavailable.detail, "routing inventory read was inconclusive — previous snapshot kept");
-                                None
+                                Err(unavailable.event)
                             }
                         }
                     }
                 }
                 _ => {
                     tracing::warn!(event_type = "route_map_discovery_incomplete", device_id, "routing inventory read returned fewer outputs than commands — previous snapshot kept");
-                    None
+                    Err("route_map_discovery_incomplete")
                 }
             }
         }
         Err(e) => {
             tracing::warn!(event_type = "route_map_discovery_failed", device_id, error = %e, "routing inventory was not refreshed");
-            None
+            Err("route_map_discovery_failed")
         }
     };
 
@@ -576,7 +592,7 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     }
 
     let mut peers_with_prefix_list: u64 = 0;
-    if let Some(snapshot) = route_context.as_ref() {
+    if let Ok(snapshot) = route_context.as_ref() {
         // These fields are a snapshot, not append-only hints. Clear assignments
         // that disappeared before writing the current set. `route_context_discovered_at`
         // is stamped in the SAME statement so the freshness marker can never
@@ -657,7 +673,7 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
         event_type = "route_context_discovered",
         device_id,
         prefixes = prefixes.len(),
-        route_context_refreshed = route_context.is_some(),
+        route_context_refreshed = route_context.is_ok(),
         route_maps = route_context
             .as_ref()
             .map(|s| s.route_maps.len())
@@ -675,6 +691,26 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
             .unwrap_or(0),
         "routing inventory discovery finished"
     );
+
+    // Post-discovery DRIFT AUDIT. The conclusive/inconclusive signal is threaded
+    // straight out of the reads above and never re-derived from the database:
+    // after an inconclusive run the database looks exactly like it does after a
+    // clean one (that is the whole point of keeping the previous snapshot), so
+    // only the reader knows which it was. Anything short of "every read proved the
+    // router's current configuration" audits nothing and changes nothing.
+    let read = match (announced_prefixes_proven, route_context) {
+        (true, Ok(_)) => crate::reroute::inventory_audit::InventoryRead::Conclusive,
+        (false, _) => crate::reroute::inventory_audit::InventoryRead::Inconclusive(
+            "announced_prefix_read_unproven",
+        ),
+        (_, Err(reason)) => crate::reroute::inventory_audit::InventoryRead::Inconclusive(reason),
+    };
+    if let Err(e) = crate::reroute::inventory_audit::audit_device(pool, device_id, read).await {
+        // The audit only ever ADDS a warning, and each of its writes is its own
+        // transaction, so a failure here leaves the database untouched and must
+        // not fail the discovery run that just succeeded.
+        tracing::error!(event_type = "inventory_drift_audit_failed", device_id, error = %e, "post-discovery inventory drift audit failed; no rule was changed");
+    }
 
     Ok(prefixes.len())
 }

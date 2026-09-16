@@ -47,7 +47,7 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     });
     spawn_supervised("prefix_discovery", {
         let pool = pool.clone();
-        move || discover_prefixes_daily(pool.clone())
+        move || discover_prefixes_hourly(pool.clone())
     });
     spawn_supervised("aggregate_detection", {
         let pool = pool.clone();
@@ -94,19 +94,50 @@ where
     });
 }
 
-/// How often to revalidate announced prefixes over SSH.
-const PREFIX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// How often to revalidate routing inventory over SSH.
+///
+/// Hourly, not daily. Two things hang off this loop, and both want a short
+/// cadence:
+///
+/// * `templates::ROUTING_INVENTORY_MAX_AGE_HOURS` is 48h. At a 24h cadence TWO
+///   consecutive failed runs silently aged the routing inventory out and every
+///   dependent action started being refused at fire time. At 1h it takes ~48
+///   consecutive failures, and the expiry alert has ~47 chances to page first.
+/// * the post-discovery drift audit (`reroute::inventory_audit`) can only notice a
+///   router-side change when a discovery run happens, so the cadence IS the
+///   detection latency for "my mitigation no longer matches the router".
+///
+/// Cost is two short SSH sessions per device per hour — far below the reachability
+/// probe's own rate — and the loop stays strictly in the background: discovery is
+/// never run inline on a trigger path (see `discover_prefixes_hourly`).
+const PREFIX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Discover each device's announced BGP prefixes over SSH, shortly after boot and
-/// then daily. Best-effort: a device without working SSH is logged and skipped
+/// Upper bound of the random pre-read delay applied to EACH device, so a fleet
+/// does not open SSH sessions to every router in the same second.
+const PREFIX_DISCOVERY_DEVICE_JITTER: Duration = Duration::from_secs(300);
+
+/// Discover each device's routing inventory over SSH, shortly after boot and then
+/// hourly. Best-effort: a device without working SSH is logged and skipped
 /// (manual "Discover prefixes" remains available). The SNMP-cached ASN/neighbors
-/// refresh every poll, so only the SSH-sourced prefixes need this slow loop.
-async fn discover_prefixes_daily(pool: MySqlPool) {
+/// refresh every poll, so only the SSH-sourced inventory needs this slow loop.
+///
+/// This is the ONLY scheduled caller of `discover_prefixes_and_store`, and it is
+/// deliberately a background loop with no relationship to detection or execution.
+/// Inventory is never refreshed inline just before a mitigation fires: during a
+/// volumetric attack the router control plane is precisely what is saturated, SSH
+/// is the first thing to go slow (the russh inactivity timeout is 60s), and the
+/// executor already gates on cheaper, stricter liveness signals — the reachability
+/// probe plus `reroute::reachability::STABILITY_WINDOW`. Adding an inline refresh
+/// would spend incident time re-learning what this loop already knows.
+async fn discover_prefixes_hourly(pool: MySqlPool) {
     tokio::time::sleep(Duration::from_secs(120)).await; // let the box settle after boot
     loop {
         match snmp::load_enabled_devices(&pool).await {
             Ok(devices) => {
                 for d in devices {
+                    // Per-device jitter: spread the fleet's SSH sessions across the
+                    // window instead of hitting every router at the top of the hour.
+                    tokio::time::sleep(device_discovery_jitter()).await;
                     match crate::ssh::discover_prefixes_and_store(&pool, d.id).await {
                         Ok(n) => tracing::debug!(
                             event_type = "prefix_discovery",
@@ -126,6 +157,12 @@ async fn discover_prefixes_daily(pool: MySqlPool) {
         }
         tokio::time::sleep(PREFIX_DISCOVERY_INTERVAL).await;
     }
+}
+
+/// A uniform random delay in `0..=PREFIX_DISCOVERY_DEVICE_JITTER`, drawn fresh per
+/// device per pass so the spread does not settle into a fixed order.
+fn device_discovery_jitter() -> Duration {
+    Duration::from_secs(rand::rng().random_range(0..=PREFIX_DISCOVERY_DEVICE_JITTER.as_secs()))
 }
 
 /// One day-windowed retention rule: delete rows whose `ts_column` is older than
@@ -485,6 +522,32 @@ fn jittered(base_secs: u32, jitter_percent: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The discovery cadence is what keeps SSH routing inventory inside the
+    /// validator window. If the two ever drift apart (cadence lengthened, or the
+    /// max age shortened) the controller starts silently refusing dependent
+    /// actions after only a couple of missed runs — the failure this test exists
+    /// to prevent.
+    #[test]
+    fn discovery_cadence_leaves_real_margin_before_inventory_expires() {
+        let max_age = Duration::from_secs(
+            crate::reroute::templates::ROUTING_INVENTORY_MAX_AGE_HOURS as u64 * 3600,
+        );
+        let worst_case_pass = PREFIX_DISCOVERY_INTERVAL + PREFIX_DISCOVERY_DEVICE_JITTER;
+        let tolerated_failures = max_age.as_secs() / worst_case_pass.as_secs();
+        assert!(
+            tolerated_failures >= 24,
+            "routing inventory ages out after only {tolerated_failures} consecutive failed \
+             discovery runs; the cadence must leave far more margin than that"
+        );
+    }
+
+    #[test]
+    fn per_device_jitter_stays_inside_its_window() {
+        for _ in 0..200 {
+            assert!(device_discovery_jitter() <= PREFIX_DISCOVERY_DEVICE_JITTER);
+        }
+    }
 
     #[test]
     fn retention_specs_map_config_windows_to_tables() {

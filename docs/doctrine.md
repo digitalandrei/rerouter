@@ -434,6 +434,32 @@ only), and a global circuit breaker (`global_action_rate_limit_count` actions pe
 `global_action_rate_limit_window_seconds`, default 3/600). A `0` disables a
 throttle.
 
+**Inventory drift is detected between incidents, not during them.** Every SSH
+routing-inventory discovery run (hourly) finishes by re-running the same read-only
+validators over the stored parameters of that device's enabled `rule_actions`. A
+parameter that no longer matches the router marks the action
+(`rule_actions.inventory_state = 'drifted'` + the concrete reason) and **disarms
+only that rule's automatic execution** (`rules.automatic_reroute_enabled = 0`,
+with `auto_disarmed_at` / `auto_disarmed_reason`); the rule stays `enabled` and
+keeps detecting and alerting, and manual execution stays available. Three
+constraints are absolute:
+
+- auto-disarm fires **only on a positive, confirmed drift signal** — a conclusive
+  discovery read whose freshly reconciled inventory positively refuses the stored
+  value. Never on a denied, failed, empty-but-unproven or stale read, and never on
+  a database error. Otherwise whoever can make a router return an empty read could
+  disarm the operator's mitigations, which is precisely what an attacker wants;
+- the audit **never runs on an incident path**: discovery is never performed inline
+  before firing (the router control plane is what an attack saturates), and a
+  device with a reroute in flight, or a rule that is `matching`/`firing`, is
+  skipped entirely and re-checked next run;
+- recovery clears the drift marker but **never re-arms**. Re-arming is a human act
+  through the normal arming gate.
+
+Silent expiry is alerted separately: if a device's routing inventory ages past the
+validator window while rules depend on it, a critical `routing_inventory_expired`
+alert is raised. Expiry alerts; it never disarms.
+
 Two-phase action state machine:
 
 ```text
@@ -478,8 +504,10 @@ per the 2026-07 audit. See
 Rerouter sends alerts from the controller itself on: rule fired (`rule_fired` —
 carrying the would-run action plan in observe mode), reroute
 started/succeeded/failed, action `uncertain`, global arming changes, account
-lockout/recovery-code use, automatic-action/recovery degradation, and permanent
-delivery failure. Device/telemetry staleness is surfaced through status and the
+lockout/recovery-code use, automatic-action/recovery degradation, inventory drift
+auto-disarm (`rule_auto_disarmed`, always immediate) and its non-armed sibling
+(`rule_action_inventory_drift`), routing-inventory expiry
+(`routing_inventory_expired`), and permanent delivery failure. Device/telemetry staleness is surfaced through status and the
 UI; ordinary lock changes remain audit-only. There are two delivery channels:
 
 - **email** via SMTP (lettre, rustls) — SMTP credentials come from the

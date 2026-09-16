@@ -20,8 +20,12 @@ use serde_json::{Map, Value};
 use sqlx::types::Json as SqlxJson;
 use sqlx::MySqlPool;
 
-/// SSH-derived routing inventory is refreshed daily. After two missed refreshes
-/// it is no longer authoritative enough to permit a new destructive action.
+/// SSH-derived routing inventory is refreshed hourly
+/// (`scheduler::PREFIX_DISCOVERY_INTERVAL`). Two days without a successful
+/// refresh — about 48 consecutive failed runs — means it is no longer
+/// authoritative enough to permit a new destructive action. The gap between the
+/// cadence and this window is the margin: `reroute::inventory_audit` alerts
+/// (`routing_inventory_expired`) long before the window closes.
 pub const ROUTING_INVENTORY_MAX_AGE_HOURS: i64 = 48;
 /// Interface and BGP inventory is refreshed by the regular SNMP loop. A full day
 /// without a successful observation makes it ineligible for a new action.
@@ -300,6 +304,25 @@ pub async fn canonicalize_inventory_params(
     Ok(Value::Object(canonical))
 }
 
+/// Templates whose `prefix` parameter must fall inside the device's freshly
+/// discovered announced space. The dependency is on the template NAME, not on a
+/// schema `source` annotation, so callers that need to know which templates
+/// depend on `device_bgp_networks` freshness (the drift audit) ask here rather
+/// than re-listing the names.
+pub fn requires_announced_prefix_containment(template_name: &str) -> bool {
+    matches!(
+        template_name,
+        "null_route_prefix"
+            | "null_route_withdraw"
+            | "null_route_prefix_v6"
+            | "null_route_withdraw_v6"
+            | "blackhole_prefix"
+            | "blackhole_withdraw"
+            | "blackhole_prefix_v6"
+            | "blackhole_withdraw_v6"
+    )
+}
+
 /// Null0/RTBH targets must be contained in space the target device currently
 /// advertises. Rollbacks bypass this inventory check in the executor so a stale
 /// discovery cache can never prevent corrective work.
@@ -309,17 +332,7 @@ pub async fn prefix_target_is_contained(
     template: &Template,
     params: &Value,
 ) -> Result<bool> {
-    if !matches!(
-        template.name.as_str(),
-        "null_route_prefix"
-            | "null_route_withdraw"
-            | "null_route_prefix_v6"
-            | "null_route_withdraw_v6"
-            | "blackhole_prefix"
-            | "blackhole_withdraw"
-            | "blackhole_prefix_v6"
-            | "blackhole_withdraw_v6"
-    ) {
+    if !requires_announced_prefix_containment(&template.name) {
         return Ok(true);
     }
     let subst = validate_and_expand(&template.parameter_schema, params)?;

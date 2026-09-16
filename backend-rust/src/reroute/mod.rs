@@ -6,6 +6,7 @@ pub mod bundle;
 pub mod executor;
 pub mod flow_target;
 pub mod guard;
+pub mod inventory_audit;
 pub mod locks;
 pub mod reachability;
 pub mod rollback;
