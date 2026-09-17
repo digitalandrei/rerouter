@@ -36,18 +36,20 @@ sudo /tmp/rerouter-controller --install
 systemd unit — it **never overwrites** an existing `.env` or `config.toml`).
 It:
 
-1. creates the `rerouter` system user if missing (tolerated/warned if
-   `useradd` is unavailable);
-2. installs the binary to `/srv/rerouter/rerouter-controller` (mode `0755`);
+1. creates the `rerouter` system user if missing (a real install fails if the
+   account cannot be created);
+2. creates `/srv/rerouter` as `root:rerouter` mode `0750` and installs the
+   binary as `root:root` mode `0755`;
 3. writes `/srv/rerouter/.env` **only if it does not exist** (mode `0600`,
    owned by `rerouter`) — with `SESSION_SECRET` and `SECRETS_KEY` already
    filled in (32 random bytes hex each, generated at install time);
-4. writes `/srv/rerouter/config.toml` **only if it does not exist** — an
+4. writes `/srv/rerouter/config.toml` **only if it does not exist**
+   (`root:rerouter`, mode `0640`) — an
    embedded copy of
    [../backend-rust/config.example.toml](../backend-rust/config.example.toml)
    (loopback bind `127.0.0.1:9277`, `operating_mode = "observe"`,
    `automatic_actions_enabled = false`);
-5. writes `/etc/systemd/system/rerouter-controller.service` (overwrite
+5. writes `/etc/systemd/system/rerouter-controller.service` as `0644` (overwrite
    allowed — the unit is ours), then `systemctl daemon-reload && systemctl
    enable rerouter-controller` (**enable, not start** — the `.env` needs
    filling first). If systemctl is unavailable (containers), it warns and
@@ -56,6 +58,37 @@ It:
 
 For testing, `--install --prefix /tmp/x` installs under a prefix instead of
 `/`.
+
+The installer explicitly sets and verifies ownership and modes for artifacts it
+creates or replaces, so a restrictive invoking umask cannot leave the service
+unable to traverse or read its new files. A new `.env` is
+`rerouter:rerouter` mode `0600`. Existing `.env` and `config.toml` remain
+operator-owned: an upgrade does not rewrite, chmod, or chown them. A real-root
+install fails if the service account or required ownership cannot be
+established. A prefixed test install never invokes `useradd`, `chown`, or
+`systemctl`; its files remain owned by the invoking test user.
+
+### Upgrade an existing controller
+
+Re-running `--install` atomically replaces the binary and updates the unit, but
+does not restart an already-running process. Complete every upgrade explicitly:
+
+```bash
+sudo /tmp/rerouter-controller --install
+sudo systemctl restart rerouter-controller
+sudo systemctl is-active --quiet rerouter-controller
+curl -fsS http://127.0.0.1:9277/api/health
+curl -fsS http://127.0.0.1:9277/api/ready
+
+# The running process must be the newly installed inode. A stale process points
+# at an old/deleted inode after the installer's atomic rename.
+PID=$(systemctl show --property MainPID --value rerouter-controller)
+sudo cmp --silent "/proc/$PID/exe" /srv/rerouter/rerouter-controller
+```
+
+Treat a failed restart, readiness check, or binary comparison as a failed
+upgrade. Inspect `journalctl -u rerouter-controller` before enabling traffic
+actions. The startup migration runs before readiness becomes healthy.
 
 Then:
 
@@ -108,21 +141,33 @@ the first authenticator.
 ## Release gate (local)
 
 There is **no hosted CI** (owner decision, 2026-07-21). Before every release,
-run the full gate locally and require all five commands to pass:
+run the full gate locally and require every command to pass:
 
 ```bash
 (cd backend-rust && cargo fmt --check)
 (cd backend-rust && cargo clippy --all-targets -- -D warnings)
-(cd backend-rust && DATABASE_URL="mysql://…/rerouter_test" cargo test --all-targets)
+(cd backend-rust && REROUTER_TEST_DATABASE_URL="mysql://rerouter_test:…@127.0.0.1/rerouter_test" cargo test --locked --all-targets -- --test-threads=1)
 (cd frontend && npm run typecheck)
+(cd frontend && npm test -- --run)
 (cd frontend && npm run build)
+(cd backend-rust && cargo build --locked --features embed-ui)
 ```
 
-The integration suites under `backend-rust/tests/` **skip silently when
-`DATABASE_URL` is unset** — a green `cargo test` without a MariaDB test
-database has not exercised reroute-guard, state-recovery, reachability, or
-collector behavior. Point `DATABASE_URL` at a disposable MariaDB database
-(the tests run migrations and write to it; never use the production DB).
+Database suites now **fail when `REROUTER_TEST_DATABASE_URL` is missing**. The
+shared harness requires a non-root account containing `test`, a database named
+`rerouter_test` or `rerouter_test_*`, confirms the server-side identity, sets UTC,
+and serializes suites. Application `DATABASE_URL` is not accepted as a fallback.
+Use a restricted account and dedicated schema on the existing database service;
+never start a test daemon on this shared server or point tests at production.
+All advisory locks are namespaced by database so test locks cannot stall another
+installation. Run the complete Rust/frontend gate with:
+
+```bash
+REROUTER_TEST_DATABASE_URL="mysql://rerouter_test:…@127.0.0.1/rerouter_test" bash scripts/check-release.sh
+```
+
+The frontend gate includes its interaction tests. The mocked browser harness is
+`frontend/tests/manual-mitigations-browser.mjs`; it is not IOS certification.
 
 Run `cargo audit` manually each audit cycle; accepted findings are recorded
 in `plans/README.md`.
@@ -234,7 +279,8 @@ One unit, written by `--install` to
 
 ## Environment & config
 
-Everything lives in `/srv/rerouter/`, owned by `rerouter`:
+Everything lives in `/srv/rerouter/`. Fresh installs use root-owned application
+files with service-readable permissions, and a private service-owned `.env`:
 
 - `/srv/rerouter/rerouter-controller` — the binary;
 - `/srv/rerouter/.env` — environment, mode `0600`, generated by `--install`
@@ -286,5 +332,25 @@ always wins. Never commit secrets to Git, and never overwrite an operator's
 If the flow collector is enabled, separately allow UDP 2055 and/or 6343 only
 from exporter management addresses. The web-origin Cloudflare allowlist does not
 protect those UDP listeners; enforce router-to-collector ACL/uRPF controls.
+
+## IOS exclusive-write platform certification
+
+Enforce mode requires native IOS configuration locking for the complete
+multi-device change window. A target must accept `show configuration lock` and
+`configure terminal lock`, retain the session-owned lock while the controller
+runs its narrowly allowlisted `do show` / soft-clear checks, and release it on
+`end` or disconnect. Unsupported or denied lock commands fail closed; there is
+no unlocked fallback.
+
+The implementation and parser tests cover the command contract, but no real IOS
+or IOS-XE hardware/image has yet completed the certification matrix. Keep the
+deployment in `observe` until each exact platform/image/account combination has
+passed a staged lock-acquire, read, write, readback, disconnect-release, and
+concurrent-operator test. Certification must also show that `do clear` works
+without releasing the lock, BGP reaches `Established` and exact advertised-route
+readback inside the 30-second convergence window, each command returns a complete
+prompt inside 25 seconds, and the full ordered lock window fits the 12-minute
+cap. This is a platform qualification requirement, not a claim that the database
+and router form one atomic transaction.
 
 Day-2 operations: [operations-runbook.md](operations-runbook.md).

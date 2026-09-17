@@ -241,15 +241,21 @@ async fn retention_cleanup(pool: MySqlPool, cfg: Arc<Config>) {
             loop {
                 // SAFETY: table/ts_column are 'static literals from our own code;
                 // the batch size is a compile-time integer constant.
+                let protected = match spec.table {
+                    "alerts" => " AND EXISTS (SELECT 1 FROM alert_delivery_intents i WHERE i.alert_id = alerts.id) AND NOT EXISTS (SELECT 1 FROM alert_delivery_intents i WHERE i.alert_id = alerts.id AND i.state <> 'settled')",
+                    "rule_events" => " AND NOT EXISTS (SELECT 1 FROM reroutes r WHERE r.rule_event_id = rule_events.id AND (r.state IN ('planned','pending','running','verifying','uncertain') OR r.mutation_effect IN ('changed','unknown') OR (r.state = 'succeeded' AND r.mutation_effect = 'pending')) AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded'))",
+                    _ => "",
+                };
                 let sql = format!(
                     "DELETE target FROM ( \
                          SELECT id FROM {} FORCE INDEX ({}) \
-                         WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) \
+                         WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) {} \
                          ORDER BY {} LIMIT {} \
                      ) AS expired STRAIGHT_JOIN {} AS target ON target.id = expired.id",
                     spec.table,
                     spec.index,
                     spec.ts_column,
+                    protected,
                     spec.ts_column,
                     RETENTION_DELETE_BATCH,
                     spec.table

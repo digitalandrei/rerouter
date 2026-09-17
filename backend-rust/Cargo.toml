@@ -58,5 +58,13 @@ sha2 = "0.10"
 time = "0.3"
 russh = "0.61.2"
 
+# Security floors for transitive protocol/runtime crates. Keep these direct
+# constraints even though application code reaches them through hyper/sqlx:
+# they prevent a lockfile refresh from selecting known-vulnerable versions.
+h2 = "0.4.19"
+event-listener = "5.4.2"
+rustls = { version = "0.23.45", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 # fixtures + parser tests live under tests/
+tower = { version = "0.5", features = ["util"] }

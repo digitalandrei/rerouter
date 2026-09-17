@@ -158,6 +158,9 @@ pub async fn audit_device(
     device_id: u64,
     read: InventoryRead,
 ) -> Result<AuditSummary> {
+    // Definition changes, disarming and actuation share a serialization point.
+    // A quietness observation cannot become stale before we record its verdict.
+    let _policy_fence = super::guard::policy_fence(pool).await?;
     // The expiry check runs whatever the read said — its entire purpose is to
     // notice that discovery has NOT been succeeding, which is precisely the
     // inconclusive case.
@@ -286,7 +289,12 @@ async fn device_is_quiet(pool: &MySqlPool, device_id: u64) -> Result<bool> {
     .bind(device_id)
     .fetch_one(pool)
     .await?;
-    Ok(in_flight == 0)
+    let windows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_change_windows WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(in_flight == 0 && windows == 0)
 }
 
 /// Re-run the read-only executor validators over one action's STORED parameters.
@@ -343,6 +351,14 @@ async fn record_drift(
 
     // begin()/commit() only: MySQL 8.x cannot PREPARE `START TRANSACTION`.
     let mut tx = pool.begin().await?;
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT current_state FROM rule_states WHERE rule_id = ? FOR UPDATE")
+            .bind(action.rule_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if current.as_deref().is_some_and(|state| state != "clear") {
+        return Ok((false, false));
+    }
     sqlx::query(
         "UPDATE rule_actions SET inventory_state = 'drifted', inventory_drift_reason = ?, \
                 inventory_checked_at = UTC_TIMESTAMP() \

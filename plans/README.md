@@ -12,12 +12,14 @@ truthful state presentation. Production records and deployment were not inspecte
 
 | Plan | Title | Priority | Effort | Status |
 | --- | --- | --- | --- | --- |
-| [014](014-full-project-review-roadmap.md) | Remediate the full-project audit | P1–P3 | See 17 work items | TODO — audit complete; fixes pending (14.07 delivered by plan 015) |
+| [014](014-full-project-review-roadmap.md) | Remediate the full-project audit | P1–P3 | See 17 work items | Runtime remediation implemented under 018; certification and remaining acceptance checks tracked there |
 | [015](015-ordered-mitigation-bundles.md) | Ordered mitigation bundles (one-click multi-action mitigation) | P1 | L | DONE 2026-09-16 — implements 14.07 / SPEC-13 |
+| [018](018-production-safe-mitigations.md) | Production-safe Rules and Manual Mitigations | P1 | L | Implemented; MariaDB/MySQL release verification passes, IOS certification remains open |
 
 Plan 014 gives the dependency order, affected interfaces and acceptance checks.
-The audit produced documentation only; none of its remediation items is marked
-implemented. The earlier verdicts below remain historical snapshots.
+The original audit produced documentation only. Plan 018 records the subsequent
+implementation and verification; the earlier verdicts below remain historical
+snapshots.
 
 ## Completed plans (2026-07-23 audit at `ef14aec`)
 

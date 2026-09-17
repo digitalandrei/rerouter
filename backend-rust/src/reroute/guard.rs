@@ -21,6 +21,48 @@ use crate::reroute::executor::ActionRequest;
 use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template};
 
+/// Cross-component policy fence. The detached connection is never returned to
+/// the pool while it owns the MySQL advisory lock; cancellation/drop closes the
+/// socket and MySQL releases the lock with the session.
+pub struct PolicyFence {
+    conn: Option<MySqlConnection>,
+    lock_name: String,
+}
+
+impl PolicyFence {
+    pub async fn release(mut self) -> anyhow::Result<()> {
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+                .bind(&self.lock_name)
+                .execute(&mut conn)
+                .await;
+            // Closing the owning MySQL session is the authoritative release and
+            // remains correct if the explicit RELEASE response is lost.
+            let _ = conn.close().await;
+        }
+        Ok(())
+    }
+}
+
+/// Acquire the policy fence used by both actuation and safety-policy mutations.
+/// The caller must keep the returned guard alive through exact verification.
+pub async fn policy_fence(pool: &MySqlPool) -> anyhow::Result<PolicyFence> {
+    let mut pooled = pool.acquire().await?;
+    let lock_name = crate::db::scoped_advisory_lock_name(&mut pooled, "execution:policy").await?;
+    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
+        .bind(&lock_name)
+        .fetch_one(&mut *pooled)
+        .await?;
+    anyhow::ensure!(
+        got == Some(1),
+        "execution policy is being changed; retry later"
+    );
+    Ok(PolicyFence {
+        conn: Some(pooled.detach()),
+        lock_name,
+    })
+}
+
 /// The reason the Guard refuses a reroute. `Display` renders the exact strings
 /// the executor returned before the Guard existed, so the API/UI are unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,10 +263,16 @@ pub async fn gather(
     plan: &RenderedPlan,
 ) -> Result<GateInputs, BlockReason> {
     let device_ref = req.device_id.to_string();
-    let protected_interface =
+    let corrective_interface = prepared_corrective_interface(pool, req)
+        .await
+        .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
+    let protected_interface = if corrective_interface {
+        None
+    } else {
         protected_interface_name(pool, req.device_id, &req.template, &req.params)
             .await
-            .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
+            .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?
+    };
     let automatic_actions_enabled = if req.trigger_type == "automatic" {
         crate::api::settings::bool_setting(
             pool,
@@ -237,9 +285,14 @@ pub async fn gather(
     };
     let global_maintenance_lock =
         crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await;
-    let device_locked = locks::is_blocked(pool, "device", &device_ref)
+    let administratively_locked = locks::is_blocked(pool, "device", &device_ref)
         .await
         .unwrap_or(true);
+    let owner_token = req.authorization.as_ref().map(|a| a.owner_token.as_str());
+    let change_window_locked = !locks::change_window_allows(pool, req.device_id, owner_token)
+        .await
+        .unwrap_or(false);
+    let device_locked = administratively_locked || change_window_locked;
     let device_cooldown_until = effective_cooldown(
         pool,
         "device",
@@ -267,8 +320,10 @@ pub async fn gather(
     };
     let rate_limit = cfg.safety.global_action_rate_limit_count;
     let rate_window_secs = cfg.safety.global_action_rate_limit_window_seconds;
-    let recent_count = if rate_limit > 0 {
-        recent_reroute_count(pool, rate_window_secs, req.bundle.map(|b| b.bundle_id)).await
+    let recent_count = if rate_limit > 0 && req.bundle.is_none() {
+        let recent = recent_reroute_count(pool, rate_window_secs, None).await;
+        let reserved = outstanding_bundle_actions_pool(pool, rate_window_secs, None).await;
+        recent.saturating_add(reserved)
     } else {
         0
     };
@@ -276,7 +331,7 @@ pub async fn gather(
         trigger_type: req.trigger_type,
         protected_interface,
         automatic_actions_enabled,
-        has_verify_step: plan.verify.is_some(),
+        has_verify_step: plan.verify.is_some() || req.authorization.is_some(),
         require_verification: cfg.reroute.require_verification,
         global_maintenance_lock,
         device_locked,
@@ -287,6 +342,70 @@ pub async fn gather(
         rate_window_secs,
         recent_count,
     })
+}
+
+fn corrective_interface_state(states: &[crate::reroute::device_plan::DeviceStateSnapshot]) -> bool {
+    let mut saw_interface = false;
+    for state in states {
+        match state {
+            crate::reroute::device_plan::DeviceStateSnapshot::InterfaceAdmin {
+                shutdown: false,
+                ..
+            }
+            | crate::reroute::device_plan::DeviceStateSnapshot::InterfaceMss {
+                mss: None, ..
+            } => saw_interface = true,
+            crate::reroute::device_plan::DeviceStateSnapshot::InterfaceAdmin {
+                shutdown: true,
+                ..
+            }
+            | crate::reroute::device_plan::DeviceStateSnapshot::InterfaceMss {
+                mss: Some(_), ..
+            } => return false,
+            _ => {}
+        }
+    }
+    saw_interface
+}
+
+async fn prepared_corrective_interface(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+) -> anyhow::Result<bool> {
+    let Some(auth) = req.authorization.as_ref() else {
+        return Ok(false);
+    };
+    if let Some(action_id) = auth.snapshot_action_id {
+        let prepared: Option<sqlx::types::Json<Value>> = sqlx::query_scalar(
+            "SELECT prepared_action_json FROM reroute_bundle_actions WHERE id = ?",
+        )
+        .bind(action_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(prepared) = prepared else {
+            return Ok(false);
+        };
+        let prepared: crate::reroute::device_plan::PreparedDeviceAction =
+            serde_json::from_value(prepared.0)?;
+        return Ok(corrective_interface_state(&prepared.after));
+    }
+    if auth.kind == crate::reroute::executor::ExecutionAuthorityKind::Compensation {
+        let original_id = req
+            .rollback_of_reroute_id
+            .ok_or_else(|| anyhow::anyhow!("compensation has no original action"))?;
+        let inverse: Option<sqlx::types::Json<Value>> =
+            sqlx::query_scalar("SELECT rollback_snapshot_json FROM reroutes WHERE id = ?")
+                .bind(original_id)
+                .fetch_optional(pool)
+                .await?;
+        let inverse: crate::reroute::device_plan::PreparedInverse = serde_json::from_value(
+            inverse
+                .ok_or_else(|| anyhow::anyhow!("original action has no prepared inverse"))?
+                .0,
+        )?;
+        return Ok(corrective_interface_state(&inverse.restore));
+    }
+    Ok(false)
 }
 
 /// Cooldown rows are convenient bookkeeping, but the durable reroute history is
@@ -378,30 +497,64 @@ pub async fn admit_bundle(
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
 
-    let got: Option<i64> =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK('rrt_rate_global', 5)")
-            .fetch_one(&mut *conn)
-            .await
-            .ok()
-            .flatten();
+    let rate_lock = crate::db::scoped_advisory_lock_name(&mut conn, "reroute:rate-global")
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    conn.close_on_drop();
+    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
+        .bind(&rate_lock)
+        .fetch_one(&mut *conn)
+        .await
+        .ok()
+        .flatten();
     if got != Some(1) {
         return Err(BlockReason::GuardBusy);
     }
 
     let already = recent_reroute_count_on(&mut conn, window, Some(bundle_id)).await;
     let outstanding = outstanding_bundle_actions(&mut conn, window, bundle_id).await;
-    let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
-        .execute(&mut *conn)
-        .await;
-
     let projected = already.saturating_add(outstanding);
     if projected.saturating_add(size as i64) > limit as i64 {
+        let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+            .bind(&rate_lock)
+            .execute(&mut *conn)
+            .await;
         return Err(BlockReason::RateLimit {
             recent: projected,
             window_secs: window,
             max: limit,
         });
     }
+    let reserved = sqlx::query(
+        "UPDATE reroute_bundles SET rate_reserved_actions = ? \
+         WHERE id = ? AND state = 'planned' AND rate_reserved_actions = 0",
+    )
+    .bind(size)
+    .bind(bundle_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| BlockReason::PersistFailed(e.to_string()))?;
+    if reserved.rows_affected() != 1 {
+        let existing: Option<u32> =
+            sqlx::query_scalar("SELECT rate_reserved_actions FROM reroute_bundles WHERE id = ?")
+                .bind(bundle_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| BlockReason::PersistFailed(e.to_string()))?;
+        if existing != Some(size) {
+            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+                .bind(&rate_lock)
+                .execute(&mut *conn)
+                .await;
+            return Err(BlockReason::PersistFailed(
+                "bundle was not in an admissible planned state".into(),
+            ));
+        }
+    }
+    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+        .bind(&rate_lock)
+        .execute(&mut *conn)
+        .await;
     Ok(())
 }
 
@@ -417,13 +570,52 @@ async fn outstanding_bundle_actions(
     // fail-closed fallback then refuses every bundle while looking like a
     // legitimate rate-limit refusal. COALESCE keeps the no-rows case at 0.
     sqlx::query_scalar::<_, i64>(
-        "SELECT CAST(COALESCE(SUM(GREATEST(CAST(total_actions AS SIGNED) \
-                                         - CAST(completed_actions AS SIGNED), 0)), 0) AS SIGNED) \
+        "SELECT CAST(COALESCE(SUM(CAST(rate_reserved_actions AS SIGNED)), 0) AS SIGNED) \
            FROM reroute_bundles \
-          WHERE state IN ('planned', 'running') \
+          WHERE state IN ('planned', 'running', 'compensating') \
             AND id <> ? \
             AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
     )
+    .bind(exclude_bundle)
+    .bind(window_secs as i64)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(i64::MAX)
+}
+
+async fn outstanding_bundle_actions_pool(
+    pool: &MySqlPool,
+    window_secs: u64,
+    exclude_bundle: Option<u64>,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(COALESCE(SUM(CAST(rate_reserved_actions AS SIGNED)), 0) AS SIGNED) \
+           FROM reroute_bundles \
+          WHERE state IN ('planned', 'running', 'compensating') \
+            AND (? IS NULL OR id <> ?) \
+            AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(exclude_bundle)
+    .bind(exclude_bundle)
+    .bind(window_secs as i64)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(i64::MAX)
+}
+
+async fn outstanding_bundle_actions_pool_on(
+    conn: &mut MySqlConnection,
+    window_secs: u64,
+    exclude_bundle: Option<u64>,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(COALESCE(SUM(CAST(rate_reserved_actions AS SIGNED)), 0) AS SIGNED) \
+           FROM reroute_bundles \
+          WHERE state IN ('planned', 'running', 'compensating') \
+            AND (? IS NULL OR id <> ?) \
+            AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+    )
+    .bind(exclude_bundle)
     .bind(exclude_bundle)
     .bind(window_secs as i64)
     .fetch_one(&mut *conn)
@@ -457,31 +649,66 @@ pub async fn reserve_and_persist(
     let rate_limit = cfg.safety.global_action_rate_limit_count;
     let rate_window = cfg.safety.global_action_rate_limit_window_seconds;
     let use_global = req.trigger_type != "rollback" && rate_limit > 0;
+    let mut rate_lock = None;
     if use_global {
-        let got: Option<i64> =
-            sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK('rrt_rate_global', 5)")
-                .fetch_one(&mut *conn)
-                .await
-                .ok()
-                .flatten();
+        let name = crate::db::scoped_advisory_lock_name(&mut conn, "reroute:rate-global")
+            .await
+            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+        conn.close_on_drop();
+        let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
+            .bind(&name)
+            .fetch_one(&mut *conn)
+            .await
+            .ok()
+            .flatten();
         if got != Some(1) {
             return Err(BlockReason::GuardBusy);
         }
+        rate_lock = Some(name);
         let recent =
             recent_reroute_count_on(&mut conn, rate_window, req.bundle.map(|b| b.bundle_id)).await;
-        if recent >= rate_limit as i64 {
-            let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+        let reserved_elsewhere = outstanding_bundle_actions_pool_on(
+            &mut conn,
+            rate_window,
+            req.bundle.map(|b| b.bundle_id),
+        )
+        .await;
+        let projected = recent.saturating_add(reserved_elsewhere);
+        let own_reserved = if let Some(bundle) = req.bundle {
+            sqlx::query_scalar::<_, u32>(
+                "SELECT rate_reserved_actions FROM reroute_bundles WHERE id = ?",
+            )
+            .bind(bundle.bundle_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        if (req.bundle.is_some() && own_reserved == 0)
+            || (req.bundle.is_none() && projected >= rate_limit as i64)
+        {
+            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+                .bind(rate_lock.as_deref().expect("rate lock acquired"))
                 .execute(&mut *conn)
                 .await;
             return Err(BlockReason::RateLimit {
-                recent,
+                recent: projected,
                 window_secs: rate_window,
                 max: rate_limit,
             });
         }
     }
 
-    let lock_name = format!("reroute_dev_{}", req.device_id);
+    let lock_name = crate::db::scoped_advisory_lock_name(
+        &mut conn,
+        &format!("reroute:device:{}", req.device_id),
+    )
+    .await
+    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    conn.close_on_drop();
     let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
         .bind(&lock_name)
         .fetch_one(&mut *conn)
@@ -490,21 +717,23 @@ pub async fn reserve_and_persist(
         .flatten();
     if got != Some(1) {
         if use_global {
-            let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+                .bind(rate_lock.as_deref().expect("rate lock acquired"))
                 .execute(&mut *conn)
                 .await;
         }
         return Err(BlockReason::GuardBusy);
     }
 
-    let reserved = reserve_slot(pool, &mut conn, req, plan).await;
+    let reserved = reserve_slot(pool, &mut conn, req, plan, use_global).await;
 
     let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
         .bind(&lock_name)
         .execute(&mut *conn)
         .await;
     if use_global {
-        let _ = sqlx::query("SELECT RELEASE_LOCK('rrt_rate_global')")
+        let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+            .bind(rate_lock.as_deref().expect("rate lock acquired"))
             .execute(&mut *conn)
             .await;
     }
@@ -517,6 +746,7 @@ async fn reserve_slot(
     conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
+    consume_bundle_reservation: bool,
 ) -> Result<u64, BlockReason> {
     // Authoritative re-check under the advisory lock: an admin lock set after the
     // lock-free early check must still stop this action (same pattern as the
@@ -530,13 +760,37 @@ async fn reserve_slot(
     {
         return Err(BlockReason::DeviceLocked);
     }
+    let owner_token = req
+        .authorization
+        .as_ref()
+        .map(|auth| auth.owner_token.as_str());
+    if !locks::change_window_allows(pool, req.device_id, owner_token)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(BlockReason::DeviceLocked);
+    }
     if running_on_device(conn, req.device_id).await {
         return Err(BlockReason::AlreadyRunning);
     }
     if has_uncertain(conn, req.device_id).await {
         return Err(BlockReason::UnresolvedUncertain);
     }
-    insert_reroute(conn, req, plan)
+    if let Some(original_id) = req.rollback_of_reroute_id {
+        let inverse_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reroutes \
+             WHERE rollback_of_reroute_id = ? \
+               AND state IN ('planned','pending','running','verifying','succeeded')",
+        )
+        .bind(original_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(1);
+        if inverse_exists > 0 {
+            return Err(BlockReason::AlreadyRunning);
+        }
+    }
+    insert_reroute(conn, req, plan, consume_bundle_reservation)
         .await
         .map_err(|e| BlockReason::PersistFailed(e.to_string()))
 }
@@ -671,15 +925,104 @@ async fn insert_reroute(
     conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
+    consume_bundle_reservation: bool,
 ) -> anyhow::Result<u64> {
     let steps = json!({ "commands": plan.commands, "verify": plan.verify });
     let mut tx = conn.begin().await?;
+    let auth = req
+        .authorization
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("reroute has no durable execution authority"))?;
+    let (template_snapshot, catalog_rollback_snapshot, prepared) =
+        if let Some(snapshot_action_id) = auth.snapshot_action_id {
+            let snapshot: (
+                sqlx::types::Json<Value>,
+                Option<sqlx::types::Json<Value>>,
+                sqlx::types::Json<Value>,
+            ) = sqlx::query_as(
+                "SELECT template_snapshot_json, rollback_snapshot_json, prepared_action_json \
+                 FROM reroute_bundle_actions WHERE id = ? FOR UPDATE",
+            )
+            .bind(snapshot_action_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let prepared = serde_json::from_value(snapshot.2 .0)?;
+            (snapshot.0 .0, snapshot.1.map(|value| value.0), prepared)
+        } else if auth.kind == crate::reroute::executor::ExecutionAuthorityKind::Compensation {
+            let original_id = req
+                .rollback_of_reroute_id
+                .ok_or_else(|| anyhow::anyhow!("compensation has no original reroute"))?;
+            type OriginalSnapshot = (
+                Option<sqlx::types::Json<Value>>,
+                Option<sqlx::types::Json<Value>>,
+                Option<sqlx::types::Json<Value>>,
+            );
+            let original: OriginalSnapshot = sqlx::query_as(
+                "SELECT template_snapshot_json, parameters_json, rollback_snapshot_json \
+                 FROM reroutes WHERE id = ? FOR UPDATE",
+            )
+            .bind(original_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let inverse: crate::reroute::device_plan::PreparedInverse = serde_json::from_value(
+                original
+                    .2
+                    .ok_or_else(|| anyhow::anyhow!("original reroute has no prepared inverse"))?
+                    .0,
+            )?;
+            let prepared = crate::reroute::device_plan::PreparedDeviceAction {
+                schema_version: crate::reroute::device_plan::PREPARED_DEVICE_ACTION_SCHEMA_VERSION,
+                device_id: req.device_id,
+                template_id: req.template.id,
+                template_name: req.template.name.clone(),
+                canonical_params: original.1.map(|value| value.0).unwrap_or(Value::Null),
+                commands: inverse.commands,
+                before: inverse.expected_current,
+                after: inverse.restore,
+                verify: inverse.verify,
+                effect: crate::reroute::device_plan::PreparedEffect::Change,
+                inverse: None,
+                prepared_at: chrono::Utc::now(),
+            };
+            (
+                serde_json::to_value(&req.template)?,
+                original.0.map(|value| value.0),
+                prepared,
+            )
+        } else {
+            anyhow::bail!("reroute has no durable prepared sibling");
+        };
+    prepared.validate()?;
+    let prior_state = serde_json::to_value(&prepared.before)?;
+    let after_state = serde_json::to_value(&prepared.after)?;
+    let rollback_snapshot = match prepared.inverse.as_ref() {
+        Some(inverse) => Some(serde_json::to_value(inverse)?),
+        None => catalog_rollback_snapshot,
+    };
+    if consume_bundle_reservation {
+        if let Some(bundle) = req.bundle {
+            let consumed = sqlx::query(
+                "UPDATE reroute_bundles \
+                    SET rate_reserved_actions = rate_reserved_actions - 1, \
+                        rate_consumed_actions = rate_consumed_actions + 1 \
+                  WHERE id = ? AND rate_reserved_actions > 0",
+            )
+            .bind(bundle.bundle_id)
+            .execute(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                consumed.rows_affected() == 1,
+                "bundle has no unspent rate reservation"
+            );
+        }
+    }
     let res = sqlx::query(
         "INSERT INTO reroutes \
             (device_id, rule_id, bundle_id, bundle_position, rule_event_id, \
              reroute_template_id, rollback_of_reroute_id, \
-             trigger_type, triggered_by_user_id, state, reason, parameters_json, planned_steps_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)",
+             trigger_type, triggered_by_user_id, state, reason, parameters_json, planned_steps_json, \
+             prior_state_json, after_state_json, template_snapshot_json, rollback_snapshot_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(req.device_id)
     .bind(req.rule_id)
@@ -693,6 +1036,10 @@ async fn insert_reroute(
     .bind(&req.reason)
     .bind(sqlx::types::Json(&req.params))
     .bind(sqlx::types::Json(&steps))
+    .bind(sqlx::types::Json(prior_state))
+    .bind(sqlx::types::Json(after_state))
+    .bind(sqlx::types::Json(template_snapshot))
+    .bind(rollback_snapshot.map(sqlx::types::Json))
     .execute(&mut *tx)
     .await?;
     let reroute_id = res.last_insert_id();
@@ -913,5 +1260,35 @@ mod tests {
             "interface 'Gi0/0' is flagged as a protected management/transit path; \
              disruptive interface actions on it are blocked to prevent self-lockout"
         );
+    }
+
+    #[test]
+    fn typed_interface_restore_is_corrective_but_disruptive_inverse_is_not() {
+        use crate::reroute::device_plan::DeviceStateSnapshot;
+
+        assert!(corrective_interface_state(&[
+            DeviceStateSnapshot::InterfaceAdmin {
+                interface: "Gi0/0".into(),
+                shutdown: false,
+            }
+        ]));
+        assert!(corrective_interface_state(&[
+            DeviceStateSnapshot::InterfaceMss {
+                interface: "Gi0/0".into(),
+                mss: None,
+            }
+        ]));
+        assert!(!corrective_interface_state(&[
+            DeviceStateSnapshot::InterfaceAdmin {
+                interface: "Gi0/0".into(),
+                shutdown: true,
+            }
+        ]));
+        assert!(!corrective_interface_state(&[
+            DeviceStateSnapshot::InterfaceMss {
+                interface: "Gi0/0".into(),
+                mss: Some(1_436),
+            }
+        ]));
     }
 }

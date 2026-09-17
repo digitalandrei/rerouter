@@ -125,7 +125,7 @@ pub async fn resolve_flow_dst_host(
         "SELECT dst_addr, \
          CAST(SUM(bytes * effective_sampling_rate) AS UNSIGNED) AS est_bytes, \
          CAST(SUM(pkts  * effective_sampling_rate) AS UNSIGNED) AS est_pkts, \
-         CAST(MAX(sampling_confidence = 'low') AS UNSIGNED) AS low_conf \
+         CAST(MAX(sampling_confidence = 'low' OR pkts_available = 0 OR bytes_available = 0) AS UNSIGNED) AS low_conf \
          FROM flow_talker_buckets \
          WHERE device_id = ? AND if_index = ? AND direction = ? \
            AND bucket_ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",

@@ -498,8 +498,44 @@ pub async fn update(
     Path(id): Path<u64>,
     Json(body): Json<UpdateDevice>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     if let Err(response) = require_device(&state.pool, id).await {
         return response;
+    }
+    if body.hostname.is_some() || body.ssh_port.is_some() {
+        let current: (String, u16) =
+            match sqlx::query_as("SELECT hostname, ssh_port FROM devices WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+            {
+                Ok(row) => row,
+                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            };
+        let changing = body.hostname.as_ref().is_some_and(|v| v != &current.0)
+            || body.ssh_port.is_some_and(|v| v != current.1);
+        if changing {
+            let owned: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM reroutes r WHERE r.device_id = ? \
+                AND (r.state IN ('planned','pending','running','verifying','uncertain') OR r.mutation_effect IN ('changed','unknown') \
+                     OR (r.state='succeeded' AND r.mutation_effect='pending')) \
+                AND r.rollback_of_reroute_id IS NULL \
+                AND NOT EXISTS(SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id=r.id AND rb.state='succeeded')")
+                .bind(id).fetch_one(&state.pool).await {
+                Ok(count) => count, Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            };
+            if owned > 0 {
+                return err(StatusCode::CONFLICT, "restore or reconcile outstanding mitigations before changing this router's transport identity");
+            }
+        }
     }
     if let Some(v) = &body.snmp_version {
         if v != "v2c" {
@@ -728,10 +764,34 @@ pub async fn remove(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
+    let history: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM reroutes WHERE device_id = ?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+    {
+        Ok(count) => count,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if history > 0 {
+        return err(
+            StatusCode::CONFLICT,
+            "this router has execution history; disable it instead of deleting it",
+        );
+    }
     let res = sqlx::query("DELETE FROM devices WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)

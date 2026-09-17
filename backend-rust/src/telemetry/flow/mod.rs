@@ -82,8 +82,10 @@ pub struct FlowRecord {
     pub dst_as: Option<u32>,
     /// NetFlow DIRECTION (61) if the template carried it.
     pub direction: Option<u8>,
-    pub bytes: u64,
-    pub pkts: u64,
+    /// Presence is evidence: `Some(0)` is a measured zero; `None` means the
+    /// export template did not carry this counter and must never be treated as 0.
+    pub bytes: Option<u64>,
+    pub pkts: Option<u64>,
 }
 
 impl FlowRecord {

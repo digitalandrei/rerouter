@@ -9,6 +9,7 @@ import {
   Settings,
   Users,
   BookOpen,
+  ListChecks,
 } from 'lucide-react'
 import type { SidebarData } from '@/components/layout/types'
 
@@ -27,7 +28,8 @@ export const sidebarData: SidebarData = {
       items: [
         { title: 'Devices', url: '/devices', icon: Router },
         { title: 'Rules', url: '/rules', icon: SlidersHorizontal },
-        { title: 'Templates', url: '/templates', icon: FileCode2 },
+        { title: 'Action Templates', url: '/templates', icon: FileCode2 },
+        { title: 'Manual Mitigations', url: '/manual-mitigations', icon: ListChecks },
         { title: 'Mitigations', url: '/mitigations', icon: Shuffle, badgeKey: 'active_rule_matches' },
         { title: 'Flows', url: '/flows', icon: Waves },
         { title: 'Audit', url: '/audit', icon: ScrollText },

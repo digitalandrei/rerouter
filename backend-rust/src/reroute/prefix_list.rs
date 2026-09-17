@@ -159,6 +159,7 @@ pub fn parse_prefix_list(output: &str, name: &str) -> Result<Vec<PrefixListEntry
     }
     let mut entries: Vec<PrefixListEntry> = Vec::new();
     let mut header_seen = false;
+    let mut expected_entries: Option<usize> = None;
     let mut in_target = false;
 
     for line in output.lines() {
@@ -166,9 +167,17 @@ pub fn parse_prefix_list(output: &str, name: &str) -> Result<Vec<PrefixListEntry
         if line.is_empty() {
             continue;
         }
-        if let Some(header) = parse_header(line) {
+        if let Some((header, count)) = parse_header(line) {
             in_target = header == name;
-            header_seen |= in_target;
+            if in_target {
+                if header_seen {
+                    return Err(format!(
+                        "prefix-list '{name}' was reported more than once; refusing an ambiguous read"
+                    ));
+                }
+                header_seen = true;
+                expected_entries = Some(count);
+            }
             continue;
         }
         if !line.starts_with("seq ") {
@@ -197,16 +206,29 @@ pub fn parse_prefix_list(output: &str, name: &str) -> Result<Vec<PrefixListEntry
              guess its contents"
         ));
     }
+    if expected_entries != Some(entries.len()) {
+        return Err(format!(
+            "prefix-list '{name}' declared {} entr{} but the completed read contained {}; refusing a truncated read",
+            expected_entries.unwrap_or(0),
+            if expected_entries == Some(1) { "y" } else { "ies" },
+            entries.len()
+        ));
+    }
     entries.sort_by_key(|e| e.sequence);
     Ok(entries)
 }
 
-/// `ip prefix-list NAME: 2 entries` -> `NAME`.
-fn parse_header(line: &str) -> Option<&str> {
+/// `ip prefix-list NAME: 2 entries` -> (`NAME`, 2).
+fn parse_header(line: &str) -> Option<(&str, usize)> {
     let rest = line.strip_prefix("ip prefix-list ")?;
-    let (name, _) = rest.split_once(':')?;
+    let (name, count) = rest.split_once(':')?;
     let name = name.trim();
-    (!name.is_empty()).then_some(name)
+    let mut words = count.split_whitespace();
+    let count = words.next()?.parse().ok()?;
+    if !matches!(words.next(), Some("entry" | "entries")) || words.next().is_some() {
+        return None;
+    }
+    (!name.is_empty()).then_some((name, count))
 }
 
 /// `seq 10 deny 0.0.0.0/0 le 32` -> a typed entry. Anything unexpected errors.
@@ -569,6 +591,27 @@ ip prefix-list no-export: 1 entries
     fn duplicate_sequences_are_refused() {
         let out = "ip prefix-list x: 2 entries\nseq 5 permit 1.0.0.0/8\nseq 5 deny 2.0.0.0/8";
         assert!(parse_prefix_list(out, "x").is_err());
+    }
+
+    #[test]
+    fn declared_entry_count_must_match_the_complete_body() {
+        let truncated = "ip prefix-list x: 2 entries\nseq 5 permit 192.0.2.0/24";
+        let err = parse_prefix_list(truncated, "x").unwrap_err();
+        assert!(err.contains("declared 2 entries"), "{err}");
+        assert!(matches!(
+            plan_add(truncated, "x", "198.51.100.0/24"),
+            SequencePlan::Refuse(_)
+        ));
+
+        let header_only = "ip prefix-list x: 1 entry";
+        assert!(parse_prefix_list(header_only, "x").is_err());
+    }
+
+    #[test]
+    fn an_empty_list_requires_an_explicit_zero_count() {
+        assert!(parse_prefix_list("ip prefix-list x: 0 entries", "x")
+            .expect("complete empty list")
+            .is_empty());
     }
 
     #[test]

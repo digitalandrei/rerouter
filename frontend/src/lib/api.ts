@@ -451,6 +451,8 @@ export interface Rule {
   reroute_template_id: number | null;
   action_count?: number;
   actions?: RuleAction[];
+  /** Optimistic revision for atomic replacement/import of the complete action set. */
+  actions_revision?: number;
   // Resolved target labels + live evaluation snapshot (from rule_states).
   interface_name?: string | null;
   device_name?: string | null;
@@ -475,6 +477,7 @@ export interface Alert {
   device_id: number | null;
   interface_id: number | null;
   rule_id: number | null;
+  bundle_id?: number | null;
   device_name: string | null;
   interface_name: string | null;
   rule_name: string | null;
@@ -504,6 +507,7 @@ export type RerouteState =
 
 export interface Reroute {
   id: number;
+  bundle_id?: number | null;
   device_id: number | null;
   device_name: string | null;
   reroute_template_id: number | null;
@@ -520,6 +524,10 @@ export interface Reroute {
   started_at: string | null;
   finished_at: string | null;
   created_at: string;
+  source_preset_id?: number | null;
+  source_preset_name?: string | null;
+  source_preset_revision?: number | null;
+  source?: ActionSource | null;
 }
 
 export interface RerouteStep {
@@ -563,6 +571,11 @@ export interface RerouteResult {
    *  CIDR (/32 or /128) and whether the flow sampling was low-confidence. */
   auto_target?: string | null;
   auto_target_low_confidence?: boolean;
+  before_state?: unknown;
+  after_state?: unknown;
+  verification_states?: unknown[];
+  mutation_effect?: "changed" | "noop" | "pending" | "unknown";
+  predicted_noop?: boolean;
 }
 
 export interface ManualReroutePayload {
@@ -577,6 +590,69 @@ export interface ActionResultsResponse {
   results: RerouteResult[];
   /** Present only for an enforce-mode dry run; short-lived and single-use. */
   preview_token?: string | null;
+}
+
+export interface RuleClearResponse {
+  ok: boolean;
+  cleared: boolean;
+  results?: RerouteResult[];
+  preview_token?: string | null;
+  bundle_id?: number | null;
+  operating_mode?: "observe" | "enforce";
+}
+
+export interface ReconcileRerouteResponse {
+  ok: boolean;
+  outcome: "changed" | "not_applied" | "conflict";
+  message: string;
+}
+
+/** One ordered action accepted by preset and atomic rule-action APIs. */
+export interface ActionDraft {
+  id?: number;
+  reroute_template_id: number;
+  device_id: number;
+  params: Record<string, unknown>;
+  enabled?: boolean;
+  auto_target?: string | null;
+}
+
+export interface PresetAction extends ActionDraft {
+  template_name?: string;
+  template_display_name?: string | null;
+  device_name?: string;
+  validation_status?: "needs_preview" | "valid" | "invalid";
+  validation_error?: string | null;
+  checked_at?: string | null;
+}
+
+export interface MitigationPreset {
+  id: number;
+  name: string;
+  description: string | null;
+  revision: number;
+  archived_at: string | null;
+  actions: PresetAction[];
+  created_at: string;
+  updated_at: string;
+  recent_runs?: Array<{ bundle_id: number; state: string; created_at: string }>;
+  validation_status?: "needs_preview" | "valid" | "invalid";
+  validation_error?: string | null;
+  checked_at?: string | null;
+}
+
+export interface ManualMitigationPreview {
+  plan_id: number | null;
+  preview_token: string | null;
+  results: RerouteResult[];
+  source?: ActionSource | null;
+  expires_at?: string | null;
+  operating_mode: "observe" | "enforce";
+}
+
+export interface ManualMitigationAccepted {
+  bundle_id: number;
+  async: true;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +689,8 @@ export function isBundleTerminal(state: string): boolean {
 }
 
 export interface RerouteBundleAction {
-  reroute_id: number;
+  /** Null while the durable bundle ledger entry is queued/not yet attempted. */
+  reroute_id: number | null;
   /** Execution order within the bundle (rule_actions.position). */
   position: number | null;
   device_id: number;
@@ -621,6 +698,8 @@ export interface RerouteBundleAction {
   state: string;
   failure_reason: string | null;
   template_display_name: string | null;
+  template_name?: string | null;
+  params?: Record<string, unknown> | null;
 }
 
 export interface RerouteBundle {
@@ -638,6 +717,21 @@ export interface RerouteBundle {
   /** Siblings that RAN and were NOT reversed. Non-empty means traffic is still
    *  diverted and a manual rollback is required — never hide this. */
   still_applied_reroute_ids: number[];
+  source_preset_id?: number | null;
+  source_preset_name?: string | null;
+  source_preset_revision?: number | null;
+  source?: ActionSource | null;
+  created_at?: string;
+  triggered_by?: string | null;
+}
+
+export interface ActionSource {
+  kind: "manual" | "preset" | "rule" | "rollback";
+  preset_id?: number | null;
+  preset_name?: string | null;
+  preset_revision?: number | null;
+  rule_id?: number | null;
+  name?: string | null;
 }
 
 /** 202 from a confirmed enforce-mode rule apply: the bundle runs in background. */
@@ -1002,9 +1096,13 @@ export const api = {
       request<Rule>(`/api/rules/${id}`, { method: "PUT", body: rule }),
     remove: (id: number) =>
       request<void>(`/api/rules/${id}`, { method: "DELETE" }),
-    clear: (id: number) =>
-      request<{ ok: boolean; cleared: boolean }>(`/api/rules/${id}/clear`, {
+    clear: (
+      id: number,
+      body?: { reason?: string; dry_run?: boolean; preview_token?: string },
+    ) =>
+      request<RuleClearResponse>(`/api/rules/${id}/clear`, {
         method: "POST",
+        body: body ?? {},
       }),
     /** Manually apply a firing rule's configured actions (the supervised
      *  alternative to automatic execution). Gated server-side: requires the
@@ -1051,10 +1149,60 @@ export const api = {
         `/api/rules/${ruleId}/actions/reorder`,
         { method: "POST", body: { order } },
       ),
+    /** Atomically replace a rule's complete ordered action set. The server
+     *  rejects stale revisions and disarms automatic execution on success. */
+    saveActions: (
+      ruleId: number,
+      body: {
+        revision: number;
+        actions: ActionDraft[];
+        preset_id?: number;
+        preset_revision?: number;
+      },
+    ) =>
+      request<Rule>(`/api/rules/${ruleId}/actions`, {
+        method: "PUT",
+        body,
+      }),
+  },
+
+  mitigationPresets: {
+    list: () => request<MitigationPreset[]>("/api/mitigation-presets"),
+    get: (id: number) => request<MitigationPreset>(`/api/mitigation-presets/${id}`),
+    create: (body: { name: string; description?: string; actions: ActionDraft[] }) =>
+      request<MitigationPreset>("/api/mitigation-presets", { method: "POST", body }),
+    update: (
+      id: number,
+      body: { name: string; description?: string; revision: number; actions: ActionDraft[] },
+    ) => request<MitigationPreset>(`/api/mitigation-presets/${id}`, { method: "PUT", body }),
+    remove: (id: number, revision: number) =>
+      request<{ ok: true }>(`/api/mitigation-presets/${id}`, {
+        method: "DELETE",
+        body: { revision },
+      }),
+  },
+
+  manualMitigations: {
+    preview: (body: {
+      preset_id?: number;
+      preset_revision?: number;
+      actions: ActionDraft[];
+      reason?: string;
+    }) =>
+      request<ManualMitigationPreview>("/api/manual-mitigations/preview", {
+        method: "POST",
+        body,
+      }),
+    apply: (body: { plan_id: number; preview_token: string }) =>
+      request<ManualMitigationAccepted>("/api/manual-mitigations/apply", {
+        method: "POST",
+        body,
+      }),
   },
 
   /** Progress of an ordered mitigation bundle (async enforce-mode rule apply). */
   bundles: {
+    list: () => request<RerouteBundle[]>("/api/reroute-bundles"),
     get: (id: number) => request<RerouteBundle>(`/api/reroute-bundles/${id}`),
   },
 
@@ -1099,6 +1247,11 @@ export const api = {
       request<{ ok: boolean }>(`/api/reroutes/${id}/cancel`, { method: "POST" }),
     acknowledgeUncertain: (id: number, note: string) =>
       request<{ ok: boolean }>(`/api/reroutes/${id}/acknowledge-uncertain`, {
+        method: "POST",
+        body: { note },
+      }),
+    reconcile: (id: number, note: string) =>
+      request<ReconcileRerouteResponse>(`/api/reroutes/${id}/reconcile`, {
         method: "POST",
         body: { note },
       }),

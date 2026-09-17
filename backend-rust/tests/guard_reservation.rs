@@ -4,30 +4,18 @@
 //! stop the action at this last gate (TOCTOU close). Both reads fail closed, and a
 //! blocked reservation must not leave a `reroutes` row behind.
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB the test
-//! may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB the test
+//! may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
 use rerouter_controller::config::Config;
-use rerouter_controller::db::MIGRATOR;
 use rerouter_controller::reroute::executor::ActionRequest;
 use rerouter_controller::reroute::guard::{self, BlockReason};
 use rerouter_controller::reroute::locks;
 use rerouter_controller::reroute::templates::{RenderedPlan, Template};
 use serde_json::json;
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
 
-/// Connect + migrate, or `None` when DATABASE_URL is unset (skip).
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
+mod common;
 
 /// A minimal manual `ActionRequest` for `device_id`. The reservation short-circuits
 /// on the lock gates before it ever needs a valid template, so `template.id = 0`
@@ -60,6 +48,7 @@ fn manual_request(device_id: u64) -> ActionRequest {
         reason: Some("guard reservation test".into()),
         defer_cooldown: false,
         bundle: None,
+        authorization: None,
     }
 }
 
@@ -95,10 +84,8 @@ async fn reroute_count(pool: &MySqlPool, device_id: u64) -> i64 {
 
 #[tokio::test]
 async fn reservation_rechecks_maintenance_and_device_locks() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping guard reservation integration test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let cfg = Config::default();
 
     let device_id = sqlx::query(

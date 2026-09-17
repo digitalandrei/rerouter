@@ -2,7 +2,11 @@
 
 **Written against:** `08126a182283688b91617cd0d81a0ad24ad4f233` (`main`), including the pre-existing Claude settings change.
 
-**Status:** TODO — the audit is complete; the fixes in this roadmap are not implemented.
+**Status (2026-09-17):** Execution, recovery, Manual Mitigations and supporting
+runtime fixes are implemented under
+[plan 018](018-production-safe-mitigations.md). That report records integration
+evidence and open certification requirements. The historical acceptance matrix
+below remains applicable; implementation alone does not close every scenario.
 
 **Source:** [Full-project audit](../docs/audit-2026-09-15.md). Finding IDs below refer to that report. Keep Standards and Spec conclusions separate when closing findings; one fix may address evidence from both axes.
 
@@ -16,7 +20,7 @@ The existing audit established 106 passing Rust tests, frontend typecheck/build 
 
 ## Implementation order
 
-Effort: S = small bounded change; M = several coordinated changes; L = safety/data redesign with substantial regression coverage. Risk refers to the fix, not the severity of the existing defect. All rows start TODO.
+Effort: S = small bounded change; M = several coordinated changes; L = safety/data redesign with substantial regression coverage. Risk refers to the fix, not the severity of the existing defect. Rows retain the original scope; use plan 018 for current implementation evidence.
 
 | Item | Change | Findings | Priority | Effort / risk | Dependencies |
 | --- | --- | --- | --- | --- | --- |

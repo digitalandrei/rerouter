@@ -1,12 +1,11 @@
-//! Ordered mitigation bundles — one authorized activation of one rule's whole
-//! action set. See ../../docs/reroute-engine.md and ../../plans/015-ordered-mitigation-bundles.md.
+//! Ordered mitigation bundles — one authorized activation of a complete rule or
+//! manual action set. See ../../docs/manual-mitigations.md.
 //!
 //! A real mitigation is rarely one command. Diverting an attacked prefix to a
 //! scrubbing provider means advertising it to the scrubber on every border router
 //! AND withdrawing it from the saturated upstreams — a dozen-plus actions that the
-//! operator previewed and confirmed ONCE. Doctrine expresses that as an ordered set
-//! of `rule_actions`, never as a composite template, so this module is the runner
-//! for that ordered set, not a new kind of action.
+//! operator previewed and confirmed ONCE. Presets and rules both expand to explicit
+//! ordered actions; this module executes their immutable prepared snapshots.
 //!
 //! Three properties make a bundle safe where a plain loop was not:
 //!
@@ -14,16 +13,16 @@
 //!      fallback can exclude the bundle's own earlier siblings. Without it the
 //!      first action's `started_at` throttles the remaining thirteen (SPEC-13).
 //!   2. ORDER + FAILURE POLICY — siblings run sequentially by `position`, and the
-//!      default policy STOPS at the first non-success instead of ploughing on.
+//!      policy STOPS at the first non-success; best-effort continuation is refused.
 //!      Ordering additive actions before destructive ones therefore means a
 //!      failure aborts before anything is torn down.
 //!   3. COMPENSATION — under `abort_and_compensate` the siblings that already
-//!      succeeded are rolled back in reverse order, so a half-applied mitigation
-//!      does not survive the request that created it.
+//!      changed configuration are rolled back in reverse order only when every
+//!      remaining effect and inverse is proven safe. No-ops own no inverse.
 //!
-//! What this module deliberately does NOT do: bypass a device lock. A sibling that
-//! ends `uncertain` locks its device pending admin acknowledgement, and compensation
-//! honours that lock. The bundle then ends `compensation_blocked` with a critical
+//! A sibling that ends `uncertain` freezes the entire set, including compensation
+//! on other devices. Evidence-bound reconciliation must resolve it before recovery.
+//! The bundle ends `compensation_blocked` with a critical
 //! alert naming every sibling left applied. Reporting an unsafe state loudly beats
 //! forcing config onto a device whose state we could not read.
 
@@ -31,9 +30,13 @@ use serde_json::{json, Value};
 use sqlx::MySqlPool;
 
 use crate::config::Config;
-use crate::reroute::executor::{self, ActionRequest, ActorContext, BundleMembership};
+use crate::reroute::executor::{
+    self, ActionRequest, ActorContext, BundleMembership, ExecutionAuthorization,
+};
+use crate::reroute::locks;
 use crate::reroute::rollback;
 use crate::reroute::templates::Template;
+use crate::ssh::{RusshExecutor, SshExecutor};
 
 /// What to do when a sibling does not succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,7 @@ impl FailurePolicy {
 /// One sibling, already resolved (template loaded, flow auto-target applied) and
 /// ordered. Resolution happens once, before the bundle is admitted, so the plan
 /// the operator confirmed is exactly the plan that runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BundleAction {
     pub device_id: u64,
     pub template: Template,
@@ -77,14 +81,201 @@ pub struct BundleAction {
     pub position: u32,
     pub auto_target: Option<String>,
     pub auto_target_low_confidence: Option<bool>,
+    /// Typed, read-only device snapshot prepared while every target device is
+    /// exclusively locked. Required for real execution.
+    pub prepared: Option<crate::reroute::device_plan::PreparedDeviceAction>,
+    /// Set for an inverse prepared action. The runner and guard then preserve
+    /// the original-action ownership link and apply rollback gates.
+    pub original_reroute_id: Option<u64>,
+}
+
+pub(crate) fn safety_phase(template_name: &str) -> (&'static str, u8) {
+    match template_name {
+        "bgp_advertise_add"
+        | "bgp_session_enable"
+        | "iface_no_shutdown"
+        | "iface_tcp_adjust_mss" => ("additive", 0),
+        "bgp_advertise_remove"
+        | "bgp_session_disable"
+        | "iface_shutdown"
+        | "iface_tcp_adjust_mss_remove"
+        | "null_route_prefix"
+        | "null_route_prefix_v6"
+        | "blackhole_prefix"
+        | "blackhole_prefix_v6" => ("destructive", 2),
+        _ => ("neutral", 1),
+    }
+}
+
+/// Persist the complete intended sibling set before the asynchronous hand-off.
+/// Any render/ordering/write failure aborts the transaction, so a runner never
+/// discovers a deterministic invalid sibling after earlier router writes.
+pub async fn persist_actions(
+    pool: &MySqlPool,
+    bundle_id: u64,
+    actions: &[BundleAction],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!actions.is_empty(), "bundle has no prepared actions");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last_phase = 0u8;
+    let mut prepared = Vec::with_capacity(actions.len());
+    for action in actions {
+        anyhow::ensure!(
+            seen.insert(action.position),
+            "duplicate bundle position {}",
+            action.position
+        );
+        anyhow::ensure!(
+            action.template.enabled,
+            "template '{}' is disabled",
+            action.template.name
+        );
+        let prepared_action = action.prepared.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("action {} has no locked prepared snapshot", action.position)
+        })?;
+        prepared_action.validate()?;
+        anyhow::ensure!(
+            prepared_action.device_id == action.device_id,
+            "prepared device mismatch"
+        );
+        anyhow::ensure!(
+            prepared_action.template_id == action.template.id,
+            "prepared template mismatch"
+        );
+        let rendered = crate::reroute::templates::RenderedPlan {
+            template_id: prepared_action.template_id,
+            template_name: prepared_action.template_name.clone(),
+            config_mode: false,
+            commands: prepared_action.commands.clone(),
+            verify: None,
+            sequence_pending: false,
+        };
+        let rollback_snapshot = prepared_action
+            .inverse
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let rendered_rollback = prepared_action.inverse.as_ref().map(|inverse| {
+            json!({
+                "commands": inverse.commands,
+                "verify": inverse.verify,
+                "sequence_pending": false,
+            })
+        });
+        let (phase, rank) = safety_phase(&action.template.name);
+        anyhow::ensure!(
+            rank >= last_phase,
+            "unsafe action order: '{}' appears after a more destructive phase",
+            action.template.name
+        );
+        last_phase = rank;
+        prepared.push((
+            action,
+            serde_json::to_value(&action.template)?,
+            serde_json::to_value(&rendered)?,
+            rollback_snapshot,
+            rendered_rollback,
+            serde_json::to_value(prepared_action)?,
+            phase,
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id = ?")
+            .bind(bundle_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if existing > 0 {
+        anyhow::ensure!(
+            existing == actions.len() as i64,
+            "bundle snapshot already exists with a different action count"
+        );
+        tx.commit().await?;
+        return Ok(());
+    }
+    for (
+        action,
+        template,
+        rendered,
+        rollback_snapshot,
+        rendered_rollback,
+        prepared_action,
+        phase,
+    ) in prepared
+    {
+        let auto_target = action.auto_target.as_ref().map(|target| {
+            json!({
+                "target": target,
+                "low_confidence": action.auto_target_low_confidence,
+            })
+        });
+        sqlx::query(
+            "INSERT INTO reroute_bundle_actions \
+                (bundle_id, position, source_rule_action_id, original_reroute_id, device_id, \
+                 template_snapshot_json, rollback_snapshot_json, \
+                 canonical_params_json, rendered_plan_json, rendered_rollback_json, \
+                 prepared_action_json, \
+                 auto_target_json, safety_phase) \
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(bundle_id)
+        .bind(action.position)
+        .bind(action.original_reroute_id)
+        .bind(action.device_id)
+        .bind(sqlx::types::Json(template))
+        .bind(rollback_snapshot.map(sqlx::types::Json))
+        .bind(sqlx::types::Json(
+            action
+                .prepared
+                .as_ref()
+                .expect("prepared above")
+                .canonical_params
+                .clone(),
+        ))
+        .bind(sqlx::types::Json(rendered))
+        .bind(rendered_rollback.map(sqlx::types::Json))
+        .bind(sqlx::types::Json(prepared_action))
+        .bind(auto_target.map(sqlx::types::Json))
+        .bind(phase)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Original mitigation ownership still active for this bundle. For an apply
+/// bundle the originals are its own reroutes; for a rollback/recovery bundle the
+/// immutable ledger points back to source originals. Successful inverses close
+/// originals and never become new ownership themselves.
+pub async fn outstanding_owned_originals(
+    pool: &MySqlPool,
+    bundle_id: u64,
+) -> anyhow::Result<Vec<(u64, u64)>> {
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT original.id, original.device_id \
+           FROM reroutes original \
+           LEFT JOIN reroute_bundle_actions ba \
+             ON ba.bundle_id = ? AND ba.original_reroute_id = original.id \
+          WHERE original.rollback_of_reroute_id IS NULL \
+            AND (original.bundle_id = ? OR ba.id IS NOT NULL) \
+            AND original.mutation_effect IN ('changed','unknown') \
+            AND NOT EXISTS (SELECT 1 FROM reroutes inverse \
+                 WHERE inverse.rollback_of_reroute_id = original.id \
+                   AND inverse.state = 'succeeded' \
+                   AND inverse.mutation_effect IN ('changed','noop')) \
+          ORDER BY original.id",
+    )
+    .bind(bundle_id)
+    .bind(bundle_id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// A sibling that succeeded, kept so compensation can reverse it.
 struct AppliedSibling {
     reroute_id: u64,
-    device_id: u64,
-    template_id: u64,
-    params: Value,
     position: u32,
 }
 
@@ -147,6 +338,8 @@ pub struct BundleRun {
     /// activation under `"manual"` would silently bypass the master switch, so
     /// this is threaded through explicitly rather than defaulted.
     pub trigger_type: &'static str,
+    pub authorization_plan_id: Option<u64>,
+    pub owner_token: String,
 }
 
 impl BundleRun {
@@ -167,6 +360,8 @@ impl BundleRun {
             user_id: Some(user_id),
             actor_context: Some(actor_context),
             trigger_type: "manual",
+            authorization_plan_id: None,
+            owner_token: format!("bundle:{bundle_id}"),
         }
     }
 
@@ -188,7 +383,52 @@ impl BundleRun {
             user_id: None,
             actor_context: None,
             trigger_type: "automatic",
+            authorization_plan_id: None,
+            owner_token: format!("bundle:{bundle_id}"),
         }
+    }
+
+    pub fn rollback(
+        bundle_id: u64,
+        policy: FailurePolicy,
+        user_id: u64,
+        actor_context: ActorContext,
+    ) -> Self {
+        Self {
+            bundle_id,
+            policy,
+            rule_id: None,
+            rule_event_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(actor_context),
+            trigger_type: "rollback",
+            authorization_plan_id: None,
+            owner_token: format!("bundle:{bundle_id}"),
+        }
+    }
+
+    pub fn automatic_recovery(bundle_id: u64, policy: FailurePolicy, rule_id: u64) -> Self {
+        Self {
+            bundle_id,
+            policy,
+            rule_id: Some(rule_id),
+            rule_event_id: None,
+            user_id: None,
+            actor_context: None,
+            trigger_type: "recovery",
+            authorization_plan_id: None,
+            owner_token: format!("recovery:bundle:{bundle_id}"),
+        }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        plan_id: Option<u64>,
+        owner_token: impl Into<String>,
+    ) -> Self {
+        self.authorization_plan_id = plan_id;
+        self.owner_token = owner_token.into();
+        self
     }
 }
 
@@ -204,6 +444,20 @@ pub async fn run(
     run: BundleRun,
     actions: Vec<BundleAction>,
 ) -> BundleOutcome {
+    let ssh = RusshExecutor::new(pool.clone());
+    run_with_ssh(pool, cfg, run, actions, &ssh).await
+}
+
+/// Testable orchestration seam. Production passes [`RusshExecutor`]; integration
+/// tests pass a fake that must explicitly implement native lock ownership and
+/// prepared execution, otherwise the trait defaults fail closed.
+pub async fn run_with_ssh<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    run: BundleRun,
+    actions: Vec<BundleAction>,
+    ssh: &S,
+) -> BundleOutcome {
     let BundleRun {
         bundle_id,
         policy,
@@ -212,11 +466,176 @@ pub async fn run(
         user_id,
         actor_context,
         trigger_type,
+        authorization_plan_id,
+        owner_token,
     } = run;
     debug_assert!(
-        trigger_type == "manual" || trigger_type == "automatic",
-        "bundle trigger_type must be manual or automatic, got {trigger_type}"
+        matches!(
+            trigger_type,
+            "manual" | "automatic" | "rollback" | "recovery"
+        ),
+        "bundle trigger_type must be manual, automatic, rollback or recovery, got {trigger_type}"
     );
+    if let Err(e) = persist_actions(pool, bundle_id, &actions).await {
+        let reason = format!("bundle preparation failed before execution: {e}");
+        finish(pool, bundle_id, "failed", Some(&reason)).await;
+        return BundleOutcome {
+            bundle_id,
+            state: "failed".into(),
+            results: Vec::new(),
+            still_applied: Vec::new(),
+            failure_reason: Some(reason),
+        };
+    }
+    if let Some(plan_id) = authorization_plan_id {
+        if let Err(e) = validate_manual_snapshot(pool, plan_id, bundle_id, &actions).await {
+            let reason = format!("authorized bundle snapshot mismatch: {e}");
+            finish(pool, bundle_id, "failed", Some(&reason)).await;
+            return BundleOutcome {
+                bundle_id,
+                state: "failed".into(),
+                results: Vec::new(),
+                still_applied: Vec::new(),
+                failure_reason: Some(reason),
+            };
+        }
+    }
+    let device_ids: Vec<u64> = actions.iter().map(|action| action.device_id).collect();
+    let originals: Option<Vec<u64>> = actions
+        .iter()
+        .map(|action| action.original_reroute_id)
+        .collect();
+    if let Some(originals) = originals {
+        if let Err(e) =
+            locks::claim_change_windows_for_recovery(pool, bundle_id, &owner_token, &originals)
+                .await
+        {
+            let reason = format!("could not claim original action ownership for recovery: {e}");
+            finish(pool, bundle_id, "failed", Some(&reason)).await;
+            return BundleOutcome {
+                bundle_id,
+                state: "failed".into(),
+                results: Vec::new(),
+                still_applied: Vec::new(),
+                failure_reason: Some(reason),
+            };
+        }
+    }
+    if let Err(e) =
+        locks::acquire_bundle_change_windows(pool, bundle_id, &owner_token, &device_ids).await
+    {
+        let reason = format!("could not acquire the bundle device change window: {e}");
+        finish(pool, bundle_id, "failed", Some(&reason)).await;
+        return BundleOutcome {
+            bundle_id,
+            state: "failed".into(),
+            results: Vec::new(),
+            still_applied: Vec::new(),
+            failure_reason: Some(reason),
+        };
+    }
+    let _ = locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "applying").await;
+
+    let mut native_locks = match ssh.lock_devices(&device_ids).await {
+        Ok(locks) => locks,
+        Err(e) => {
+            let reason = format!("could not acquire native device configuration locks: {e}");
+            if let Err(finalize) =
+                finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+            {
+                tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            }
+            return BundleOutcome {
+                bundle_id,
+                state: "failed".into(),
+                results: Vec::new(),
+                still_applied: Vec::new(),
+                failure_reason: Some(reason),
+            };
+        }
+    };
+    let source: Option<sqlx::types::Json<Value>> =
+        sqlx::query_scalar("SELECT source_json FROM reroute_bundles WHERE id = ?")
+            .bind(bundle_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let expected_identities = source
+        .and_then(|source| source.0.get("transport_identities").cloned())
+        .ok_or_else(|| anyhow::anyhow!("bundle has no prepared transport identity map"))
+        .and_then(|value| {
+            serde_json::from_value::<
+                std::collections::BTreeMap<
+                    u64,
+                    crate::reroute::device_plan::DeviceTransportIdentity,
+                >,
+            >(value)
+            .map_err(Into::into)
+        });
+    let identities_match = expected_identities.and_then(|expected| {
+        crate::reroute::device_plan::verify_transport_identities(native_locks.as_ref(), &expected)
+    });
+    if !matches!(identities_match, Ok(true)) {
+        let reason = match identities_match {
+            Ok(false) => "device transport identity changed after preparation".to_string(),
+            Err(e) => format!("could not prove prepared device transport identities: {e}"),
+            Ok(true) => unreachable!(),
+        };
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+        {
+            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
+        let _ = native_locks.unlock_all().await;
+        return BundleOutcome {
+            bundle_id,
+            state: "failed".into(),
+            results: Vec::new(),
+            still_applied: Vec::new(),
+            failure_reason: Some(reason),
+        };
+    }
+    // Validate the entire projected sequence while every native lock is retained.
+    // Later same-device siblings may legitimately expect an earlier sibling's
+    // projected after-state, so the verifier checks first occurrences live and
+    // subsequent occurrences against that projection.
+    let prepared_sequence: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            action
+                .prepared
+                .clone()
+                .expect("persist_actions checked prepared plans")
+        })
+        .collect();
+    let preflight = crate::reroute::device_plan::verify_prepared_sequence(
+        native_locks.as_mut(),
+        &prepared_sequence,
+    )
+    .await;
+    if !matches!(preflight, Ok(true)) {
+        let reason = match preflight {
+            Ok(false) => "prepared bundle sequence no longer matches router state".to_string(),
+            Err(e) => format!("could not prove the complete prepared bundle sequence: {e}"),
+            Ok(true) => unreachable!(),
+        };
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+        {
+            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
+        let _ = native_locks.unlock_all().await;
+        return BundleOutcome {
+            bundle_id,
+            state: "failed".into(),
+            results: Vec::new(),
+            still_applied: Vec::new(),
+            failure_reason: Some(reason),
+        };
+    }
+    let locked_ssh = executor::LockedSshExecutor::new(native_locks.as_mut());
+
     let _ = sqlx::query(
         "UPDATE reroute_bundles SET state = 'running', started_at = UTC_TIMESTAMP() \
          WHERE id = ? AND state = 'planned'",
@@ -229,21 +648,98 @@ pub async fn run(
     let mut applied: Vec<AppliedSibling> = Vec::new();
     let mut acted_devices: Vec<u64> = Vec::new();
     let mut stopped_at: Option<(u32, String)> = None;
+    let mut freeze_on_ambiguity: Option<u64> = None;
+    let mut projected_state_lost = false;
+    let mut any_failure = false;
+    let mut corrective_failure = false;
+    let mut succeeded_prepared: Vec<crate::reroute::device_plan::PreparedDeviceAction> = Vec::new();
 
     for action in actions {
-        let template_id = action.template.id;
         let device_id = action.device_id;
         let position = action.position;
-        let params = action.params.clone();
+        let inverse_action = action.original_reroute_id.is_some();
+        let prepared_for_proof = action
+            .prepared
+            .clone()
+            .expect("persist_actions required a prepared action");
+        let destructive_forward = matches!(trigger_type, "manual" | "automatic")
+            && safety_phase(&action.template.name).1 == 2;
+        if destructive_forward && !succeeded_prepared.is_empty() {
+            match locked_ssh.verify_projected_after(&succeeded_prepared).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    projected_state_lost = true;
+                    stopped_at = Some((
+                        position,
+                        "previously verified replacement state changed before the destructive action"
+                            .into(),
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    projected_state_lost = true;
+                    stopped_at = Some((
+                        position,
+                        format!(
+                            "could not re-prove replacement state before the destructive action: {e}"
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        let snapshot_action_id: Option<u64> = sqlx::query_scalar(
+            "SELECT id FROM reroute_bundle_actions WHERE bundle_id = ? AND position = ?",
+        )
+        .bind(bundle_id)
+        .bind(position)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        let authorization = match trigger_type {
+            "manual" => authorization_plan_id.map(|plan_id| {
+                ExecutionAuthorization::manual(
+                    plan_id,
+                    Some(bundle_id),
+                    owner_token.clone(),
+                    snapshot_action_id,
+                )
+            }),
+            "automatic" => Some(ExecutionAuthorization::automatic(
+                bundle_id,
+                owner_token.clone(),
+                snapshot_action_id,
+            )),
+            "rollback" => authorization_plan_id.map(|plan_id| {
+                ExecutionAuthorization::manual(
+                    plan_id,
+                    Some(bundle_id),
+                    owner_token.clone(),
+                    snapshot_action_id,
+                )
+            }),
+            "recovery" => Some(ExecutionAuthorization::recovery(
+                bundle_id,
+                owner_token.clone(),
+                snapshot_action_id,
+            )),
+            _ => None,
+        };
+        let action_trigger_type = if trigger_type == "recovery" {
+            "rollback"
+        } else {
+            trigger_type
+        };
 
         let req = ActionRequest {
             device_id,
             template: action.template,
             params: action.params,
-            trigger_type,
+            trigger_type: action_trigger_type,
             rule_id,
             rule_event_id,
-            rollback_of_reroute_id: None,
+            rollback_of_reroute_id: action.original_reroute_id,
             user_id,
             actor_context: actor_context.clone(),
             reason: Some(action.reason),
@@ -252,23 +748,58 @@ pub async fn run(
                 bundle_id,
                 position,
             }),
+            authorization,
         };
 
-        let outcome = executor::execute(pool, cfg, req, false).await;
+        let outcome = executor::execute_with(pool, cfg, &locked_ssh, req, false).await;
         if outcome.executed {
             acted_devices.push(outcome.device_id);
         }
         let succeeded = outcome.state.as_deref() == Some("succeeded");
-        if succeeded {
+        let changed = outcome.mutation_effect.as_deref() == Some("changed");
+        let ambiguous = outcome.state.as_deref() == Some("uncertain")
+            || outcome.mutation_effect.as_deref() == Some("unknown")
+            || (!succeeded && changed);
+        if succeeded && changed && !inverse_action {
             if let Some(reroute_id) = outcome.reroute_id {
                 applied.push(AppliedSibling {
                     reroute_id,
-                    device_id,
-                    template_id,
-                    params,
                     position,
                 });
             }
+        }
+        if succeeded {
+            succeeded_prepared.push(prepared_for_proof);
+        }
+        if ambiguous {
+            freeze_on_ambiguity = outcome.reroute_id;
+        }
+        if !succeeded {
+            any_failure = true;
+            corrective_failure |= inverse_action;
+        }
+
+        if let Some(action_id) = snapshot_action_id {
+            let snapshot_state = if outcome.state.as_deref() == Some("uncertain") {
+                "uncertain"
+            } else if succeeded && outcome.mutation_effect.as_deref() == Some("noop") {
+                "noop"
+            } else if succeeded {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            let _ = sqlx::query(
+                "UPDATE reroute_bundle_actions SET state = ?, mutation_effect = ?, \
+                        reroute_id = ?, failure_reason = ? WHERE id = ?",
+            )
+            .bind(snapshot_state)
+            .bind(outcome.mutation_effect.as_deref().unwrap_or("unknown"))
+            .bind(outcome.reroute_id)
+            .bind(&outcome.blocked_reason)
+            .bind(action_id)
+            .execute(pool)
+            .await;
         }
 
         let mut value = serde_json::to_value(&outcome).unwrap_or_else(|_| json!({}));
@@ -290,13 +821,60 @@ pub async fn run(
         .execute(pool)
         .await;
 
-        if !succeeded && policy != FailurePolicy::Continue {
+        if ambiguous || (!succeeded && policy != FailurePolicy::Continue) {
             let why = outcome
                 .blocked_reason
                 .clone()
                 .unwrap_or_else(|| outcome.message.clone());
             stopped_at = Some((position, why));
             break;
+        }
+    }
+
+    if stopped_at.is_none() && !any_failure && !succeeded_prepared.is_empty() {
+        match locked_ssh.verify_projected_after(&succeeded_prepared).await {
+            Ok(true) => {}
+            Ok(false) => {
+                projected_state_lost = true;
+                stopped_at = Some((
+                    u32::MAX,
+                    "final projected bundle state no longer matches the routers".into(),
+                ));
+            }
+            Err(e) => {
+                projected_state_lost = true;
+                stopped_at = Some((
+                    u32::MAX,
+                    format!("could not prove final projected bundle state: {e}"),
+                ));
+            }
+        }
+    }
+    if stopped_at.is_none() && matches!(trigger_type, "rollback" | "recovery") {
+        match outstanding_owned_originals(pool, bundle_id).await {
+            Ok(outstanding) if outstanding.is_empty() => {
+                if let Err(e) = settle_source_activations(pool, bundle_id).await {
+                    corrective_failure = true;
+                    stopped_at = Some((
+                        u32::MAX,
+                        format!("could not settle original activation ownership: {e}"),
+                    ));
+                }
+            }
+            Ok(_) => {
+                corrective_failure = true;
+                stopped_at = Some((
+                    u32::MAX,
+                    "corrective bundle finished without closing every original mutation".into(),
+                ));
+            }
+            Err(e) => {
+                corrective_failure = true;
+                stopped_at = Some((
+                    u32::MAX,
+                    format!("could not prove corrective ownership closure: {e}"),
+                ));
+            }
         }
     }
 
@@ -313,7 +891,34 @@ pub async fn run(
     }
 
     let Some((failed_position, why)) = stopped_at else {
-        finish(pool, bundle_id, "succeeded", None).await;
+        if any_failure {
+            let summary = "one or more actions failed under continue policy".to_string();
+            let still: Vec<u64> = applied.iter().map(|a| a.reroute_id).collect();
+            if let Err(finalize) =
+                finish_and_release(pool, bundle_id, "aborted", Some(&summary), &owner_token).await
+            {
+                tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            }
+            if !still.is_empty() {
+                alert_still_applied(pool, bundle_id, &still, &summary).await;
+            }
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return BundleOutcome {
+                bundle_id,
+                state: "aborted".into(),
+                results,
+                still_applied: still,
+                failure_reason: Some(summary),
+            };
+        }
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "succeeded", None, &owner_token).await
+        {
+            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
+        drop(locked_ssh);
+        let _ = native_locks.unlock_all().await;
         return BundleOutcome {
             bundle_id,
             state: "succeeded".into(),
@@ -325,14 +930,73 @@ pub async fn run(
 
     let summary = format!("stopped at action #{failed_position}: {why}");
 
+    if corrective_failure {
+        let outstanding = outstanding_owned_originals(pool, bundle_id)
+            .await
+            .unwrap_or_default();
+        let still: Vec<u64> = outstanding.into_iter().map(|(id, _)| id).collect();
+        let _ =
+            locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
+        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still, &summary).await {
+            tracing::error!(event_type = "corrective_bundle_finalize_failed", bundle_id, error = %e);
+        }
+        drop(locked_ssh);
+        let _ = native_locks.unlock_all().await;
+        return BundleOutcome {
+            bundle_id,
+            state: "compensation_blocked".into(),
+            results,
+            still_applied: still,
+            failure_reason: Some(summary),
+        };
+    }
+
+    // Once any sibling has an unknown or partially-applied effect, NO further
+    // router write is safe, including rollback on another device. The uncertain
+    // command may have removed the old path already; undoing an earlier additive
+    // sibling could remove the last viable path.
+    if freeze_on_ambiguity.is_some() || projected_state_lost {
+        let mut still: Vec<u64> = applied.iter().map(|a| a.reroute_id).collect();
+        if let Some(ambiguous_id) = freeze_on_ambiguity {
+            if !still.contains(&ambiguous_id) {
+                still.push(ambiguous_id);
+            }
+        }
+        if projected_state_lost {
+            if let Err(e) = quarantine_changed_actions(pool, &applied, &summary).await {
+                tracing::error!(event_type="bundle_projected_state_quarantine_failed", bundle_id, error=%e, "changed actions remain protected by bundle device windows");
+            }
+        }
+        let _ =
+            locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
+        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still, &summary).await {
+            tracing::error!(event_type = "bundle_blocked_finalize_failed", bundle_id, error = %e, "bundle remains recoverable as in-flight");
+        }
+        drop(locked_ssh);
+        let _ = native_locks.unlock_all().await;
+        return BundleOutcome {
+            bundle_id,
+            state: "compensation_blocked".into(),
+            results,
+            still_applied: still,
+            failure_reason: Some(summary),
+        };
+    }
+
     // `Abort` leaves applied siblings deliberately; with nothing applied there is
     // nothing to compensate either way.
     if policy == FailurePolicy::Abort || applied.is_empty() {
-        finish(pool, bundle_id, "aborted", Some(&summary)).await;
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "aborted", Some(&summary), &owner_token).await
+        {
+            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
         let still: Vec<u64> = applied.iter().map(|a| a.reroute_id).collect();
         if !still.is_empty() {
             alert_still_applied(pool, bundle_id, &still, &summary).await;
         }
+        drop(locked_ssh);
+        let _ = native_locks.unlock_all().await;
         return BundleOutcome {
             bundle_id,
             state: "aborted".into(),
@@ -347,15 +1011,14 @@ pub async fn run(
         .bind(bundle_id)
         .execute(pool)
         .await;
+    let _ =
+        locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "compensating").await;
 
     let mut still_applied: Vec<u64> = Vec::new();
     // Reverse order: undo the most recent change first, so intermediate states
     // mirror the way the bundle was built up.
-    for sibling in applied.iter().rev() {
-        let req = rollback::RollbackRequest {
-            device_id: sibling.device_id,
-            template_id: sibling.template_id,
-            params: &sibling.params,
+    for (reverse_index, sibling) in applied.iter().rev().enumerate() {
+        let req = rollback::PersistedRollbackRequest {
             original_reroute_id: Some(sibling.reroute_id),
             rule_event_id,
             user_id,
@@ -366,8 +1029,12 @@ pub async fn run(
             ),
             defer_cooldown: true,
             dry_run: false,
+            authorization: Some(ExecutionAuthorization::compensation(
+                bundle_id,
+                owner_token.clone(),
+            )),
         };
-        match rollback::rollback_of(pool, cfg, req).await {
+        match rollback::rollback_persisted_with(pool, cfg, &locked_ssh, req).await {
             Ok(Some(out)) if out.state.as_deref() == Some("succeeded") => {}
             Ok(Some(out)) => {
                 tracing::error!(
@@ -378,6 +1045,9 @@ pub async fn run(
                     "a bundle sibling could not be rolled back; it remains applied"
                 );
                 still_applied.push(sibling.reroute_id);
+                let remaining = applied.len().saturating_sub(reverse_index + 1);
+                still_applied.extend(applied[..remaining].iter().map(|item| item.reroute_id));
+                break;
             }
             // No rollback template: the action has no inverse, so it stays.
             Ok(None) => {
@@ -388,6 +1058,9 @@ pub async fn run(
                     "sibling template has no rollback; it remains applied"
                 );
                 still_applied.push(sibling.reroute_id);
+                let remaining = applied.len().saturating_sub(reverse_index + 1);
+                still_applied.extend(applied[..remaining].iter().map(|item| item.reroute_id));
+                break;
             }
             Err(e) => {
                 tracing::error!(
@@ -398,6 +1071,9 @@ pub async fn run(
                     "rollback of a bundle sibling errored; it remains applied"
                 );
                 still_applied.push(sibling.reroute_id);
+                let remaining = applied.len().saturating_sub(reverse_index + 1);
+                still_applied.extend(applied[..remaining].iter().map(|item| item.reroute_id));
+                break;
             }
         }
     }
@@ -407,10 +1083,21 @@ pub async fn run(
     } else {
         "compensation_blocked"
     };
-    finish(pool, bundle_id, state, Some(&summary)).await;
     if !still_applied.is_empty() {
-        alert_still_applied(pool, bundle_id, &still_applied, &summary).await;
+        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still_applied, &summary).await {
+            tracing::error!(event_type = "bundle_blocked_finalize_failed", bundle_id, error = %e, "bundle remains recoverable as in-flight");
+        }
+        let _ =
+            locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
+    } else {
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, state, Some(&summary), &owner_token).await
+        {
+            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
     }
+    drop(locked_ssh);
+    let _ = native_locks.unlock_all().await;
 
     BundleOutcome {
         bundle_id,
@@ -421,9 +1108,61 @@ pub async fn run(
     }
 }
 
+async fn validate_manual_snapshot(
+    pool: &MySqlPool,
+    plan_id: u64,
+    bundle_id: u64,
+    actions: &[BundleAction],
+) -> anyhow::Result<()> {
+    let snapshot: sqlx::types::Json<Value> = sqlx::query_scalar(
+        "SELECT snapshot_json FROM execution_plans \
+         WHERE id = ? AND bundle_id = ? AND consumed_at IS NOT NULL",
+    )
+    .bind(plan_id)
+    .bind(bundle_id)
+    .fetch_one(pool)
+    .await?;
+    let expected_actions = snapshot
+        .0
+        .get("actions")
+        .ok_or_else(|| anyhow::anyhow!("plan has no action snapshot"))?;
+    anyhow::ensure!(
+        serde_json::to_value(actions)? == *expected_actions,
+        "runner actions differ from the consumed plan"
+    );
+    let expected_devices = snapshot
+        .0
+        .get("device_actions")
+        .ok_or_else(|| anyhow::anyhow!("plan has no device action snapshot"))?;
+    let actual_devices: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            action
+                .prepared
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("action has no prepared device snapshot"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(
+        serde_json::to_value(actual_devices)? == *expected_devices,
+        "prepared device sequence differs from the consumed plan"
+    );
+    let bundle_source: Option<sqlx::types::Json<Value>> =
+        sqlx::query_scalar("SELECT source_json FROM reroute_bundles WHERE id = ?")
+            .bind(bundle_id)
+            .fetch_optional(pool)
+            .await?;
+    anyhow::ensure!(
+        bundle_source.map(|source| source.0) == snapshot.0.get("source").cloned(),
+        "bundle source/revision differs from the consumed plan"
+    );
+    Ok(())
+}
+
 async fn finish(pool: &MySqlPool, bundle_id: u64, state: &str, failure_reason: Option<&str>) {
     if let Err(e) = sqlx::query(
         "UPDATE reroute_bundles SET state = ?, failure_reason = ?, finished_at = UTC_TIMESTAMP() \
+                , rate_reserved_actions = 0 \
          WHERE id = ?",
     )
     .bind(state)
@@ -440,6 +1179,37 @@ async fn finish(pool: &MySqlPool, bundle_id: u64, state: &str, failure_reason: O
             "could not persist terminal bundle state"
         );
     }
+}
+
+async fn finish_and_release(
+    pool: &MySqlPool,
+    bundle_id: u64,
+    state: &str,
+    failure_reason: Option<&str>,
+    owner_token: &str,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE reroute_bundles SET state = ?, failure_reason = ?, \
+                finished_at = UTC_TIMESTAMP(), rate_reserved_actions = 0 WHERE id = ? \
+          AND state IN ('planned','running','compensating')",
+    )
+    .bind(state)
+    .bind(failure_reason)
+    .bind(bundle_id)
+    .execute(&mut *tx)
+    .await?;
+    anyhow::ensure!(
+        updated.rows_affected() == 1,
+        "bundle terminal state conflict"
+    );
+    sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ? AND owner_token = ?")
+        .bind(bundle_id)
+        .bind(owner_token)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// A mitigation is half-applied and the controller could not undo it. This is the
@@ -486,23 +1256,272 @@ async fn alert_still_applied(pool: &MySqlPool, bundle_id: u64, still: &[u64], su
     }
 }
 
+async fn finish_blocked_with_alert(
+    pool: &MySqlPool,
+    bundle_id: u64,
+    still: &[u64],
+    summary: &str,
+) -> anyhow::Result<()> {
+    let payload = json!({
+        "bundle_id": bundle_id,
+        "still_applied_reroute_ids": still,
+        "reason": summary,
+        "operator_action": "reconcile ambiguous actions before any recovery write",
+    });
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE reroute_bundles SET state = 'compensation_blocked', failure_reason = ?, \
+                finished_at = UTC_TIMESTAMP(), rate_reserved_actions = 0 \
+          WHERE id = ? AND state IN ('planned','running','compensating')",
+    )
+    .bind(summary)
+    .bind(bundle_id)
+    .execute(&mut *tx)
+    .await?;
+    anyhow::ensure!(
+        updated.rows_affected() == 1,
+        "bundle terminal state conflict"
+    );
+    sqlx::query(
+        "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) \
+         VALUES ('reroute_bundle_partial', 'critical', ?, ?)",
+    )
+    .bind(sqlx::types::Json(payload))
+    .bind(format!("reroute_bundle_partial:{bundle_id}"))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO audit_logs \
+            (actor_type, event_type, entity_type, entity_id, message) \
+         VALUES ('system', 'reroute_bundle_partial', 'reroute_bundle', ?, ?)",
+    )
+    .bind(bundle_id)
+    .bind(format!(
+        "bundle #{bundle_id} left {} changed or ambiguous action(s): {summary}",
+        still.len()
+    ))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn quarantine_changed_actions(
+    pool: &MySqlPool,
+    applied: &[AppliedSibling],
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    for sibling in applied {
+        let device_id: u64 = sqlx::query_scalar(
+            "SELECT device_id FROM reroutes WHERE id = ? AND state = 'succeeded' \
+             AND mutation_effect = 'changed' FOR UPDATE",
+        )
+        .bind(sibling.reroute_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE reroutes SET state = 'uncertain', success = NULL, \
+                    verification_status = 'uncertain', mutation_effect = 'unknown', \
+                    failure_reason = ? WHERE id = ? AND state = 'succeeded'",
+        )
+        .bind(format!(
+            "bundle projected state lost after verification: {reason}"
+        ))
+        .bind(sibling.reroute_id)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "changed reroute state conflict"
+        );
+        sqlx::query(
+            "UPDATE reroute_bundle_actions SET state = 'uncertain', mutation_effect = 'unknown', \
+                    failure_reason = ? WHERE reroute_id = ?",
+        )
+        .bind(reason)
+        .bind(sibling.reroute_id)
+        .execute(&mut *tx)
+        .await?;
+        crate::reroute::locks::create_on(
+            &mut tx,
+            "device",
+            Some(&device_id.to_string()),
+            Some(sibling.reroute_id),
+            "auto_uncertain",
+            &format!(
+                "reroute #{} lost its bundle-level projected-state proof",
+                sibling.reroute_id
+            ),
+            None,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[doc(hidden)]
+pub async fn settle_source_activations(
+    pool: &MySqlPool,
+    recovery_bundle_id: u64,
+) -> anyhow::Result<()> {
+    let source_bundles: Vec<u64> = sqlx::query_scalar(
+        "SELECT DISTINCT original.bundle_id \
+           FROM reroute_bundle_actions ba \
+           JOIN reroutes original ON original.id = ba.original_reroute_id \
+          WHERE ba.bundle_id = ? AND original.bundle_id IS NOT NULL",
+    )
+    .bind(recovery_bundle_id)
+    .fetch_all(pool)
+    .await?;
+    for source_bundle in source_bundles {
+        anyhow::ensure!(
+            outstanding_owned_originals(pool, source_bundle)
+                .await?
+                .is_empty(),
+            "source bundle #{source_bundle} still owns unresolved mutations"
+        );
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "UPDATE reroute_bundles SET state = 'compensated', finished_at = UTC_TIMESTAMP(), \
+                    failure_reason = CONCAT(COALESCE(failure_reason,''), \
+                        ' | all original mutations were verified restored') \
+              WHERE id = ? AND state IN ('aborted','compensation_blocked')",
+        )
+        .bind(source_bundle)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ?")
+            .bind(source_bundle)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
 /// Bundles caught mid-flight by a restart. Their in-flight siblings are already
 /// marked `uncertain` (and their devices locked) by
 /// [`super::state_machine::recover_on_startup`]; this closes the bundle row so the
 /// UI never shows a mitigation as still progressing after a crash.
 pub async fn recover_on_startup(pool: &MySqlPool) -> anyhow::Result<()> {
-    let res = sqlx::query(
-        "UPDATE reroute_bundles \
-            SET state = 'aborted', finished_at = UTC_TIMESTAMP(), \
-                failure_reason = 'controller restarted mid-bundle; siblings marked uncertain' \
-          WHERE state IN ('planned', 'running', 'compensating')",
+    let bundles: Vec<u64> = sqlx::query_scalar(
+        "SELECT id FROM reroute_bundles \
+         WHERE state IN ('planned', 'running', 'compensating') ORDER BY id",
     )
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    if res.rows_affected() > 0 {
+    for bundle_id in &bundles {
+        let outstanding = outstanding_owned_originals(pool, *bundle_id).await?;
+        let mut tx = pool.begin().await?;
+        let blocked = !outstanding.is_empty();
+        let state = if blocked {
+            "compensation_blocked"
+        } else {
+            "aborted"
+        };
+        let reason = if blocked {
+            "controller restarted mid-bundle; changed or ambiguous siblings require reconciliation"
+        } else {
+            "controller restarted before any owned router mutation remained"
+        };
+        let updated = sqlx::query(
+            "UPDATE reroute_bundles SET state = ?, finished_at = UTC_TIMESTAMP(), \
+                    interrupted_at = UTC_TIMESTAMP(), failure_reason = ?, \
+                    rate_reserved_actions = 0 \
+              WHERE id = ? AND state IN ('planned', 'running', 'compensating')",
+        )
+        .bind(state)
+        .bind(reason)
+        .bind(bundle_id)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "bundle changed during recovery"
+        );
+
+        if blocked {
+            let owner_token = format!("recovery:bundle:{bundle_id}");
+            let mut devices: Vec<u64> = outstanding.iter().map(|(_, device)| *device).collect();
+            devices.sort_unstable();
+            devices.dedup();
+            for device_id in devices {
+                let owner: Option<(Option<u64>, String)> = sqlx::query_as(
+                    "SELECT bundle_id, owner_token FROM device_change_windows \
+                     WHERE device_id = ? FOR UPDATE",
+                )
+                .bind(device_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match owner {
+                    Some((Some(owner_bundle), _)) if owner_bundle == *bundle_id => {
+                        sqlx::query(
+                            "UPDATE device_change_windows SET phase = 'uncertain' \
+                             WHERE device_id = ? AND bundle_id = ?",
+                        )
+                        .bind(device_id)
+                        .bind(bundle_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    Some((owner_bundle, token)) => anyhow::bail!(
+                        "device {device_id} has foreign change-window owner {owner_bundle:?}/{token}"
+                    ),
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO device_change_windows \
+                                (device_id, bundle_id, owner_token, phase) \
+                             VALUES (?, ?, ?, 'uncertain')",
+                        )
+                        .bind(device_id)
+                        .bind(bundle_id)
+                        .bind(&owner_token)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+            let ids: Vec<u64> = outstanding.iter().map(|(id, _)| *id).collect();
+            let payload = json!({
+                "bundle_id": bundle_id,
+                "still_applied_or_ambiguous_reroute_ids": ids,
+                "reason": reason,
+                "operator_action": "reconcile every listed action before releasing device change windows",
+            });
+            sqlx::query(
+                "INSERT INTO alerts (event_type, severity, payload_json, dedup_key) \
+                 VALUES ('reroute_bundle_partial', 'critical', ?, ?)",
+            )
+            .bind(sqlx::types::Json(payload))
+            .bind(format!("reroute_bundle_interrupted:{bundle_id}"))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO audit_logs \
+                    (actor_type, event_type, entity_type, entity_id, message) \
+                 VALUES ('system', 'reroute_bundle_interrupted', 'reroute_bundle', ?, ?)",
+            )
+            .bind(bundle_id)
+            .bind(format!(
+                "bundle #{bundle_id} interrupted with {} changed or ambiguous action(s)",
+                outstanding.len()
+            ))
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ?")
+                .bind(bundle_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+    }
+    if !bundles.is_empty() {
         tracing::warn!(
             event_type = "bundle_recovery_aborted",
-            count = res.rows_affected(),
+            count = bundles.len(),
             "closed in-flight mitigation bundles after restart"
         );
     }
@@ -555,5 +1574,22 @@ mod tests {
             assert_eq!(FailurePolicy::parse(p.as_str()), Some(p));
         }
         assert_eq!(FailurePolicy::parse("something-else"), None);
+    }
+
+    #[test]
+    fn recovery_constructor_binds_corrective_authority() {
+        let run = BundleRun::automatic_recovery(11, FailurePolicy::AbortAndCompensate, 7);
+        assert_eq!(run.trigger_type, "recovery");
+        assert_eq!(run.rule_id, Some(7));
+        assert!(run.user_id.is_none());
+        assert!(run.authorization_plan_id.is_none());
+    }
+
+    #[test]
+    fn mss_phases_allow_multi_router_add_and_cleanup_ordering() {
+        assert_eq!(safety_phase("iface_tcp_adjust_mss").1, 0);
+        assert_eq!(safety_phase("bgp_advertise_add").1, 0);
+        assert_eq!(safety_phase("bgp_advertise_remove").1, 2);
+        assert_eq!(safety_phase("iface_tcp_adjust_mss_remove").1, 2);
     }
 }

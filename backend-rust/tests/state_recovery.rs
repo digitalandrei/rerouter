@@ -3,33 +3,16 @@
 //! `uncertain` and LOCKS its device until an admin acknowledges it. We never
 //! assume "nothing happened" after a crash.
 //!
-//! This is a DB integration test. It runs only when DATABASE_URL points at a
-//! MariaDB the test may migrate + write to (CI provides one); without it the
-//! test skips so the unit suite still passes locally. It cleans up its rows so
-//! repeated runs stay isolated.
+//! This is a DB integration test. It runs only when REROUTER_TEST_DATABASE_URL points at a
+//! dedicated test schema. Missing or unsafe configuration fails the suite.
+//! Tests serialize their database work and clean up their own rows.
 
-use rerouter_controller::db::MIGRATOR;
-use sqlx::mysql::MySqlPoolOptions;
-use sqlx::MySqlPool;
-
-/// Connect + migrate, or `None` when DATABASE_URL is unset (skip).
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
+mod common;
 
 #[tokio::test]
 async fn in_flight_reroute_becomes_uncertain_and_locks_the_device() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping state-recovery integration test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
 
     // Seed a device and an in-flight (running) reroute against it.
     let device_id = sqlx::query("INSERT INTO devices (name, hostname) VALUES (?, ?)")
@@ -97,10 +80,8 @@ async fn in_flight_reroute_becomes_uncertain_and_locks_the_device() {
 /// vs #123). This mirrors the exact UPDATE the handler runs.
 #[tokio::test]
 async fn acknowledge_lock_clear_does_not_match_a_longer_reroute_id() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping lock-anchor integration test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
 
     // Ids chosen far outside the auto-increment range so they cannot collide
     // with real reroute rows from parallel tests. `long` string-prefixes `short`
@@ -240,4 +221,138 @@ async fn acknowledge_lock_clear_does_not_match_a_longer_reroute_id() {
         .bind(device_id)
         .execute(&pool)
         .await;
+}
+
+#[tokio::test]
+async fn interrupted_cross_device_bundle_quarantines_every_owned_or_ambiguous_device() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let suffix = uuid::Uuid::new_v4();
+    let device_a = sqlx::query("INSERT INTO devices (name, hostname) VALUES (?, '192.0.2.10')")
+        .bind(format!("recovery-bundle-a-{suffix}"))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let device_b = sqlx::query("INSERT INTO devices (name, hostname) VALUES (?, '192.0.2.11')")
+        .bind(format!("recovery-bundle-b-{suffix}"))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let bundle_id = sqlx::query(
+        "INSERT INTO reroute_bundles \
+            (trigger_type, state, failure_policy, total_actions, completed_actions) \
+         VALUES ('manual', 'running', 'abort_and_compensate', 2, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let succeeded = sqlx::query(
+        "INSERT INTO reroutes \
+            (device_id, bundle_id, bundle_position, trigger_type, state, mutation_effect, \
+             started_at, finished_at, success) \
+         VALUES (?, ?, 0, 'manual', 'succeeded', 'changed', UTC_TIMESTAMP(), UTC_TIMESTAMP(), 1)",
+    )
+    .bind(device_a)
+    .bind(bundle_id)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let interrupted = sqlx::query(
+        "INSERT INTO reroutes \
+            (device_id, bundle_id, bundle_position, trigger_type, state, mutation_effect, started_at) \
+         VALUES (?, ?, 1, 'manual', 'running', 'pending', UTC_TIMESTAMP())",
+    )
+    .bind(device_b)
+    .bind(bundle_id)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+
+    rerouter_controller::reroute::state_machine::recover_on_startup(&pool)
+        .await
+        .unwrap();
+    rerouter_controller::reroute::bundle::recover_on_startup(&pool)
+        .await
+        .unwrap();
+
+    let bundle_state: String = sqlx::query_scalar("SELECT state FROM reroute_bundles WHERE id = ?")
+        .bind(bundle_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bundle_state, "compensation_blocked");
+    let windows: Vec<(u64, String)> = sqlx::query_as(
+        "SELECT device_id, phase FROM device_change_windows \
+         WHERE bundle_id = ? ORDER BY device_id",
+    )
+    .bind(bundle_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        windows,
+        vec![
+            (device_a, "uncertain".into()),
+            (device_b, "uncertain".into())
+        ]
+    );
+    let alerted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alerts WHERE dedup_key = ? AND severity = 'critical'",
+    )
+    .bind(format!("reroute_bundle_interrupted:{bundle_id}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(alerted, 1);
+    let ids: Vec<u64> = sqlx::query_scalar(
+        "SELECT id FROM reroutes WHERE bundle_id = ? AND mutation_effect IN ('changed','unknown') ORDER BY id",
+    )
+    .bind(bundle_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ids, vec![succeeded, interrupted]);
+
+    sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ?")
+        .bind(bundle_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM locks WHERE reroute_id IN (?, ?)")
+        .bind(succeeded)
+        .bind(interrupted)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM reroutes WHERE bundle_id = ?")
+        .bind(bundle_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM alerts WHERE dedup_key = ?")
+        .bind(format!("reroute_bundle_interrupted:{bundle_id}"))
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM audit_logs WHERE entity_type = 'reroute_bundle' AND entity_id = ?")
+        .bind(bundle_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM reroute_bundles WHERE id = ?")
+        .bind(bundle_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM devices WHERE id IN (?, ?)")
+        .bind(device_a)
+        .bind(device_b)
+        .execute(&pool)
+        .await
+        .ok();
 }

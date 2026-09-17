@@ -4,7 +4,7 @@
  * Route map:
  * /login, /dashboard, /devices, /devices/:id,
  * /devices/:deviceId/interfaces/:ifaceId, /rules, /templates, /mitigations,
- * /mitigations/manual, /flows, /alerts, /audit, /settings, /documentation,
+ * /manual-mitigations, /flows, /alerts, /audit, /settings, /documentation,
  * /users.
  *
  * Everything except /login sits behind <RequireAuth>; the session itself is
@@ -88,7 +88,11 @@ export default function App() {
               <Route path="/rules" element={<Rules />} />
               <Route path="/templates" element={<Templates />} />
               <Route path="/mitigations" element={<Mitigations />} />
-              <Route path="/mitigations/manual" element={<ManualReroute />} />
+              <Route path="/manual-mitigations" element={<ManualReroute />} />
+              <Route
+                path="/mitigations/manual"
+                element={<Navigate to="/manual-mitigations" replace />}
+              />
               <Route path="/flows" element={<Flows />} />
               {/* /alerts redirects to the Mitigations page Alerts tab */}
               <Route path="/alerts" element={<Navigate to="/mitigations?tab=alerts" replace />} />

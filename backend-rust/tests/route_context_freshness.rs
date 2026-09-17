@@ -12,26 +12,13 @@
 //! transaction as the value) against ROUTING_INVENTORY_MAX_AGE_HOURS. It still
 //! fails closed: a stale or never-stamped route context is refused.
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB the
-//! test may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB the
+//! test may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
-use rerouter_controller::db::MIGRATOR;
 use rerouter_controller::reroute::templates::{canonicalize_inventory_params, Template};
 use serde_json::json;
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
-
-/// Connect + migrate, or `None` when DATABASE_URL is unset (skip).
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
+mod common;
 
 /// A template shaped like `bgp_advertise_add`, restricted to the parameters the
 /// case under test needs. Only the `source` annotations matter here.
@@ -120,10 +107,8 @@ async fn cleanup(pool: &MySqlPool, device_id: u64) {
 
 #[tokio::test]
 async fn fresh_route_context_is_accepted_although_snmp_polling_is_stale() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping route-context freshness test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Discovered an hour ago; SNMP has not polled this peer in ~69 days.
     let device_id = seed(&pool, "route-ctx-fresh", Some(1650), Some(1)).await;
 
@@ -142,10 +127,8 @@ async fn fresh_route_context_is_accepted_although_snmp_polling_is_stale() {
 
 #[tokio::test]
 async fn stale_route_context_is_refused_although_snmp_polling_is_fresh() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping route-context staleness test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Peer is alive (polled minutes ago) but the routing read is ~8 days old.
     let device_id = seed(&pool, "route-ctx-stale", Some(0), Some(200)).await;
 
@@ -172,10 +155,8 @@ async fn stale_route_context_is_refused_although_snmp_polling_is_fresh() {
 
 #[tokio::test]
 async fn never_discovered_route_context_is_refused() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping never-discovered test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // The field state before this fix: a value can only exist here by hand, and
     // a NULL marker means "never proven by a discovery run" => refuse.
     let device_id = seed(&pool, "route-ctx-null", Some(0), None).await;
@@ -194,10 +175,8 @@ async fn never_discovered_route_context_is_refused() {
 
 #[tokio::test]
 async fn a_device_without_route_maps_still_resolves_its_peer_prefix_list() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping no-route-map test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // The regression this fixes: peer + prefix-list both fresh, device has NO
     // route-maps at all (direct `neighbor <ip> prefix-list <NAME> out`), which
     // the old EXISTS(device_route_maps) subquery rejected permanently.

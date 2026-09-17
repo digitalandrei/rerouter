@@ -59,19 +59,39 @@ const ALLOWLIST_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_EXPORTERS: usize = 1_024;
 
 /// Running counts for a single aggregation key.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Counts {
     pkts: u64,
     bytes: u64,
     flows: u64,
+    pkts_available: bool,
+    bytes_available: bool,
+}
+
+impl Default for Counts {
+    fn default() -> Self {
+        Self {
+            pkts: 0,
+            bytes: 0,
+            flows: 0,
+            pkts_available: true,
+            bytes_available: true,
+        }
+    }
 }
 
 impl Counts {
-    fn add(&mut self, pkts: u64, bytes: u64) {
+    fn add(&mut self, pkts: Option<u64>, bytes: Option<u64>) {
         // Attacker-controlled wire values accumulated across a bucket window:
         // saturate rather than panic (debug) / wrap (release) on overflow.
-        self.pkts = self.pkts.saturating_add(pkts);
-        self.bytes = self.bytes.saturating_add(bytes);
+        match pkts {
+            Some(value) => self.pkts = self.pkts.saturating_add(value),
+            None => self.pkts_available = false,
+        }
+        match bytes {
+            Some(value) => self.bytes = self.bytes.saturating_add(value),
+            None => self.bytes_available = false,
+        }
         self.flows = self.flows.saturating_add(1);
     }
 }
@@ -107,8 +127,8 @@ const MAX_OPEN_BUCKETS: usize = 120;
 fn add_bounded<K: Eq + Hash>(
     map: &mut HashMap<K, Counts>,
     key: K,
-    pkts: u64,
-    bytes: u64,
+    pkts: Option<u64>,
+    bytes: Option<u64>,
     cap: usize,
 ) -> bool {
     if let Some(counts) = map.get_mut(&key) {
@@ -494,6 +514,14 @@ async fn recv_loop(
         let decoded = match proto {
             Protocol::NetflowV9 => v9::decode(&buf[..len], &mut exporter.templates)
                 .map(|d| {
+                    if d.exporter_restarted || d.sampling_state_expired {
+                        // Sampling options belong to the old exporter generation.
+                        // Keep configured DB overrides, but relearn reported/derived
+                        // evidence alongside the new template generation.
+                        exporter.reported_rate = None;
+                        exporter.snmp_derived_rate = None;
+                        exporter.snmp_xcal_ratio = None;
+                    }
                     exporter.dropped_no_template = exporter
                         .dropped_no_template
                         .saturating_add(d.data_without_template as u64);
@@ -606,6 +634,7 @@ struct ExporterFlush {
     dropped_no_template: u64,
     dropped_malformed: u64,
     last_sequence: Option<u32>,
+    last_seen: i64,
     closed: Vec<(i64, Accum)>,
 }
 
@@ -650,6 +679,7 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                     dropped_no_template: ex.dropped_no_template,
                     dropped_malformed: ex.dropped_malformed,
                     last_sequence: ex.last_sequence,
+                    last_seen: ex.last_seen,
                     closed,
                 });
             }
@@ -821,7 +851,9 @@ async fn flush_exporter(
             reported_sampling_rate = ?, snmp_derived_rate = ?, effective_sampling_rate = ?, \
             sampling_source = ?, sampling_confidence = ?, snmp_xcal_ratio = COALESCE(?, snmp_xcal_ratio), \
             last_sequence = ?, datagrams_total = ?, dropped_no_template = ?, dropped_malformed = ?, \
-            last_packet_at = UTC_TIMESTAMP() \
+            last_packet_at = CASE \
+                WHEN last_packet_at IS NULL OR last_packet_at < FROM_UNIXTIME(?) \
+                THEN FROM_UNIXTIME(?) ELSE last_packet_at END \
          WHERE id = ?",
     )
     .bind(f.reported_rate)
@@ -834,6 +866,8 @@ async fn flush_exporter(
     .bind(f.datagrams_total)
     .bind(f.dropped_no_template)
     .bind(f.dropped_malformed)
+    .bind(f.last_seen)
+    .bind(f.last_seen)
     .bind(exporter_id)
     .execute(pool)
     .await?;
@@ -907,13 +941,15 @@ async fn write_bucket(
         let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_iface_buckets \
-                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, pkts, pkts_available, bytes, bytes_available, flow_count, effective_sampling_rate, sampling_confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), pkts_available = VALUES(pkts_available), \
+                bytes = VALUES(bytes), bytes_available = VALUES(bytes_available), flow_count = VALUES(flow_count), \
                 effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
-        .bind(bucket_ts).bind(c.pkts).bind(c.bytes).bind(c.flows).bind(rate).bind(conf)
+        .bind(bucket_ts).bind(c.pkts).bind(c.pkts_available).bind(c.bytes).bind(c.bytes_available)
+        .bind(c.flows).bind(rate).bind(conf)
         .execute(&mut *tx).await?;
     }
 
@@ -922,14 +958,16 @@ async fn write_bucket(
         let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_port_buckets \
-                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, protocol, port_kind, port, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, protocol, port_kind, port, pkts, pkts_available, bytes, bytes_available, flow_count, effective_sampling_rate, sampling_confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), pkts_available = VALUES(pkts_available), \
+                bytes = VALUES(bytes), bytes_available = VALUES(bytes_available), flow_count = VALUES(flow_count), \
                 effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(*proto).bind(kind.as_str()).bind(*port)
-        .bind(c.pkts).bind(c.bytes).bind(c.flows).bind(rate).bind(conf)
+        .bind(c.pkts).bind(c.pkts_available).bind(c.bytes).bind(c.bytes_available)
+        .bind(c.flows).bind(rate).bind(conf)
         .execute(&mut *tx).await?;
     }
 
@@ -938,14 +976,16 @@ async fn write_bucket(
         let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_as_buckets \
-                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, as_kind, asn, pkts, bytes, flow_count, effective_sampling_rate, sampling_confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), flow_count = VALUES(flow_count), \
+                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, as_kind, asn, pkts, pkts_available, bytes, bytes_available, flow_count, effective_sampling_rate, sampling_confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), pkts_available = VALUES(pkts_available), \
+                bytes = VALUES(bytes), bytes_available = VALUES(bytes_available), flow_count = VALUES(flow_count), \
                 effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(kind.as_str()).bind(*asn)
-        .bind(c.pkts).bind(c.bytes).bind(c.flows).bind(rate).bind(conf)
+        .bind(c.pkts).bind(c.pkts_available).bind(c.bytes).bind(c.bytes_available)
+        .bind(c.flows).bind(rate).bind(conf)
         .execute(&mut *tx).await?;
     }
 
@@ -975,14 +1015,15 @@ async fn write_bucket(
         let iface_id = resolve_interface_id(&mut tx, iface_cache, device_id, *if_index).await?;
         sqlx::query(
             "INSERT INTO flow_talker_buckets \
-                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, src_addr, dst_addr, src_port, dst_port, protocol, pkts, bytes, effective_sampling_rate, sampling_confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), bytes = VALUES(bytes), \
+                (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, src_addr, dst_addr, src_port, dst_port, protocol, pkts, pkts_available, bytes, bytes_available, effective_sampling_rate, sampling_confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE pkts = VALUES(pkts), pkts_available = VALUES(pkts_available), \
+                bytes = VALUES(bytes), bytes_available = VALUES(bytes_available), \
                 effective_sampling_rate = VALUES(effective_sampling_rate), sampling_confidence = VALUES(sampling_confidence)",
         )
         .bind(exporter_id).bind(device_id).bind(iface_id).bind(*if_index).bind(dir.as_str())
         .bind(bucket_ts).bind(src.to_string()).bind(dst.to_string()).bind(*sport).bind(*dport).bind(*proto)
-        .bind(c.pkts).bind(c.bytes).bind(rate).bind(conf)
+        .bind(c.pkts).bind(c.pkts_available).bind(c.bytes).bind(c.bytes_available).bind(rate).bind(conf)
         .execute(&mut *tx).await?;
     }
 
@@ -1011,7 +1052,7 @@ async fn cross_calibrate(
         .iter()
         .filter(|((_, d), _)| *d == Direction::Ingress)
         .max_by_key(|(_, c)| c.bytes)?;
-    if c.bytes == 0 {
+    if !c.bytes_available || c.bytes == 0 {
         return None;
     }
     let iface_id: Option<u64> =
@@ -1062,8 +1103,8 @@ async fn cross_calibrate(
 #[cfg(test)]
 mod tests {
     use super::{
-        wire_observation_domain, Accum, Exporter, FlowRecord, Protocol, MAX_OPEN_BUCKETS,
-        MAX_TALKER_KEYS,
+        wire_observation_domain, Accum, Direction, Exporter, FlowRecord, Protocol,
+        MAX_OPEN_BUCKETS, MAX_TALKER_KEYS,
     };
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1079,8 +1120,8 @@ mod tests {
             src_as: None,
             dst_as: None,
             direction: None,
-            bytes: 100,
-            pkts: 1,
+            bytes: Some(100),
+            pkts: Some(1),
         }
     }
 
@@ -1099,6 +1140,20 @@ mod tests {
             "expected >=1000 dropped, got {}",
             acc.talker_dropped
         );
+    }
+
+    #[test]
+    fn missing_counter_is_not_converted_to_measured_zero() {
+        let mut acc = Accum::default();
+        let mut missing = rec(1);
+        missing.pkts = None;
+        missing.bytes = Some(0); // an explicit, measured zero remains available.
+        acc.fold(&missing);
+        let counts = acc.iface.get(&(1, Direction::Ingress)).unwrap();
+        assert!(!counts.pkts_available);
+        assert!(counts.bytes_available);
+        assert_eq!(counts.pkts, 0);
+        assert_eq!(counts.bytes, 0);
     }
 
     #[test]

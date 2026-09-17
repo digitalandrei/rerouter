@@ -24,6 +24,12 @@ const HEADER_LEN: usize = 20;
 const FIRST_DATA_FLOWSET_ID: u16 = 256;
 const TEMPLATE_FLOWSET_ID: u16 = 0;
 const OPTIONS_TEMPLATE_FLOWSET_ID: u16 = 1;
+/// Exporters refresh templates periodically. Refuse a layout that has not been
+/// refreshed for thirty minutes rather than decoding new data through stale state.
+const TEMPLATE_TTL_SECONDS: u32 = 30 * 60;
+/// Small uptime regressions are ordinary UDP reordering. A larger regression,
+/// with non-decreasing wall time, proves a new exporter generation.
+const REORDER_UPTIME_TOLERANCE_MS: u32 = 60_000;
 
 // NetFlow v9 field type ids we understand. Unknown ids are skipped (their bytes
 // advanced) so an unfamiliar template still decodes its known fields.
@@ -55,6 +61,12 @@ pub enum FlowError {
     UnsupportedVersion(u16),
     #[error("flowset length {0} is too small to be valid")]
     BadFlowsetLength(u16),
+    #[error("flowset length {declared} exceeds remaining datagram bytes {available}")]
+    TruncatedFlowset { declared: usize, available: usize },
+    #[error("flowset length {0} is not 4-byte aligned")]
+    UnalignedFlowset(u16),
+    #[error("non-zero trailing NetFlow padding ({0} bytes)")]
+    BadPadding(usize),
     #[error("template {0} declares zero fields")]
     EmptyTemplate(u16),
     #[error("template {0} has a zero-length record")]
@@ -83,8 +95,17 @@ const MAX_TEMPLATES: usize = 1024;
 
 #[derive(Debug, Default)]
 pub struct TemplateCache {
-    templates: HashMap<(u32, u16), (Template, u64)>, // value + last-write tick (LRU)
+    // value + last-write tick (LRU) + exporter wall time when refreshed.
+    templates: HashMap<(u32, u16), (Template, u64, u32)>,
+    exporters: HashMap<u32, ExporterClock>,
     tick: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExporterClock {
+    sys_uptime: u32,
+    unix_secs: u32,
+    sequence: u32,
 }
 
 impl TemplateCache {
@@ -98,9 +119,11 @@ impl TemplateCache {
         self.templates.is_empty()
     }
     fn get(&self, source_id: u32, template_id: u16) -> Option<&Template> {
+        let now = self.exporters.get(&source_id)?.unix_secs;
         self.templates
             .get(&(source_id, template_id))
-            .map(|(t, _)| t)
+            .filter(|(_, _, refreshed)| now.saturating_sub(*refreshed) <= TEMPLATE_TTL_SECONDS)
+            .map(|(t, _, _)| t)
     }
     fn insert(&mut self, source_id: u32, template_id: u16, t: Template) {
         self.tick = self.tick.wrapping_add(1);
@@ -112,14 +135,72 @@ impl TemplateCache {
             if let Some(victim) = self
                 .templates
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(k, _)| *k)
             {
                 self.templates.remove(&victim);
             }
         }
         let tick = self.tick;
-        self.templates.insert(key, (t, tick));
+        let refreshed = self
+            .exporters
+            .get(&source_id)
+            .map(|c| c.unix_secs)
+            .unwrap_or(0);
+        self.templates.insert(key, (t, tick, refreshed));
+    }
+
+    /// Advance exporter generation. Returns true only for a confirmed restart;
+    /// sequence wrap and small out-of-order datagrams preserve the cache.
+    fn begin_datagram(
+        &mut self,
+        source_id: u32,
+        sys_uptime: u32,
+        unix_secs: u32,
+        sequence: u32,
+    ) -> (bool, bool) {
+        let previous = self.exporters.get(&source_id).copied();
+        let reference_time = previous
+            .map(|clock| clock.unix_secs.max(unix_secs))
+            .unwrap_or(unix_secs);
+        let before = self.templates.len();
+        self.templates.retain(|(sid, _), (_, _, refreshed)| {
+            *sid != source_id || reference_time.saturating_sub(*refreshed) <= TEMPLATE_TTL_SECONDS
+        });
+        let expired = self.templates.len() != before;
+        let wrapped = previous.is_some_and(|p| {
+            p.sys_uptime > u32::MAX - REORDER_UPTIME_TOLERANCE_MS
+                && sys_uptime < REORDER_UPTIME_TOLERANCE_MS
+        });
+        let restarted = previous.is_some_and(|p| {
+            !wrapped
+                && p.sys_uptime.saturating_sub(sys_uptime) > REORDER_UPTIME_TOLERANCE_MS
+                && unix_secs >= p.unix_secs
+        });
+        if restarted {
+            self.templates.retain(|(sid, _), _| *sid != source_id);
+        }
+        let should_advance = restarted
+            || previous.is_none()
+            || previous.is_some_and(|p| {
+                unix_secs > p.unix_secs
+                    || sys_uptime >= p.sys_uptime
+                    || sequence.wrapping_sub(p.sequence) < (u32::MAX / 2)
+            });
+        if should_advance {
+            let stable_time = previous
+                .map(|p| p.unix_secs.max(unix_secs))
+                .unwrap_or(unix_secs);
+            self.exporters.insert(
+                source_id,
+                ExporterClock {
+                    sys_uptime,
+                    unix_secs: stable_time,
+                    sequence,
+                },
+            );
+        }
+        (restarted, expired)
     }
 }
 
@@ -134,6 +215,8 @@ pub struct Decoded {
     pub reported_sampling: Option<u32>,
     pub templates_learned: usize,
     pub data_without_template: usize,
+    pub exporter_restarted: bool,
+    pub sampling_state_expired: bool,
 }
 
 /// Bounds-checked big-endian reader. Every accessor returns `Err(Short)` rather
@@ -197,14 +280,18 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
         return Err(FlowError::UnsupportedVersion(version));
     }
     let _count = r.u16()?; // record count is advisory; we iterate by length.
-    let _sys_uptime = r.u32()?;
-    let _unix_secs = r.u32()?;
+    let sys_uptime = r.u32()?;
+    let unix_secs = r.u32()?;
     let sequence = r.u32()?;
     let source_id = r.u32()?;
+    let (exporter_restarted, sampling_state_expired) =
+        cache.begin_datagram(source_id, sys_uptime, unix_secs, sequence);
 
     let mut out = Decoded {
         source_id,
         sequence,
+        exporter_restarted,
+        sampling_state_expired,
         ..Default::default()
     };
 
@@ -216,9 +303,16 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
         if (flowset_len as usize) < 4 {
             return Err(FlowError::BadFlowsetLength(flowset_len));
         }
-        // Body length excludes the 4-byte header. Clamp to what's left so a lying
-        // length can't read past the datagram.
-        let body_len = (flowset_len as usize - 4).min(r.remaining());
+        if flowset_len % 4 != 0 {
+            return Err(FlowError::UnalignedFlowset(flowset_len));
+        }
+        let body_len = flowset_len as usize - 4;
+        if body_len > r.remaining() {
+            return Err(FlowError::TruncatedFlowset {
+                declared: body_len,
+                available: r.remaining(),
+            });
+        }
         let body = r.take(body_len)?;
 
         match flowset_id {
@@ -234,11 +328,17 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
                         out.reported_sampling = Some(rate);
                     }
                 }
-                Some(t) => parse_data_records(body, t, &mut out.records),
+                Some(t) => parse_data_records(body, t, &mut out.records)?,
                 None => out.data_without_template += 1,
             },
             // ids 2..=255 are reserved; skip the body.
             _ => {}
+        }
+    }
+    if r.remaining() > 0 {
+        let padding = r.take(r.remaining())?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(FlowError::BadPadding(padding.len()));
         }
     }
     Ok(out)
@@ -284,6 +384,7 @@ fn parse_templates(
         );
         learned += 1;
     }
+    validate_padding(r.take(r.remaining())?)?;
     Ok(learned)
 }
 
@@ -330,16 +431,22 @@ fn parse_options_template(
         );
         learned += 1;
     }
+    validate_padding(r.take(r.remaining())?)?;
     Ok(learned)
 }
 
 /// Decode flow data records from a Data FlowSet body against its template,
-/// appending normalized [`FlowRecord`]s. Trailing padding (< record_len) is
-/// ignored. Bounds are guaranteed by slicing exactly `record_len` per record.
-fn parse_data_records(body: &[u8], template: &Template, out: &mut Vec<FlowRecord>) {
+/// appending normalized [`FlowRecord`]s. Trailing padding must be at most three
+/// zero bytes; a partial record is malformed. Bounds are guaranteed by slicing
+/// exactly `record_len` per record.
+fn parse_data_records(
+    body: &[u8],
+    template: &Template,
+    out: &mut Vec<FlowRecord>,
+) -> Result<(), FlowError> {
     let rec = template.record_len;
     if rec == 0 {
-        return;
+        return Ok(());
     }
     let n = body.len() / rec;
     for i in 0..n {
@@ -348,6 +455,23 @@ fn parse_data_records(body: &[u8], template: &Template, out: &mut Vec<FlowRecord
         if let Some(fr) = decode_one_record(record, template) {
             out.push(fr);
         }
+    }
+    let trailing = &body[n * rec..];
+    if trailing.len() > 3 {
+        return Err(FlowError::TruncatedFlowset {
+            declared: rec,
+            available: trailing.len(),
+        });
+    }
+    validate_padding(trailing)?;
+    Ok(())
+}
+
+fn validate_padding(padding: &[u8]) -> Result<(), FlowError> {
+    if padding.iter().any(|byte| *byte != 0) {
+        Err(FlowError::BadPadding(padding.len()))
+    } else {
+        Ok(())
     }
 }
 
@@ -368,10 +492,10 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
     let mut src_as: Option<u32> = None;
     let mut dst_as: Option<u32> = None;
     let mut direction: Option<u8> = None;
-    let mut in_bytes: u64 = 0;
-    let mut out_bytes: u64 = 0;
-    let mut in_pkts: u64 = 0;
-    let mut out_pkts: u64 = 0;
+    let mut in_bytes: Option<u64> = None;
+    let mut out_bytes: Option<u64> = None;
+    let mut in_pkts: Option<u64> = None;
+    let mut out_pkts: Option<u64> = None;
 
     for &(ftype, flen) in &template.fields {
         let flen = flen as usize;
@@ -383,10 +507,10 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
         let f = &record[off..off + flen];
         off += flen;
         match ftype {
-            F_IN_BYTES => in_bytes = be_uint(f),
-            F_OUT_BYTES => out_bytes = be_uint(f),
-            F_IN_PKTS => in_pkts = be_uint(f),
-            F_OUT_PKTS => out_pkts = be_uint(f),
+            F_IN_BYTES => in_bytes = Some(be_uint(f)),
+            F_OUT_BYTES => out_bytes = Some(be_uint(f)),
+            F_IN_PKTS => in_pkts = Some(be_uint(f)),
+            F_OUT_PKTS => out_pkts = Some(be_uint(f)),
             F_PROTOCOL => protocol = be_uint(f) as u8,
             F_L4_SRC_PORT => src_port = Some(be_uint(f) as u16),
             F_L4_DST_PORT => dst_port = Some(be_uint(f) as u16),
@@ -425,9 +549,19 @@ fn decode_one_record(record: &[u8], template: &Template) -> Option<FlowRecord> {
         // (in OR out). Sum so we don't lose the populated side. `saturating_add`
         // because both operands are attacker-controlled u64 wire fields: a raw
         // `+` panics in debug / wraps in release on a crafted maximal counter.
-        bytes: in_bytes.saturating_add(out_bytes),
-        pkts: in_pkts.saturating_add(out_pkts),
+        bytes: sum_present(in_bytes, out_bytes),
+        pkts: sum_present(in_pkts, out_pkts),
     })
+}
+
+/// Cisco commonly exports one of IN_* / OUT_* depending on direction. Preserve
+/// absence when neither field exists, while retaining an explicit measured zero.
+fn sum_present(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 /// Scan an options DATA record for a sampling interval (best-effort). Returns the

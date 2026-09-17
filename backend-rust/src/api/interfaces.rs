@@ -263,6 +263,16 @@ pub async fn set_protected(
     Path(id): Path<u64>,
     Json(body): Json<SetProtected>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),

@@ -1,5 +1,14 @@
 # Reroute Engine
 
+The September 17 execution contract is described in
+[Manual Mitigations and safe action sets](manual-mitigations.md). Named manual
+sets, Rules, and corrective runs now share immutable preparation, consumed
+preview authority, native exclusive locks, exact typed verification, and durable
+mutation ownership. These requirements supersede older descriptions below of
+substring-only verification, unprepared single-action execution, deferred
+apply-time preview sequences, and per-device-only compensation. Uncertainty
+freezes the whole set; no-op actions never own an inverse.
+
 Reroutes are controlled, audited mitigations that move traffic. This is the most
 dangerous part of the system. Everything here exists to make reroutes slow,
 explicit, reversible, and blocked whenever state is uncertain.
@@ -506,7 +515,7 @@ and is refused whole if it does not fit. See
 Lock scopes: the device-CLI engine uses the `device` scope (and `global`). Locks
 can be manual, automatic after crash recovery, or automatic after action
 uncertainty. A
-locked scope blocks all reroutes touching it until cleared (admin ack for
+locked scope blocks all reroutes touching it until cleared (exact reconciliation for
 safety-induced locks).
 
 ## Manual reroutes
@@ -691,17 +700,17 @@ silently drop an action, which would silently shorten a mitigation.
 
 ### Compensation, and where it stops
 
-Under `abort_and_compensate` the already-succeeded siblings are rolled back in
+Under `abort_and_compensate` the siblings that own proven mutations are rolled back in
 reverse order as ordinary `trigger_type = rollback` actions: each one is a fresh
 audited, verified reroute, exempt from cooldown and rate throttles like any
 corrective rollback, and still subject to mode, maintenance, and device locks.
 
-**Compensation does not cross a device lock.** A sibling that ends `uncertain`
-locks its device pending admin acknowledgement, and rolling it back through that
-lock is exactly what doctrine forbids. The bundle then finishes
+**Uncertainty freezes the entire set.** A sibling that ends `uncertain`
+retains ownership and prevents all further apply or compensation commands,
+including commands on another device. The bundle then finishes
 `compensation_blocked`: a **critical** `reroute_bundle_partial` alert plus an
-audit row name the exact reroutes that are **still applied**, and an admin
-resolves them by hand (see [operations-runbook.md](operations-runbook.md)). A
+audit row name known-applied and ambiguous reroutes. An authorized operator
+reconciles recorded state and previews recovery (see [operations-runbook.md](operations-runbook.md)). A
 sibling whose template has no rollback, or whose rollback itself fails, ends the
 same way. Reporting a half-applied mitigation loudly beats forcing config onto a
 device whose state could not be read; it is never silently retried.

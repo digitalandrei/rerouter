@@ -152,6 +152,16 @@ pub async fn update(
     ConnectInfo(socket): ConnectInfo<SocketAddr>,
     Json(body): Json<Value>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     let pool = &state.pool;
 
     // Admin only — this is the safety boundary for the operating mode.

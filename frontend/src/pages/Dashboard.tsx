@@ -273,7 +273,7 @@ export default function Dashboard() {
       {applyRule && (
         <ApplyMitigationDialog
           rule={applyRule}
-          operatingMode={settings?.operating_mode ?? "observe"}
+          operatingMode={settings?.operating_mode ?? "unknown"}
           onClose={() => setApplyRule(null)}
           onApplied={() => {
             setApplyRule(null);

@@ -62,6 +62,7 @@ topology): [docs/deployment.md](docs/deployment.md).
 - [docs/database.md](docs/database.md) — MariaDB schema.
 - [docs/detection-engine.md](docs/detection-engine.md) — attack-detection rules.
 - [docs/reroute-engine.md](docs/reroute-engine.md) — reroute templates & execution.
+- [docs/manual-mitigations.md](docs/manual-mitigations.md) — named action sets, shared Rules execution, preview authorization and recovery.
 - [docs/email-alerts.md](docs/email-alerts.md) — alert channel and triggers.
 - [docs/operations-runbook.md](docs/operations-runbook.md) — day-2 operations.
 
@@ -75,17 +76,18 @@ flip the operating mode to `enforce` (audited) before Rerouter ever acts.
 
 Beyond that, automatic reroutes are **disabled by default** even in enforce
 mode. Every reroute must be defined as an action template and is allowlisted,
-rate-limited, cooled down, audited, and verified with a separate read-only SSH
-session. Enforce-mode manual actions, rule applies, and rollbacks require a short-lived,
+rate-limited, cooled down, audited, and verified while native router configuration
+locks remain held across the complete set. Enforce-mode manual actions, rule applies, and rollbacks require a short-lived,
 single-use token bound to the exact server-rendered preview. Fresh device
 inventory bounds every new target; interface shutdown and route-map changes are
 manual-only. Any action left unresolved by a crash is marked `uncertain` and
-locks the affected device until an admin acknowledges it.
+locks the affected device until evidence-bound reconciliation resolves it.
 
 ## Status
 
 Inventory, telemetry, detection, the authenticated UI, alert delivery, manual
 and gated automatic execution, rollback, and crash recovery are implemented.
 The shipped database default remains `observe`; production arming is always an
-explicit, step-up-authenticated operator decision. See the latest
-[re-audit](docs/audit-2026-07-10.md) for verified safeguards and residual risks.
+explicit, step-up-authenticated operator decision. See the current
+[implementation and readiness report](plans/018-production-safe-mitigations.md)
+for verified safeguards and remaining platform-certification requirements.

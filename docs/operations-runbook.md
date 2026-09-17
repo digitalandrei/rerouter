@@ -16,6 +16,13 @@ Everything the controller needs lives in `/srv/rerouter/`:
 - `/etc/systemd/system/rerouter-controller.service` — the unit (owned by the
   installer; overwritten on `--install`).
 
+Installer-managed ownership is `root:rerouter` mode `0750` for
+`/srv/rerouter`, `root:root` mode `0755` for the controller binary,
+`root:rerouter` mode `0640` for a newly created `config.toml`, and
+`rerouter:rerouter` mode `0600` for a newly created `.env`. Reinstall preserves
+an existing operator-managed `.env` or `config.toml`, including its ownership
+and mode.
+
 ## Services
 
 ```bash
@@ -51,8 +58,31 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
 - `--create-admin` — create/rotate a superadmin (`ADMIN_EMAIL`/`ADMIN_NAME`/
   `ADMIN_PASSWORD` via flags or interactive prompt; idempotent on email). It
   prints the separate one-time code required for first-login 2FA enrollment.
-- `--install` — re-run to upgrade the binary and systemd unit; never touches
-  an existing `.env`/`config.toml`.
+
+Run `--install` as root, as shown below, to replace the binary and unit. It
+preserves an existing `.env`/`config.toml` and does not restart the controller.
+
+## Controller upgrade
+
+An atomic binary replacement does not change the executable already mapped by
+the running process. Always restart and prove both readiness and running-binary
+identity:
+
+```bash
+sudo /tmp/rerouter-controller --install
+sudo systemctl restart rerouter-controller
+sudo systemctl is-active --quiet rerouter-controller
+curl -fsS http://127.0.0.1:9277/api/health
+curl -fsS http://127.0.0.1:9277/api/ready
+PID=$(systemctl show --property MainPID --value rerouter-controller)
+sudo cmp --silent "/proc/$PID/exe" /srv/rerouter/rerouter-controller
+journalctl -u rerouter-controller --since '-5 minutes' --no-pager
+```
+
+Do not treat the copied file as the running version. If `cmp` differs or
+`/proc/$PID/exe` resolves to a deleted inode, the old process is still serving.
+Readiness must be healthy after startup migrations before the upgrade is
+accepted.
 
 ## Global safety switches
 
@@ -79,6 +109,19 @@ sudo -u rerouter /srv/rerouter/rerouter-controller \
 Use the authenticated Settings UI for lock changes; API calls require a signed,
 fully authenticated session and `manage_locks`.
 
+### Router platform gate for enforce mode
+
+Every router used by an enforced action must be certified for the native IOS
+exclusive-lock sequence (`show configuration lock` → `configure terminal lock`
+→ locked reads/write/readback/soft clear → `end`). The controller refuses an
+unsupported, busy, or denied lock; never work around that refusal by loosening
+the router account or using an unlocked CLI session. Real IOS/IOS-XE platform
+certification is still outstanding, so production remains in `observe` until
+the exact hardware/image/account combination passes the staging matrix in
+[deployment.md](deployment.md#ios-exclusive-write-platform-certification),
+including the 25-second command, 30-second BGP convergence, and 12-minute whole
+lock-window bounds.
+
 ## Common incidents
 
 ### An attack is detected but no reroute happened
@@ -88,24 +131,24 @@ shows what *would* have run), automatic reroutes are off, the rule's
 `automatic_reroute_enabled` is false, a cooldown is active, or a safety gate
 failed. Check the rule event, the device's locks/cooldowns, and the controller log
 line for the abort reason. In enforce mode, trigger a **manual** reroute from
-`/mitigations/manual` if appropriate.
+`/manual-mitigations` if appropriate.
 
 ### A reroute is stuck `uncertain`
 
 The controller could not prove the outcome (often after a crash). The device is
-locked and automatic reroutes are disabled for it. Verify the real routing state
-on the router (e.g. `show ip route <prefix>` for a Null0, or the neighbor's
-session state), then **acknowledge** from the authenticated UI.
-
-Only acknowledge after you have confirmed the real routing state.
+locked and the whole set is frozen. Use **Reconcile** in the authenticated UI
+to compare the router with the action's persisted before/after state. This is a
+read-only operation requiring `acknowledge_uncertain_reroute`, also granted to
+the seeded operator role. A note alone cannot clear the lock. Conflicting or
+incomplete evidence leaves quarantine intact; missing legacy snapshots require
+investigation outside automatic recovery.
 
 ### A mitigation bundle ended `compensation_blocked`
 
-**The listed actions are STILL APPLIED on the routers.** The bundle stopped at a
-failed action and tried to roll back the siblings that had already succeeded, but
-one of them could not be reversed — usually because that sibling ended
-`uncertain`, which locks its device, and the controller will not push through a
-safety lock.
+**Known-applied actions and ambiguous actions require recovery.** Any uncertain
+sibling stops all further writes across the set, including compensation on
+other routers. A proven failure may permit compensation; if an inverse becomes
+uncertain, that also freezes the entire set. Ownership remains held.
 
 What you see: a critical `reroute_bundle_partial` alert and an audit row naming
 the bundle and the reroute ids still in force, the bundle in state
@@ -120,8 +163,8 @@ Resolve in this order:
 2. On each affected router, confirm the REAL state of each listed action
    (e.g. show ip route <prefix> for a Null0, show ip bgp neighbors <ip>,
    show running-config | include <network>). Do not trust the UI here.
-3. Acknowledge the uncertain reroute from the UI — only after step 2 — which
-   clears its device lock.
+3. Reconcile each uncertain reroute from the UI. Only exact recorded state
+   resolves uncertainty; conflicting evidence retains quarantine.
 4. Roll back each still-applied reroute individually from /mitigations
    (POST /api/reroutes/{id}/rollback), in reverse order of bundle_position:
    undo the most recent change first.
@@ -150,9 +193,9 @@ mitigation the all-or-nothing admission prevents.
 
 ### A mitigation needs to be lifted
 
-Run the template's **rollback** (`null_route_withdraw`, `blackhole_withdraw`, or
-`bgp_session_disable`) from `/mitigations`. Rollbacks are themselves audited and
-verified. In enforce mode the UI first obtains a server-rendered rollback plan,
+Run the original action's **rollback** from `/mitigations`. Recovery uses the
+persisted inverse of its owned change, including exact pre-existing values.
+Rollbacks are themselves audited and verified. In enforce mode the UI first obtains a server-rendered rollback plan,
 then consumes its five-minute one-time preview token. There is no auto-expiry: a
 mitigation stays in effect until you explicitly run its rollback.
 
@@ -164,10 +207,14 @@ design). Check device reachability and the SNMP community with `POST
 
 ### Email alerts not arriving
 
-Check `alert_deliveries` for `failed`/`bounced`, the controller's alert-dispatcher
-log lines (`journalctl -u rerouter-controller`), and the `SMTP_*` values in
+Check `alert_delivery_intents` first: each alert/channel/target has durable
+`pending`, `retry`, or `settled` work with its next-attempt time and last error.
+Use `alert_deliveries` for the append-only attempt history (`failed`/`bounced` /
+`sent`), then inspect the controller's alert-dispatcher log
+(`journalctl -u rerouter-controller`) and `SMTP_*` values in
 `/srv/rerouter/.env`. Rate-limited deliveries retry after backoff; transport
-failures retry up to five times and then raise a permanent-delivery meta-alert.
+failures retry up to five times and then settle with a permanent-delivery
+meta-alert. Unresolved intents prevent retention from deleting the source alert.
 Uncertain/failed reroutes, arming changes, degradation, and security events bypass
 deduplication and rate limits.
 

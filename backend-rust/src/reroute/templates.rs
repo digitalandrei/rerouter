@@ -43,7 +43,7 @@ pub const SNMP_INVENTORY_MAX_AGE_HOURS: i64 = 24;
 pub const DEFERRED_SEQUENCE: &str = "<auto-seq>";
 
 /// A full reroute template loaded from the DB.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Template {
     pub id: u64,
     pub name: String,
@@ -372,7 +372,7 @@ pub async fn prefix_target_is_contained(
 }
 
 /// The concrete, ready-to-run plan for a device_cli template + parameters.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RenderedPlan {
     pub template_id: u64,
     pub template_name: String,
@@ -394,7 +394,7 @@ pub struct RenderedPlan {
 pub const SEQUENCE_PARAM: &str = "sequence";
 
 /// A post-action verification read (a `show` command + substring expectations).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VerifyStep {
     pub command: String,
     /// Substring that MUST appear in the output for success.

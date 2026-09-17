@@ -37,14 +37,31 @@ impl PacketBuilder {
 
 /// Build a v9 header. `count` is advisory (the decoder iterates by length).
 fn header(source_id: u32, sequence: u32) -> PacketBuilder {
+    header_at(source_id, sequence, 123_456, 1_700_000_000)
+}
+
+fn header_at(source_id: u32, sequence: u32, uptime: u32, unix_secs: u32) -> PacketBuilder {
     let mut p = PacketBuilder::default();
     p.u16(9) // version
         .u16(1) // count (advisory)
-        .u32(123_456) // sys_uptime
-        .u32(1_700_000_000) // unix_secs
+        .u32(uptime)
+        .u32(unix_secs)
         .u32(sequence)
         .u32(source_id);
     p
+}
+
+fn template_flowset(template_id: u16, fields: &[(u16, u16)]) -> Vec<u8> {
+    let mut inner = PacketBuilder::default();
+    inner.u16(template_id).u16(fields.len() as u16);
+    for &(kind, len) in fields {
+        inner.u16(kind).u16(len);
+    }
+    let mut fs = PacketBuilder::default();
+    fs.u16(0)
+        .u16((4 + inner.body.len()) as u16)
+        .bytes(&inner.body);
+    fs.body
 }
 
 /// The 8-field flow template used across tests. record_len = 25.
@@ -81,6 +98,9 @@ fn flow_data_flowset(template_id: u16) -> Vec<u8> {
         .u32(7) // input snmp ifIndex
         .u32(1000) // pkts
         .u32(64000); // bytes
+    while rec.body.len() % 4 != 0 {
+        rec.u8(0);
+    }
     let len = 4 + rec.body.len() as u16;
     let mut fs = PacketBuilder::default();
     fs.u16(template_id).u16(len).bytes(&rec.body);
@@ -109,8 +129,8 @@ fn template_then_data_decodes_one_flow() {
     assert_eq!(r.dst_port, Some(53));
     assert_eq!(r.protocol, 17);
     assert_eq!(r.in_if_index, Some(7));
-    assert_eq!(r.pkts, 1000);
-    assert_eq!(r.bytes, 64000);
+    assert_eq!(r.pkts, Some(1000));
+    assert_eq!(r.bytes, Some(64000));
     assert!(r.has_ports());
     // No DIRECTION field -> ingress on INPUT_SNMP.
     assert_eq!(r.attribution().1, Some(7));
@@ -160,6 +180,9 @@ fn multiple_records_in_one_data_set() {
         rec.body
     };
     data.bytes(&one).bytes(&one);
+    while data.body.len() % 4 != 0 {
+        data.u8(0);
+    }
     let len = 4 + data.body.len() as u16;
     let mut fs = PacketBuilder::default();
     fs.u16(256).u16(len).bytes(&data.body);
@@ -185,6 +208,9 @@ fn options_template_reports_sampling_interval() {
         .u16(4) // scope len
         .u16(34) // option field: SAMPLING_INTERVAL
         .u16(4); // option len
+    while inner.body.len() % 4 != 0 {
+        inner.u8(0);
+    }
     let len = 4 + inner.body.len() as u16;
     let mut opt_tmpl = PacketBuilder::default();
     opt_tmpl.u16(1).u16(len).bytes(&inner.body); // flowset id 1 = options template
@@ -253,6 +279,106 @@ fn malformed_input_never_panics() {
         }
         let _ = decode(&buf, &mut cache); // must not panic
     }
+}
+
+#[test]
+fn missing_packet_counter_remains_unavailable_but_measured_zero_is_present() {
+    let fields = &[(8, 4), (12, 4), (10, 4), (1, 4)];
+    let mut record = PacketBuilder::default();
+    record
+        .bytes(&[192, 0, 2, 1])
+        .bytes(&[198, 51, 100, 2])
+        .u32(7)
+        .u32(0);
+    let mut data = PacketBuilder::default();
+    data.u16(300)
+        .u16((4 + record.body.len()) as u16)
+        .bytes(&record.body);
+    let mut packet = header(42, 1);
+    packet
+        .bytes(&template_flowset(300, fields))
+        .bytes(&data.body);
+    let mut cache = TemplateCache::new();
+    let decoded = decode(&packet.body, &mut cache).expect("decode");
+    assert_eq!(decoded.records[0].bytes, Some(0));
+    assert_eq!(decoded.records[0].pkts, None);
+}
+
+#[test]
+fn exporter_restart_invalidates_old_template_generation() {
+    let mut cache = TemplateCache::new();
+    let mut learned = header_at(42, 100, 500_000, 1_700_000_000);
+    learned.bytes(&flow_template_flowset(256));
+    decode(&learned.body, &mut cache).expect("learn");
+
+    let mut after_restart = header_at(42, 1, 2_000, 1_700_000_010);
+    after_restart.bytes(&flow_data_flowset(256));
+    let decoded = decode(&after_restart.body, &mut cache).expect("restart datagram");
+    assert!(decoded.exporter_restarted);
+    assert_eq!(decoded.records.len(), 0);
+    assert_eq!(decoded.data_without_template, 1);
+}
+
+#[test]
+fn reorder_and_uptime_wrap_preserve_current_templates() {
+    let mut cache = TemplateCache::new();
+    let mut learned = header_at(7, u32::MAX - 5, u32::MAX - 30_000, 1_700_000_000);
+    learned.bytes(&flow_template_flowset(256));
+    decode(&learned.body, &mut cache).expect("learn");
+
+    let mut wrapped = header_at(7, 2, 10_000, 1_700_000_010);
+    wrapped.bytes(&flow_data_flowset(256));
+    let decoded = decode(&wrapped.body, &mut cache).expect("wrap");
+    assert!(!decoded.exporter_restarted);
+    assert_eq!(decoded.records.len(), 1);
+
+    let mut reordered = header_at(7, 1, 9_500, 1_700_000_009);
+    reordered.bytes(&flow_data_flowset(256));
+    assert_eq!(
+        decode(&reordered.body, &mut cache)
+            .expect("reorder")
+            .records
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn stale_template_expires_without_refresh() {
+    let mut cache = TemplateCache::new();
+    let mut learned = header_at(5, 1, 100_000, 1_700_000_000);
+    learned.bytes(&flow_template_flowset(256));
+    decode(&learned.body, &mut cache).expect("learn");
+    let mut stale = header_at(5, 2, 2_000_000, 1_700_001_801);
+    stale.bytes(&flow_data_flowset(256));
+    let decoded = decode(&stale.body, &mut cache).expect("decode stale");
+    assert_eq!(decoded.records.len(), 0);
+    assert_eq!(decoded.data_without_template, 1);
+}
+
+#[test]
+fn invalid_flowset_framing_is_rejected() {
+    let mut cache = TemplateCache::new();
+    let mut truncated = header(1, 1);
+    truncated.u16(256).u16(100);
+    assert!(matches!(
+        decode(&truncated.body, &mut cache),
+        Err(FlowError::TruncatedFlowset { .. })
+    ));
+
+    let mut unaligned = header(1, 2);
+    unaligned.u16(256).u16(5).u8(0);
+    assert_eq!(
+        decode(&unaligned.body, &mut cache),
+        Err(FlowError::UnalignedFlowset(5))
+    );
+
+    let mut bad_padding = header(1, 3);
+    bad_padding.bytes(&[1, 2]);
+    assert_eq!(
+        decode(&bad_padding.body, &mut cache),
+        Err(FlowError::BadPadding(2))
+    );
 }
 
 #[test]

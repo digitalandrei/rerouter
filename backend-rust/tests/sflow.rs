@@ -159,8 +159,8 @@ fn ethernet_ipv4_udp_flow_sample_decodes_one_record() {
     assert_eq!(r.protocol, 17);
     assert_eq!(r.in_if_index, Some(7));
     assert_eq!(r.out_if_index, Some(9));
-    assert_eq!(r.bytes, 1500);
-    assert_eq!(r.pkts, 1);
+    assert_eq!(r.bytes, Some(1500));
+    assert_eq!(r.pkts, Some(1));
     assert!(r.has_ports());
     // No DIRECTION field -> ingress on the input ifIndex.
     assert_eq!(r.attribution().1, Some(7));
@@ -215,7 +215,7 @@ fn expanded_flow_sample_decodes() {
     let r = &d.records[0];
     assert_eq!(r.in_if_index, Some(11));
     assert_eq!(r.out_if_index, Some(12));
-    assert_eq!(r.bytes, 64);
+    assert_eq!(r.bytes, Some(64));
     assert_eq!(d.reported_sampling, Some(4096));
 }
 
@@ -281,6 +281,48 @@ fn truncated_l4_yields_record_without_ports() {
     assert_eq!(r.protocol, 17);
     assert_eq!(r.src_port, None);
     assert_eq!(r.dst_port, None);
+}
+
+#[test]
+fn non_initial_ipv4_fragment_never_fabricates_transport_ports() {
+    let mut l3 = ipv4_udp([5, 6, 7, 8], [9, 10, 11, 12], 40000, 53);
+    l3[6..8].copy_from_slice(&1u16.to_be_bytes()); // fragment offset = 1
+    let rec = raw_header_record(11, 60, &l3);
+    let sample = flow_sample(1, 1, 1, 1, &rec);
+    let decoded = decode(&datagram(1, 1, 1, &sample)).expect("fragment decodes");
+    let record = &decoded.records[0];
+    assert_eq!(record.src_port, None);
+    assert_eq!(record.dst_port, None);
+    assert_eq!(record.protocol, 17);
+}
+
+#[test]
+fn malformed_xdr_lengths_padding_and_counts_are_rejected() {
+    let oversized = datagram(1, 1, 1, &{
+        let mut sample = u32b(2);
+        sample.extend(u32b(100));
+        sample
+    });
+    assert!(matches!(decode(&oversized), Err(SflowError::Short { .. })));
+
+    let mut bad_padding = u32b(2);
+    bad_padding.extend(u32b(1));
+    bad_padding.push(0);
+    bad_padding.extend([1, 0, 0]);
+    assert_eq!(
+        decode(&datagram(1, 1, 1, &bad_padding)),
+        Err(SflowError::BadPadding)
+    );
+
+    let one = {
+        let mut sample = u32b(2);
+        sample.extend(opaque(&[]));
+        sample
+    };
+    assert!(matches!(
+        decode(&datagram(1, 1, 2, &one)),
+        Err(SflowError::Short { .. })
+    ));
 }
 
 #[test]

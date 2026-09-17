@@ -358,12 +358,16 @@ pub async fn update_user_safely(
     actor: &crate::auth::sessions::Session,
 ) -> anyhow::Result<Option<bool>> {
     let mut conn = pool.acquire().await?;
-    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK('rrt_superadmin_guard', 5)")
+    let lock_name =
+        crate::db::scoped_advisory_lock_name(&mut conn, "users:superadmin-guard").await?;
+    conn.close_on_drop();
+    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
+        .bind(&lock_name)
         .fetch_one(&mut *conn)
         .await?;
     anyhow::ensure!(got == Some(1), "superadmin guard busy");
     let result = update_user_locked(&mut conn, user_id, name, role, actor).await;
-    release_superadmin_guard(&mut conn).await;
+    release_superadmin_guard(&mut conn, &lock_name).await;
     result
 }
 
@@ -437,8 +441,9 @@ async fn update_user_locked(
 
 /// Release the advisory lock, logging (never propagating) a failure so the
 /// caller's result is preserved.
-async fn release_superadmin_guard(conn: &mut sqlx::MySqlConnection) {
-    if let Err(e) = sqlx::query("SELECT RELEASE_LOCK('rrt_superadmin_guard')")
+async fn release_superadmin_guard(conn: &mut sqlx::MySqlConnection, lock_name: &str) {
+    if let Err(e) = sqlx::query("SELECT RELEASE_LOCK(?)")
+        .bind(lock_name)
         .execute(conn)
         .await
     {
@@ -455,12 +460,16 @@ pub async fn delete_user_safely(
     actor: &crate::auth::sessions::Session,
 ) -> anyhow::Result<Option<bool>> {
     let mut conn = pool.acquire().await?;
-    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK('rrt_superadmin_guard', 5)")
+    let lock_name =
+        crate::db::scoped_advisory_lock_name(&mut conn, "users:superadmin-guard").await?;
+    conn.close_on_drop();
+    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
+        .bind(&lock_name)
         .fetch_one(&mut *conn)
         .await?;
     anyhow::ensure!(got == Some(1), "superadmin guard busy");
     let result = delete_user_locked(&mut conn, user_id, actor).await;
-    release_superadmin_guard(&mut conn).await;
+    release_superadmin_guard(&mut conn, &lock_name).await;
     result
 }
 

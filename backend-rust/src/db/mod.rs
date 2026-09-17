@@ -3,17 +3,34 @@
 //! --migrate) is the single source of schema truth. Reference documentation
 //! lives in ../docs/database.md.
 
+use std::ops::Deref;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::migrate::Migrator;
-use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{Executor, MySqlPool};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+use sqlx::{Executor, MySqlConnection, MySqlPool};
 
 use crate::config::Config;
 
 /// Compile-time embedded migrations from backend-rust/migrations/.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// MySQL advisory-lock names are server-global, not schema-local. Resolve every
+/// logical lock label through the selected database name so colocated Rerouter
+/// installations and their dedicated test schemas never contend. The `rrt:`
+/// prefix plus 60 SHA-256 hex characters is exactly MySQL's 64-byte limit.
+pub async fn scoped_advisory_lock_name(
+    conn: &mut MySqlConnection,
+    logical_label: &str,
+) -> Result<String> {
+    sqlx::query_scalar("SELECT CONCAT('rrt:', LEFT(SHA2(CONCAT(DATABASE(), ':', ?), 256), 60))")
+        .bind(logical_label)
+        .fetch_one(conn)
+        .await
+        .context("deriving database-scoped advisory lock name")
+}
 
 /// Credential preflight budget — fail fast with a clear message instead of
 /// hanging on an unreachable or misconfigured MariaDB.
@@ -101,16 +118,17 @@ pub async fn migrate(pool: &MySqlPool) -> Result<()> {
 /// Unit tests share one disposable schema and run concurrently. Serialize its
 /// first migration pass because MySQL DDL and SQLx's migration-row insert are
 /// not atomic together on a brand-new database.
-#[cfg(test)]
+#[doc(hidden)]
 pub async fn migrate_test_schema(pool: &MySqlPool) -> Result<()> {
-    let database: String = sqlx::query_scalar("SELECT DATABASE()")
-        .fetch_one(pool)
+    let mut lock_conn = pool
+        .acquire()
         .await
-        .context("reading test database name")?;
-    let lock_name = format!("rerouter-test-migrate:{database}");
+        .context("acquiring migration lock connection")?;
+    let lock_name = scoped_advisory_lock_name(&mut lock_conn, "test:migrate").await?;
+    lock_conn.close_on_drop();
     let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 30)")
         .bind(&lock_name)
-        .fetch_one(pool)
+        .fetch_one(&mut *lock_conn)
         .await
         .context("acquiring test migration lock")?;
     if acquired != Some(1) {
@@ -120,13 +138,117 @@ pub async fn migrate_test_schema(pool: &MySqlPool) -> Result<()> {
     let migration_result = MIGRATOR.run(pool).await.context("running test migrations");
     let released: Option<i64> = sqlx::query_scalar("SELECT RELEASE_LOCK(?)")
         .bind(&lock_name)
-        .fetch_one(pool)
+        .fetch_one(&mut *lock_conn)
         .await
         .context("releasing test migration lock")?;
     if released != Some(1) {
         anyhow::bail!("test migration lock was not owned at release");
     }
     migration_result
+}
+
+/// Integration-test pool plus the detached connection that owns the global test
+/// serialization lock. Public only so `tests/` crates and in-module DB tests use
+/// one fail-loud safety boundary.
+#[doc(hidden)]
+pub struct TestDatabase {
+    pool: MySqlPool,
+    _serial_lock: MySqlConnection,
+}
+
+impl Deref for TestDatabase {
+    type Target = MySqlPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl TestDatabase {
+    pub fn pool(&self) -> &MySqlPool {
+        &self.pool
+    }
+}
+
+/// Connect to `REROUTER_TEST_DATABASE_URL`, refusing privileged accounts and
+/// non-test database names. Missing configuration is a test failure, never a
+/// silent skip. Pure tests remain available with `cargo test --lib` filters that
+/// do not invoke DB-backed cases.
+#[doc(hidden)]
+pub async fn connect_test_database() -> TestDatabase {
+    let raw = std::env::var("REROUTER_TEST_DATABASE_URL").expect(
+        "REROUTER_TEST_DATABASE_URL is required for DB integration tests; use filtered pure unit tests when MariaDB coverage is intentionally out of scope",
+    );
+    let options = MySqlConnectOptions::from_str(&raw)
+        .expect("REROUTER_TEST_DATABASE_URL must be a valid mysql:// URL");
+    let database = options
+        .get_database()
+        .expect("REROUTER_TEST_DATABASE_URL must name a database")
+        .to_ascii_lowercase();
+    let username = options.get_username().to_ascii_lowercase();
+    assert!(
+        database == "rerouter_test" || database.starts_with("rerouter_test_"),
+        "refusing DB tests against non-dedicated database {database:?}; expected rerouter_test or rerouter_test_*"
+    );
+    assert!(
+        username != "root" && username.contains("test"),
+        "refusing DB tests as privileged/non-test account {username:?}"
+    );
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(10))
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                conn.execute("SET time_zone = '+00:00'").await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await
+        .expect("connect dedicated test database");
+    let actual_db: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&pool)
+        .await
+        .expect("read connected database name");
+    let actual_user: String = sqlx::query_scalar("SELECT CURRENT_USER()")
+        .fetch_one(&pool)
+        .await
+        .expect("read connected database account");
+    assert_eq!(actual_db.to_ascii_lowercase(), database);
+    assert!(
+        actual_user.split('@').next().is_some_and(|user| {
+            let user = user.to_ascii_lowercase();
+            user.contains("test") && user != "root"
+        }),
+        "server authenticated DB tests as unsafe account {actual_user:?}"
+    );
+
+    let mut pooled = pool
+        .acquire()
+        .await
+        .expect("acquire test-suite lock connection");
+    let lock_name = scoped_advisory_lock_name(&mut pooled, "test:suite")
+        .await
+        .expect("derive test-suite lock name");
+    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 60)")
+        .bind(&lock_name)
+        .fetch_one(&mut *pooled)
+        .await
+        .expect("acquire cross-suite test database lock");
+    assert_eq!(
+        acquired,
+        Some(1),
+        "timed out serializing DB integration tests"
+    );
+    let serial_lock = pooled.detach();
+    migrate_test_schema(&pool)
+        .await
+        .expect("migrate dedicated test schema");
+    TestDatabase {
+        pool,
+        _serial_lock: serial_lock,
+    }
 }
 
 /// Human description of a mysql:// URL with the password REDACTED — safe for

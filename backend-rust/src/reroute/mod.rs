@@ -3,12 +3,14 @@
 //! ../agents/reroute-safety-agent.md.
 
 pub mod bundle;
+pub mod device_plan;
 pub mod executor;
 pub mod flow_target;
 pub mod guard;
 pub mod inventory_audit;
 pub mod locks;
 pub mod prefix_list;
+pub mod preparation;
 pub mod reachability;
 pub mod rollback;
 pub mod state_machine;

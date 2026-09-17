@@ -11,6 +11,8 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 - active detection-rule states and consecutive-match counters;
 - planned / pending / running / verifying reroutes;
 - in-flight mitigation bundles and each sibling's bundle membership + order;
+- immutable prepared plans, mutation effects, exact before/after state and inverses;
+- durable device ownership, including siblings that never started;
 - last step output and verification status per action;
 - active locks and cooldowns (device-scoped);
 - device + interface inventory and discovered BGP peers/prefixes.
@@ -26,22 +28,18 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
 4. If any recovery transaction fails, abort startup. The untouched/rolled-back
    row is retried on the next start; the service never continues with a partial
    recovery trail.
-5. Close any mitigation bundle left `planned` / `running` / `compensating` as
-   `aborted`, with the restart recorded as its `failure_reason`. This runs
-   *after* step 3, so a bundle is never left looking "in progress" while its
-   siblings are already quarantined. A bundle is a record, not a resumable job:
-   the controller does not continue or compensate it after a restart — the
-   quarantined siblings are resolved through the uncertain path below
-   ([reroute-engine.md](reroute-engine.md#ordered-mitigation-bundles)).
+5. Reconstruct each interrupted bundle's original mutation ownership. Mark it
+   `compensation_blocked` if changed or ambiguous originals remain, or `aborted`
+   if none remain. Preserve/reconstruct ownership windows and release unused
+   rate reservations. Persist the result, critical alert and audit together.
+   The controller does not continue or compensate writes after a restart.
 6. Start the supervised alert, telemetry, detection, retention, and API tasks.
    Inventory, baselines, and rule state remain durable in MariaDB; SSH sessions
    are opened on demand rather than reconnected at startup.
-7. (Aspirational — **NOT implemented.**) Automatic SSH re-verification of the
-    routing state on recovery is future work; today the controller does not
-    re-read the device on startup.
-8. The device stays locked and the reroute stays `uncertain` until an **admin
-    acknowledges** it (`POST /api/reroutes/{id}/acknowledge-uncertain`) — there is
-    no automatic clear.
+7. Startup does not re-read routers. Explicit read-only reconciliation compares
+   the current router state with durable action snapshots.
+8. Conflicting or incomplete evidence leaves uncertainty and ownership intact.
+   A recorded acknowledgement note cannot override the evidence.
 ```
 
 Do **not** assume no reroute happened just because the process crashed. A
@@ -55,8 +53,9 @@ For any `uncertain` action:
 - show it prominently in the GUI (dashboard + device detail);
 - disable automatic reroutes for the affected device (it stays locked);
 - send an email/Teams alert according to configured subscriptions;
-- require explicit admin acknowledgement (audited) before automatic actions
-  resume on that device.
+- require explicit, audited reconciliation using
+  `acknowledge_uncertain_reroute` (also granted to the seeded operator role);
+- retain bundle ownership until every original mutation is proved restored.
 
 An SSH apply error is uncertain even when a later text check sees the intended
 configuration. The transport may have failed after only part of the plan,
@@ -66,21 +65,19 @@ failure.
 
 ## Manual verification after recovery
 
-Automatic startup re-verification is not implemented. The operator should use
-the same IOS `show` evidence used during normal execution
-([reroute-engine.md](reroute-engine.md)):
+Use **Reconcile**, `POST /api/reroutes/{id}/reconcile`. The compatibility
+`acknowledge-uncertain` endpoint performs the same evidence-bound operation.
+An exact after-state match records the owned change as `reconciled_after`; an
+exact before-state match records no lasting change as `reconciled_before`.
+Neither matching state causes additional configuration commands. A conflict
+leaves quarantine intact. Legacy rows without sufficient snapshots cannot be
+automatically reconciled or assigned invented rollback evidence.
 
-- `show ip route <prefix>` to confirm the `Null0` route is present (RTBH /
-  blackhole) or absent (after a withdrawal);
-- `show ip bgp neighbors <ip>` to confirm the session is — or is no longer —
-  reported as administratively shut;
-- compare current device traffic against expectation.
-
-After checking the router, the operator records an acknowledgement. The original
-row becomes `failed` with `verification_status = acknowledged`, and only the lock
-linked to that reroute is cleared; unrelated manual/device locks remain. If the
-configuration must be undone, run the server-previewed rollback after the lock is
-cleared. The controller never claims recovered success from an acknowledgement.
+Only the resolved action's correlated uncertainty lock can clear; unrelated
+locks remain. Known-applied siblings retain ownership and require a newly
+previewed inverse. Recovery loads original action IDs, uses recorded parameters,
+and reverses only owned mutations. It never reverses a no-op or treats an inverse
+as a new mitigation to undo. See [Manual Mitigations](manual-mitigations.md).
 
 ## Failure modes
 

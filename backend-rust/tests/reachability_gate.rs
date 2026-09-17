@@ -4,32 +4,17 @@
 //! that avoids re-probing / tripping the device's SSH throttle). The outcome is
 //! classified into ssh_status (reachable / no_privilege / unreachable).
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB the test
-//! may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB the test
+//! may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
-use rerouter_controller::db::MIGRATOR;
 use rerouter_controller::reroute::reachability::{self, STATUS_REACHABLE, STATUS_UNREACHABLE};
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
-
-/// Connect + migrate, or `None` when DATABASE_URL is unset (skip).
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
+mod common;
 
 #[tokio::test]
 async fn unreachable_ssh_blocks_but_recent_contact_passes_without_probing() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping reachability integration test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
 
     // A device with SSH pointed at a closed port and NO recent SSH contact. There
     // is nothing to connect to, so the live liveness probe fails (unreachable).

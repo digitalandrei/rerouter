@@ -24,6 +24,7 @@ import {
   type Reroute,
   type RerouteDetail,
   type RerouteResult,
+  type RerouteBundle,
   type Rule,
   type SystemSettings,
 } from "@/lib/api";
@@ -214,7 +215,7 @@ function DetectionsTab({
       {applyRule && (
         <ApplyMitigationDialog
           rule={applyRule}
-          operatingMode={settings?.operating_mode ?? "observe"}
+          operatingMode={settings?.operating_mode ?? "unknown"}
           onClose={() => setApplyRule(null)}
           onApplied={() => {
             setApplyRule(null);
@@ -500,7 +501,7 @@ function AlertsTab({
       {applyRule && (
         <ApplyMitigationDialog
           rule={applyRule}
-          operatingMode={settings?.operating_mode ?? "observe"}
+          operatingMode={settings?.operating_mode ?? "unknown"}
           onClose={() => setApplyRule(null)}
           onApplied={() => {
             onRulesRefresh();
@@ -525,12 +526,19 @@ function RerouteDrawer({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const { hasPermission } = useAuth();
   const [detail, setDetail] = useState<RerouteDetail | null>(null);
   const [busy, setBusy] = useState(false);
-  const [ackOpen, setAckOpen] = useState(false);
   const [rollbackOpen, setRollbackOpen] = useState(false);
   const [rollbackPreview, setRollbackPreview] = useState<RerouteResult | null>(null);
   const [rollbackToken, setRollbackToken] = useState<string | null>(null);
+  const [rollbackExecuted, setRollbackExecuted] = useState(false);
+  const [rollbackError, setRollbackError] = useState<string | null>(null);
+  const [reconcileOpen, setReconcileOpen] = useState(false);
+  const [reconcileResult, setReconcileResult] = useState<{
+    outcome: "changed" | "not_applied" | "conflict";
+    message: string;
+  } | null>(null);
 
   const load = useCallback(() => {
     api.reroutes.get(id).then(setDetail).catch(() => setDetail(null));
@@ -559,6 +567,8 @@ function RerouteDrawer({
       const response = await api.reroutes.rollback(detail.id, { dry_run: true });
       setRollbackPreview(response.result);
       setRollbackToken(response.preview_token ?? null);
+      setRollbackExecuted(false);
+      setRollbackError(null);
       setRollbackOpen(true);
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "rollback preview failed");
@@ -598,6 +608,22 @@ function RerouteDrawer({
                   <span className="text-muted-foreground">By: </span>
                   {detail.triggered_by ?? "—"}
                 </div>
+                {(detail.source?.preset_name || detail.source_preset_name) && (
+                  <div className="col-span-2">
+                    <span className="text-muted-foreground">Source: </span>
+                    Manual mitigation “{detail.source?.preset_name ?? detail.source_preset_name}”
+                    {(detail.source?.preset_revision ?? detail.source_preset_revision) != null
+                      ? ` · revision ${detail.source?.preset_revision ?? detail.source_preset_revision}`
+                      : ""}
+                  </div>
+                )}
+                {detail.bundle_id != null && (
+                  <div className="col-span-2">
+                    <Link className="font-medium text-primary underline-offset-4 hover:underline" to={`/manual-mitigations?bundle=${detail.bundle_id}`}>
+                      View complete bundle #{detail.bundle_id}
+                    </Link>
+                  </div>
+                )}
                 <div className="col-span-2">
                   <span className="text-muted-foreground">Verification: </span>
                   {detail.verification_status ?? "—"}
@@ -611,6 +637,12 @@ function RerouteDrawer({
                 {detail.failure_reason && (
                   <div className="col-span-2 text-destructive">
                     {detail.failure_reason}
+                  </div>
+                )}
+                {reconcileResult && (
+                  <div className={`col-span-2 rounded-md border p-3 ${reconcileResult.outcome === "conflict" ? "border-destructive bg-destructive/10 text-destructive" : "border-border bg-muted/30"}`} role="status">
+                    <span className="font-medium">Reconciliation: {humanizeToken(reconcileResult.outcome)}.</span>{" "}
+                    {reconcileResult.message}
                   </div>
                 )}
               </div>
@@ -666,15 +698,17 @@ function RerouteDrawer({
                     Cancel
                   </Button>
                 )}
-                {detail.state === "uncertain" && (
-                  <Button
-                    size="sm"
-                    variant="destructive"
-                    disabled={busy}
-                    onClick={() => setAckOpen(true)}
-                  >
-                    Acknowledge uncertain (clears device lock)
-                  </Button>
+                {detail.state === "uncertain" && hasPermission("acknowledge_uncertain_reroute") && (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => setReconcileOpen(true)}
+                    >
+                      Reconcile device state
+                    </Button>
+                  </>
                 )}
                 {(detail.state === "succeeded" ||
                   (detail.state === "failed" && detail.started_at !== null)) && (
@@ -695,16 +729,29 @@ function RerouteDrawer({
 
       {detail && (
         <PromptDialog
-          open={ackOpen}
-          onOpenChange={setAckOpen}
-          title="Acknowledge uncertain mitigation"
-          description="This resolves the action and clears the device lock so reroutes can resume."
-          label="Acknowledgement note (what did you verify on the router?)"
+          open={reconcileOpen}
+          onOpenChange={setReconcileOpen}
+          title="Reconcile uncertain mitigation"
+          description="The controller will read the router and compare it with the action's intended before/after state. This does not push configuration."
+          label="Operator note"
           multiline
-          submitLabel="Acknowledge"
+          submitLabel="Read and reconcile"
           onSubmit={async (note) => {
-            setAckOpen(false);
-            await act(() => api.reroutes.acknowledgeUncertain(detail.id, note));
+            setReconcileOpen(false);
+            setBusy(true);
+            try {
+              const result = await api.reroutes.reconcile(detail.id, note);
+              setReconcileResult({ outcome: result.outcome, message: result.message });
+              load();
+              onChanged();
+            } catch (error) {
+              setReconcileResult({
+                outcome: "conflict",
+                message: error instanceof Error ? error.message : "Reconciliation failed",
+              });
+            } finally {
+              setBusy(false);
+            }
           }}
         />
       )}
@@ -717,6 +764,8 @@ function RerouteDrawer({
             if (!open) {
               setRollbackPreview(null);
               setRollbackToken(null);
+              setRollbackExecuted(false);
+              setRollbackError(null);
             }
           }}
         >
@@ -739,12 +788,37 @@ function RerouteDrawer({
                   </p>
                 )}
               </div>
+            ) : rollbackPreview ? (
+              <div
+                className={`space-y-2 rounded-md border p-3 text-sm ${
+                  rollbackPreview.state === "uncertain" || rollbackPreview.blocked_reason
+                    ? "border-destructive bg-destructive/10"
+                    : "border-border"
+                }`}
+                role="status"
+              >
+                <div className="flex items-center gap-2">
+                  <StateBadge
+                    state={rollbackPreview.state ?? (rollbackPreview.executed ? "succeeded" : "blocked")}
+                  />
+                  {rollbackExecuted && <span className="font-medium">Rollback result</span>}
+                </div>
+                <p className="break-words">
+                  {rollbackPreview.blocked_reason ?? rollbackPreview.message}
+                </p>
+                {rollbackPreview.reroute_id && (
+                  <p className="text-xs text-muted-foreground">
+                    New rollback action #{rollbackPreview.reroute_id}. Its state and evidence are now in history.
+                  </p>
+                )}
+              </div>
             ) : (
-              <p className="text-sm text-destructive">
-                {rollbackPreview?.blocked_reason ??
-                  rollbackPreview?.message ??
-                  "No rollback plan is available."}
-              </p>
+              <p className="text-sm text-destructive">No rollback plan is available.</p>
+            )}
+            {rollbackError && (
+              <div className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">
+                {rollbackError} The one-use approval may be spent. Close this dialog, refresh history, and prepare a new rollback preview before retrying.
+              </div>
             )}
             <DialogFooter>
               <Button
@@ -754,20 +828,34 @@ function RerouteDrawer({
               >
                 Cancel
               </Button>
-              <Button
-                variant="destructive"
-                disabled={busy || !rollbackPreview?.would_run}
-                onClick={() => {
-                  setRollbackOpen(false);
-                  void act(() =>
-                    api.reroutes.rollback(detail.id, {
-                      preview_token: rollbackToken ?? undefined,
-                    }),
-                  );
-                }}
-              >
-                {busy ? "Rolling back…" : "Execute reviewed rollback"}
-              </Button>
+              {!rollbackExecuted && (
+                <Button
+                  variant="destructive"
+                  disabled={busy || !rollbackPreview?.would_run || !rollbackToken}
+                  onClick={() => {
+                    setBusy(true);
+                    void api.reroutes
+                      .rollback(detail.id, { preview_token: rollbackToken ?? undefined })
+                      .then((response) => {
+                        setRollbackPreview(response.result);
+                        setRollbackToken(null);
+                        setRollbackExecuted(true);
+                        load();
+                        onChanged();
+                      })
+                      .catch((e) =>
+                        {
+                          setRollbackToken(null);
+                          setRollbackExecuted(true);
+                          setRollbackError(e instanceof Error ? e.message : "Rollback response was not confirmed.");
+                        },
+                      )
+                      .finally(() => setBusy(false));
+                  }}
+                >
+                  {busy ? "Rolling back…" : "Execute reviewed rollback"}
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -778,6 +866,8 @@ function RerouteDrawer({
 
 function HistoryTab({ initialOpenId }: { initialOpenId?: number | null }) {
   const [reroutes, setReroutes] = useState<Reroute[]>([]);
+  const [bundles, setBundles] = useState<RerouteBundle[]>([]);
+  const [bundleError, setBundleError] = useState<string | null>(null);
   const [locks, setLocks] = useState<Lock[]>([]);
   // ?reroute=<id> deep-links straight to one action (the bundle-progress dialog
   // links here when a sibling is left applied and needs a manual rollback).
@@ -786,6 +876,7 @@ function HistoryTab({ initialOpenId }: { initialOpenId?: number | null }) {
   const load = useCallback(() => {
     api.reroutes.list().then(setReroutes).catch(() => setReroutes([]));
     api.locks.list().then(setLocks).catch(() => setLocks([]));
+    api.bundles.list().then((rows) => { setBundles(rows); setBundleError(null); }).catch((error) => setBundleError(error instanceof Error ? error.message : "Could not load mitigation runs"));
   }, []);
   useEffect(() => {
     load();
@@ -823,6 +914,21 @@ function HistoryTab({ initialOpenId }: { initialOpenId?: number | null }) {
       )}
 
       <Card>
+        <CardHeader><CardTitle className="text-base">Mitigation runs</CardTitle></CardHeader>
+        <CardContent className="px-0 py-2">
+          {bundleError ? (
+            <div className="mx-6 rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">{bundleError}. Run history is unavailable; an empty list would be unsafe to assume.</div>
+          ) : bundles.length === 0 ? (
+            <p className="px-6 py-4 text-sm text-muted-foreground">No mitigation runs yet.</p>
+          ) : (
+            <Table><TableHeader><TableRow className="hover:bg-transparent"><TableHead className="pl-6">Bundle</TableHead><TableHead>Source</TableHead><TableHead>Progress</TableHead><TableHead>State</TableHead><TableHead>When</TableHead><TableHead className="pr-6 text-right">Actions</TableHead></TableRow></TableHeader>
+              <TableBody>{bundles.map((run) => <TableRow key={run.id}><TableCell className="pl-6 font-medium tabular-nums">#{run.id}</TableCell><TableCell className="text-xs">{run.source?.preset_name ?? run.source?.name ?? triggerTypeLabel(run.trigger_type)}</TableCell><TableCell className="text-xs tabular-nums">{run.completed_actions}/{run.total_actions}</TableCell><TableCell><StateBadge state={run.state} /></TableCell><TableCell className="text-xs text-muted-foreground">{run.created_at ? new Date(run.created_at).toLocaleString() : "—"}</TableCell><TableCell className="pr-6 text-right"><Button asChild size="sm" variant="ghost"><Link to={`/manual-mitigations?bundle=${run.id}`}>View run</Link></Button></TableCell></TableRow>)}</TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardContent className="px-0 py-2">
           {reroutes.length === 0 ? (
             <p className="px-6 py-4 text-sm text-muted-foreground">
@@ -850,7 +956,15 @@ function HistoryTab({ initialOpenId }: { initialOpenId?: number | null }) {
                     </TableCell>
                     <TableCell>{r.device_name ?? "—"}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">
-                      {triggerTypeLabel(r.trigger_type)}
+                      <span className="block">{triggerTypeLabel(r.trigger_type)}</span>
+                      {(r.source?.preset_name || r.source_preset_name) && (
+                        <span className="block max-w-44 truncate" title={r.source?.preset_name ?? r.source_preset_name ?? undefined}>
+                          {r.source?.preset_name ?? r.source_preset_name}
+                          {(r.source?.preset_revision ?? r.source_preset_revision) != null
+                            ? ` · r${r.source?.preset_revision ?? r.source_preset_revision}`
+                            : ""}
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell>
                       <StateBadge state={r.state} />
@@ -954,7 +1068,7 @@ export default function Mitigations() {
           )}
         </div>
         <Button asChild variant="outline">
-          <Link to="/mitigations/manual">
+          <Link to="/manual-mitigations">
             <Shuffle className="size-4" />
             New manual mitigation
           </Link>

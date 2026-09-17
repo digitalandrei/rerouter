@@ -9,6 +9,16 @@
 **Primary goal:** detect DDoS / abnormal-traffic conditions on protected prefixes
 and safely trigger automated or manual **reroute** actions to mitigate them.
 
+**Execution contract, 2026-09-17:** [Manual Mitigations and safe action
+sets](manual-mitigations.md) specifies the shared Rules/manual pipeline. Every
+enabled sibling is required; an immutable complete plan and exact typed
+before/after/inverse evidence precede writes. Actor-bound preview authority is
+required for operator execution, including corrective clear and rollback.
+Enforced runs require native exclusive configuration locks, and any ambiguous
+sibling freezes the entire activation. No-op actions own no inverse. These
+requirements supersede older execution details in this document. MariaDB is the
+primary database, with MySQL 8.4 protocol/schema compatibility required.
+
 ---
 
 ## 1. Purpose
@@ -483,8 +493,9 @@ planned -> pending -> running -> verifying -> succeeded
 
 If the process crashes mid-action (any reroute left `planned`/`pending`/`running`/
 `verifying`), the restarted service marks the action `uncertain` and locks the
-**device** until an admin acknowledges. The app prefers doing nothing over doing
-the wrong thing.
+**device** until evidence-bound reconciliation proves its recorded state.
+The existing `acknowledge_uncertain_reroute` permission authorizes this read-only
+operation (including the seeded operator role); a note cannot clear uncertainty.
 
 ---
 
@@ -593,9 +604,9 @@ execution. The shipped default is `observe` mode (read-only / alert-only — see
    global switch (`automatic_actions_enabled`) and the rule's
    `automatic_reroute_enabled` are on (enforce mode only), output capture,
    verification, audit log, device-scoped locks & cooldowns, crash recovery
-   (`uncertain` + device lock + admin ack). The full automatic-execution
+   (`uncertain` + device lock + exact reconciliation). The full automatic-execution
    machinery — global + per-rule enable, safety locks, cooldown, state recovery,
-   uncertain handling, admin ack — is built and active in `enforce` mode; the
+   uncertain handling, reconciliation — is built and active in `enforce` mode; the
    shipped default `observe` mode renders `would_run_actions` and executes
    nothing.
 4. **De-scoped.** The original "more providers" milestone (Cloudflare,

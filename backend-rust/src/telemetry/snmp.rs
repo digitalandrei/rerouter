@@ -670,9 +670,11 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             load_baseline(pool, m.interface_id).await?;
         let rates = interface_rates(&current, previous.as_ref(), m.if_speed_bps);
 
-        let oper_s = oper
-            .get(&m.if_index)
-            .map(|&v| oper_status_str(v).to_string());
+        let oper_raw = oper.get(&m.if_index).copied();
+        let oper_s = oper_raw.map(|v| oper_status_str(v).to_string());
+        // ifOperStatus=unknown(4), an unknown enum, or a missing walk is not
+        // evidence that the link is down.
+        let oper_status_valid = matches!(oper_raw, Some(1 | 2 | 3 | 5 | 6 | 7));
         let admin_s = admin
             .get(&m.if_index)
             .map(|&v| admin_status_str(v).to_string());
@@ -683,25 +685,19 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
         let cur_out_disc = out_disc.get(&m.if_index).copied();
         let opt = optics.get(&m.interface_id);
 
-        // Error rates (errors/sec) from the cumulative counters over the same
-        // interval as the bps/pps rates. No baseline / wrap => 0 (rate_from_counters
-        // returns None). Only meaningful when valid_sample = 1 (detection gates on it).
-        let err_elapsed = previous
-            .as_ref()
-            .map(|p| (current.sampled_at - p.sampled_at).num_milliseconds() as f64 / 1000.0)
-            .unwrap_or(0.0);
-        let in_err_rate = super::rate_from_counters(
-            cur_in_err.unwrap_or(0),
-            prev_in_err.unwrap_or(0),
-            err_elapsed,
-        )
-        .unwrap_or(0.0);
-        let out_err_rate = super::rate_from_counters(
-            cur_out_err.unwrap_or(0),
-            prev_out_err.unwrap_or(0),
-            err_elapsed,
-        )
-        .unwrap_or(0.0);
+        // Metric-specific evidence: a missing error walk is UNKNOWN, never zero.
+        // Each counter keeps its own last-seen timestamp so a gap neither invents
+        // a spike nor destroys the valid baseline used after the walk resumes.
+        let (in_err_rate, in_err_rate_valid) = counter_rate(cur_in_err, prev_in_err, now);
+        let (out_err_rate, out_err_rate_valid) = counter_rate(cur_out_err, prev_out_err, now);
+        let (sample_in_errors, sample_in_errors_valid) =
+            counter_delta(cur_in_err, prev_in_err.map(|b| b.value));
+        let (sample_out_errors, sample_out_errors_valid) =
+            counter_delta(cur_out_err, prev_out_err.map(|b| b.value));
+        let (sample_in_discards, sample_in_discards_valid) =
+            counter_delta(cur_in_disc, prev_in_disc.map(|b| b.value));
+        let (sample_out_discards, sample_out_discards_valid) =
+            counter_delta(cur_out_disc, prev_out_disc.map(|b| b.value));
 
         store_metrics(
             pool,
@@ -715,13 +711,20 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
             cur_out_disc,
             in_err_rate,
             out_err_rate,
+            in_err_rate_valid,
+            out_err_rate_valid,
             admin_s.as_deref(),
             oper_s.as_deref(),
+            oper_status_valid,
             // per-interval error/discard deltas for the history charts
-            err_delta(cur_in_err, prev_in_err),
-            err_delta(cur_out_err, prev_out_err),
-            err_delta(cur_in_disc, prev_in_disc),
-            err_delta(cur_out_disc, prev_out_disc),
+            sample_in_errors,
+            sample_out_errors,
+            sample_in_discards,
+            sample_out_discards,
+            sample_in_errors_valid,
+            sample_out_errors_valid,
+            sample_in_discards_valid,
+            sample_out_discards_valid,
             opt.and_then(|o| o.temp_c),
             opt.and_then(|o| o.tx_power_dbm),
             opt.and_then(|o| o.rx_power_dbm),
@@ -744,8 +747,14 @@ pub async fn poll(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     Ok(updated)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MetricCounterBaseline {
+    value: u64,
+    sampled_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Load the previous raw octet/packet counters (rate baseline) plus the previous
-/// cumulative error and discard counters (for per-interval deltas) from
+/// independently timestamped error and discard counters from
 /// `interface_metrics_current`. Returns
 /// `(counters, in_errors, out_errors, in_discards, out_discards)`.
 #[allow(clippy::type_complexity)]
@@ -754,10 +763,10 @@ async fn load_baseline(
     interface_id: u64,
 ) -> Result<(
     Option<InterfaceCounters>,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
+    Option<MetricCounterBaseline>,
+    Option<MetricCounterBaseline>,
+    Option<MetricCounterBaseline>,
+    Option<MetricCounterBaseline>,
 )> {
     // sampled_at is a TIMESTAMP column -> DateTime<Utc> (sqlx-mysql maps
     // NaiveDateTime only to DATETIME).
@@ -768,13 +777,18 @@ async fn load_baseline(
         Option<u64>,
         Option<u64>,
         Option<u64>,
+        Option<chrono::DateTime<chrono::Utc>>,
         Option<u64>,
+        Option<chrono::DateTime<chrono::Utc>>,
         Option<u64>,
+        Option<chrono::DateTime<chrono::Utc>>,
         Option<u64>,
+        Option<chrono::DateTime<chrono::Utc>>,
     );
     let row = sqlx::query_as::<_, Row>(
         "SELECT sampled_at, in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, \
-                in_errors, out_errors, in_discards, out_discards \
+                in_errors, in_errors_sampled_at, out_errors, out_errors_sampled_at, \
+                in_discards, in_discards_sampled_at, out_discards, out_discards_sampled_at \
          FROM interface_metrics_current WHERE interface_id = ?",
     )
     .bind(interface_id)
@@ -782,7 +796,9 @@ async fn load_baseline(
     .await
     .context("loading interface baseline")?;
 
-    let Some((ts, io, oo, ip, op, in_e, out_e, in_d, out_d)) = row else {
+    let Some((ts, io, oo, ip, op, in_e, in_e_at, out_e, out_e_at, in_d, in_d_at, out_d, out_d_at)) =
+        row
+    else {
         return Ok((None, None, None, None, None));
     };
     let counters = match (ts, io, oo, ip, op) {
@@ -795,15 +811,43 @@ async fn load_baseline(
         }),
         _ => None,
     };
-    Ok((counters, in_e, out_e, in_d, out_d))
+    let metric = |value, sampled_at| match (value, sampled_at) {
+        (Some(value), Some(sampled_at)) => Some(MetricCounterBaseline { value, sampled_at }),
+        _ => None,
+    };
+    Ok((
+        counters,
+        metric(in_e, in_e_at),
+        metric(out_e, out_e_at),
+        metric(in_d, in_d_at),
+        metric(out_d, out_d_at),
+    ))
 }
 
-/// Per-interval error count: current minus the previous cumulative counter.
-/// Returns 0 when there is no baseline yet or the counter wrapped (current < previous).
-fn err_delta(current: Option<u64>, previous: Option<u64>) -> u64 {
+/// Per-interval count plus evidence validity. `0,true` is a measured zero;
+/// `0,false` is unavailable/no baseline/reset and must not drive recovery.
+fn counter_delta(current: Option<u64>, previous: Option<u64>) -> (u64, bool) {
     match (current, previous) {
-        (Some(c), Some(p)) if c >= p => c - p,
-        _ => 0,
+        (Some(c), Some(p)) if c >= p => (c - p, true),
+        _ => (0, false),
+    }
+}
+
+fn counter_rate(
+    current: Option<u64>,
+    previous: Option<MetricCounterBaseline>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (f64, bool) {
+    let Some(current) = current else {
+        return (0.0, false);
+    };
+    let Some(previous) = previous else {
+        return (0.0, false);
+    };
+    let elapsed = (now - previous.sampled_at).num_milliseconds() as f64 / 1000.0;
+    match super::rate_from_counters(current, previous.value, elapsed) {
+        Some(rate) => (rate, true),
+        None => (0.0, false),
     }
 }
 
@@ -822,12 +866,19 @@ async fn store_metrics(
     out_discards: Option<u64>,
     in_err_rate: f64,
     out_err_rate: f64,
+    in_err_rate_valid: bool,
+    out_err_rate_valid: bool,
     admin_status: Option<&str>,
     oper_status: Option<&str>,
+    oper_status_valid: bool,
     sample_in_errors: u64,
     sample_out_errors: u64,
     sample_in_discards: u64,
     sample_out_discards: u64,
+    sample_in_errors_valid: bool,
+    sample_out_errors_valid: bool,
+    sample_in_discards_valid: bool,
+    sample_out_discards_valid: bool,
     temp_c: Option<f64>,
     tx_power_dbm: Option<f64>,
     rx_power_dbm: Option<f64>,
@@ -841,21 +892,31 @@ async fn store_metrics(
             (interface_id, device_id, sampled_at, valid_sample, \
              in_octets, out_octets, in_ucast_pkts, out_ucast_pkts, \
              rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
-             in_errors, out_errors, in_discards, out_discards, in_err_rate, out_err_rate, \
-             admin_status, oper_status, \
+             in_errors, in_errors_sampled_at, out_errors, out_errors_sampled_at, \
+             in_discards, in_discards_sampled_at, out_discards, out_discards_sampled_at, \
+             in_err_rate, in_err_rate_valid, out_err_rate, out_err_rate_valid, \
+             admin_status, oper_status, oper_status_valid, \
              temp_c, tx_power_dbm, rx_power_dbm) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON DUPLICATE KEY UPDATE \
             sampled_at = VALUES(sampled_at), valid_sample = VALUES(valid_sample), \
             in_octets = VALUES(in_octets), out_octets = VALUES(out_octets), \
             in_ucast_pkts = VALUES(in_ucast_pkts), out_ucast_pkts = VALUES(out_ucast_pkts), \
             rx_bps = VALUES(rx_bps), tx_bps = VALUES(tx_bps), rx_pps = VALUES(rx_pps), \
             tx_pps = VALUES(tx_pps), rx_util_percent = VALUES(rx_util_percent), \
-            tx_util_percent = VALUES(tx_util_percent), in_errors = VALUES(in_errors), \
-            out_errors = VALUES(out_errors), in_discards = VALUES(in_discards), \
-            out_discards = VALUES(out_discards), in_err_rate = VALUES(in_err_rate), \
-            out_err_rate = VALUES(out_err_rate), admin_status = VALUES(admin_status), \
-            oper_status = VALUES(oper_status), temp_c = VALUES(temp_c), \
+            tx_util_percent = VALUES(tx_util_percent), \
+            in_errors = COALESCE(VALUES(in_errors), in_errors), \
+            in_errors_sampled_at = COALESCE(VALUES(in_errors_sampled_at), in_errors_sampled_at), \
+            out_errors = COALESCE(VALUES(out_errors), out_errors), \
+            out_errors_sampled_at = COALESCE(VALUES(out_errors_sampled_at), out_errors_sampled_at), \
+            in_discards = COALESCE(VALUES(in_discards), in_discards), \
+            in_discards_sampled_at = COALESCE(VALUES(in_discards_sampled_at), in_discards_sampled_at), \
+            out_discards = COALESCE(VALUES(out_discards), out_discards), \
+            out_discards_sampled_at = COALESCE(VALUES(out_discards_sampled_at), out_discards_sampled_at), \
+            in_err_rate = VALUES(in_err_rate), in_err_rate_valid = VALUES(in_err_rate_valid), \
+            out_err_rate = VALUES(out_err_rate), out_err_rate_valid = VALUES(out_err_rate_valid), \
+            admin_status = VALUES(admin_status), oper_status = VALUES(oper_status), \
+            oper_status_valid = VALUES(oper_status_valid), temp_c = VALUES(temp_c), \
             tx_power_dbm = VALUES(tx_power_dbm), rx_power_dbm = VALUES(rx_power_dbm)",
     )
     .bind(interface_id)
@@ -873,13 +934,20 @@ async fn store_metrics(
     .bind(rates.rx_util_percent)
     .bind(rates.tx_util_percent)
     .bind(in_errors)
+    .bind(in_errors.map(|_| sampled_at))
     .bind(out_errors)
+    .bind(out_errors.map(|_| sampled_at))
     .bind(in_discards)
+    .bind(in_discards.map(|_| sampled_at))
     .bind(out_discards)
+    .bind(out_discards.map(|_| sampled_at))
     .bind(in_err_rate)
+    .bind(in_err_rate_valid)
     .bind(out_err_rate)
+    .bind(out_err_rate_valid)
     .bind(admin_status)
     .bind(oper_status)
+    .bind(oper_status_valid)
     .bind(temp_c)
     .bind(tx_power_dbm)
     .bind(rx_power_dbm)
@@ -893,9 +961,10 @@ async fn store_metrics(
         "INSERT INTO interface_samples \
             (interface_id, device_id, sampled_at, valid_sample, \
              rx_bps, tx_bps, rx_pps, tx_pps, rx_util_percent, tx_util_percent, \
-             in_errors, out_errors, in_discards, out_discards, \
+             in_errors, in_errors_valid, out_errors, out_errors_valid, \
+             in_discards, in_discards_valid, out_discards, out_discards_valid, \
              temp_c, tx_power_dbm, rx_power_dbm) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(interface_id)
     .bind(device_id)
@@ -908,9 +977,13 @@ async fn store_metrics(
     .bind(rates.rx_util_percent)
     .bind(rates.tx_util_percent)
     .bind(sample_in_errors)
+    .bind(sample_in_errors_valid)
     .bind(sample_out_errors)
+    .bind(sample_out_errors_valid)
     .bind(sample_in_discards)
+    .bind(sample_in_discards_valid)
     .bind(sample_out_discards)
+    .bind(sample_out_discards_valid)
     .bind(temp_c)
     .bind(tx_power_dbm)
     .bind(rx_power_dbm)
@@ -1316,5 +1389,22 @@ mod tests {
         assert_eq!(value_to_u64(&ObjectValue::Counter32(7)), Some(7));
         assert_eq!(value_to_u64(&ObjectValue::String(vec![1, 2])), None);
         assert_eq!(value_to_string(&ObjectValue::Counter64(99)), "99");
+    }
+
+    #[test]
+    fn missing_error_evidence_is_not_a_zero_or_spike() {
+        let now = Utc::now();
+        let baseline = MetricCounterBaseline {
+            value: 900_000,
+            sampled_at: now - chrono::Duration::seconds(30),
+        };
+        assert_eq!(counter_rate(None, Some(baseline), now), (0.0, false));
+        assert_eq!(counter_rate(Some(900_000), None, now), (0.0, false));
+        assert_eq!(
+            counter_rate(Some(900_000), Some(baseline), now),
+            (0.0, true)
+        );
+        assert_eq!(counter_delta(None, Some(900_000)), (0, false));
+        assert_eq!(counter_delta(Some(900_000), Some(900_000)), (0, true));
     }
 }

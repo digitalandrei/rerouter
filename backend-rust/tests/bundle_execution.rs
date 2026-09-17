@@ -11,42 +11,25 @@
 //! hammer the same device, so each "sibling is allowed" assertion below is paired
 //! with a "stranger is still blocked" assertion over the very same history row.
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB the test
-//! may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB the test
+//! may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
 use rerouter_controller::config::Config;
-use rerouter_controller::db::MIGRATOR;
 use rerouter_controller::reroute::executor::{ActionRequest, BundleMembership};
 use rerouter_controller::reroute::guard::{self, BlockReason};
 use rerouter_controller::reroute::templates::{RenderedPlan, Template};
 use serde_json::json;
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
+
+mod common;
 
 /// Migrate once per process. Several `#[tokio::test]`s in one binary run
 /// concurrently, and concurrent migrator runs against one schema fail — which
 /// surfaces as a fail-closed `i64::MAX` gate read rather than an obvious error.
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
-
 /// Serializes the tests in this file. The rate-budget gates read GLOBAL counters,
 /// so two of these running at once would read each other's rows.
 static SERIAL: Mutex<()> = Mutex::const_new(());
-
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATED
-        .get_or_init(|| async {
-            MIGRATOR.run(&pool).await.expect("run migrations");
-        })
-        .await;
-    Some(pool)
-}
 
 /// Shipped nonzero cooldowns and no rate limit, so a test that blocks is blocking
 /// on cooldown and nothing else.
@@ -90,6 +73,7 @@ fn request(device_id: u64, rule_id: u64, bundle: Option<BundleMembership>) -> Ac
         reason: Some("bundle execution test".into()),
         defer_cooldown: true,
         bundle,
+        authorization: None,
     }
 }
 
@@ -136,7 +120,7 @@ async fn insert_device(pool: &MySqlPool, name: &str) -> u64 {
 async fn insert_bundle(pool: &MySqlPool, rule_id: u64, total: u32) -> u64 {
     sqlx::query(
         "INSERT INTO reroute_bundles (rule_id, trigger_type, state, total_actions) \
-         VALUES (?, 'manual', 'running', ?)",
+         VALUES (?, 'manual', 'planned', ?)",
     )
     .bind(rule_id)
     .bind(total)
@@ -197,10 +181,8 @@ async fn cleanup(pool: &MySqlPool, rule_id: u64, device_ids: &[u64]) {
 #[tokio::test]
 async fn bundle_sibling_survives_cooldown_but_a_stranger_does_not() {
     let _serial = SERIAL.lock().await;
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping bundle execution integration test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let cfg = cfg_with_cooldowns();
 
     let rule_id = insert_rule(&pool, &unique("bundle-cooldown-test")).await;
@@ -302,10 +284,8 @@ async fn bundle_sibling_survives_cooldown_but_a_stranger_does_not() {
 #[tokio::test]
 async fn standalone_history_still_throttles_a_standalone_action() {
     let _serial = SERIAL.lock().await;
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping standalone cooldown test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let cfg = cfg_with_cooldowns();
 
     let rule_id = insert_rule(&pool, &unique("standalone-cooldown-test")).await;
@@ -334,10 +314,8 @@ async fn standalone_history_still_throttles_a_standalone_action() {
 #[tokio::test]
 async fn oversized_bundle_is_refused_whole() {
     let _serial = SERIAL.lock().await;
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping bundle admission test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let mut cfg = Config::default();
     cfg.safety.global_action_rate_limit_count = 3;
     // A SHORT window, so rows left behind by an earlier crashed run (or by another
@@ -374,10 +352,8 @@ async fn oversized_bundle_is_refused_whole() {
 #[tokio::test]
 async fn reserved_capacity_of_another_bundle_blocks_admission() {
     let _serial = SERIAL.lock().await;
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping bundle reservation test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Large absolute numbers, so the assertions turn on the RESERVATION and not on
     // how many rows a concurrently-running test binary happened to leave behind.
     let mut cfg = Config::default();
@@ -388,6 +364,11 @@ async fn reserved_capacity_of_another_bundle_blocks_admission() {
     let rule_id = insert_rule(&pool, &unique("bundle-reservation-test")).await;
     // A large bundle is already running and has spent none of its budget.
     let running = insert_bundle(&pool, rule_id, 4_995).await;
+    sqlx::query("UPDATE reroute_bundles SET rate_reserved_actions = 4995 WHERE id = ?")
+        .bind(running)
+        .execute(&pool)
+        .await
+        .expect("reserve the running bundle capacity");
     let mine = insert_bundle(&pool, rule_id, 10).await;
 
     // Assert on the COUNT as well as the refusal. A fail-closed read error also
@@ -417,4 +398,51 @@ async fn reserved_capacity_of_another_bundle_blocks_admission() {
     );
 
     cleanup(&pool, rule_id, &[]).await;
+}
+
+/// An admitted bundle's unspent reservation must also block a standalone action.
+/// Previously only other bundle admissions counted it, so a standalone request
+/// could steal a slot between admission and the first sibling.
+#[tokio::test]
+async fn standalone_cannot_steal_an_admitted_bundle_reservation() {
+    let _serial = SERIAL.lock().await;
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let mut cfg = Config::default();
+    cfg.safety.global_action_rate_limit_count = 2;
+    cfg.safety.global_action_rate_limit_window_seconds = 5;
+
+    let rule_id = insert_rule(&pool, &unique("bundle-standalone-rate-test")).await;
+    let device_id = insert_device(&pool, &unique("bundle-standalone-rate-device")).await;
+    let bundle_id = sqlx::query(
+        "INSERT INTO reroute_bundles \
+            (rule_id, trigger_type, state, total_actions, rate_reserved_actions) \
+         VALUES (?, 'manual', 'planned', 2, 0)",
+    )
+    .bind(rule_id)
+    .execute(&pool)
+    .await
+    .expect("insert unadmitted bundle")
+    .last_insert_id();
+    guard::admit_bundle(&pool, &cfg, bundle_id, 2)
+        .await
+        .expect("admit full-budget bundle");
+
+    let stranger = request(device_id, rule_id, None);
+    let inputs = guard::gather(&pool, &cfg, &stranger, &plan())
+        .await
+        .expect("gather standalone gates");
+    assert_eq!(
+        inputs.recent_count, 2,
+        "unspent bundle slots count as occupied"
+    );
+    assert!(
+        matches!(
+            guard::decide(&inputs),
+            Err(BlockReason::RateLimit { max: 2, .. })
+        ),
+        "standalone action must not steal admitted bundle capacity"
+    );
+
+    cleanup(&pool, rule_id, &[device_id]).await;
 }

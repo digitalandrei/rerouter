@@ -926,7 +926,7 @@ export default function Documentation() {
                 <tbody>
                   <tr><td className={tdClass}>Auto</td><td className={tdClass}>Condition stops matching for the configured recovery window/sample count.</td></tr>
                   <tr><td className={tdClass}>Threshold</td><td className={tdClass}>A distinct recovery threshold is crossed, providing explicit hysteresis.</td></tr>
-                  <tr><td className={tdClass}>Manual</td><td className={tdClass}>An operator explicitly clears the rule; clearing executes no rollback or action.</td></tr>
+                  <tr><td className={tdClass}>Manual</td><td className={tdClass}>An operator previews and confirms the clear. If automatic mitigations were applied, their rollback finishes before the rule clears.</td></tr>
                 </tbody>
               </TopicTable>
               <H3>Flow selectors</H3>
@@ -1004,12 +1004,12 @@ export default function Documentation() {
             >
               <H3>Manual mitigation</H3>
               <Steps>
-                <li>Open <AppLink to="/mitigations/manual">New manual mitigation</AppLink>.</li>
-                <li>Select a template and router. Fill parameters using inventory-backed pickers.</li>
-                <li>Optionally enter a reason; it becomes part of the audit record and preview binding.</li>
-                <li>Preview exact configuration commands, verification, and rollback commands.</li>
-                <li>Review live SSH posture and any warning. Changing a field invalidates the preview.</li>
-                <li>Execute. Observe mode returns a would-run result; enforce mode consumes the one-use token and runs only if every gate still passes.</li>
+                <li>Open <AppLink to="/manual-mitigations">Manual Mitigations</AppLink>.</li>
+                <li>Create or select a named mitigation containing one or more ordered action templates and target routers.</li>
+                <li>Save the complete set, then choose Run once. Temporary router and parameter overrides do not change the saved mitigation.</li>
+                <li>Enter a reason; it becomes part of the audit record and preview binding.</li>
+                <li>Preview the exact complete plan. Changing a field invalidates the preview.</li>
+                <li>Execute. Enforce mode consumes the one-use token and follows bundle progress until every action is terminal.</li>
                 <li>Open History to inspect state, outputs, and verification.</li>
               </Steps>
               <H3>Supervised apply from a firing rule</H3>

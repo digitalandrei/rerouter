@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
@@ -65,7 +65,10 @@ SECRETS_KEY={secrets_key}
 pub fn run_install(prefix: &str) -> Result<()> {
     let prefix_is_root = prefix == "/";
     let prefix_path = Path::new(prefix);
-    let install_dir = prefix_path.join("srv/rerouter");
+    let srv_dir = prefix_path.join("srv");
+    let install_dir = srv_dir.join("rerouter");
+    let etc_dir = prefix_path.join("etc");
+    let systemd_dir = etc_dir.join("systemd");
     let unit_dir = prefix_path.join("etc/systemd/system");
     let unit_path = unit_dir.join("rerouter-controller.service");
 
@@ -76,12 +79,25 @@ pub fn run_install(prefix: &str) -> Result<()> {
         "installing rerouter-controller"
     );
 
-    // b. system user (tolerate failure/absence; never attempt for test prefixes).
-    let have_user = ensure_system_user(prefix_is_root);
+    // b. system user (required for a real install; never inspect or modify host
+    // accounts for test prefixes).
+    let service_account = ensure_system_user(prefix_is_root)?;
 
-    fs::create_dir_all(&install_dir)
-        .with_context(|| format!("creating {}", install_dir.display()))?;
-    fs::create_dir_all(&unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
+    fs::create_dir_all(prefix_path)
+        .with_context(|| format!("creating prefix {}", prefix_path.display()))?;
+    create_dir_with_mode_if_new(&srv_dir, 0o755)?;
+    create_dir_with_mode_if_new(&install_dir, 0o750)?;
+    // Do not let the invoking shell's umask make the service directory
+    // untraversable by the rerouter account. This changes only the installer-owned
+    // directory; existing operator-owned files inside retain their modes.
+    fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o750))
+        .context("chmod 0750 on install directory")?;
+    if let Some(account) = service_account {
+        set_owner(&install_dir, 0, account.gid, "root:rerouter")?;
+    }
+    create_dir_with_mode_if_new(&etc_dir, 0o755)?;
+    create_dir_with_mode_if_new(&systemd_dir, 0o755)?;
+    create_dir_with_mode_if_new(&unit_dir, 0o755)?;
 
     // c. binary: copy ourselves in via tmp+rename so an upgrade replaces a
     // running binary atomically (plain copy would hit ETXTBSY).
@@ -92,6 +108,9 @@ pub fn run_install(prefix: &str) -> Result<()> {
         .with_context(|| format!("copying {} -> {}", exe.display(), bin_tmp.display()))?;
     fs::set_permissions(&bin_tmp, fs::Permissions::from_mode(0o755))
         .context("chmod 0755 on binary")?;
+    if service_account.is_some() {
+        set_owner(&bin_tmp, 0, 0, "root:root")?;
+    }
     fs::rename(&bin_tmp, &bin_dest).context("installing binary into place")?;
     tracing::info!(event_type = "install_binary", path = %bin_dest.display(), "binary installed");
 
@@ -114,8 +133,10 @@ pub fn run_install(prefix: &str) -> Result<()> {
             .open(&env_path)
             .with_context(|| format!("creating {}", env_path.display()))?;
         f.write_all(content.as_bytes()).context("writing .env")?;
-        if have_user {
-            chown_rerouter(&env_path);
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600))
+            .context("chmod 0600 on .env")?;
+        if let Some(account) = service_account {
+            set_owner(&env_path, account.uid, account.gid, "rerouter:rerouter")?;
         }
         tracing::info!(
             event_type = "install_env_written",
@@ -133,8 +154,20 @@ pub fn run_install(prefix: &str) -> Result<()> {
             "existing config.toml left untouched (operator-owned)"
         );
     } else {
-        fs::write(&config_path, CONFIG_TEMPLATE)
-            .with_context(|| format!("writing {}", config_path.display()))?;
+        let mut config = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&config_path)
+            .with_context(|| format!("creating {}", config_path.display()))?;
+        config
+            .write_all(CONFIG_TEMPLATE.as_bytes())
+            .context("writing config.toml")?;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640))
+            .context("chmod 0640 on config.toml")?;
+        if let Some(account) = service_account {
+            set_owner(&config_path, 0, account.gid, "root:rerouter")?;
+        }
         tracing::info!(
             event_type = "install_config_written",
             path = %config_path.display(),
@@ -146,6 +179,11 @@ pub fn run_install(prefix: &str) -> Result<()> {
     // (enable only: .env must be filled before the first start).
     fs::write(&unit_path, SYSTEMD_UNIT)
         .with_context(|| format!("writing {}", unit_path.display()))?;
+    fs::set_permissions(&unit_path, fs::Permissions::from_mode(0o644))
+        .context("chmod 0644 on systemd unit")?;
+    if service_account.is_some() {
+        set_owner(&unit_path, 0, 0, "root:root")?;
+    }
     tracing::info!(event_type = "install_unit_written", path = %unit_path.display(), "systemd unit written");
 
     let mut systemd_ready = false;
@@ -324,63 +362,137 @@ pub async fn create_admin(
     Ok(())
 }
 
-/// Create the 'rerouter' system user when installing for real (prefix "/").
-/// Failure or absence is tolerated with a warning — and for prefixed (test)
-/// installs we never touch the host's user database at all. Returns whether
-/// the user exists afterwards (drives chown attempts).
-fn ensure_system_user(prefix_is_root: bool) -> bool {
-    let exists = Command::new("id")
-        .args(["-u", "rerouter"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if exists {
-        return true;
-    }
+/// Create the `rerouter` system user and same-named group when installing for
+/// real (prefix "/"). Prefixed installs never inspect or modify host accounts.
+#[derive(Clone, Copy)]
+struct AccountIds {
+    uid: u32,
+    gid: u32,
+}
+
+fn ensure_system_user(prefix_is_root: bool) -> Result<Option<AccountIds>> {
     if !prefix_is_root {
         tracing::warn!(
             event_type = "install_user_skipped",
-            "system user 'rerouter' missing — tolerated for prefixed (test) install; \
-             on a real host: useradd -r -s /usr/sbin/nologin rerouter"
+            "prefixed (test) install — skipping host user lookup and ownership changes"
         );
-        return false;
+        return Ok(None);
     }
-    match Command::new("useradd")
-        .args(["-r", "-s", "/usr/sbin/nologin", "rerouter"])
+    if let Some(account) = lookup_account("rerouter")? {
+        return Ok(Some(account));
+    }
+    let status = Command::new("useradd")
+        .args(["-r", "-U", "-s", "/usr/sbin/nologin", "rerouter"])
         .status()
-    {
-        Ok(s) if s.success() => {
-            tracing::info!(
-                event_type = "install_user_created",
-                "created system user 'rerouter'"
-            );
-            true
-        }
-        _ => {
-            tracing::warn!(
-                event_type = "install_user_failed",
-                "could not create system user 'rerouter' — create it manually: \
-                 useradd -r -s /usr/sbin/nologin rerouter"
-            );
-            false
-        }
-    }
+        .context("running useradd for rerouter")?;
+    anyhow::ensure!(
+        status.success(),
+        "could not create required system user 'rerouter'; create it with: \
+         useradd -r -U -s /usr/sbin/nologin rerouter"
+    );
+    tracing::info!(
+        event_type = "install_user_created",
+        "created system user 'rerouter'"
+    );
+    lookup_account("rerouter")?
+        .map(Some)
+        .context("rerouter account is still unavailable after successful useradd")
 }
 
-/// Best-effort chown to rerouter:rerouter (warn, never fail the install).
-fn chown_rerouter(path: &Path) {
-    let ok = Command::new("chown")
-        .arg("rerouter:rerouter")
+fn lookup_account(name: &str) -> Result<Option<AccountIds>> {
+    let uid = numeric_id(&["-u", name])?;
+    let Some(uid) = uid else {
+        return Ok(None);
+    };
+    anyhow::ensure!(uid != 0, "service account {name} must not have uid 0");
+    let group = Command::new("getent")
+        .args(["group", name])
+        .output()
+        .with_context(|| format!("looking up required group {name}"))?;
+    anyhow::ensure!(
+        group.status.success(),
+        "service account {name} exists but required group {name} does not"
+    );
+    let group_text =
+        std::str::from_utf8(&group.stdout).context("getent returned non-UTF-8 output")?;
+    let gid = group_text
+        .trim()
+        .split(':')
+        .nth(2)
+        .context("getent group output did not contain a gid")?
+        .parse::<u32>()
+        .context("getent group returned an invalid numeric gid")?;
+    let memberships = Command::new("id")
+        .args(["-G", name])
+        .output()
+        .with_context(|| format!("checking group memberships for {name}"))?;
+    anyhow::ensure!(
+        memberships.status.success(),
+        "could not determine group memberships for {name}"
+    );
+    let membership_text =
+        std::str::from_utf8(&memberships.stdout).context("id returned non-UTF-8 output")?;
+    let is_member = membership_text
+        .split_whitespace()
+        .filter_map(|value| value.parse::<u32>().ok())
+        .any(|value| value == gid);
+    anyhow::ensure!(
+        is_member,
+        "service account {name} is not a member of required group {name}"
+    );
+    Ok(Some(AccountIds { uid, gid }))
+}
+
+fn numeric_id(args: &[&str]) -> Result<Option<u32>> {
+    let output = Command::new("id")
+        .args(args)
+        .output()
+        .with_context(|| format!("running id {}", args.join(" ")))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(&output.stdout).context("id returned non-UTF-8 output")?;
+    let id = text
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("id {} returned an invalid numeric id", args.join(" ")))?;
+    Ok(Some(id))
+}
+
+/// Establish and verify ownership for an installer-managed artifact. A real
+/// install must stop here rather than leave files unreadable or service-owned.
+fn set_owner(path: &Path, uid: u32, gid: u32, label: &str) -> Result<()> {
+    let owner = format!("{uid}:{gid}");
+    let status = Command::new("chown")
+        .arg(&owner)
         .arg(path)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        tracing::warn!(
-            event_type = "install_chown_failed",
-            path = %path.display(),
-            "could not chown to rerouter:rerouter — fix ownership manually"
-        );
+        .with_context(|| format!("setting {label} ownership on {}", path.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "could not establish required {label} ownership on {}",
+        path.display()
+    );
+    let metadata =
+        fs::metadata(path).with_context(|| format!("verifying ownership of {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.uid() == uid && metadata.gid() == gid,
+        "ownership verification failed for {}: expected {label} ({uid}:{gid}), found {}:{}",
+        path.display(),
+        metadata.uid(),
+        metadata.gid()
+    );
+    Ok(())
+}
+
+/// Create one installer path component and normalize its mode only when this
+/// invocation created it. Existing ancestors may be operator-managed.
+fn create_dir_with_mode_if_new(path: &Path, mode: u32) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} on new directory {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("creating {}", path.display())),
     }
 }
 

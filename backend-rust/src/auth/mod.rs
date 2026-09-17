@@ -1041,17 +1041,8 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_totp_step_cannot_be_replayed() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("connect to DATABASE_URL");
-        crate::db::migrate_test_schema(&pool)
-            .await
-            .expect("run migrations");
+        let test_database = crate::db::connect_test_database().await;
+        let pool = (*test_database).clone();
 
         let email = format!("totp-replay-{}@example.test", uuid::Uuid::new_v4());
         let user_id = sqlx::query(
@@ -1097,17 +1088,8 @@ mod tests {
     // produces `ReplayedStep` is covered by `accepted_totp_step_cannot_be_replayed`.
     #[tokio::test]
     async fn step_up_hides_totp_outcome_until_password_passes() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("connect to DATABASE_URL");
-        crate::db::migrate_test_schema(&pool)
-            .await
-            .expect("run migrations");
+        let test_database = crate::db::connect_test_database().await;
+        let pool = (*test_database).clone();
 
         let password = "correct horse battery staple";
         let phc = super::password::hash(password).expect("hash password");
@@ -1167,17 +1149,8 @@ mod tests {
 
     #[tokio::test]
     async fn consume_recovery_code_reports_state_errors_and_absent_codes() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("connect to DATABASE_URL");
-        crate::db::migrate_test_schema(&pool)
-            .await
-            .expect("run migrations");
+        let test_database = crate::db::connect_test_database().await;
+        let pool = (*test_database).clone();
 
         // Malformed recovery-code JSON must surface as an error, not a silent
         // failed match (which would count toward account lockout).

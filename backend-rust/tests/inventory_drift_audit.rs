@@ -13,10 +13,9 @@
 //! alert are written; a database failure changes nothing; and a rule that is
 //! mid-incident is never disarmed by a discovery run that lands on top of it.
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB/MySQL the
-//! test may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB/MySQL the
+//! test may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
-use rerouter_controller::db::MIGRATOR;
 use rerouter_controller::reroute::inventory_audit::{audit_device, InventoryRead};
 use serde_json::json;
 use sqlx::mysql::MySqlPoolOptions;
@@ -30,16 +29,7 @@ const GOOD_PEER: &str = "198.51.100.7";
 const PREFIX_LIST: &str = "pfx-to-viva";
 const ANNOUNCED: &str = "198.51.100.0/24";
 
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
+mod common;
 
 struct Fixture {
     device_id: u64,
@@ -196,10 +186,8 @@ async fn count(pool: &MySqlPool, sql: &str, id: u64) -> i64 {
 
 #[tokio::test]
 async fn confirmed_drift_marks_the_action_and_disarms_only_automatic_execution() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let f = seed(&pool, "confirmed", DRIFTED_PEER).await;
 
     let summary = audit_device(&pool, f.device_id, InventoryRead::Conclusive)
@@ -257,10 +245,8 @@ async fn confirmed_drift_marks_the_action_and_disarms_only_automatic_execution()
 
 #[tokio::test]
 async fn an_inconclusive_read_never_marks_and_never_disarms() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Exactly the fixture that DOES drift above: the stored prefix-list is not on
     // the targeted peer. The only difference is that the router's read proved
     // nothing — which must be enough to change nothing.
@@ -303,10 +289,8 @@ async fn an_inconclusive_read_never_marks_and_never_disarms() {
 
 #[tokio::test]
 async fn recovery_clears_the_drift_marker_but_never_re_arms() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // The action validates again, but the rule is still disarmed from an earlier
     // drift. Re-arming is a human act (global enable + step-up re-auth), so the
     // audit must clear the marker and stop there.
@@ -361,10 +345,8 @@ async fn recovery_clears_the_drift_marker_but_never_re_arms() {
 
 #[tokio::test]
 async fn a_database_failure_during_the_audit_changes_nothing() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let f = seed(&pool, "db-error", DRIFTED_PEER).await;
 
     // A pool that cannot answer. Every verdict the audit could reach is
@@ -372,7 +354,7 @@ async fn a_database_failure_during_the_audit_changes_nothing() {
     // hiccup that disarmed live mitigations would be a denial-of-protection bug.
     let broken = MySqlPoolOptions::new()
         .max_connections(1)
-        .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .connect(&std::env::var("REROUTER_TEST_DATABASE_URL").expect("test database URL"))
         .await
         .expect("second pool");
     broken.close().await;
@@ -392,10 +374,8 @@ async fn a_database_failure_during_the_audit_changes_nothing() {
 
 #[tokio::test]
 async fn a_rule_that_is_mid_incident_is_never_disarmed() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Drifted parameters AND a firing rule: a discovery run landing here must not
     // switch off the mitigation that is running right now. It defers to the next run.
     let f = seed(&pool, "firing", DRIFTED_PEER).await;
@@ -421,10 +401,8 @@ async fn a_rule_that_is_mid_incident_is_never_disarmed() {
 
 #[tokio::test]
 async fn an_in_flight_reroute_defers_the_whole_device() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     let f = seed(&pool, "in-flight", DRIFTED_PEER).await;
     sqlx::query(
         "INSERT INTO reroutes (device_id, rule_id, trigger_type, state) \
@@ -456,10 +434,8 @@ async fn an_in_flight_reroute_defers_the_whole_device() {
 
 #[tokio::test]
 async fn expired_routing_inventory_alerts_without_disarming() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("DATABASE_URL not set — skipping inventory drift audit test");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
     // Two missed discovery runs used to age the route context out in silence while
     // every dependent action started being refused at fire time. Expiry is not
     // drift — the router never said anything — so it alerts and changes nothing.

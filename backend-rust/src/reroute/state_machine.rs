@@ -10,8 +10,189 @@
 use anyhow::{Context, Result};
 use sqlx::MySqlPool;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationResult {
+    Changed,
+    NotApplied,
+    Conflict,
+}
+
+/// Read-only exact reconciliation for an uncertain action. Only an exact match
+/// with the persisted owned before/after snapshot resolves quarantine. A
+/// conflict or inconclusive read leaves every state and lock in place.
+pub async fn reconcile_uncertain(
+    pool: &MySqlPool,
+    reroute_id: u64,
+    actor_user_id: u64,
+    note: &str,
+) -> Result<ReconciliationResult> {
+    type Row = (
+        String,
+        Option<u64>,
+        Option<u64>,
+        Option<sqlx::types::Json<serde_json::Value>>,
+        Option<sqlx::types::Json<serde_json::Value>>,
+    );
+    let row: Row = sqlx::query_as(
+        "SELECT state, device_id, bundle_id, prior_state_json, after_state_json \
+         FROM reroutes WHERE id = ?",
+    )
+    .bind(reroute_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("reroute not found"))?;
+    anyhow::ensure!(row.0 == "uncertain", "reroute is not uncertain");
+    let device_id = row
+        .1
+        .ok_or_else(|| anyhow::anyhow!("reroute has no device"))?;
+    let before: Vec<crate::reroute::device_plan::DeviceStateSnapshot> = serde_json::from_value(
+        row.3
+            .ok_or_else(|| anyhow::anyhow!("missing before snapshot"))?
+            .0,
+    )?;
+    let after: Vec<crate::reroute::device_plan::DeviceStateSnapshot> = serde_json::from_value(
+        row.4
+            .ok_or_else(|| anyhow::anyhow!("missing after snapshot"))?
+            .0,
+    )?;
+
+    let matches_after =
+        crate::reroute::device_plan::verify_snapshots_read_only(pool, device_id, &after).await?;
+    let matches_before = if before == after {
+        matches_after
+    } else {
+        crate::reroute::device_plan::verify_snapshots_read_only(pool, device_id, &before).await?
+    };
+    let result = match (matches_after, matches_before, before == after) {
+        (true, _, false) => ReconciliationResult::Changed,
+        (_, true, _) => ReconciliationResult::NotApplied,
+        _ => ReconciliationResult::Conflict,
+    };
+
+    let mut tx = pool.begin().await?;
+    let locked: Option<String> =
+        sqlx::query_scalar("SELECT state FROM reroutes WHERE id = ? FOR UPDATE")
+            .bind(reroute_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    anyhow::ensure!(
+        locked.as_deref() == Some("uncertain"),
+        "reroute changed during reconciliation"
+    );
+    match result {
+        ReconciliationResult::Changed => {
+            sqlx::query(
+                "UPDATE reroutes SET state = 'succeeded', success = 1, \
+                        verification_status = 'reconciled_after', mutation_effect = 'changed', \
+                        failure_reason = CONCAT(COALESCE(failure_reason,''), ?) \
+                  WHERE id = ? AND state = 'uncertain'",
+            )
+            .bind(format!(" | reconciled exact after-state: {note}"))
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE reroute_bundle_actions SET state = 'succeeded', mutation_effect = 'changed' \
+                 WHERE reroute_id = ?",
+            )
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        ReconciliationResult::NotApplied => {
+            sqlx::query(
+                "UPDATE reroutes SET state = 'failed', success = 0, \
+                        verification_status = 'reconciled_before', mutation_effect = 'noop', \
+                        failure_reason = CONCAT(COALESCE(failure_reason,''), ?) \
+                  WHERE id = ? AND state = 'uncertain'",
+            )
+            .bind(format!(" | reconciled exact before-state: {note}"))
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE reroute_bundle_actions SET state = 'noop', mutation_effect = 'noop' \
+                 WHERE reroute_id = ?",
+            )
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        ReconciliationResult::Conflict => {}
+    }
+    sqlx::query(
+        "INSERT INTO audit_logs \
+            (actor_type, actor_user_id, event_type, entity_type, entity_id, reroute_id, message) \
+         VALUES ('user', ?, 'reroute_reconciled', 'reroute', ?, ?, ?)",
+    )
+    .bind(actor_user_id)
+    .bind(reroute_id)
+    .bind(reroute_id)
+    .bind(format!("reconciliation result {:?}: {note}", result))
+    .execute(&mut *tx)
+    .await?;
+
+    if result != ReconciliationResult::Conflict {
+        sqlx::query(
+            "UPDATE locks SET cleared_at = UTC_TIMESTAMP(), cleared_by = ? \
+             WHERE reroute_id = ? AND cleared_at IS NULL \
+               AND kind IN ('auto_crash','auto_uncertain')",
+        )
+        .bind(actor_user_id)
+        .bind(reroute_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(bundle_id) = row.2 {
+        let unknown: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reroutes \
+             WHERE bundle_id = ? AND (state = 'uncertain' OR mutation_effect = 'unknown')",
+        )
+        .bind(bundle_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let owned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT original.id) FROM reroutes original \
+             LEFT JOIN reroute_bundle_actions ba \
+               ON ba.bundle_id = ? AND ba.original_reroute_id = original.id \
+             WHERE original.rollback_of_reroute_id IS NULL \
+               AND (original.bundle_id = ? OR ba.id IS NOT NULL) \
+               AND original.mutation_effect IN ('changed','unknown') \
+               AND NOT EXISTS (SELECT 1 FROM reroutes inverse \
+                 WHERE inverse.rollback_of_reroute_id = original.id \
+                   AND inverse.state = 'succeeded' \
+                   AND inverse.mutation_effect IN ('changed','noop'))",
+        )
+        .bind(bundle_id)
+        .bind(bundle_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if unknown == 0 && owned == 0 {
+            sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ?")
+                .bind(bundle_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE reroute_bundles SET state = 'compensated', finished_at = UTC_TIMESTAMP() \
+                 WHERE id = ? AND state = 'compensation_blocked'",
+            )
+            .bind(bundle_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else if result == ReconciliationResult::NotApplied {
+        sqlx::query("DELETE FROM device_change_windows WHERE reroute_id = ?")
+            .bind(reroute_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(result)
+}
+
 /// On startup, any reroute in pending/running/verifying becomes `uncertain` and
-/// locks the affected device until an admin acknowledges it. Do NOT assume
+/// locks the affected device until evidence-bound reconciliation. Do NOT assume
 /// nothing happened after a crash — a config push made milliseconds before the
 /// crash may have taken effect.
 ///
@@ -40,6 +221,7 @@ pub async fn recover_on_startup(pool: &MySqlPool) -> Result<()> {
             let mut tx = pool.begin().await?;
             let updated = sqlx::query(
                 "UPDATE reroutes SET state = 'uncertain', finished_at = UTC_TIMESTAMP(), \
+                 mutation_effect = 'unknown', \
                  failure_reason = 'controller restarted mid-action; outcome unverified' \
                  WHERE id = ? AND state IN ('planned','pending','running','verifying')",
             )

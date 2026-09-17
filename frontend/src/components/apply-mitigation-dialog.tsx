@@ -59,7 +59,7 @@ function AutoTargetInfo({ result: r }: { result: RerouteResult }) {
       {r.auto_target_low_confidence && (
         <span
           className="rounded bg-red-100 px-1 text-red-700 dark:bg-red-900/40 dark:text-red-400"
-          title="Low flow-sampling confidence — automatic execution was blocked; manual apply proceeded"
+          title="Low flow-sampling confidence blocks automatic execution"
         >
           low sampling confidence
         </span>
@@ -69,18 +69,23 @@ function AutoTargetInfo({ result: r }: { result: RerouteResult }) {
 }
 
 /** Renders one result from the apply endpoint. */
-function ApplyResultRow({ r }: { r: RerouteResult }) {
+export function ApplyResultRow({ r }: { r: RerouteResult }) {
   const deviceLabel = r.device_name ?? `device ${r.device_id}`;
 
   if (!r.executed && r.would_run) {
-    // observe mode — nothing ran; show the exact would-run plan
+    // Preview/observe response — nothing ran; show the exact would-run plan.
     return (
       <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-700 dark:bg-amber-950/40">
         <div className="flex flex-wrap items-center gap-2 font-medium text-amber-800 dark:text-amber-300">
-          <span>Would run (observe mode — nothing executed)</span>
+          <span>Would run — preview only, nothing executed</span>
           <span className="font-normal text-muted-foreground">· {deviceLabel}</span>
         </div>
         <AutoTargetInfo result={r} />
+        {(r.predicted_noop || r.mutation_effect === "noop") && (
+          <p className="mt-1 text-xs font-medium text-emerald-800 dark:text-emerald-300">
+            Verified unchanged target — no configuration command is required.
+          </p>
+        )}
         <p className="mt-1 text-xs text-muted-foreground">{r.message}</p>
         <pre className="mt-2 overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
           {r.would_run.commands.join("\n")}
@@ -90,15 +95,37 @@ function ApplyResultRow({ r }: { r: RerouteResult }) {
             Verify: <code>{r.would_run.verify.command}</code>
           </div>
         )}
+        {r.verification_states && r.verification_states.length > 0 && (
+          <div className="mt-2 space-y-1">
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Required read-back state
+            </div>
+            <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
+              {JSON.stringify(r.verification_states, null, 2)}
+            </pre>
+          </div>
+        )}
+        {(r.before_state != null || r.after_state != null) && (
+          <details className="mt-2 text-xs">
+            <summary className="cursor-pointer font-medium text-muted-foreground">Observed and intended state</summary>
+            <pre className="mt-1 overflow-x-auto rounded-md border border-border bg-muted/40 p-2">
+              {JSON.stringify({ before: r.before_state, after: r.after_state }, null, 2)}
+            </pre>
+          </details>
+        )}
         <div className="mt-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Rollback (to undo by hand)
+          Prepared rollback
         </div>
         {r.would_run_rollback ? (
           <pre className="mt-1 overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-xs">
             {r.would_run_rollback.commands.join("\n")}
           </pre>
         ) : (
-          <p className="mt-1 text-xs text-muted-foreground">No rollback defined for this template.</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {r.predicted_noop || r.mutation_effect === "noop"
+              ? "No rollback needed: this action makes no configuration change."
+              : "No verified inverse is available for this action."}
+          </p>
         )}
       </div>
     );
@@ -126,6 +153,12 @@ function ApplyResultRow({ r }: { r: RerouteResult }) {
       <div className="flex flex-wrap items-center gap-2">
         <StateBadge state={r.state ?? (r.executed ? "succeeded" : "not executed")} />
         <span className="text-muted-foreground">· {deviceLabel}</span>
+        {r.mutation_effect === "noop" && (
+          <span className="text-xs font-medium text-muted-foreground">already satisfied · no change sent</span>
+        )}
+        {r.mutation_effect === "unknown" && (
+          <span className="text-xs font-medium text-amber-800 dark:text-amber-300">change unknown</span>
+        )}
       </div>
       <AutoTargetInfo result={r} />
       <p className="mt-1 text-xs text-muted-foreground">{r.message}</p>
@@ -162,7 +195,7 @@ const BUNDLE_STATE_LABEL: Record<string, string> = {
  * deliberately loud — the difference between an operator who knows and one who
  * does not.
  */
-function BundleProgressView({
+export function BundleProgressView({
   bundle,
   bundleId,
   totalHint,
@@ -260,25 +293,34 @@ function BundleProgressView({
       <div className="space-y-1.5">
         {(bundle?.actions ?? []).map((a) => (
           <div
-            key={a.reroute_id}
+            key={`${a.position ?? "queued"}-${a.reroute_id ?? "not-run"}`}
             className="flex flex-wrap items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
           >
             <span className="w-6 shrink-0 text-xs text-muted-foreground">
-              #{a.position ?? 0}
+              #{(a.position ?? 0) + 1}
             </span>
             <StateBadge state={a.state} />
             <span className="font-medium">{a.template_display_name ?? "action"}</span>
             <span className="text-muted-foreground">on</span>
             <span className="font-medium">{a.device_name ?? `device ${a.device_id}`}</span>
             <span className="flex-1" />
-            <Link
-              to={`/mitigations?tab=history&reroute=${a.reroute_id}`}
-              className="text-xs text-primary underline-offset-4 hover:underline"
-            >
-              #{a.reroute_id}
-            </Link>
+            {a.reroute_id != null ? (
+              <Link
+                to={`/mitigations?tab=history&reroute=${a.reroute_id}`}
+                className="text-xs text-primary underline-offset-4 hover:underline"
+              >
+                #{a.reroute_id}
+              </Link>
+            ) : (
+              <span className="text-xs text-muted-foreground">not attempted</span>
+            )}
             {a.failure_reason && (
               <p className="w-full text-xs text-destructive">{a.failure_reason}</p>
+            )}
+            {a.params && Object.keys(a.params).length > 0 && (
+              <p className="w-full break-all pl-8 text-xs text-muted-foreground">
+                {Object.entries(a.params).map(([key, value]) => `${key}=${String(value)}`).join(", ")}
+              </p>
             )}
           </div>
         ))}
@@ -305,7 +347,7 @@ function BundleProgressView({
 interface ApplyMitigationDialogProps {
   rule: Rule;
   /** Pass the current operating mode so the confirmation copy is accurate. */
-  operatingMode?: "observe" | "enforce";
+  operatingMode?: "observe" | "enforce" | "unknown";
   onClose: () => void;
   /** Called after a successful apply so the caller can refresh data. */
   onApplied?: () => void;
@@ -318,7 +360,7 @@ interface ApplyMitigationDialogProps {
  */
 export function ApplyMitigationDialog({
   rule,
-  operatingMode = "observe",
+  operatingMode = "unknown",
   onClose,
   onApplied,
 }: ApplyMitigationDialogProps) {
@@ -337,6 +379,7 @@ export function ApplyMitigationDialog({
   const [pollError, setPollError] = useState<string | null>(null);
 
   const isObserve = operatingMode === "observe";
+  const isUnknown = operatingMode === "unknown";
   const bundleRunning =
     phase === "progress" && (bundle === null || !isBundleTerminal(bundle.state));
 
@@ -440,6 +483,11 @@ export function ApplyMitigationDialog({
                 <p className="font-medium text-amber-700 dark:text-amber-400">
                   The controller is in <strong>observe mode</strong>: nothing will
                   execute. You will see the exact commands that would run.
+                </p>
+              ) : isUnknown ? (
+                <p className="font-medium text-amber-800 dark:text-amber-300">
+                  The current operating mode could not be confirmed. The server will
+                  enforce the preview token and all execution gates.
                 </p>
               ) : (
                 <p className="font-medium text-destructive">

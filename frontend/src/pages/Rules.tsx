@@ -15,12 +15,9 @@ import {
   Trash2,
   ArrowUp,
   ArrowDown,
-  ChevronUp,
-  ChevronDown,
   ChevronsUpDown,
   Workflow,
   Plus,
-  X,
   Info,
   AlertTriangle,
   ShieldAlert,
@@ -33,18 +30,22 @@ import {
   type Device,
   type Template,
   type SystemSettings,
+  type ActionDraft,
+  type MitigationPreset,
   ApiError,
 } from "@/lib/api";
 import { Label } from "@/components/ui/label";
 import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
-import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
+import { ApplyMitigationDialog, ApplyResultRow } from "@/components/apply-mitigation-dialog";
+import { OrderedActionSetEditor } from "@/components/ordered-action-set-editor";
 import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
-import { templateLabel, templateLabelFrom, automationStatus, timeAgo } from "@/lib/labels";
+import { templateLabel, templateLabelFrom, timeAgo } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
+import { expandBulkActions, importActionCopies } from "@/lib/action-sets";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,9 +58,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -88,11 +91,10 @@ import {
  * Ordering and bulk add (plans/015):
  * - `position` is always sent explicitly (max existing + 1). Execution order is a
  *   safety property: additive actions must be able to run before destructive ones.
- * - Up/down controls rewrite the affected suffix via delete + re-add; the API has
- *   no PATCH on rule_actions.
- * - Routers and announced prefixes are multi-selects; submitting posts the
- *   cartesian product sequentially. A mid-sequence failure stops, reports exactly
- *   how many landed, and re-reads the rule (audit finding FE-06).
+ * - Up/down controls and bulk additions submit the complete ordered set through
+ *   one optimistic-revision API call. Validation and persistence are atomic.
+ * - Routers and announced prefixes are multi-selects; the UI expands their
+ *   cartesian product locally before saving the complete set once.
  */
 type PlannedAction = {
   reroute_template_id: number;
@@ -102,6 +104,17 @@ type PlannedAction = {
   auto_target?: string | null;
   label: string;
 };
+
+function actionDraft(action: RuleAction): ActionDraft {
+  return {
+    id: action.id,
+    reroute_template_id: action.reroute_template_id,
+    device_id: action.device_id,
+    params: action.params ?? {},
+    enabled: action.enabled,
+    auto_target: action.auto_target ?? null,
+  };
+}
 
 /**
  * Inventory drift: when a router's route-map or outbound prefix-list moves
@@ -146,6 +159,10 @@ function RuleActionsDialog({
   const [current, setCurrent] = useState<Rule>(rule);
   const [allTemplates, setAllTemplates] = useState<Template[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [presets, setPresets] = useState<MitigationPreset[]>([]);
+  const [presetImportId, setPresetImportId] = useState("");
+  const [importMode, setImportMode] = useState<"append" | "replace">("append");
+  const [editActionIndex, setEditActionIndex] = useState<number | null>(null);
   const [templateId, setTemplateId] = useState<string>("");
   /** Bulk add: every checked router gets the same action set. */
   const [deviceIds, setDeviceIds] = useState<number[]>([]);
@@ -163,14 +180,6 @@ function RuleActionsDialog({
    *  primed with that action's template + router and this says what to re-pick. */
   const [fixHint, setFixHint] = useState<string | null>(null);
   const addFormRef = useRef<HTMLDivElement>(null);
-  /** What a partially-failed add still owes, pinned to the form it came from.
-   *  The API has no batch endpoint and no idempotency key, so re-submitting the
-   *  whole routers x prefixes product would duplicate everything that already
-   *  landed. The button therefore re-arms as "Retry remaining N" instead. */
-  const [pendingRetry, setPendingRetry] = useState<{
-    items: PlannedAction[];
-    signature: string;
-  } | null>(null);
 
   // BGP + MSS bundle state (only relevant for bgp_advertise_* templates)
   const [mssBundle, setMssBundle] = useState(false);
@@ -199,6 +208,10 @@ function RuleActionsDialog({
       .list()
       .then(setDevices)
       .catch(() => setDevices([]));
+    api.mitigationPresets
+      .list()
+      .then((items) => setPresets(items.filter((item) => !item.archived_at)))
+      .catch(() => setPresets([]));
   }, []);
 
   // Per-device inventory needed by the bulk form: announced prefixes (the
@@ -315,7 +328,6 @@ function RuleActionsDialog({
    *  values are deliberately NOT copied — they are exactly what stopped
    *  validating, and inventory params are re-derived per router anyway. */
   function startFix(a: RuleAction) {
-    setPendingRetry(null);
     setTemplateId(String(a.reroute_template_id));
     setDeviceIds([a.device_id]);
     setValuesByDevice({});
@@ -333,7 +345,6 @@ function RuleActionsDialog({
   }
 
   function resetAddForm() {
-    setPendingRetry(null);
     setFixHint(null);
     setTemplateId("");
     setDeviceIds([]);
@@ -372,52 +383,31 @@ function RuleActionsDialog({
     if (isBgpAdvertise && mssBundle && !mssTemplate)
       return `MSS template "${mssTemplateName}" not found. Enable it in Templates.`;
 
-    const plan: PlannedAction[] = [];
-    let pos = nextPosition;
-    for (const deviceId of deviceIds) {
-      const deviceName = devices.find((d) => d.id === deviceId)?.name ?? `device ${deviceId}`;
-      const base: Record<string, unknown> = {};
-      const raw = valuesByDevice[deviceId] ?? {};
-      for (const name of Object.keys(schema)) {
-        if (omitFromParamsForm.has(name)) continue;
-        if (raw[name]) base[name] = raw[name];
-      }
-      const prefixes: (string | null)[] = bulkPrefixParam ? selectedPrefixes : [null];
-      for (const prefix of prefixes) {
-        const params = { ...base };
-        if (bulkPrefixParam && prefix !== null) params[bulkPrefixParam] = prefix;
-        plan.push({
-          reroute_template_id: template.id,
-          device_id: deviceId,
-          params,
-          position: pos++,
-          ...(autoDetectMode ? { auto_target: "flow_dst_host" } : {}),
-          label: `${templateLabel(template)} on ${deviceName}${prefix ? ` · ${prefix}` : ""}`,
-        });
-      }
-      // The MSS clamp is an interface-level action, so it is attached ONCE per
-      // router, right after that router's BGP actions.
-      if (isBgpAdvertise && mssBundle && mssTemplate) {
-        const mssParams: Record<string, unknown> = { interface: mssIfaceByDevice[deviceId] ?? "" };
-        if (template.name === BGP_ADVERTISE_ADD && mssValue) mssParams.mss = mssValue;
-        plan.push({
-          reroute_template_id: mssTemplate.id,
-          device_id: deviceId,
-          params: mssParams,
-          position: pos++,
-          label: `${templateLabel(mssTemplate)} on ${deviceName}`,
-        });
-      }
-    }
-    return plan;
+    const paramsByDevice = Object.fromEntries(deviceIds.map((id) => [id,
+      Object.fromEntries(Object.entries(valuesByDevice[id] ?? {}).filter(([name, value]) => !omitFromParamsForm.has(name) && value)),
+    ]));
+    const mssParamsByDevice = Object.fromEntries(deviceIds.map((id) => [id, {
+      interface: mssIfaceByDevice[id] ?? "",
+      ...(template.name === BGP_ADVERTISE_ADD && mssValue ? { mss: mssValue } : {}),
+    }]));
+    return expandBulkActions({
+      templateId: template.id, deviceIds, paramsByDevice,
+      prefixParam: bulkPrefixParam, prefixes: selectedPrefixes,
+      autoTarget: autoDetectMode ? "flow_dst_host" : null,
+      mss: isBgpAdvertise && mssBundle && mssTemplate ? {
+        templateId: mssTemplate.id,
+        paramsByDevice: mssParamsByDevice,
+        placement: template.name === BGP_ADVERTISE_ADD ? "before" : "after",
+      } : null,
+    }).map((action, index) => ({
+      ...action,
+      position: nextPosition + index,
+      label: `${templateLabel(allTemplates.find((item) => item.id === action.reroute_template_id) ?? template)} on ${devices.find((device) => device.id === action.device_id)?.name ?? `device ${action.device_id}`}`,
+    }));
   }
 
-  async function add(retry?: PlannedAction[]) {
-    // A retry re-sends ONLY what did not land, re-ranked from the current tail
-    // of the (re-read) action list so it cannot collide with what is saved.
-    const plan = retry
-      ? retry.map((item, i) => ({ ...item, position: nextPosition + i }))
-      : buildPlan();
+  async function add() {
+    const plan = buildPlan();
     if (typeof plan === "string") {
       setError(plan);
       return;
@@ -425,50 +415,52 @@ function RuleActionsDialog({
     setBusy(true);
     setError(null);
     setNotice(null);
-    let written = 0;
-    let latest = current;
     try {
-      // Sequential, one commit each: the API has no batch endpoint. If one write
-      // fails we stop immediately and report exactly how many landed — a silent
-      // partial rule is how a mitigation ends up half-configured.
-      for (const item of plan) {
-        const { label: _label, ...body } = item;
-        latest = await api.rules.addAction(current.id, body);
-        written++;
-      }
-      setCurrent(latest);
-      onChanged(latest);
-      setPendingRetry(null);
+      const updated = await api.rules.saveActions(current.id, {
+        revision: current.actions_revision ?? 0,
+        actions: [
+          ...actions.map(actionDraft),
+          ...plan.map((item) => ({
+            reroute_template_id: item.reroute_template_id,
+            device_id: item.device_id,
+            params: item.params,
+            enabled: true,
+            auto_target: item.auto_target ?? null,
+          })),
+        ],
+      });
+      setCurrent(updated);
+      onChanged(updated);
       resetAddForm();
       setNotice(
         `Added ${plan.length} action${plan.length === 1 ? "" : "s"} at position ${nextPosition}+.`,
       );
     } catch (e) {
-      const failed = plan[written];
-      const remaining = plan.slice(written);
-      // Disarm the full plan: pressing Add again must NOT re-send the actions
-      // that already succeeded. Only the remainder stays queued.
-      setPendingRetry({ items: remaining, signature: formSignature });
       setError(
-        `Added ${written} of ${plan.length} action(s), then failed on "${failed?.label ?? "next action"}": ` +
-          `${e instanceof ApiError ? e.message : "request failed"}. The list above is the real saved state — ` +
-          `the actions already written were NOT rolled back. Use "Retry remaining ${remaining.length}" ` +
-          `to finish; editing the form starts a fresh plan.`,
+        `${e instanceof ApiError ? e.message : "Save failed"}. No action was added; ` +
+          "the server saves and validates the complete ordered set atomically.",
       );
-      await reconcile(latest);
+      await reconcile(current);
     } finally {
       setBusy(false);
     }
   }
 
-  async function remove(actionId: number) {
+  async function remove(index: number) {
+    const next = actions.filter((_, itemIndex) => itemIndex !== index).map(actionDraft);
+    setBusy(true);
+    setError(null);
     try {
-      const updated = await api.rules.removeAction(current.id, actionId);
+      const updated = await api.rules.saveActions(current.id, {
+        revision: current.actions_revision ?? 0,
+        actions: next,
+      });
       setCurrent(updated);
       onChanged(updated);
-    } catch {
-      /* ignore */
-    }
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not remove action");
+      await reconcile(current);
+    } finally { setBusy(false); }
   }
 
   /**
@@ -488,13 +480,12 @@ function RuleActionsDialog({
     setError(null);
     setNotice(null);
     try {
-      await api.rules.reorderActions(
-        current.id,
-        desired.map((a) => a.id),
-      );
-      const latest = await api.rules.get(current.id);
-      setCurrent(latest);
-      onChanged(latest);
+      const updated = await api.rules.saveActions(current.id, {
+        revision: current.actions_revision ?? 0,
+        actions: desired.map(actionDraft),
+      });
+      setCurrent(updated);
+      onChanged(updated);
     } catch (e) {
       setError(
         `Reorder failed: ${e instanceof ApiError ? e.message : "request failed"}. ` +
@@ -506,6 +497,31 @@ function RuleActionsDialog({
     }
   }
 
+  async function importPreset() {
+    const preset = presets.find((item) => String(item.id) === presetImportId);
+    if (!preset) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await api.rules.saveActions(current.id, {
+        revision: current.actions_revision ?? 0,
+        actions: importActionCopies(actions.map(actionDraft), preset.actions, importMode),
+        preset_id: preset.id,
+        preset_revision: preset.revision,
+      });
+      setCurrent(updated);
+      onChanged(updated);
+      setPresetImportId("");
+      setNotice(
+        `Imported an independent copy of “${preset.name}”. Future preset edits will not change this rule. Automatic execution was disarmed for review.`,
+      );
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Preset import failed");
+      await reconcile(current);
+    } finally { setBusy(false); }
+  }
+
   async function toggleAuto() {
     try {
       const updated = await api.rules.update(current.id, {
@@ -513,8 +529,8 @@ function RuleActionsDialog({
       });
       setCurrent(updated);
       onChanged(updated);
-    } catch {
-      /* ignore */
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not change automatic execution");
     }
   }
 
@@ -525,24 +541,10 @@ function RuleActionsDialog({
       });
       setCurrent(updated);
       onChanged(updated);
-    } catch {
-      /* ignore */
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not change manual apply");
     }
   }
-
-  /** Identity of the current add form. A retry is only offered while the form
-   *  is byte-for-byte the one that failed; any edit falls back to a normal add. */
-  const formSignature = JSON.stringify([
-    templateId,
-    deviceIds,
-    valuesByDevice,
-    selectedPrefixes,
-    mssBundle,
-    mssIfaceByDevice,
-    mssValue,
-  ]);
-  const retryItems =
-    pendingRetry && pendingRetry.signature === formSignature ? pendingRetry.items : null;
 
   const plannedCount = (() => {
     if (!template || deviceIds.length === 0) return 0;
@@ -632,162 +634,84 @@ function RuleActionsDialog({
 
         {/* Existing actions, in execution order */}
         <div className="space-y-2">
-          {actions.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No actions attached yet.</p>
-          ) : (
-            <>
-              <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
-                <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                <p className="text-xs text-muted-foreground">
-                  Execution order matters: put additive actions (advertise to a
-                  scrubber) <strong>before</strong> destructive ones (withdraw from
-                  an upstream, shut an interface), so an abort never leaves a
-                  black-hole. Reordering rewrites the affected actions (delete +
-                  re-add) because the API has no position-update endpoint.
-                </p>
-              </div>
-              {actions.map((a, i) => {
-                // Only an explicit "drifted" is a problem: the field is absent on
-                // API builds that predate the inventory check.
-                const drifted = a.inventory_state === "drifted";
-                return (
-                  <div
-                    key={a.id}
-                    className={
-                      "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-sm " +
-                      (drifted
-                        ? "border-amber-400 bg-amber-50 dark:border-amber-700 dark:bg-amber-950/30"
-                        : "border-border")
-                    }
-                  >
-                    <span
-                      className="w-8 shrink-0 text-xs tabular-nums text-muted-foreground"
-                      title={`execution rank ${a.position ?? 0}`}
-                    >
-                      {i + 1}.
-                    </span>
-                    <span className="font-medium">{templateLabelFrom(a.template_display_name, a.template_name)}</span>
-                    <span className="text-muted-foreground">on</span>
-                    <span className="font-medium">{a.device_name}</span>
-                    {(() => {
-                      const dev = devices.find((d) => d.id === a.device_id);
-                      const auto = dev ? automationStatus(dev) : null;
-                      return auto ? (
-                        <Badge
-                          variant="outline"
-                          className={
-                            auto.tone === "bad"
-                              ? "text-[10px] border-red-400 text-red-700 dark:text-red-400"
-                              : "text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                          }
-                          title="Automatic mitigation on this device is currently held (SSH unhealthy or stabilizing). Detection still fires and alerts; a manual reroute may still be allowed."
-                        >
-                          {auto.label}
-                        </Badge>
-                      ) : null;
-                    })()}
-                    {drifted && (
-                      <Badge
-                        variant="outline"
-                        className="gap-1 text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                        title="This action's saved parameters no longer match the router's discovered inventory"
-                      >
-                        <AlertTriangle className="size-3" />
-                        inventory drift
-                      </Badge>
-                    )}
-                    {a.auto_target === "flow_dst_host" ? (
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] border-amber-400 text-amber-700 dark:text-amber-400"
-                        title="Target resolved at mitigation time: top attacked destination IP from this rule's flows, null-routed as /32 or /128"
-                      >
-                        target: attacked dst IP (auto /32·/128)
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">
-                        {Object.entries(a.params ?? {})
-                          .map(([k, v]) => `${k}=${String(v)}`)
-                          .join(", ")}
-                      </span>
-                    )}
-                    {/* Show non-prefix params even when auto-targeting (e.g. blackhole tag) */}
-                    {a.auto_target === "flow_dst_host" &&
-                      Object.entries(a.params ?? {}).filter(([k]) => k !== "prefix").length > 0 && (
-                        <span className="text-xs text-muted-foreground">
-                          {Object.entries(a.params ?? {})
-                            .filter(([k]) => k !== "prefix")
-                            .map(([k, v]) => `${k}=${String(v)}`)
-                            .join(", ")}
-                        </span>
-                      )}
-                    <span className="flex-1" />
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      onClick={() => void move(i, -1)}
-                      disabled={busy || i === 0}
-                      title="Run earlier"
-                    >
-                      <ChevronUp className="size-4" />
-                      <span className="sr-only">Move up</span>
-                    </Button>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      onClick={() => void move(i, 1)}
-                      disabled={busy || i === actions.length - 1}
-                      title="Run later"
-                    >
-                      <ChevronDown className="size-4" />
-                      <span className="sr-only">Move down</span>
-                    </Button>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      className="text-destructive hover:text-destructive"
-                      onClick={() => void remove(a.id)}
-                      disabled={busy}
-                      title="Remove action"
-                    >
-                      <X className="size-4" />
-                    </Button>
-                    {drifted && (
-                      // The server's reason is the actionable part (it names the
-                      // neighbour / prefix-list that moved), so it is rendered in
-                      // full and verbatim on its own line.
-                      <div className="basis-full space-y-1 border-t border-amber-300 pt-1.5 dark:border-amber-800">
-                        <p className="break-words text-xs text-amber-800 dark:text-amber-300">
-                          {a.inventory_drift_reason ??
-                            "Saved parameters no longer match this router's discovered inventory."}
-                        </p>
-                        <div className="flex flex-wrap items-center gap-2">
-                          {/* Empty on an API build without the field: say nothing
-                              rather than claim a check that never ran. */}
-                          {timeAgo(a.inventory_checked_at) && (
-                            <span className="text-[11px] text-muted-foreground">
-                              last checked {timeAgo(a.inventory_checked_at)}
-                            </span>
-                          )}
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-6 px-2 text-[11px]"
-                            onClick={() => startFix(a)}
-                            disabled={busy}
-                            title="Prime the add form with this template and router so you can re-pick the parameters from discovered inventory"
-                          >
-                            Re-pick parameters
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </>
-          )}
+          <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+            <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+            <p className="text-xs text-muted-foreground">
+              Execution order matters: put additive actions before destructive ones.
+              Every reorder, add, remove, or import now saves the complete set atomically.
+            </p>
+          </div>
+          <OrderedActionSetEditor
+            actions={actions.map((action) => ({
+              ...actionDraft(action),
+              warning:
+                action.inventory_state === "drifted"
+                  ? action.inventory_drift_reason ?? "Saved parameters no longer match router inventory."
+                  : null,
+            }))}
+            templates={allTemplates}
+            devices={devices}
+            busy={busy}
+            onMove={(index, delta) => void move(index, delta)}
+            onRemove={(index) => void remove(index)}
+            selectedIndex={editActionIndex}
+            onSelect={setEditActionIndex}
+            emptyMessage="No actions attached yet. Add actions or import a saved manual mitigation."
+          />
+          {editActionIndex !== null && actions[editActionIndex] && (() => {
+            const action = actions[editActionIndex];
+            const actionTemplate = allTemplates.find((item) => item.id === action.reroute_template_id);
+            if (!actionTemplate) return null;
+            const omit = action.auto_target === "flow_dst_host" ? new Set(["prefix"]) : undefined;
+            const values = Object.fromEntries(Object.entries(action.params ?? {}).map(([key, value]) => [key, String(value)]));
+            return <div className="space-y-3 rounded-md border border-border bg-muted/30 p-3">
+              <div><div className="text-sm font-medium">Edit action {editActionIndex + 1}</div><p className="text-xs text-muted-foreground">Changing the router clears inventory-bound parameters. Save validates and replaces the complete set atomically.</p></div>
+              <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={action.device_id} onChange={(event) => {
+                const next = [...actions]; next[editActionIndex] = { ...action, device_id: Number(event.target.value), params: {} }; setCurrent({ ...current, actions: next });
+              }}>{devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
+              <ActionParamsForm schema={actionTemplate.parameter_schema} deviceId={action.device_id} values={values} omitParams={omit} onChange={(nextValues) => {
+                const next = [...actions]; next[editActionIndex] = { ...action, params: Object.fromEntries(Object.entries(nextValues).filter(([, value]) => value.trim() !== "")) }; setCurrent({ ...current, actions: next });
+              }} />
+              <div className="flex justify-end gap-2"><Button variant="outline" size="sm" onClick={() => { setEditActionIndex(null); void reconcile(rule); }}>Cancel</Button><Button size="sm" disabled={busy} onClick={async () => {
+                setBusy(true); setError(null); try { const updated = await api.rules.saveActions(current.id, { revision: current.actions_revision ?? 0, actions: (current.actions ?? []).map(actionDraft) }); setCurrent(updated); onChanged(updated); setEditActionIndex(null); setNotice("Action updated; automatic execution was disarmed for review."); } catch (error) { setError(error instanceof ApiError ? error.message : "Action update failed"); await reconcile(rule); } finally { setBusy(false); }
+              }}>Save complete set</Button></div>
+            </div>;
+          })()}
+          {driftedActions(current).map((action) => (
+            <div key={action.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+              <span className="break-words">
+                {templateLabelFrom(action.template_display_name, action.template_name)} · last checked {timeAgo(action.inventory_checked_at) || "unknown"}
+              </span>
+              <Button size="sm" variant="outline" onClick={() => startFix(action)} disabled={busy}>
+                Re-pick parameters
+              </Button>
+            </div>
+          ))}
         </div>
+
+        {presets.length > 0 && (
+          <div className="space-y-3 rounded-md border border-border p-3">
+            <div>
+              <div className="text-sm font-medium">Import saved manual mitigation</div>
+              <p className="text-xs text-muted-foreground">
+                Imports an independent copy. Later changes to the saved mitigation do not change this rule.
+              </p>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_9rem_auto]">
+              <select className={inputClass} value={presetImportId} onChange={(event) => setPresetImportId(event.target.value)}>
+                <option value="">Select saved mitigation…</option>
+                {presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name} · {preset.actions.length} actions</option>)}
+              </select>
+              <select className={inputClass} value={importMode} onChange={(event) => setImportMode(event.target.value as "append" | "replace")}>
+                <option value="append">Append</option>
+                <option value="replace">Replace all</option>
+              </select>
+              <Button variant="outline" onClick={() => void importPreset()} disabled={busy || !presetImportId}>
+                Import copy
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Add actions (bulk: routers x prefixes) */}
         <div ref={addFormRef} className="space-y-3 rounded-md border border-dashed border-border p-3">
@@ -1026,15 +950,13 @@ function RuleActionsDialog({
           )}
           <Button
             size="sm"
-            onClick={() => void add(retryItems ?? undefined)}
-            disabled={busy || (retryItems === null && plannedCount === 0)}
+            onClick={() => void add()}
+            disabled={busy || plannedCount === 0}
           >
             <Plus className="size-4" />
             {busy
               ? "Adding…"
-              : retryItems
-                ? `Retry remaining ${retryItems.length}`
-                : plannedCount > 1
+              : plannedCount > 1
                   ? `Add ${plannedCount} actions`
                   : "Add action"}
           </Button>
@@ -1152,6 +1074,75 @@ function RuleStatus({ rule }: { rule: Rule }) {
   );
 }
 
+function ClearRuleDialog({ rule, onClose, onChanged }: {
+  rule: Rule;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [reason, setReason] = useState("");
+  const [phase, setPhase] = useState<"reason" | "preview" | "result">("reason");
+  const [busy, setBusy] = useState(false);
+  const [response, setResponse] = useState<Awaited<ReturnType<typeof api.rules.clear>> | null>(null);
+  const [token, setToken] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(dryRun: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.rules.clear(rule.id, {
+        reason: reason.trim() || undefined,
+        dry_run: dryRun,
+        preview_token: dryRun ? undefined : token ?? undefined,
+      });
+      setResponse(result);
+      if (dryRun) {
+        setToken(result.preview_token ?? null);
+        setPhase("preview");
+      } else {
+        setToken(null);
+        setPhase("result");
+        onChanged();
+      }
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Clear request failed");
+      if (!dryRun) {
+        setToken(null);
+        setPhase("reason");
+      }
+    } finally { setBusy(false); }
+  }
+
+  return <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
+    <DialogContent className="sm:max-w-xl">
+      <DialogHeader>
+        <DialogTitle>Clear firing rule — {rule.name}</DialogTitle>
+        <DialogDescription>Clearing can roll back successful automatic actions. Review the exact server plan before confirming.</DialogDescription>
+      </DialogHeader>
+      {phase === "reason" && <label className="block space-y-1 text-sm font-medium">
+        Reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
+        <Input value={reason} maxLength={500} onChange={(event) => setReason(event.target.value)} />
+      </label>}
+      {(phase === "preview" || phase === "result") && <div className="max-h-[55vh] space-y-3 overflow-y-auto" aria-live="polite">
+        {(response?.results ?? []).map((result, index) => <ApplyResultRow key={index} r={result} />)}
+        {phase === "preview" && (response?.results?.length ?? 0) === 0 && <p className="text-sm text-muted-foreground">No router rollback is required. Confirmation will clear only the detection state.</p>}
+        {phase === "preview" && !token && (response?.results?.length ?? 0) > 0 && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode cannot reverse the actions still applied by this rule. Switch to enforce mode and prepare a fresh rollback preview before clearing it.</p>}
+        {phase === "result" && <div className={`rounded-md border p-3 text-sm ${response?.cleared ? "border-border" : "border-destructive bg-destructive/10 text-destructive"}`} role="status">
+          {response?.cleared
+            ? "The server confirmed that the rule is clear. Review any rollback results above before closing."
+            : "The rule was not confirmed clear. It may still be firing; refresh and inspect the rollback results before retrying."}
+        </div>}
+      </div>}
+      {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+      <DialogFooter>
+        <Button variant="outline" disabled={busy} onClick={onClose}>{phase === "result" ? "Close" : "Cancel"}</Button>
+        {phase === "reason" && <Button disabled={busy} onClick={() => void submit(true)}>{busy ? "Preparing…" : "Preview clear plan"}</Button>}
+        {phase === "preview" && <Button variant="destructive" disabled={busy || !token} onClick={() => void submit(false)}>{busy ? "Clearing…" : "Confirm reviewed clear"}</Button>}
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>;
+}
+
 type SortDir = "asc" | "desc";
 
 export default function Rules() {
@@ -1170,6 +1161,7 @@ export default function Rules() {
   // Firing rule the operator chose to mitigate from this page (same guarded
   // preview -> token -> execute dialog as Dashboard and Mitigations).
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
+  const [clearRuleTarget, setClearRuleTarget] = useState<Rule | null>(null);
 
   const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
 
@@ -1206,24 +1198,14 @@ export default function Rules() {
     return () => clearInterval(t);
   }, []);
 
-  async function clearRule(rule: Rule) {
-    try {
-      const res = await api.rules.clear(rule.id);
-      if (res.cleared) toast.success(`Cleared "${rule.name}"`);
-      loadRules();
-    } catch {
-      toast.error("Failed to clear rule");
-    }
-  }
-
   async function toggleRule(rule: Rule) {
     try {
       const updated = await api.rules.update(rule.id, {
         enabled: !rule.enabled,
       });
       setRules((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-    } catch {
-      // ignore
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : "Could not change rule state");
     }
   }
 
@@ -1491,8 +1473,8 @@ export default function Rules() {
                               size="sm"
                               variant="outline"
                               className="h-7"
-                              title="Clear this firing rule (resets detection state; executes nothing)"
-                              onClick={() => void clearRule(rule)}
+                              title="Review the rollback plan, then clear this firing rule"
+                              onClick={() => setClearRuleTarget(rule)}
                             >
                               Clear
                             </Button>
@@ -1534,7 +1516,7 @@ export default function Rules() {
       {applyRule && (
         <ApplyMitigationDialog
           rule={applyRule}
-          operatingMode={settings?.operating_mode ?? "observe"}
+          operatingMode={settings?.operating_mode ?? "unknown"}
           onClose={() => setApplyRule(null)}
           onApplied={() => loadRules()}
         />
@@ -1590,6 +1572,13 @@ export default function Rules() {
           await deleteRule(rule);
         }}
       />
+      {clearRuleTarget && (
+        <ClearRuleDialog
+          rule={clearRuleTarget}
+          onClose={() => setClearRuleTarget(null)}
+          onChanged={loadRules}
+        />
+      )}
     </div>
   );
 }

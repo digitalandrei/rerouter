@@ -62,6 +62,10 @@ pub enum SflowError {
     UnsupportedVersion(u32),
     #[error("unsupported agent address type {0}")]
     BadAddressType(u32),
+    #[error("invalid XDR padding byte")]
+    BadPadding,
+    #[error("trailing bytes after declared sFlow samples: {0}")]
+    TrailingBytes(usize),
 }
 
 /// The outcome of decoding one sFlow datagram. `sub_agent_id` maps to the
@@ -109,20 +113,17 @@ impl<'a> Reader<'a> {
         let s = self.take(4)?;
         Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
-    /// Skip `n` bytes, clamped to what remains (never errors — used for opaque
-    /// padding and for stepping over a body we have already sub-parsed).
-    fn skip(&mut self, n: usize) {
-        self.pos = (self.pos + n).min(self.buf.len());
-    }
     /// Read an XDR opaque<>: a u32 length followed by that many bytes, then the
-    /// 4-byte-alignment padding. Returns just the data slice. The declared
-    /// length is clamped to what remains so a lying length cannot over-read.
+    /// exact 4-byte-alignment padding. A lying length is malformed, not a short
+    /// but otherwise trustworthy record.
     fn opaque(&mut self) -> Result<&'a [u8], SflowError> {
         let len = self.u32()? as usize;
-        let len = len.min(self.remaining());
         let data = self.take(len)?;
         let pad = (4 - (len % 4)) % 4;
-        self.skip(pad);
+        let padding = self.take(pad)?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(SflowError::BadPadding);
+        }
         Ok(data)
     }
 }
@@ -149,24 +150,27 @@ pub fn decode(datagram: &[u8]) -> Result<Decoded, SflowError> {
         ..Default::default()
     };
 
-    // Walk samples. `num_samples` is advisory: we stop when the buffer is
-    // exhausted so a lying count cannot loop us past the data.
+    // Walk exactly the declared samples. A count/length mismatch is malformed
+    // evidence and the caller drops the datagram.
     for _ in 0..num_samples {
         if r.remaining() < 8 {
-            break;
+            return Err(SflowError::Short {
+                needed: 8,
+                have: r.remaining(),
+            });
         }
         let sample_type = r.u32()?;
-        let body = match r.opaque() {
-            Ok(b) => b,
-            Err(_) => break, // truncated sample body — stop cleanly.
-        };
+        let body = r.opaque()?;
         out.samples_total += 1;
         match sample_type {
-            SAMPLE_FLOW => parse_flow_sample(body, false, &mut out),
-            SAMPLE_FLOW_EXPANDED => parse_flow_sample(body, true, &mut out),
+            SAMPLE_FLOW => parse_flow_sample(body, false, &mut out)?,
+            SAMPLE_FLOW_EXPANDED => parse_flow_sample(body, true, &mut out)?,
             // counter samples (2 / 4) and unknown types: ignored in v1.
             _ => out.samples_skipped += 1,
         }
+    }
+    if r.remaining() != 0 {
+        return Err(SflowError::TrailingBytes(r.remaining()));
     }
     Ok(out)
 }
@@ -213,7 +217,7 @@ fn iface_expanded(format: u32, value: u32) -> Option<u32> {
 
 /// Parse a (possibly expanded) flow sample body, appending one [`FlowRecord`]
 /// per sample that contains a usable raw-packet-header record.
-fn parse_flow_sample(body: &[u8], expanded: bool, out: &mut Decoded) {
+fn parse_flow_sample(body: &[u8], expanded: bool, out: &mut Decoded) -> Result<(), SflowError> {
     let mut r = Reader::new(body);
     // header fields up to num_records; bail (skip the sample) on truncation.
     let parsed = (|| -> Result<(u32, Option<u32>, Option<u32>, u32), SflowError> {
@@ -246,7 +250,7 @@ fn parse_flow_sample(body: &[u8], expanded: bool, out: &mut Decoded) {
         Ok(v) => v,
         Err(_) => {
             out.samples_skipped += 1;
-            return;
+            return Ok(());
         }
     };
 
@@ -261,16 +265,13 @@ fn parse_flow_sample(body: &[u8], expanded: bool, out: &mut Decoded) {
     let mut record: Option<FlowRecord> = None;
     for _ in 0..num_records {
         if r.remaining() < 8 {
-            break;
+            return Err(SflowError::Short {
+                needed: 8,
+                have: r.remaining(),
+            });
         }
-        let data_format = match r.u32() {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        let rec_body = match r.opaque() {
-            Ok(b) => b,
-            Err(_) => break,
-        };
+        let data_format = r.u32()?;
+        let rec_body = r.opaque()?;
         if data_format == RECORD_RAW_PACKET_HEADER {
             if let Some(mut fr) = parse_raw_header(rec_body) {
                 fr.in_if_index = in_if;
@@ -284,6 +285,10 @@ fn parse_flow_sample(body: &[u8], expanded: bool, out: &mut Decoded) {
         Some(fr) => out.records.push(fr),
         None => out.samples_skipped += 1,
     }
+    if r.remaining() != 0 {
+        return Err(SflowError::TrailingBytes(r.remaining()));
+    }
+    Ok(())
 }
 
 /// Parse a `sampled_header` record: header_protocol, frame_length, stripped, and
@@ -318,8 +323,8 @@ fn parse_raw_header(body: &[u8]) -> Option<FlowRecord> {
         // attributes ingress on the input ifIndex (the Cisco-default behavior the
         // NetFlow path already uses).
         direction: None,
-        bytes: frame_length as u64,
-        pkts: 1,
+        bytes: Some(frame_length as u64),
+        pkts: Some(1),
     })
 }
 
@@ -364,7 +369,15 @@ fn parse_ipv4(h: &[u8]) -> Option<Tuple> {
     let protocol = h[9];
     let src = IpAddr::V4(Ipv4Addr::new(h[12], h[13], h[14], h[15]));
     let dst = IpAddr::V4(Ipv4Addr::new(h[16], h[17], h[18], h[19]));
-    let (src_port, dst_port) = l4_ports(h, ihl, protocol);
+    // Only fragment offset zero contains the transport header. Payload bytes in
+    // later fragments must never be promoted to source/destination ports.
+    let fragment = be16(h, 6)?;
+    let fragment_offset = fragment & 0x1fff;
+    let (src_port, dst_port) = if fragment_offset == 0 {
+        l4_ports(h, ihl, protocol)
+    } else {
+        (None, None)
+    };
     Some((src, dst, protocol, src_port, dst_port))
 }
 

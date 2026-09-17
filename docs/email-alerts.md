@@ -65,20 +65,27 @@ controller writes an `alerts` row
 alert-dispatcher task (async, in-process) picks up new alerts
         |
         v
-resolve recipients (by role + event-type subscriptions)
+transactionally snapshot every email/Teams target into `alert_delivery_intents`
         |
         v
-de-duplicate + rate-limit (see below)
+claim eligible per-target work fairly, then de-duplicate + rate-limit
         |
         v
-render email -> send via SMTP (lettre) -> record outcome in `alert_deliveries`
+send -> append outcome in `alert_deliveries` -> settle or reschedule the intent
 ```
 
 The dispatcher is a dedicated tokio task inside `rerouter-controller`, decoupled
 from the detection and reroute engines: the engines only write `alerts` rows, so
 a slow or failing SMTP server never blocks telemetry ingestion or a reroute. The
-intent is durably recorded in the database first — a crash or restart never loses
-an alert; the dispatcher resumes from unsent rows.
+complete audience is durably recorded before sending. Each target resumes
+independently after restart; one attempted recipient cannot strand its siblings.
+Unmaterialized alerts and unresolved delivery intents are excluded from ordinary
+retention. A crash after a remote send but before its acknowledgement is persisted
+can cause a duplicate delivery; external delivery is not exactly-once.
+
+Eligible work reserves capacity for both critical and ordinary alerts. Settled
+intents no longer occupy retry slots. An empty audience receives an explicit
+settled `no_audience` record, so old unroutable alerts cannot block newer work.
 
 ## De-duplication & rate limiting
 
@@ -103,7 +110,9 @@ Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 - Subscriptions (`alert_subscriptions`): by event type (a NULL event type matches
   all).
 - Critical alerts (`uncertain`, `failed`, security events) always fan out to the
-  admin tier (`admin` / `superadmin`).
+  verified recipients linked to the current admin tier (`admin` / `superadmin`).
+  Recipient creation links an unambiguous normalized user email; external
+  recipients remain valid independent subscription targets.
 
 ## Teams webhook channel
 
@@ -113,10 +122,10 @@ Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
 - Per-event routing lives in `webhook_subscriptions` (NULL `event_type` = all
   events), mirroring `alert_subscriptions`. The same 10-minute de-dup and 20/hr
   rate limit apply, keyed on the endpoint; `ALWAYS_IMMEDIATE` events bypass both.
-- The dispatcher drains when **either** SMTP is configured **or** at least one
-  enabled webhook exists. If SMTP is down but a webhook is configured, Teams still
-  delivers; an alert with no audience on either channel stays queued (so email
-  retries once SMTP comes up) unless SMTP was up and simply had no recipients.
+- The dispatcher materializes work even while SMTP is unavailable. Existing
+  email targets remain retryable without spending transport-failure attempts;
+  Teams targets can still deliver. No-audience records settle explicitly and
+  do not retroactively acquire recipients added later.
 - No alert payload (email or Teams) ever contains a secret.
 
 ## Configuration
@@ -158,7 +167,7 @@ not confirm the SMTP credentials or permission to send from `SMTP_FROM`.
 
 ## Tables
 
-`alerts`, `alert_recipients`, `alert_subscriptions`, `alert_deliveries` (now
+`alerts`, `alert_recipients`, `alert_subscriptions`, `alert_delivery_intents`, `alert_deliveries` (now
 channel-aware, with a nullable `recipient_id` + an `endpoint_id`),
 `webhook_endpoints`, `webhook_subscriptions` — see [database.md](database.md).
 Delivery records (sent/failed/bounced/queued) are retained for audit and

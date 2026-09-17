@@ -23,7 +23,94 @@ use crate::detection::cooldown;
 use crate::reroute::guard;
 use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template, VerifyStep};
-use crate::ssh::{RusshExecutor, SshExecutor};
+use crate::ssh::{
+    LockedDeviceSetPort, ResolvedApply, RusshExecutor, SessionPlan, SshExecutor, SshOutcome,
+};
+
+/// Adapter that runs the existing state machine through a retained set of native
+/// IOS configuration-lock sessions. Bundle orchestration owns the lock set; this
+/// adapter only serializes mutable access to it.
+pub struct LockedSshExecutor<'a> {
+    locked: tokio::sync::Mutex<&'a mut dyn LockedDeviceSetPort>,
+}
+
+impl<'a> LockedSshExecutor<'a> {
+    pub fn new(locked: &'a mut dyn LockedDeviceSetPort) -> Self {
+        Self {
+            locked: tokio::sync::Mutex::new(locked),
+        }
+    }
+
+    pub async fn verify_projected_after(
+        &self,
+        actions: &[crate::reroute::device_plan::PreparedDeviceAction],
+    ) -> anyhow::Result<bool> {
+        let mut locked = self.locked.lock().await;
+        crate::reroute::device_plan::verify_projected_after(&mut **locked, actions).await
+    }
+}
+
+// An explicit Drop impl makes the retained mutable-session borrow boundary
+// visible to orchestration before it consumes the underlying lock set.
+impl Drop for LockedSshExecutor<'_> {
+    fn drop(&mut self) {}
+}
+
+impl SshExecutor for LockedSshExecutor<'_> {
+    async fn apply(&self, device_id: u64, commands: &[String]) -> anyhow::Result<SshOutcome> {
+        self.locked.lock().await.execute(device_id, commands).await
+    }
+
+    async fn verify_read(&self, device_id: u64, command: &str) -> anyhow::Result<String> {
+        let result = self.locked.lock().await.read(device_id, command).await?;
+        Ok(result.output)
+    }
+
+    async fn apply_resolved<'a>(
+        &'a self,
+        device_id: u64,
+        read_command: &'a str,
+        resolve: crate::ssh::SessionResolver<'a>,
+    ) -> anyhow::Result<ResolvedApply> {
+        let mut locked = self.locked.lock().await;
+        let read = locked.read(device_id, read_command).await?;
+        let decision = resolve(read.output.clone()).await?;
+        let mut results = vec![read];
+        if let SessionPlan::Push(commands) = &decision {
+            let pushed = locked.execute(device_id, commands).await?;
+            results.extend(pushed.results);
+        }
+        Ok(ResolvedApply {
+            outcome: SshOutcome {
+                results,
+                fingerprint: String::new(),
+                pinned_now: false,
+            },
+            decision,
+        })
+    }
+
+    fn execute_prepared<'a>(
+        &'a self,
+        action: &'a crate::reroute::device_plan::PreparedDeviceAction,
+    ) -> crate::ssh::BoxFuture<'a, anyhow::Result<SshOutcome>> {
+        Box::pin(async move {
+            let mut locked = self.locked.lock().await;
+            crate::reroute::device_plan::execute_prepared(&mut **locked, action).await
+        })
+    }
+
+    fn execute_prepared_inverse<'a>(
+        &'a self,
+        device_id: u64,
+        inverse: &'a crate::reroute::device_plan::PreparedInverse,
+    ) -> crate::ssh::BoxFuture<'a, anyhow::Result<SshOutcome>> {
+        Box::pin(async move {
+            let mut locked = self.locked.lock().await;
+            crate::reroute::device_plan::execute_inverse(&mut **locked, device_id, inverse).await
+        })
+    }
+}
 
 /// What to run and on whose behalf.
 pub struct ActionRequest {
@@ -47,6 +134,84 @@ pub struct ActionRequest {
     /// own earlier siblings from cooldown history so a 14-action mitigation does
     /// not block itself after the first action (plan 015 / audit SPEC-13).
     pub bundle: Option<BundleMembership>,
+    /// Durable authority for a real write. Manual writes name the consumed
+    /// execution plan; unattended and compensating writes name their internal
+    /// bundle authority. `None` is accepted only for previews.
+    pub authorization: Option<ExecutionAuthorization>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionAuthorityKind {
+    Manual,
+    Automatic,
+    Compensation,
+    Recovery,
+}
+
+/// Capability threaded from preview/activation admission to the executor.
+/// `owner_token` is also the ownership key for device change windows.
+#[derive(Debug, Clone)]
+pub struct ExecutionAuthorization {
+    pub kind: ExecutionAuthorityKind,
+    pub plan_id: Option<u64>,
+    pub bundle_id: Option<u64>,
+    pub owner_token: String,
+    pub snapshot_action_id: Option<u64>,
+}
+
+impl ExecutionAuthorization {
+    pub fn manual(
+        plan_id: u64,
+        bundle_id: Option<u64>,
+        owner_token: impl Into<String>,
+        snapshot_action_id: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::Manual,
+            plan_id: Some(plan_id),
+            bundle_id,
+            owner_token: owner_token.into(),
+            snapshot_action_id,
+        }
+    }
+
+    pub fn automatic(
+        bundle_id: u64,
+        owner_token: impl Into<String>,
+        snapshot_action_id: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::Automatic,
+            plan_id: None,
+            bundle_id: Some(bundle_id),
+            owner_token: owner_token.into(),
+            snapshot_action_id,
+        }
+    }
+
+    pub fn compensation(bundle_id: u64, owner_token: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::Compensation,
+            plan_id: None,
+            bundle_id: Some(bundle_id),
+            owner_token: owner_token.into(),
+            snapshot_action_id: None,
+        }
+    }
+
+    pub fn recovery(
+        bundle_id: u64,
+        owner_token: impl Into<String>,
+        snapshot_action_id: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::Recovery,
+            plan_id: None,
+            bundle_id: Some(bundle_id),
+            owner_token: owner_token.into(),
+            snapshot_action_id,
+        }
+    }
 }
 
 /// This action's place in an ordered bundle.
@@ -70,6 +235,10 @@ pub struct ExecOutcome {
     pub executed: bool,
     pub reroute_id: Option<u64>,
     pub state: Option<String>,
+    /// Whether this activation changed router configuration. A verified no-op is
+    /// successful but is not owned state and therefore must never be inverted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_effect: Option<String>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
@@ -82,6 +251,23 @@ pub struct ExecOutcome {
     pub would_run_rollback: Option<RenderedPlan>,
     pub device_id: u64,
     pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationEffect {
+    Changed,
+    Noop,
+    Unknown,
+}
+
+impl MutationEffect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Noop => "noop",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// The reroute engine. Holds its SSH transport behind the [`SshExecutor`] seam
@@ -128,7 +314,7 @@ pub async fn execute(
 }
 
 /// Core orchestration, generic over the [`SshExecutor`] seam.
-async fn execute_with<S: SshExecutor>(
+pub(crate) async fn execute_with<S: SshExecutor>(
     pool: &MySqlPool,
     cfg: &Config,
     ssh: &S,
@@ -147,72 +333,33 @@ async fn execute_with<S: SshExecutor>(
             "template is not allowed for automatic execution".into(),
         );
     }
-    // Rollbacks use the exact typed parameters persisted with the original
-    // action. Fresh inventory may legitimately have changed and must not block
-    // corrective work; every new manual/automatic action is canonicalized.
-    if req.trigger_type != "rollback" {
-        req.params = match crate::reroute::templates::canonicalize_inventory_params(
-            pool,
-            req.device_id,
-            &req.template,
-            &req.params,
-        )
-        .await
-        {
-            Ok(params) => params,
-            Err(e) => {
-                return blocked(
-                    &req,
-                    device_name,
-                    format!("inventory validation failed: {e}"),
-                )
-            }
-        };
-        match crate::reroute::templates::prefix_target_is_contained(
-            pool,
-            req.device_id,
-            &req.template,
-            &req.params,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return blocked(
-                    &req,
-                    device_name,
-                    "prefix target is outside the device's announced space".into(),
-                )
-            }
-            Err(e) => {
-                return blocked(
-                    &req,
-                    device_name,
-                    format!("could not validate prefix containment: {e}"),
-                )
-            }
-        }
-    }
-    if let Err(e) = snapshot_prior_route_map(pool, &mut req).await {
-        return blocked(
-            &req,
-            device_name,
-            format!("could not snapshot rollback state: {e}"),
-        );
-    }
-
-    // 1. Render the exact plan (also validates params).
-    let plan = match crate::reroute::templates::render(&req.template, &req.params) {
-        Ok(p) => p,
-        Err(e) => return blocked(&req, device_name, format!("invalid parameters: {e}")),
-    };
-
-    // GATE 0 — operating mode. In observe (or an enforce-mode dry-run) NOTHING
-    // runs; return the would-run plan plus its rollback (undo) commands so the
-    // preview shows how to reverse the action by hand. The rollback is rendered
-    // only here, never on the executing path.
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
     if mode != "enforce" || dry_run {
+        // Preview-only compatibility path. Real execution below never re-renders
+        // or mutates parameters; it consumes the authorized prepared snapshot.
+        if req.trigger_type != "rollback" {
+            req.params = match crate::reroute::templates::canonicalize_inventory_params(
+                pool,
+                req.device_id,
+                &req.template,
+                &req.params,
+            )
+            .await
+            {
+                Ok(params) => params,
+                Err(e) => {
+                    return blocked(
+                        &req,
+                        device_name,
+                        format!("inventory validation failed: {e}"),
+                    )
+                }
+            };
+        }
+        let plan = match crate::reroute::templates::render(&req.template, &req.params) {
+            Ok(plan) => plan,
+            Err(e) => return blocked(&req, device_name, format!("invalid parameters: {e}")),
+        };
         let would_run_rollback =
             crate::reroute::rollback::render_rollback_plan(pool, req.template.id, &req.params)
                 .await;
@@ -225,6 +372,7 @@ async fn execute_with<S: SshExecutor>(
             executed: false,
             reroute_id: None,
             state: None,
+            mutation_effect: None,
             message: message.into(),
             blocked_reason: None,
             would_run: Some(plan),
@@ -233,6 +381,54 @@ async fn execute_with<S: SshExecutor>(
             device_name,
         };
     }
+
+    // Serialize authorization, the final mutable policy reads, reservation and
+    // device execution with every policy mutation. Held through exact verify.
+    let policy_fence = match guard::policy_fence(pool).await {
+        Ok(fence) => fence,
+        Err(e) => {
+            return blocked(
+                &req,
+                device_name,
+                format!("execution policy fence unavailable: {e}"),
+            )
+        }
+    };
+    if crate::api::settings::operating_mode(pool, cfg).await != "enforce" {
+        return blocked(
+            &req,
+            device_name,
+            "operating mode changed to observe before execution".into(),
+        );
+    }
+    if let Err(e) = validate_execution_authorization(pool, &req).await {
+        return blocked(
+            &req,
+            device_name,
+            format!("execution authorization refused: {e}"),
+        );
+    }
+    let prepared_action = match load_prepared_action(pool, &req).await {
+        Ok(prepared) => {
+            req.params = prepared.canonical_params.clone();
+            prepared
+        }
+        Err(e) => {
+            return blocked(
+                &req,
+                device_name,
+                format!("prepared action snapshot refused: {e}"),
+            )
+        }
+    };
+    let plan = RenderedPlan {
+        template_id: prepared_action.template_id,
+        template_name: prepared_action.template_name.clone(),
+        config_mode: false,
+        commands: prepared_action.commands.clone(),
+        verify: None,
+        sequence_pending: false,
+    };
 
     // Safety gates — gather the facts from the DB, then a PURE decision over them
     // (see reroute::guard). Order and semantics match the historical gates, so a
@@ -313,6 +509,7 @@ async fn execute_with<S: SshExecutor>(
         reroute_id,
         &plan,
         cfg.reroute.require_verification,
+        Some(&prepared_action),
     )
     .await
     {
@@ -322,7 +519,8 @@ async fn execute_with<S: SshExecutor>(
             // planned->pending->running transitions complete.
             let aborted = sqlx::query(
                 "UPDATE reroutes SET state = 'failed', finished_at = UTC_TIMESTAMP(), success = 0, \
-                 failure_reason = ? WHERE id = ? AND state IN ('planned','pending')",
+                 mutation_effect = 'noop', failure_reason = ? \
+                 WHERE id = ? AND state IN ('planned','pending')",
             )
             .bind(format!("aborted before command execution: {e}"))
             .bind(reroute_id)
@@ -347,6 +545,7 @@ async fn execute_with<S: SshExecutor>(
                 executed: false,
                 reroute_id: Some(reroute_id),
                 state: Some(if persisted { "failed" } else { "uncertain" }.into()),
+                mutation_effect: Some(if persisted { "noop" } else { "unknown" }.into()),
                 message: "reroute aborted before command execution".into(),
                 blocked_reason: Some(e.to_string()),
                 would_run: None,
@@ -369,6 +568,7 @@ async fn execute_with<S: SshExecutor>(
         state: final_state,
         note,
         refused,
+        mutation_effect,
     } = outcome;
     // A refusal from the fresh in-session read pushed NOTHING: report it the way
     // every other fail-closed refusal is reported, with the actionable reason.
@@ -377,6 +577,7 @@ async fn execute_with<S: SshExecutor>(
             executed: false,
             reroute_id: Some(reroute_id),
             state: Some(final_state),
+            mutation_effect: Some(mutation_effect.as_str().into()),
             message: note.clone().unwrap_or_else(|| {
                 "reroute refused after reading the device's current state".into()
             }),
@@ -400,10 +601,14 @@ async fn execute_with<S: SshExecutor>(
         }
         other => format!("reroute ended in state {other}"),
     };
+    if let Err(e) = policy_fence.release().await {
+        tracing::error!(event_type = "execution_policy_fence_release_failed", reroute_id, error = %e, "policy fence connection will close rather than return locked to the pool");
+    }
     ExecOutcome {
-        executed: true,
+        executed: mutation_effect != MutationEffect::Noop,
         reroute_id: Some(reroute_id),
         state: Some(final_state),
+        mutation_effect: Some(mutation_effect.as_str().into()),
         message,
         blocked_reason: None,
         would_run: None,
@@ -413,42 +618,288 @@ async fn execute_with<S: SshExecutor>(
     }
 }
 
-/// Snapshot a Route-Map Change's current assignment in the request that is
-/// persisted with the reroute. Every execution path then restores the exact prior
-/// map rather than only the standalone manual endpoint doing so.
-async fn snapshot_prior_route_map(pool: &MySqlPool, req: &mut ActionRequest) -> anyhow::Result<()> {
-    if req.template.name != "bgp_route_map_set" || req.params.get("prior_route_map").is_some() {
-        return Ok(());
+async fn validate_execution_authorization(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+) -> anyhow::Result<()> {
+    let auth = req
+        .authorization
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("a durable prepared-action authority is required"))?;
+    anyhow::ensure!(
+        !auth.owner_token.trim().is_empty(),
+        "empty device-window owner"
+    );
+    match auth.kind {
+        ExecutionAuthorityKind::Manual => {
+            anyhow::ensure!(req.trigger_type == "manual" || req.trigger_type == "rollback");
+            let plan_id = auth
+                .plan_id
+                .ok_or_else(|| anyhow::anyhow!("manual execution has no consumed plan"))?;
+            let user_id = req
+                .user_id
+                .ok_or_else(|| anyhow::anyhow!("manual execution has no actor"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM execution_plans \
+                 WHERE id = ? AND user_id = ? AND consumed_at IS NOT NULL \
+                   AND consumed_at <= expires_at \
+                   AND ((? IS NULL AND bundle_id IS NULL) OR bundle_id = ?)",
+            )
+            .bind(plan_id)
+            .bind(user_id)
+            .bind(auth.bundle_id)
+            .bind(auth.bundle_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(
+                valid == 1,
+                "plan is missing, unconsumed, expired, or actor-mismatched"
+            );
+            if req.trigger_type == "manual" {
+                if let Some(rule_id) = req.rule_id {
+                    let current: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) \
+                           FROM reroute_bundles b \
+                           JOIN rules r ON r.id = b.rule_id \
+                           JOIN rule_states rs ON rs.rule_id = r.id \
+                          WHERE b.id = ? AND b.rule_id = ? \
+                            AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.kind')) = 'rule' \
+                            AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.actions_revision')) AS UNSIGNED) = r.actions_revision \
+                            AND r.enabled = 1 AND r.manual_apply_enabled = 1 \
+                            AND rs.current_state = 'firing'",
+                    )
+                    .bind(auth.bundle_id)
+                    .bind(rule_id)
+                    .fetch_one(pool)
+                    .await?;
+                    anyhow::ensure!(
+                        current == 1,
+                        "rule changed, was disabled, or stopped firing after authorization"
+                    );
+                }
+            }
+            if req.trigger_type == "rollback" {
+                let original_id = req
+                    .rollback_of_reroute_id
+                    .ok_or_else(|| anyhow::anyhow!("manual rollback has no original action"))?;
+                let owned: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM reroutes original \
+                     WHERE original.id = ? AND original.state IN ('succeeded','failed') \
+                       AND original.mutation_effect = 'changed' \
+                       AND original.template_snapshot_json IS NOT NULL \
+                       AND original.rollback_snapshot_json IS NOT NULL \
+                       AND NOT EXISTS (SELECT 1 FROM reroutes inverse \
+                         WHERE inverse.rollback_of_reroute_id = original.id \
+                           AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
+                )
+                .bind(original_id)
+                .fetch_one(pool)
+                .await?;
+                anyhow::ensure!(owned == 1, "original action is not safely invertible");
+            }
+        }
+        ExecutionAuthorityKind::Automatic => {
+            anyhow::ensure!(req.trigger_type == "automatic");
+            let bundle_id = auth
+                .bundle_id
+                .ok_or_else(|| anyhow::anyhow!("automatic execution has no activation"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) \
+                   FROM reroute_bundles b \
+                   JOIN rules r ON r.id = b.rule_id \
+                   JOIN rule_states rs ON rs.rule_id = r.id \
+                  WHERE b.id = ? AND b.trigger_type = 'automatic' \
+                    AND b.state IN ('planned','running') \
+                    AND r.enabled = 1 AND r.automatic_reroute_enabled = 1 \
+                    AND rs.current_state = 'firing' \
+                    AND JSON_EXTRACT(b.source_json, '$.actions_revision') IS NOT NULL \
+                    AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.actions_revision')) AS UNSIGNED) = r.actions_revision",
+            )
+            .bind(bundle_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(valid == 1, "automatic activation is not runnable");
+        }
+        ExecutionAuthorityKind::Compensation => {
+            anyhow::ensure!(req.trigger_type == "rollback");
+            let bundle_id = auth
+                .bundle_id
+                .ok_or_else(|| anyhow::anyhow!("compensation has no bundle"))?;
+            let original_id = req
+                .rollback_of_reroute_id
+                .ok_or_else(|| anyhow::anyhow!("compensation has no original reroute"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM reroutes \
+                 WHERE id = ? AND bundle_id = ? AND mutation_effect = 'changed'",
+            )
+            .bind(original_id)
+            .bind(bundle_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(
+                valid == 1,
+                "original action is not an owned mutation of this bundle"
+            );
+        }
+        ExecutionAuthorityKind::Recovery => {
+            anyhow::ensure!(req.trigger_type == "rollback");
+            let bundle_id = auth
+                .bundle_id
+                .ok_or_else(|| anyhow::anyhow!("recovery has no bundle"))?;
+            let original_id = req
+                .rollback_of_reroute_id
+                .ok_or_else(|| anyhow::anyhow!("recovery has no original reroute"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) \
+                   FROM reroute_bundles b \
+                   JOIN rules rule_row ON rule_row.id = b.rule_id \
+                   JOIN rule_states rs ON rs.rule_id = rule_row.id \
+                   JOIN reroutes original ON original.id = ? \
+                  WHERE b.id = ? AND b.trigger_type = 'automatic' \
+                    AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.kind')) = 'recovery' \
+                    AND rs.current_state = 'firing' \
+                    AND original.rule_id = b.rule_id \
+                    AND original.trigger_type = 'automatic' \
+                    AND original.mutation_effect = 'changed' \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM reroutes inverse \
+                         WHERE inverse.rollback_of_reroute_id = original.id \
+                           AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
+            )
+            .bind(original_id)
+            .bind(bundle_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(valid == 1, "automatic recovery ownership check failed");
+        }
     }
-    let Some(neighbor) = req.params.get("neighbor_ip").and_then(Value::as_str) else {
-        anyhow::bail!("route-map action has no neighbor_ip");
-    };
-    let direction = req
-        .params
-        .get("direction")
-        .and_then(Value::as_str)
-        .unwrap_or("out");
-    let prior: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT CASE WHEN ? = 'in' THEN in_route_map ELSE out_route_map END \
-         FROM device_bgp_peers p WHERE device_id = ? AND peer_remote_addr = ? \
-           AND EXISTS (SELECT 1 FROM device_route_maps r WHERE r.device_id = p.device_id \
-                       AND r.last_discovered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)) \
-         LIMIT 1",
-    )
-    .bind(direction)
-    .bind(req.device_id)
-    .bind(neighbor)
-    .bind(crate::reroute::templates::ROUTING_INVENTORY_MAX_AGE_HOURS)
-    .fetch_optional(pool)
-    .await?;
-    let prior = prior.ok_or_else(|| anyhow::anyhow!("BGP peer is no longer in inventory"))?;
-    if let Value::Object(params) = &mut req.params {
-        params.insert(
-            "prior_route_map".into(),
-            Value::String(prior.unwrap_or_default()),
+    if req.rollback_of_reroute_id.is_none() {
+        let current = crate::reroute::templates::load(pool, req.template.id).await?;
+        anyhow::ensure!(
+            current.enabled,
+            "action template was disabled after preparation"
+        );
+        if req.trigger_type == "automatic" {
+            anyhow::ensure!(
+                current.automatic_allowed,
+                "action template is no longer allowed for automatic execution"
+            );
+        }
+        anyhow::ensure!(
+            serde_json::to_value(&current)? == serde_json::to_value(&req.template)?,
+            "action template changed after preparation"
         );
     }
+    if let Some(action_id) = auth.snapshot_action_id {
+        let valid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reroute_bundle_actions \
+             WHERE id = ? AND device_id = ? AND prepared_action_json IS NOT NULL \
+               AND (? IS NULL OR bundle_id = ?)",
+        )
+        .bind(action_id)
+        .bind(req.device_id)
+        .bind(auth.bundle_id)
+        .bind(auth.bundle_id)
+        .fetch_one(pool)
+        .await?;
+        anyhow::ensure!(
+            valid == 1,
+            "prepared sibling does not match this device/bundle"
+        );
+        if auth.kind == ExecutionAuthorityKind::Manual {
+            let plan_id = auth.plan_id.expect("manual plan checked above");
+            let bound: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) \
+                   FROM execution_plans ep \
+                   JOIN reroute_bundle_actions ba ON ba.id = ? \
+                  WHERE ep.id = ? \
+                    AND JSON_CONTAINS(ep.snapshot_json, ba.prepared_action_json, '$.device_actions')",
+            )
+            .bind(action_id)
+            .bind(plan_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(
+                bound == 1,
+                "prepared sibling is not part of the consumed plan snapshot"
+            );
+        }
+    } else if req.bundle.is_some() {
+        anyhow::bail!("bundle execution is missing its prepared sibling id");
+    }
+    anyhow::ensure!(
+        locks::change_window_allows(pool, req.device_id, Some(&auth.owner_token)).await?,
+        "device change window belongs to another activation"
+    );
     Ok(())
+}
+
+async fn load_prepared_action(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+) -> anyhow::Result<crate::reroute::device_plan::PreparedDeviceAction> {
+    let auth = req
+        .authorization
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing execution authority"))?;
+    if auth.kind == ExecutionAuthorityKind::Compensation {
+        let original_id = req
+            .rollback_of_reroute_id
+            .ok_or_else(|| anyhow::anyhow!("compensation has no original reroute"))?;
+        type OriginalSnapshot = (
+            u64,
+            Option<sqlx::types::Json<Value>>,
+            Option<sqlx::types::Json<Value>>,
+        );
+        let (template_id, params, inverse): OriginalSnapshot = sqlx::query_as(
+            "SELECT reroute_template_id, parameters_json, rollback_snapshot_json \
+             FROM reroutes WHERE id = ?",
+        )
+        .bind(original_id)
+        .fetch_one(pool)
+        .await?;
+        let inverse: crate::reroute::device_plan::PreparedInverse = serde_json::from_value(
+            inverse
+                .ok_or_else(|| anyhow::anyhow!("original reroute has no prepared inverse"))?
+                .0,
+        )?;
+        let prepared = crate::reroute::device_plan::PreparedDeviceAction {
+            schema_version: crate::reroute::device_plan::PREPARED_DEVICE_ACTION_SCHEMA_VERSION,
+            device_id: req.device_id,
+            template_id,
+            template_name: format!("inverse-of-{original_id}"),
+            canonical_params: params.map(|value| value.0).unwrap_or(Value::Null),
+            commands: inverse.commands,
+            before: inverse.expected_current,
+            after: inverse.restore,
+            verify: inverse.verify,
+            effect: crate::reroute::device_plan::PreparedEffect::Change,
+            inverse: None,
+            prepared_at: chrono::Utc::now(),
+        };
+        prepared.validate()?;
+        return Ok(prepared);
+    }
+    let action_id = auth
+        .snapshot_action_id
+        .ok_or_else(|| anyhow::anyhow!("missing prepared sibling id"))?;
+    let value: sqlx::types::Json<Value> =
+        sqlx::query_scalar("SELECT prepared_action_json FROM reroute_bundle_actions WHERE id = ?")
+            .bind(action_id)
+            .fetch_one(pool)
+            .await?;
+    let prepared: crate::reroute::device_plan::PreparedDeviceAction =
+        serde_json::from_value(value.0)?;
+    prepared.validate()?;
+    anyhow::ensure!(
+        prepared.device_id == req.device_id,
+        "prepared device mismatch"
+    );
+    anyhow::ensure!(
+        prepared.template_id == req.template.id,
+        "prepared template mismatch"
+    );
+    Ok(prepared)
 }
 
 /// Record post-action cooldowns once for an ordered action bundle. Callers pass
@@ -496,6 +947,7 @@ struct MachineResult {
     note: Option<String>,
     /// True when a fresh in-session read refused the write. Nothing was pushed.
     refused: bool,
+    mutation_effect: MutationEffect,
 }
 
 /// Push the apply commands, verify the result, finalize the state. Persists
@@ -507,6 +959,7 @@ async fn run_state_machine<S: SshExecutor>(
     reroute_id: u64,
     plan: &RenderedPlan,
     require_verification: bool,
+    prepared_action: Option<&crate::reroute::device_plan::PreparedDeviceAction>,
 ) -> anyhow::Result<MachineResult> {
     // -> pending: committed to act, persisted BEFORE any side effect. Crash
     // recovery treats pending/running/verifying as in-flight (=> uncertain), so
@@ -543,7 +996,75 @@ async fn run_state_machine<S: SshExecutor>(
     // path: the SAME session first reads the target list, the sequence is chosen
     // and PERSISTED, and only then is the config pushed. See
     // `apply_with_sequence_resolution`.
-    let (apply, refusal, skip) = if plan.sequence_pending {
+    let prepared_effect = prepared_action.map(|prepared| prepared.effect);
+    let (apply, refusal, skip) = if let Some(prepared) = prepared_action {
+        match ssh.execute_prepared(prepared).await {
+            Ok(outcome) => (
+                Ok(outcome),
+                None,
+                (prepared.effect == crate::reroute::device_plan::PreparedEffect::AlreadySatisfied)
+                    .then(|| {
+                        "prepared state was already satisfied; no configuration was pushed".into()
+                    }),
+            ),
+            Err(e) => {
+                let proven_no_effect = e
+                    .downcast_ref::<crate::reroute::device_plan::PreparedExecutionError>()
+                    .is_some_and(|failure| {
+                        failure.certainty
+                            == crate::reroute::device_plan::EffectCertainty::ProvenNoEffect
+                    })
+                    || e.downcast_ref::<crate::ssh::SshPlanFailure>()
+                        .is_some_and(|failure| {
+                            failure.certainty
+                                == crate::reroute::device_plan::EffectCertainty::ProvenNoEffect
+                        });
+                if proven_no_effect {
+                    if let Some(failure) = e.downcast_ref::<crate::ssh::SshPlanFailure>() {
+                        for (index, completed) in failure.completed.iter().enumerate() {
+                            if persist_output(
+                                pool,
+                                reroute_id,
+                                (index + 1) as u32,
+                                &completed.command,
+                                &completed.output,
+                                "ok",
+                            )
+                            .await
+                            .is_err()
+                            {
+                                persistence_ok = false;
+                            }
+                        }
+                        if persist_output(
+                            pool,
+                            reroute_id,
+                            (failure.completed.len() + 1) as u32,
+                            &failure.failed_command,
+                            &failure.failed_output,
+                            "error",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            persistence_ok = false;
+                        }
+                    }
+                    (
+                        Ok(SshOutcome {
+                            results: Vec::new(),
+                            fingerprint: String::new(),
+                            pinned_now: false,
+                        }),
+                        Some(e.to_string()),
+                        None,
+                    )
+                } else {
+                    (Err(e), None, None)
+                }
+            }
+        }
+    } else if plan.sequence_pending {
         match apply_with_sequence_resolution(pool, ssh, req, reroute_id, plan).await {
             Ok((outcome, decision)) => match decision {
                 crate::ssh::SessionPlan::Refuse(reason) => (Ok(outcome), Some(reason), None),
@@ -599,7 +1120,36 @@ async fn run_state_machine<S: SshExecutor>(
             true
         }
         Err(e) => {
-            if persist_output(pool, reroute_id, 0, "<apply>", &e.to_string(), "error")
+            if let Some(failure) = e.downcast_ref::<crate::ssh::SshPlanFailure>() {
+                for (index, completed) in failure.completed.iter().enumerate() {
+                    if persist_output(
+                        pool,
+                        reroute_id,
+                        (index + 1) as u32,
+                        &completed.command,
+                        &completed.output,
+                        "ok",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        persistence_ok = false;
+                    }
+                }
+                if persist_output(
+                    pool,
+                    reroute_id,
+                    (failure.completed.len() + 1) as u32,
+                    &failure.failed_command,
+                    &failure.failed_output,
+                    "error",
+                )
+                .await
+                .is_err()
+                {
+                    persistence_ok = false;
+                }
+            } else if persist_output(pool, reroute_id, 0, "<apply>", &e.to_string(), "error")
                 .await
                 .is_err()
             {
@@ -648,6 +1198,11 @@ async fn run_state_machine<S: SshExecutor>(
             state,
             true,
             Verdict::None,
+            if persistence_ok {
+                MutationEffect::Noop
+            } else {
+                MutationEffect::Unknown
+            },
             Some(reason.clone()),
         )
         .await;
@@ -655,6 +1210,11 @@ async fn run_state_machine<S: SshExecutor>(
             state,
             note: Some(reason),
             refused: true,
+            mutation_effect: if persistence_ok {
+                MutationEffect::Noop
+            } else {
+                MutationEffect::Unknown
+            },
         });
     }
 
@@ -672,7 +1232,13 @@ async fn run_state_machine<S: SshExecutor>(
             "could not persist running->verifying transition"
         );
     }
-    let (verdict, verification_persisted) = verify(pool, ssh, req, reroute_id, plan).await;
+    let (verdict, verification_persisted) = if prepared_action.is_some() {
+        // `execute_prepared` performs exact typed after-state verification under
+        // the retained native lock before returning success.
+        (Verdict::Pass, true)
+    } else {
+        verify(pool, ssh, req, reroute_id, plan).await
+    };
     persistence_ok &= verification_persisted;
 
     let mut final_state = final_state_for(applied_ok, verdict, require_verification);
@@ -680,6 +1246,15 @@ async fn run_state_machine<S: SshExecutor>(
         final_state = "uncertain";
     }
 
+    let mutation_effect = if !persistence_ok || !applied_ok {
+        MutationEffect::Unknown
+    } else if skip.is_some()
+        || prepared_effect == Some(crate::reroute::device_plan::PreparedEffect::AlreadySatisfied)
+    {
+        MutationEffect::Noop
+    } else {
+        MutationEffect::Changed
+    };
     let state = finalize(
         pool,
         req,
@@ -687,6 +1262,7 @@ async fn run_state_machine<S: SshExecutor>(
         final_state,
         applied_ok,
         verdict,
+        mutation_effect,
         None,
     )
     .await;
@@ -694,6 +1270,7 @@ async fn run_state_machine<S: SshExecutor>(
         state,
         note: skip,
         refused: false,
+        mutation_effect,
     })
 }
 
@@ -979,6 +1556,7 @@ fn judge(output: &str, v: &VerifyStep) -> bool {
 }
 
 /// Write the terminal state + side effects (lock on uncertain, alerts, audit).
+#[allow(clippy::too_many_arguments)]
 async fn finalize(
     pool: &MySqlPool,
     req: &ActionRequest,
@@ -986,6 +1564,7 @@ async fn finalize(
     state: &str,
     applied_ok: bool,
     verdict: Verdict,
+    mutation_effect: MutationEffect,
     // Overrides the generic failure text with an explicit, actionable reason —
     // used when a fresh in-session read refused the write outright.
     refusal: Option<String>,
@@ -1017,117 +1596,100 @@ async fn finalize(
         _ => None,
     };
 
-    let finalized = match sqlx::query(
-        "UPDATE reroutes SET state = ?, finished_at = UTC_TIMESTAMP(), success = ?, \
-         verification_status = ?, failure_reason = ? \
-         WHERE id = ? AND state IN ('running','verifying')",
-    )
-    .bind(state)
-    .bind(success)
-    .bind(verification_status)
-    .bind(&failure_reason)
-    .bind(reroute_id)
-    .execute(pool)
-    .await
-    {
-        Ok(r) if r.rows_affected() == 1 => true,
-        Ok(_) => {
-            tracing::error!(
-                event_type = "reroute_finalize_state_conflict",
-                reroute_id,
-                state,
-                "terminal transition did not match an in-flight reroute"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::error!(
-            event_type = "reroute_finalize_persist_failed",
-            reroute_id,
-            device_id = req.device_id,
-            state,
-            error = %e,
-            "failed to persist final reroute state — runtime state may be inconsistent"
-            );
-            false
-        }
-    };
-
-    let effective_state = if finalized { state } else { "uncertain" };
-    if !finalized {
-        // A second, conservative transition may succeed after a transient error.
-        // It never claims success; an in-flight row is forced to uncertain.
-        if let Err(e) = sqlx::query(
-            "UPDATE reroutes SET state = 'uncertain', finished_at = UTC_TIMESTAMP(), \
-             success = NULL, verification_status = 'uncertain', \
-             failure_reason = 'could not durably persist the terminal execution state' \
-             WHERE id = ? AND state IN ('running','verifying')",
-        )
-        .bind(reroute_id)
-        .execute(pool)
-        .await
-        {
-            tracing::error!(event_type = "reroute_uncertain_fallback_failed", reroute_id, error = %e, "could not persist conservative uncertain fallback");
-        }
-    }
-
-    if effective_state == "uncertain" {
-        // Lock the device; an admin must acknowledge before reroutes resume. If
-        // this write fails the device is NOT actually locked, so make it LOUD:
-        // a silently-unlocked device after an unverifiable reroute is exactly the
-        // failure mode the doctrine forbids (mirrors recover_on_startup).
-        if let Err(e) = locks::create(
-            pool,
-            "device",
-            Some(&req.device_id.to_string()),
-            Some(reroute_id),
-            "auto_uncertain",
-            &format!("reroute #{reroute_id} could not be verified"),
-            None,
-        )
-        .await
-        {
-            tracing::error!(
-                event_type = "reroute_lock_persist_failed",
-                reroute_id,
-                device_id = req.device_id,
-                error = %e,
-                "CRITICAL: could not lock device after an uncertain reroute — manual lock required"
-            );
-        }
-    }
-
-    // `failed` and `uncertain` are both doctrine-critical (docs/email-alerts.md:
-    // they always fan out to the admin tier). Severity drives that fan-out, so
-    // `failed` must be `critical`, not `warning`.
-    let severity = match effective_state {
+    // Terminal state, required device lock, alert/outbox intent and audit form one
+    // transaction. A restart can therefore never observe a terminal row whose
+    // safety trail was only partly committed.
+    let severity = match state {
         "succeeded" => "info",
         "failed" => "critical",
         "uncertain" => "critical",
         _ => "info",
     };
-    if let Err(e) = enqueue_alert(
-        pool,
-        req,
-        reroute_id,
-        &format!("reroute_{effective_state}"),
-        severity,
-        json!({ "verification": verification_status, "failure_reason": failure_reason }),
-    )
-    .await
-    {
-        tracing::error!(event_type = "reroute_alert_enqueue_failed", reroute_id, alert = %format!("reroute_{effective_state}"), error = %e, "failed to enqueue terminal reroute alert");
+    let actor = crate::alerts::actor_json(pool, req.user_id).await;
+    let payload = json!({
+        "reroute_id": reroute_id,
+        "template": req.template.name,
+        "template_display_name": req.template.display_name,
+        "device_id": req.device_id,
+        "device_name": device_name(pool, req.device_id).await,
+        "trigger_type": req.trigger_type,
+        "actor": actor,
+        "reason": req.reason,
+        "detail": { "verification": verification_status, "failure_reason": failure_reason },
+    });
+    let event = format!("reroute_{state}");
+    let actor_type = if req.user_id.is_some() {
+        "user"
+    } else {
+        "controller"
+    };
+    let finalized = async {
+        let mut tx = pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE reroutes SET state = ?, finished_at = UTC_TIMESTAMP(), success = ?, \
+             verification_status = ?, mutation_effect = ?, failure_reason = ? \
+             WHERE id = ? AND state IN ('running','verifying')",
+        )
+        .bind(state)
+        .bind(success)
+        .bind(verification_status)
+        .bind(mutation_effect.as_str())
+        .bind(&failure_reason)
+        .bind(reroute_id)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(updated.rows_affected() == 1, "terminal state conflict");
+        if state == "uncertain" {
+            locks::create_on(
+                &mut tx,
+                "device",
+                Some(&req.device_id.to_string()),
+                Some(reroute_id),
+                "auto_uncertain",
+                &format!("reroute #{reroute_id} could not be verified"),
+                None,
+            )
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO alerts (event_type, severity, device_id, rule_id, payload_json, dedup_key) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event)
+        .bind(severity)
+        .bind(req.device_id)
+        .bind(req.rule_id)
+        .bind(sqlx::types::Json(&payload))
+        .bind(format!("{event}:reroute:{reroute_id}"))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO audit_logs (actor_type, actor_user_id, event_type, entity_type, \
+                 entity_id, reroute_id, message, ip_address, user_agent) \
+             VALUES (?, ?, ?, 'reroute', ?, ?, ?, ?, ?)",
+        )
+        .bind(actor_type)
+        .bind(req.user_id)
+        .bind(&event)
+        .bind(reroute_id)
+        .bind(reroute_id)
+        .bind(format!("reroute #{reroute_id} {state}"))
+        .bind(req.actor_context.as_ref().map(|c| c.ip_address.as_str()))
+        .bind(req.actor_context.as_ref().map(|c| c.user_agent.as_str()))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<(), anyhow::Error>(())
     }
-    if let Err(e) = audit(
-        pool,
-        req,
-        reroute_id,
-        &format!("reroute_{effective_state}"),
-        &format!("reroute #{reroute_id} {effective_state}"),
-    )
-    .await
-    {
-        tracing::error!(event_type = "reroute_audit_persist_failed", reroute_id, audited = %format!("reroute_{effective_state}"), error = %e, "failed to write terminal reroute audit row");
+    .await;
+
+    let effective_state = if finalized.is_ok() {
+        state
+    } else {
+        "uncertain"
+    };
+    if let Err(e) = finalized {
+        tracing::error!(event_type = "reroute_finalize_transaction_failed", reroute_id, error = %e, "terminal transaction failed; leaving in-flight state for startup recovery");
     }
 
     tracing::info!(
@@ -1285,7 +1847,7 @@ async fn abort_reserved(
 ) -> ExecOutcome {
     let persisted = sqlx::query(
         "UPDATE reroutes SET state = 'failed', finished_at = UTC_TIMESTAMP(), success = 0, \
-         failure_reason = ? WHERE id = ? AND state = 'planned'",
+         mutation_effect = 'noop', failure_reason = ? WHERE id = ? AND state = 'planned'",
     )
     .bind(&reason)
     .bind(reroute_id)
@@ -1297,6 +1859,7 @@ async fn abort_reserved(
         executed: false,
         reroute_id: Some(reroute_id),
         state: Some(if persisted { "failed" } else { "uncertain" }.into()),
+        mutation_effect: Some(if persisted { "noop" } else { "unknown" }.into()),
         message: "reroute aborted before command execution".into(),
         blocked_reason: Some(reason),
         would_run: None,
@@ -1320,6 +1883,7 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
         executed: false,
         reroute_id: None,
         state: None,
+        mutation_effect: None,
         message: reason.clone(),
         blocked_reason: Some(reason),
         would_run: None,

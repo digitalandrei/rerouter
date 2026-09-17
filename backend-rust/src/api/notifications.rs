@@ -49,9 +49,17 @@ pub async fn list_recipients(
     _g: RequirePermission<markers::ManageAlerts>,
     State(state): State<AppState>,
 ) -> JsonResp {
-    let rows = match sqlx::query_as::<_, (u64, String, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT id, email, verified_at FROM alert_recipients \
-         WHERE email <> 'unrouted@rerouter.local' ORDER BY email",
+    type RecipientRow = (
+        u64,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<u64>,
+        Option<String>,
+    );
+    let rows = match sqlx::query_as::<_, RecipientRow>(
+        "SELECT r.id, r.email, r.verified_at, r.user_id, u.name \
+         FROM alert_recipients r LEFT JOIN users u ON u.id=r.user_id \
+         WHERE r.email <> 'unrouted@rerouter.local' ORDER BY r.email",
     )
     .fetch_all(&state.pool)
     .await
@@ -61,7 +69,7 @@ pub async fn list_recipients(
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, email, verified_at) in rows {
+    for (id, email, verified_at, user_id, user_name) in rows {
         let events = match subscription_events(&state.pool, "recipient_id", id).await {
             Ok(events) => events,
             Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
@@ -70,6 +78,8 @@ pub async fn list_recipients(
             "id": id,
             "email": email,
             "verified": verified_at.is_some(),
+            "user_id": user_id,
+            "user_name": user_name,
             "event_types": events,
         }));
     }
@@ -105,10 +115,24 @@ pub async fn add_recipient(
         Ok(tx) => tx,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
+    // Critical fanout follows admin/superadmin roles through this link. Match by
+    // the users table's case-insensitive email collation; external recipients
+    // legitimately remain unlinked.
+    let linked_user: Option<u64> =
+        match sqlx::query_scalar("SELECT id FROM users WHERE email = ? LIMIT 1")
+            .bind(&email)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(id) => id,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
     let res = sqlx::query(
-        "INSERT INTO alert_recipients (email, verified_at) VALUES (?, UTC_TIMESTAMP()) \
-         ON DUPLICATE KEY UPDATE verified_at = UTC_TIMESTAMP()",
+        "INSERT INTO alert_recipients (user_id, email, verified_at) VALUES (?, ?, UTC_TIMESTAMP()) \
+         ON DUPLICATE KEY UPDATE verified_at = UTC_TIMESTAMP(), \
+                                 user_id = COALESCE(alert_recipients.user_id, VALUES(user_id))",
     )
+    .bind(linked_user)
     .bind(&email)
     .execute(&mut *tx)
     .await;

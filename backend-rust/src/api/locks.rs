@@ -37,6 +37,16 @@ pub async fn create_global(
     State(state): State<AppState>,
     Json(body): Json<GlobalLockBody>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     let reason = body
         .reason
         .unwrap_or_else(|| "global maintenance lock".into());
@@ -80,6 +90,16 @@ pub async fn clear_global(
     g: RequirePermission<markers::ManageLocks>,
     State(state): State<AppState>,
 ) -> JsonResp {
+    let _policy_fence = match crate::reroute::guard::policy_fence(&state.pool).await {
+        Ok(fence) => fence,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "safety policy is busy; retry after the active action finishes",
+            )
+        }
+    };
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),

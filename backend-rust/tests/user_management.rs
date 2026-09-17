@@ -5,29 +5,17 @@
 //! MySQL 8.4 (prepared `START TRANSACTION`, error 1295); see
 //! `sql_protocol_lint.rs` for the protocol guard.
 //!
-//! DB integration test — runs only when DATABASE_URL points at a MariaDB the
-//! test may migrate + write to; skips otherwise. Cleans up its rows.
+//! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB the
+//! test may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
 use rerouter_controller::api::users::{delete_user_safely, update_user_safely};
 use rerouter_controller::auth::sessions::Session;
-use rerouter_controller::db::MIGRATOR;
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
+
+mod common;
 
 const SA_EMAIL: &str = "rrt-test-users-sa@example.test";
 const USER_EMAIL: &str = "rrt-test-users-b@example.test";
-
-/// Connect + migrate, or `None` when DATABASE_URL is unset (skip).
-async fn pool_or_skip() -> Option<MySqlPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = MySqlPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-    MIGRATOR.run(&pool).await.expect("run migrations");
-    Some(pool)
-}
 
 async fn seed_user(pool: &MySqlPool, email: &str, role: &str) -> u64 {
     let id = sqlx::query("INSERT INTO users (name, email, password) VALUES (?, ?, 'x')")
@@ -97,10 +85,8 @@ fn actor(user_id: u64) -> Session {
 
 #[tokio::test]
 async fn user_update_delete_and_superadmin_interlock() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
 
     // Idempotent cleanup of leftovers from an interrupted previous run.
     for email in [SA_EMAIL, USER_EMAIL] {
@@ -149,8 +135,8 @@ async fn user_update_delete_and_superadmin_interlock() {
         .expect("missing-user delete must not error");
     assert_eq!(not_found, None);
 
-    // Last-superadmin interlock: only deterministic when this test owns the
-    // only superadmin (fresh scratch DB). Skip against a shared dev DB.
+    // This suite is restricted to a dedicated test schema. A dirty fixture must
+    // fail visibly rather than silently omit the last-superadmin safety check.
     let other_superadmins: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT ru.user_id) FROM role_user ru \
          JOIN roles r ON r.id = ru.role_id WHERE r.name = 'superadmin' AND ru.user_id <> ?",
@@ -159,7 +145,11 @@ async fn user_update_delete_and_superadmin_interlock() {
     .fetch_one(&pool)
     .await
     .expect("count other superadmins");
-    if other_superadmins == 0 {
+    assert_eq!(
+        other_superadmins, 0,
+        "last-superadmin test requires no unrelated superadmin fixtures"
+    );
+    {
         let demote = update_user_safely(&pool, sa, None, Some("admin"), &act)
             .await
             .expect("demote attempt must not error");
@@ -177,10 +167,6 @@ async fn user_update_delete_and_superadmin_interlock() {
             delete,
             Some(false),
             "deleting the last superadmin is refused"
-        );
-    } else {
-        eprintln!(
-            "skipping last-superadmin assertions: {other_superadmins} pre-existing superadmin(s)"
         );
     }
 

@@ -7,8 +7,11 @@ use serde_json::Value;
 use sqlx::MySqlPool;
 
 use crate::config::Config;
-use crate::reroute::executor::{self, ActionRequest, ActorContext, ExecOutcome};
+use crate::reroute::executor::{
+    self, ActionRequest, ActorContext, ExecOutcome, ExecutionAuthorization,
+};
 use crate::reroute::templates::{self, RenderedPlan, Template};
+use crate::ssh::{RusshExecutor, SshExecutor};
 
 /// Resolve which template + params a rollback of `template_id` would run against
 /// `device_id`'s original params, WITHOUT executing. `None` when the template has
@@ -64,6 +67,120 @@ pub struct RollbackRequest<'a> {
     pub reason: String,
     pub defer_cooldown: bool,
     pub dry_run: bool,
+    pub authorization: Option<ExecutionAuthorization>,
+}
+
+/// Rollback request whose target is derived entirely from the durable original
+/// reroute. Callers cannot accidentally pass pre-executor parameters and lose an
+/// apply-time prefix-list sequence or route-map prior state.
+pub struct PersistedRollbackRequest {
+    pub original_reroute_id: Option<u64>,
+    pub rule_event_id: Option<u64>,
+    pub user_id: Option<u64>,
+    pub actor_context: Option<ActorContext>,
+    pub reason: String,
+    pub defer_cooldown: bool,
+    pub dry_run: bool,
+    pub authorization: Option<ExecutionAuthorization>,
+}
+
+pub async fn rollback_persisted(
+    pool: &MySqlPool,
+    cfg: &Config,
+    req: PersistedRollbackRequest,
+) -> Result<Option<ExecOutcome>> {
+    let ssh = RusshExecutor::new(pool.clone());
+    rollback_persisted_with(pool, cfg, &ssh, req).await
+}
+
+pub async fn rollback_persisted_with<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    ssh: &S,
+    req: PersistedRollbackRequest,
+) -> Result<Option<ExecOutcome>> {
+    let original_id = req
+        .original_reroute_id
+        .ok_or_else(|| anyhow::anyhow!("persisted rollback requires an original reroute id"))?;
+    type Original = (
+        Option<u64>,
+        Option<u64>,
+        Option<sqlx::types::Json<Value>>,
+        String,
+        Option<sqlx::types::Json<Value>>,
+    );
+    let row: Original = sqlx::query_as(
+        "SELECT device_id, reroute_template_id, parameters_json, mutation_effect, \
+                template_snapshot_json \
+         FROM reroutes WHERE id = ?",
+    )
+    .bind(original_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("original reroute #{original_id} not found"))?;
+    let (device_id, template_id, params, effect, template_snapshot) = row;
+    let device_id = device_id.ok_or_else(|| anyhow::anyhow!("original reroute has no device"))?;
+    let template_id =
+        template_id.ok_or_else(|| anyhow::anyhow!("original reroute has no template"))?;
+
+    if effect == "noop" {
+        return Ok(Some(ExecOutcome {
+            executed: false,
+            reroute_id: None,
+            state: Some("succeeded".into()),
+            mutation_effect: Some("noop".into()),
+            message: "original action was a verified no-op; no inverse was executed".into(),
+            blocked_reason: None,
+            would_run: None,
+            would_run_rollback: None,
+            device_id,
+            device_name: None,
+        }));
+    }
+    anyhow::ensure!(
+        effect == "changed",
+        "original reroute effect is {effect}; reconcile it before rollback"
+    );
+    let params = params.map(|value| value.0).unwrap_or(Value::Null);
+    let mut prepared_inverse_template: Template = serde_json::from_value(
+        template_snapshot
+            .ok_or_else(|| anyhow::anyhow!("original reroute has no immutable template snapshot"))?
+            .0,
+    )?;
+    // Commands and exact verification come from the persisted PreparedInverse,
+    // loaded by executor authorization. This inert shell only carries identity
+    // through the legacy ActionRequest shape and cannot itself render a write.
+    prepared_inverse_template.name = format!("prepared_inverse_of_{original_id}");
+    prepared_inverse_template.parameter_schema = serde_json::json!({});
+    prepared_inverse_template.plan = serde_json::json!({
+        "transport": "ios_ssh",
+        "config_mode": false,
+        "apply": []
+    });
+    prepared_inverse_template.verification = Value::Null;
+    prepared_inverse_template.rollback_template_id = None;
+    prepared_inverse_template.enabled = true;
+    execute_resolved_rollback_with(
+        pool,
+        cfg,
+        ssh,
+        RollbackRequest {
+            device_id,
+            template_id,
+            params: &params,
+            original_reroute_id: Some(original_id),
+            rule_event_id: req.rule_event_id,
+            user_id: req.user_id,
+            actor_context: req.actor_context,
+            reason: req.reason,
+            defer_cooldown: req.defer_cooldown,
+            dry_run: req.dry_run,
+            authorization: req.authorization,
+        },
+        prepared_inverse_template,
+        Value::Object(Default::default()),
+    )
+    .await
 }
 
 pub async fn rollback_of(
@@ -71,11 +188,32 @@ pub async fn rollback_of(
     cfg: &Config,
     req: RollbackRequest<'_>,
 ) -> Result<Option<ExecOutcome>> {
+    let ssh = RusshExecutor::new(pool.clone());
+    rollback_of_with(pool, cfg, &ssh, req).await
+}
+
+pub async fn rollback_of_with<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    ssh: &S,
+    req: RollbackRequest<'_>,
+) -> Result<Option<ExecOutcome>> {
     let Some((template, params)) = resolve_rollback(pool, req.template_id, req.params).await?
     else {
         return Ok(None);
     };
 
+    execute_resolved_rollback_with(pool, cfg, ssh, req, template, params).await
+}
+
+async fn execute_resolved_rollback_with<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    ssh: &S,
+    req: RollbackRequest<'_>,
+    template: Template,
+    params: Value,
+) -> Result<Option<ExecOutcome>> {
     // A real rollback is serialized by original action. The same original may be
     // retried after a failed rollback, but never while another rollback is active
     // or after one has already succeeded.
@@ -83,8 +221,13 @@ pub async fn rollback_of(
     let mut lock_name = None;
     if !req.dry_run {
         if let Some(original_id) = req.original_reroute_id {
-            let name = format!("reroute_rollback_{original_id}");
             let mut conn = pool.acquire().await?;
+            let name = crate::db::scoped_advisory_lock_name(
+                &mut conn,
+                &format!("reroute:rollback:{original_id}"),
+            )
+            .await?;
+            conn.close_on_drop();
             let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
                 .bind(&name)
                 .fetch_one(&mut *conn)
@@ -122,8 +265,9 @@ pub async fn rollback_of(
         reason: Some(req.reason),
         defer_cooldown: req.defer_cooldown,
         bundle: None,
+        authorization: req.authorization,
     };
-    let outcome = executor::execute(pool, cfg, action, req.dry_run).await;
+    let outcome = executor::execute_with(pool, cfg, ssh, action, req.dry_run).await;
     if let (Some(mut conn), Some(name)) = (lock_conn, lock_name) {
         if let Err(e) = sqlx::query("SELECT RELEASE_LOCK(?)")
             .bind(name)

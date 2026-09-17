@@ -16,6 +16,8 @@ pub mod flows;
 pub mod health;
 pub mod interfaces;
 pub mod locks;
+pub mod manual_mitigations;
+pub mod mitigation_presets;
 pub mod notifications;
 pub mod reroutes;
 pub mod rtbh;
@@ -226,71 +228,6 @@ pub(crate) async fn audit_mutation_on(
     Ok(())
 }
 
-fn action_plan_hash(plan: &Value) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let encoded = serde_json::to_vec(plan).context("serializing action preview")?;
-    Ok(hex::encode(Sha256::digest(encoded)))
-}
-
-pub(crate) async fn store_action_preview(
-    pool: &MySqlPool,
-    user_id: u64,
-    scope: &str,
-    scope_id: Option<u64>,
-    plan: &Value,
-) -> Result<String> {
-    let token = crate::auth::sessions::generate_token();
-    let token_hash = crate::auth::sessions::hash_token(&token);
-    let plan_hash = action_plan_hash(plan)?;
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "DELETE FROM action_previews WHERE expires_at <= UTC_TIMESTAMP() OR used_at IS NOT NULL",
-    )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO action_previews \
-         (token_hash, user_id, scope, scope_id, plan_hash, expires_at) \
-         VALUES (?, ?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 5 MINUTE))",
-    )
-    .bind(token_hash)
-    .bind(user_id)
-    .bind(scope)
-    .bind(scope_id)
-    .bind(plan_hash)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(token)
-}
-
-pub(crate) async fn consume_action_preview(
-    pool: &MySqlPool,
-    token: &str,
-    user_id: u64,
-    scope: &str,
-    scope_id: Option<u64>,
-    plan: &Value,
-) -> Result<bool> {
-    let token_hash = crate::auth::sessions::hash_token(token);
-    let plan_hash = action_plan_hash(plan)?;
-    let updated = sqlx::query(
-        "UPDATE action_previews SET used_at = UTC_TIMESTAMP() \
-         WHERE token_hash = ? AND user_id = ? AND scope = ? \
-           AND ((scope_id IS NULL AND ? IS NULL) OR scope_id = ?) \
-           AND plan_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()",
-    )
-    .bind(token_hash)
-    .bind(user_id)
-    .bind(scope)
-    .bind(scope_id)
-    .bind(scope_id)
-    .bind(plan_hash)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected() == 1)
-}
-
 pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
     let cookie_key = cookie_key_from_env()?;
     let bind = cfg.server.bind.clone();
@@ -300,6 +237,21 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         cookie_key,
     };
 
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(event_type = "api_listening", bind = %bind, "API up (loopback only; public via Nginx /api proxy)");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Construct the exact production API without binding a listener. Integration
+/// tests exercise authentication, RBAC and transactions through this router.
+pub fn router(state: AppState) -> Router {
     let app = Router::new()
         // unauthenticated liveness/readiness probes; status requires a session
         .route("/api/health", get(health::health))
@@ -367,7 +319,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
         )
         .route("/api/rules/{id}/clear", post(rules::clear))
         .route("/api/rules/{id}/apply", post(rules::apply))
-        .route("/api/rules/{id}/actions", post(rules::add_action))
+        .route(
+            "/api/rules/{id}/actions",
+            post(rules::add_action).put(rules::replace_actions),
+        )
         .route(
             "/api/rules/{rule_id}/actions/{action_id}",
             delete(rules::remove_action),
@@ -379,6 +334,24 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(rules::reorder_actions),
         )
         // reroute template catalog (read-only) + render/preview
+        .route(
+            "/api/mitigation-presets",
+            get(mitigation_presets::list).post(mitigation_presets::create),
+        )
+        .route(
+            "/api/mitigation-presets/{id}",
+            get(mitigation_presets::show)
+                .put(mitigation_presets::update)
+                .delete(mitigation_presets::archive),
+        )
+        .route(
+            "/api/manual-mitigations/preview",
+            post(manual_mitigations::preview),
+        )
+        .route(
+            "/api/manual-mitigations/apply",
+            post(manual_mitigations::apply),
+        )
         .route("/api/templates", get(templates::list))
         .route("/api/templates/{id}", get(templates::show))
         .route("/api/templates/{id}/render", post(templates::render))
@@ -395,8 +368,10 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
             post(reroutes::acknowledge_uncertain),
         )
         .route("/api/reroutes/{id}/rollback", post(reroutes::rollback))
+        .route("/api/reroutes/{id}/reconcile", post(reroutes::reconcile))
         // Progress of an ordered mitigation bundle (async rule apply).
         .route("/api/reroute-bundles/{id}", get(reroutes::bundle_show))
+        .route("/api/reroute-bundles", get(reroutes::bundle_list))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))
         .route("/api/audit", get(audit::list))
@@ -450,14 +425,7 @@ pub async fn serve(pool: MySqlPool, cfg: Config) -> Result<()> {
     #[cfg(feature = "embed-ui")]
     let app = app.fallback(crate::ui::serve_spa);
 
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(event_type = "api_listening", bind = %bind, "API up (loopback only; public via Nginx /api proxy)");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    app
 }
 
 /// Extract the real client IP: trust CF-Connecting-IP (Nginx forwards it),

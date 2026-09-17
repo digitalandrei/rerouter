@@ -38,8 +38,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Total wall-clock budget for one command's response.
 const COMMAND_BUDGET: Duration = Duration::from_secs(25);
-/// Total wall-clock budget for a whole session (all commands).
-const SESSION_BUDGET: Duration = Duration::from_secs(120);
+/// Total wall-clock budget for a retained session. Per-command progress remains
+/// capped independently; this accommodates a normal 14-action bundle plus
+/// bounded BGP convergence checks without silently dropping native locks.
+const SESSION_BUDGET: Duration = Duration::from_secs(720);
+/// Whole multi-device lock-set budget, checked before every locked read/write.
+const LOCK_SET_BUDGET: Duration = Duration::from_secs(720);
 
 // ---- Credentials ---------------------------------------------------------------
 
@@ -227,6 +231,61 @@ pub struct SshOutcome {
     pub pinned_now: bool,
 }
 
+/// A failed multi-command session with enough evidence for the executor to
+/// persist what completed before the failure.  `UnknownEffect` means at least
+/// one mutating command may have reached IOS and must lead to `uncertain`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SshPlanFailure {
+    pub completed: Vec<CommandResult>,
+    pub failed_command: String,
+    pub failed_output: String,
+    pub certainty: crate::reroute::device_plan::EffectCertainty,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SshPlanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SSH plan failed at {:?} after {} completed command(s): {}",
+            self.failed_command,
+            self.completed.len(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for SshPlanFailure {}
+
+#[derive(Debug)]
+struct CommandRejected {
+    command: String,
+    output: String,
+    marker: String,
+}
+
+impl std::fmt::Display for CommandRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IOS rejected {:?}: {}", self.command, self.marker)
+    }
+}
+
+impl std::error::Error for CommandRejected {}
+
+#[derive(Debug)]
+struct IncompleteResponse {
+    partial: String,
+    reason: String,
+}
+
+impl std::fmt::Display for IncompleteResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({} partial bytes)", self.reason, self.partial.len())
+    }
+}
+
+impl std::error::Error for IncompleteResponse {}
+
 // ---- Secret redaction ----------------------------------------------------------
 
 /// What a redacted secret is replaced with. A fixed marker (never a length hint).
@@ -397,6 +456,46 @@ pub trait SshExecutor: Send + Sync {
         read_command: &'a str,
         resolve: SessionResolver<'a>,
     ) -> impl std::future::Future<Output = Result<ResolvedApply>> + Send + 'a;
+
+    /// Acquire native IOS configuration locks for every target before the first
+    /// write. Test adapters inherit the fail-closed default until they explicitly
+    /// model lock ownership.
+    fn lock_devices<'a>(
+        &'a self,
+        _device_ids: &'a [u64],
+    ) -> BoxFuture<'a, Result<Box<dyn LockedDeviceSetPort>>> {
+        Box::pin(async {
+            Err(anyhow!(
+                "SSH adapter does not implement native exclusive configuration locking"
+            ))
+        })
+    }
+
+    /// Execute an immutable prepared action. Ordinary/fake adapters fail closed;
+    /// the bundle's retained-lock wrapper overrides this and delegates to
+    /// `device_plan::execute_prepared` on its locked port.
+    fn execute_prepared<'a>(
+        &'a self,
+        _action: &'a crate::reroute::device_plan::PreparedDeviceAction,
+    ) -> BoxFuture<'a, Result<SshOutcome>> {
+        Box::pin(async {
+            Err(anyhow!(
+                "SSH adapter cannot execute an immutable prepared action under retained locks"
+            ))
+        })
+    }
+
+    fn execute_prepared_inverse<'a>(
+        &'a self,
+        _device_id: u64,
+        _inverse: &'a crate::reroute::device_plan::PreparedInverse,
+    ) -> BoxFuture<'a, Result<SshOutcome>> {
+        Box::pin(async {
+            Err(anyhow!(
+                "SSH adapter cannot execute a prepared inverse under retained locks"
+            ))
+        })
+    }
 }
 
 /// The in-session resolver: given the read's cleaned output, decide what (if
@@ -407,6 +506,31 @@ pub type SessionResolver<'a> =
 
 /// A boxed, `Send` future — the resolver's return type.
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Object-safe retained-session port used by bundle orchestration. Reads and
+/// writes address only devices acquired by the lock set.
+pub trait LockedDeviceSetPort: Send {
+    fn device_ids(&self) -> Vec<u64>;
+    fn transport_identity(
+        &self,
+        _device_id: u64,
+    ) -> Result<crate::reroute::device_plan::DeviceTransportIdentity> {
+        Err(anyhow!(
+            "locked SSH adapter does not expose transport identity"
+        ))
+    }
+    fn read<'a>(
+        &'a mut self,
+        device_id: u64,
+        command: &'a str,
+    ) -> BoxFuture<'a, Result<CommandResult>>;
+    fn execute<'a>(
+        &'a mut self,
+        device_id: u64,
+        commands: &'a [String],
+    ) -> BoxFuture<'a, Result<SshOutcome>>;
+    fn unlock_all(self: Box<Self>) -> BoxFuture<'static, Result<()>>;
+}
 
 /// What an in-session resolver decided after reading the device's current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +566,255 @@ impl RusshExecutor {
     pub fn new(pool: MySqlPool) -> Self {
         Self { pool }
     }
+
+    /// Acquire IOS native exclusive configuration locks in deterministic device
+    /// order. Every session remains open until [`LockedDevices::unlock_all`].
+    pub async fn lock_all(&self, device_ids: &[u64]) -> Result<LockedDevices> {
+        LockedDevices::acquire(&self.pool, device_ids).await
+    }
+
+    /// Build immutable read-only plans for preview/authorization. Runtime must
+    /// acquire every target lock, reprepare in the same order, and compare the
+    /// complete plans before the first write.
+    pub async fn prepare_actions(
+        &self,
+        inputs: &[crate::reroute::device_plan::PrepareInput],
+    ) -> Result<Vec<crate::reroute::device_plan::PreparedDeviceAction>> {
+        crate::reroute::device_plan::prepare_actions_read_only(&self.pool, inputs).await
+    }
+
+    /// Snapshot the mutable DB transport address together with the reviewed SSH
+    /// host-key pin. Called after read-only preparation (which may perform first
+    /// contact TOFU); enforced execution compares it to the locked sessions.
+    pub async fn transport_identities(
+        &self,
+        device_ids: &[u64],
+    ) -> Result<BTreeMap<u64, crate::reroute::device_plan::DeviceTransportIdentity>> {
+        let mut identities = BTreeMap::new();
+        for device_id in device_ids.iter().copied().collect::<BTreeSet<_>>() {
+            let row: Option<(String, u16, Option<String>)> = sqlx::query_as(
+                "SELECT hostname, ssh_port, ssh_host_fingerprint FROM devices WHERE id=?",
+            )
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let (host, port, fingerprint) =
+                row.ok_or_else(|| anyhow!("device {device_id} no longer exists"))?;
+            let pinned_host_fingerprint = fingerprint.ok_or_else(|| {
+                anyhow!("device {device_id} has no pinned SSH host key after read-only preparation")
+            })?;
+            identities.insert(
+                device_id,
+                crate::reroute::device_plan::DeviceTransportIdentity {
+                    host,
+                    port,
+                    pinned_host_fingerprint,
+                },
+            );
+        }
+        Ok(identities)
+    }
+}
+
+/// A bundle-wide set of IOS sessions holding native configuration locks.
+/// Dropping a session closes its SSH channel; callers should still invoke
+/// `unlock_all` so normal completion sends `end` and records release failures.
+pub struct LockedDevices {
+    sessions: BTreeMap<u64, IosSession>,
+    identities: BTreeMap<u64, crate::reroute::device_plan::DeviceTransportIdentity>,
+    started: Instant,
+}
+
+impl LockedDevices {
+    async fn acquire(pool: &MySqlPool, device_ids: &[u64]) -> Result<Self> {
+        let ids: BTreeSet<u64> = device_ids.iter().copied().collect();
+        if ids.is_empty() {
+            return Err(anyhow!("cannot acquire an empty device lock set"));
+        }
+        let mut sessions = BTreeMap::new();
+        let mut identities = BTreeMap::new();
+        let started = Instant::now();
+        for device_id in ids {
+            let dev = load_device_ssh(pool, device_id).await?;
+            let pinned = dev.expected_fingerprint.clone().ok_or_else(|| {
+                anyhow!(
+                    "device {device_id} has no pinned SSH host key; run a read-only preview/probe and review the observed fingerprint before enforced execution"
+                )
+            })?;
+            let identity = crate::reroute::device_plan::DeviceTransportIdentity {
+                host: dev.host.clone(),
+                port: dev.port,
+                pinned_host_fingerprint: pinned,
+            };
+            let mut session = IosSession::open(&dev).await?;
+            let fingerprint = session.fingerprint.clone();
+            let pinned_now = session.pinned_now;
+            if let Err(error) = session.acquire_config_lock().await {
+                session.close().await;
+                let locked = LockedDevices {
+                    sessions,
+                    identities,
+                    started,
+                };
+                let _ = locked.unlock_all().await;
+                return Err(error.context(format!(
+                    "device {device_id} does not provide the required exclusive IOS configuration lock"
+                )));
+            }
+            persist_tofu(
+                pool,
+                device_id,
+                &dev,
+                &SshOutcome {
+                    results: Vec::new(),
+                    fingerprint,
+                    pinned_now,
+                },
+            )
+            .await?;
+            sessions.insert(device_id, session);
+            identities.insert(device_id, identity);
+        }
+        Ok(Self {
+            sessions,
+            identities,
+            started,
+        })
+    }
+
+    pub fn device_ids(&self) -> Vec<u64> {
+        self.sessions.keys().copied().collect()
+    }
+
+    /// Run a narrowly allowlisted exec command through IOS `do` while retaining
+    /// the configuration lock and the same session.
+    pub async fn read(&mut self, device_id: u64, command: &str) -> Result<CommandResult> {
+        self.ensure_budget()?;
+        let command = command.trim();
+        if !command.starts_with("show ") {
+            return Err(anyhow!(
+                "locked read requires an allowlisted `show` command"
+            ));
+        }
+        let locked = format!("do {command}");
+        check_allowed(std::slice::from_ref(&locked))?;
+        self.session_mut(device_id)?.run(&locked).await
+    }
+
+    /// Execute a rendered plan without releasing the native IOS lock. The normal
+    /// `configure terminal`/`end` envelope is consumed here; nested interface or
+    /// router modes are exited one level and exec-after commands run through `do`.
+    pub async fn execute(&mut self, device_id: u64, commands: &[String]) -> Result<SshOutcome> {
+        self.ensure_budget()?;
+        check_allowed(commands)?;
+        let transformed = locked_commands(commands)?;
+        check_allowed(&transformed)?;
+        let session = self.session_mut(device_id)?;
+        let mut results = Vec::with_capacity(transformed.len());
+        for command in &transformed {
+            match session.run(command).await {
+                Ok(result) => results.push(result),
+                Err(error) => return Err(plan_failure(results, command, &error).into()),
+            }
+        }
+        Ok(session.outcome(results))
+    }
+
+    fn session_mut(&mut self, device_id: u64) -> Result<&mut IosSession> {
+        self.sessions
+            .get_mut(&device_id)
+            .ok_or_else(|| anyhow!("device {device_id} is not in the locked set"))
+    }
+
+    fn ensure_budget(&self) -> Result<()> {
+        if self.started.elapsed() > LOCK_SET_BUDGET {
+            return Err(anyhow!(
+                "exclusive multi-device configuration window exceeded its {} second budget",
+                LOCK_SET_BUDGET.as_secs()
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn unlock_all(mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        while let Some((device_id, mut session)) = self.sessions.pop_first() {
+            if let Err(error) = session.release_config_lock().await {
+                failures.push(format!("device {device_id}: {error}"));
+            }
+            session.close().await;
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "failed to cleanly release IOS configuration lock(s): {}",
+                failures.join("; ")
+            ))
+        }
+    }
+}
+
+fn locked_commands(commands: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut nested = false;
+    let mut after_end = false;
+    let mut entered_config = false;
+    let mut ended_config = false;
+    for (index, command) in commands.iter().enumerate() {
+        let command = command.trim();
+        match command {
+            "configure terminal" if index == 0 && !entered_config => {
+                entered_config = true;
+            }
+            "configure terminal" | "configure terminal lock" => {
+                return Err(anyhow!(
+                    "prepared plan has a duplicate or misplaced configuration entry"
+                ));
+            }
+            "exit" => {
+                return Err(anyhow!(
+                    "prepared plan may not carry raw `exit`; lock-safe context cleanup is derived"
+                ));
+            }
+            "end" => {
+                if !entered_config || ended_config {
+                    return Err(anyhow!("prepared plan has a misplaced or duplicate `end`"));
+                }
+                if nested {
+                    out.push("exit".into());
+                    nested = false;
+                }
+                after_end = true;
+                ended_config = true;
+            }
+            _ if after_end && command.starts_with("clear ") => {
+                out.push(format!("do {command}"));
+            }
+            _ if after_end => {
+                return Err(anyhow!(
+                    "command {command:?} cannot run after the config block while retaining the exclusive lock"
+                ));
+            }
+            _ => {
+                if command.starts_with("interface ") || command.starts_with("router bgp ") {
+                    if nested {
+                        return Err(anyhow!(
+                            "prepared plan enters a second configuration subcontext without leaving the first"
+                        ));
+                    }
+                    nested = true;
+                }
+                out.push(command.to_string());
+            }
+        }
+    }
+    if !entered_config || !ended_config || nested {
+        return Err(anyhow!(
+            "prepared plan must contain one complete `configure terminal` ... `end` envelope"
+        ));
+    }
+    Ok(out)
 }
 
 impl SshExecutor for RusshExecutor {
@@ -480,6 +853,52 @@ impl SshExecutor for RusshExecutor {
             .first()
             .map(|r| r.output.clone())
             .unwrap_or_default())
+    }
+
+    fn lock_devices<'a>(
+        &'a self,
+        device_ids: &'a [u64],
+    ) -> BoxFuture<'a, Result<Box<dyn LockedDeviceSetPort>>> {
+        Box::pin(async move {
+            let locked = self.lock_all(device_ids).await?;
+            Ok(Box::new(locked) as Box<dyn LockedDeviceSetPort>)
+        })
+    }
+}
+
+impl LockedDeviceSetPort for LockedDevices {
+    fn device_ids(&self) -> Vec<u64> {
+        LockedDevices::device_ids(self)
+    }
+
+    fn transport_identity(
+        &self,
+        device_id: u64,
+    ) -> Result<crate::reroute::device_plan::DeviceTransportIdentity> {
+        self.identities
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("device {device_id} is not in the locked identity set"))
+    }
+
+    fn read<'a>(
+        &'a mut self,
+        device_id: u64,
+        command: &'a str,
+    ) -> BoxFuture<'a, Result<CommandResult>> {
+        Box::pin(async move { LockedDevices::read(self, device_id, command).await })
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        device_id: u64,
+        commands: &'a [String],
+    ) -> BoxFuture<'a, Result<SshOutcome>> {
+        Box::pin(async move { LockedDevices::execute(self, device_id, commands).await })
+    }
+
+    fn unlock_all(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move { LockedDevices::unlock_all(*self).await })
     }
 }
 
@@ -677,6 +1096,43 @@ async fn persist_tofu(
 /// inventory it just reconciled ([`crate::reroute::inventory_audit`]), which may
 /// disarm automatic execution on a rule whose stored parameters have drifted.
 pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Result<usize> {
+    // Scheduler and operator-triggered discovery can overlap. A connection-owned
+    // advisory lock covers the complete read -> reconcile -> audit generation so
+    // an older SSH snapshot cannot commit after a newer one and acquire a fresh
+    // timestamp. Dropping the connection on cancellation releases the lock.
+    let mut lock_conn = pool.acquire().await?;
+    let lock_name = crate::db::scoped_advisory_lock_name(
+        &mut lock_conn,
+        &format!("inventory:device:{device_id}"),
+    )
+    .await?;
+    lock_conn.close_on_drop();
+    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
+        .bind(&lock_name)
+        .fetch_one(&mut *lock_conn)
+        .await?;
+    if acquired != Some(1) {
+        return Err(anyhow!(
+            "routing inventory discovery for device {device_id} is already running"
+        ));
+    }
+    let result = discover_prefixes_and_store_inner(pool, device_id).await;
+    let released: std::result::Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT RELEASE_LOCK(?)")
+            .bind(&lock_name)
+            .fetch_one(&mut *lock_conn)
+            .await;
+    match (result, released) {
+        (Ok(count), Ok(Some(1))) => Ok(count),
+        (Ok(_), Ok(_)) => Err(anyhow!(
+            "routing inventory refreshed but its serialization lock was not owned at release"
+        )),
+        (Ok(_), Err(error)) => Err(error).context("releasing routing inventory discovery lock"),
+        (Err(error), _) => Err(error),
+    }
+}
+
+async fn discover_prefixes_and_store_inner(pool: &MySqlPool, device_id: u64) -> Result<usize> {
     let cmd = "show running-config | section ^router bgp".to_string();
     let outcome = run_commands(pool, device_id, std::slice::from_ref(&cmd)).await?;
     let output = outcome
@@ -1241,6 +1697,144 @@ fn parse_prefix_list_names(config: &str) -> BTreeSet<String> {
     names
 }
 
+/// Enumerate every prefix-list consumer visible in the BGP and route-map
+/// configuration reads. The one-peer advertise template may proceed only when
+/// [`ensure_exclusive_prefix_list_consumer`] proves a single direct outbound
+/// neighbor reference. Peer-groups and route-maps are deliberately reported as
+/// shared/unclassifiable until a full running-config reference scan proves their
+/// complete fanout.
+pub fn prefix_list_consumers(
+    bgp_config: &str,
+    route_map_config: &str,
+    full_config: &str,
+    list: &str,
+) -> Vec<crate::reroute::device_plan::PrefixListConsumer> {
+    use crate::reroute::device_plan::PrefixListConsumer;
+
+    let mut consumers = Vec::new();
+    let mut address_family: Option<String> = None;
+    for line in bgp_config.lines() {
+        let trimmed = line.trim();
+        if let Some(family) = trimmed.strip_prefix("address-family ") {
+            address_family = Some(family.to_string());
+            continue;
+        }
+        if trimmed == "exit-address-family" || trimmed.starts_with("router bgp ") {
+            address_family = None;
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("neighbor ") else {
+            continue;
+        };
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        if let [owner, "prefix-list", name, direction] = tokens.as_slice() {
+            if *name == list && matches!(*direction, "in" | "out") {
+                let kind = if address_family.is_some() {
+                    "neighbor_address_family"
+                } else if owner.parse::<std::net::IpAddr>().is_ok() {
+                    "neighbor"
+                } else {
+                    "peer_group"
+                };
+                consumers.push(PrefixListConsumer {
+                    kind: kind.into(),
+                    owner: match &address_family {
+                        Some(family) => format!("{owner}@{family}"),
+                        None => (*owner).to_string(),
+                    },
+                    direction: (*direction).to_string(),
+                });
+            }
+        }
+    }
+
+    let mut current_map: Option<String> = None;
+    for line in route_map_config.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("route-map ") {
+            current_map = rest.split_whitespace().next().map(str::to_string);
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("match ip address prefix-list ") else {
+            continue;
+        };
+        if rest.split_whitespace().any(|name| name == list) {
+            consumers.push(PrefixListConsumer {
+                kind: "route_map".into(),
+                owner: current_map
+                    .clone()
+                    .unwrap_or_else(|| "<unclassified>".into()),
+                direction: "unknown".into(),
+            });
+        }
+    }
+    for line in full_config.lines() {
+        let trimmed = line.trim();
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        if !tokens.contains(&list) {
+            continue;
+        }
+        let known_definition =
+            matches!(tokens.as_slice(), ["ip", "prefix-list", name, ..] if *name == list);
+        let known_neighbor = matches!(
+            tokens.as_slice(),
+            ["neighbor", _, "prefix-list", name, direction]
+                if *name == list && matches!(*direction, "in" | "out")
+        );
+        let known_route_map_match = matches!(
+            tokens.as_slice(),
+            ["match", "ip", "address", "prefix-list", names @ ..]
+                if names.contains(&list)
+        );
+        if !known_definition && !known_neighbor && !known_route_map_match {
+            consumers.push(PrefixListConsumer {
+                kind: "unclassified".into(),
+                // Full running-config may contain passwords/communities. The raw
+                // line is used only in memory to classify/refuse and must never
+                // enter a prepared plan, log, audit row, or API response.
+                owner: "<redacted unclassified reference>".into(),
+                direction: "unknown".into(),
+            });
+        }
+    }
+    consumers
+        .sort_by(|a, b| (&a.kind, &a.owner, &a.direction).cmp(&(&b.kind, &b.owner, &b.direction)));
+    consumers.dedup();
+    consumers
+}
+
+pub fn ensure_exclusive_prefix_list_consumer(
+    bgp_config: &str,
+    route_map_config: &str,
+    full_config: &str,
+    list: &str,
+    peer: &str,
+) -> Result<Vec<crate::reroute::device_plan::PrefixListConsumer>> {
+    let consumers = prefix_list_consumers(bgp_config, route_map_config, full_config, list);
+    let exclusive = matches!(
+        consumers.as_slice(),
+        [consumer]
+            if consumer.kind == "neighbor"
+                && consumer.owner == peer
+                && consumer.direction == "out"
+    );
+    if !exclusive {
+        let detail = if consumers.is_empty() {
+            "no complete direct outbound consumer was proven".to_string()
+        } else {
+            consumers
+                .iter()
+                .map(|c| format!("{}:{}:{}", c.kind, c.owner, c.direction))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(anyhow!(
+            "prefix-list '{list}' is not proven exclusive to peer {peer} outbound ({detail}); refusing one-peer mutation"
+        ));
+    }
+    Ok(consumers)
+}
+
 /// A route-map section resolved into `route-map name -> outbound prefix-list`.
 struct RouteMapPrefixLists {
     /// Route-maps with exactly ONE candidate list, from permit stanzas only.
@@ -1381,14 +1975,18 @@ pub struct CapabilityCheck {
 
 /// Cisco rejection markers present in cleaned output when a command is not
 /// permitted (parser view / privilege level) or not recognised.
-fn cisco_denied(output: &str) -> Option<String> {
-    const MARKERS: [&str; 6] = [
+pub fn ios_command_error(output: &str) -> Option<String> {
+    const MARKERS: [&str; 10] = [
         "% Invalid input",
         "ommand authorization failed", // "Command authorization failed"
         "not authorized",
         "% Incomplete command",
         "% Ambiguous command",
         "% Permission denied",
+        "% Configuration locked",
+        "% Configuration lock failed",
+        "%Error",
+        "% Error",
     ];
     output
         .lines()
@@ -1397,18 +1995,23 @@ fn cisco_denied(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn cisco_denied(output: &str) -> Option<String> {
+    ios_command_error(output)
+}
+
 /// Probe whether the device's SSH account can run the commands Rerouter needs —
 /// WITHOUT changing any configuration (reads + a no-op config-mode entry).
 /// Each check reports ok + the router's message on denial. Used by the Settings
 /// "command access" panel so an under-privileged account is obvious.
 pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<CapabilityCheck>> {
     // Reads first (these cover every template's *verification* command family:
-    // running-config, ip/ipv6 route, ip bgp, interfaces), then a no-op config-mode
-    // entry. The actual apply verbs (ip route / ipv6 route / ip prefix-list /
+    // running-config, ip/ipv6 route, ip bgp, interfaces), then a native exclusive
+    // config-lock acquisition. The lock changes no configuration and is released
+    // when this probe's channel exits. The actual apply verbs (ip route / ipv6 route / ip prefix-list /
     // router / interface + sub-commands) can't be probed without side effects, so
     // they aren't executed here — the controller allowlist + the installed parser
     // view are the enforcing controls for those.
-    let probes: [(&str, &str); 7] = [
+    let probes: [(&str, &str); 8] = [
         (
             "Read running-config",
             "show running-config | section ^router bgp",
@@ -1421,10 +2024,14 @@ pub async fn probe_capabilities(pool: &MySqlPool, device_id: u64) -> Result<Vec<
         // SAME session as the config push. If the account cannot run this, the
         // add/remove fails closed at apply time — so surface it here instead.
         ("Read prefix-lists", "show ip prefix-list"),
-        ("Enter configuration mode", "configure terminal"),
+        ("Read configuration lock", "show configuration lock"),
+        (
+            "Acquire exclusive configuration lock",
+            "configure terminal lock",
+        ),
     ];
     // We deliberately do NOT append a trailing `end` to leave config mode. If
-    // `configure terminal` is denied (restricted parser view / low privilege) we
+    // `configure terminal lock` is denied (restricted parser view / low privilege) we
     // are still at the exec prompt, where IOS treats a bare `end` as a hostname to
     // telnet to — on a box with `ip domain-lookup` enabled that BLOCKS on DNS until
     // our read budget expires ("timed out waiting for device prompt"), masking the
@@ -1486,29 +2093,96 @@ pub fn caps_denied_summary(checks: &[CapabilityCheck]) -> Option<String> {
     ))
 }
 
-/// Parse `network A.B.C.D mask M.M.M.M` (and `network A.B.C.D/len`) lines from a
-/// `router bgp` config section into CIDR strings.
+/// Parse IPv4 and IPv6 BGP `network` statements into canonical CIDR strings.
+/// IPv6 statements normally live under `address-family ipv6` but retain the same
+/// one-token `network 2001:db8::/32` shape in the section output.
 fn parse_network_statements(config: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum Context {
+        Outside,
+        GlobalIpv4,
+        DefaultIpv4,
+        DefaultIpv6,
+        Unsupported,
+    }
+
     let mut out: Vec<String> = Vec::new();
+    let mut context = Context::Outside;
     for line in config.lines() {
-        let Some(rest) = line.trim().strip_prefix("network ") else {
+        let trimmed = line.trim();
+        if trimmed.starts_with("router bgp ") {
+            context = Context::GlobalIpv4;
+            continue;
+        }
+        if let Some(family) = trimmed.strip_prefix("address-family ") {
+            let tokens = family.split_whitespace().collect::<Vec<_>>();
+            context = match tokens.as_slice() {
+                ["ipv4"] | ["ipv4", "unicast"] => Context::DefaultIpv4,
+                ["ipv6"] | ["ipv6", "unicast"] => Context::DefaultIpv6,
+                _ => Context::Unsupported,
+            };
+            continue;
+        }
+        if trimmed == "exit-address-family" {
+            context = Context::GlobalIpv4;
+            continue;
+        }
+        if trimmed == "exit" {
+            context = Context::Outside;
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("network ") else {
             continue;
         };
         let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 3 && parts[1] == "mask" {
-            if let (Ok(ip), Some(len)) = (parts[0].parse::<Ipv4Addr>(), mask_to_len(parts[2])) {
-                out.push(format!("{ip}/{len}"));
-            }
-        } else if parts.len() == 1 {
-            if let Some((ip, len)) = parts[0].split_once('/') {
-                if let (Ok(ip), Ok(len)) = (ip.parse::<Ipv4Addr>(), len.parse::<u8>()) {
-                    if len <= 32 {
-                        out.push(format!("{ip}/{len}"));
+        match context {
+            Context::GlobalIpv4 | Context::DefaultIpv4 => {
+                if parts.len() >= 3 && parts[1] == "mask" && network_tail_valid(&parts, 3) {
+                    if let (Ok(ip), Ok(mask), Some(len)) = (
+                        parts[0].parse::<Ipv4Addr>(),
+                        parts[2].parse::<Ipv4Addr>(),
+                        mask_to_len(parts[2]),
+                    ) {
+                        let network = Ipv4Addr::from(u32::from(ip) & u32::from(mask));
+                        out.push(format!("{network}/{len}"));
+                    }
+                } else if !parts.is_empty() && network_tail_valid(&parts, 1) {
+                    if let Some((ip, len)) = parts[0].split_once('/') {
+                        if let (Ok(ip), Ok(len)) = (ip.parse::<Ipv4Addr>(), len.parse::<u8>()) {
+                            if len <= 32 {
+                                let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+                                out.push(format!(
+                                    "{}/{}",
+                                    Ipv4Addr::from(u32::from(ip) & mask),
+                                    len
+                                ));
+                            }
+                        }
+                    } else if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
+                        let len = classful_len(ip);
+                        let mask = u32::MAX << (32 - len);
+                        out.push(format!("{}/{}", Ipv4Addr::from(u32::from(ip) & mask), len));
                     }
                 }
-            } else if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
-                out.push(format!("{ip}/{}", classful_len(ip)));
             }
+            Context::DefaultIpv6 => {
+                if !parts.is_empty() && network_tail_valid(&parts, 1) {
+                    let Some((ip, len)) = parts[0].split_once('/') else {
+                        continue;
+                    };
+                    if let (Ok(ip), Ok(len)) = (ip.parse::<Ipv6Addr>(), len.parse::<u8>()) {
+                        if len <= 128 {
+                            let mask = if len == 0 {
+                                0
+                            } else {
+                                u128::MAX << (128 - len)
+                            };
+                            out.push(format!("{}/{}", Ipv6Addr::from(u128::from(ip) & mask), len));
+                        }
+                    }
+                }
+            }
+            Context::Outside | Context::Unsupported => {}
         }
     }
     out.sort();
@@ -1516,10 +2190,18 @@ fn parse_network_statements(config: &str) -> Vec<String> {
     out
 }
 
+fn network_tail_valid(parts: &[&str], consumed: usize) -> bool {
+    parts.len() == consumed
+        || matches!(parts.get(consumed..), Some(["route-map", name]) if is_name(name))
+}
+
 /// Dotted netmask -> prefix length (counts set bits).
 fn mask_to_len(mask: &str) -> Option<u8> {
     let ip: Ipv4Addr = mask.parse().ok()?;
-    Some(u32::from(ip).count_ones() as u8)
+    let bits = u32::from(ip);
+    let len = bits.count_ones() as u8;
+    let expected = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (bits == expected).then_some(len)
 }
 
 /// Classful default length for a maskless `network` statement.
@@ -1590,6 +2272,17 @@ fn command_allowed(cmd: &str) -> bool {
     if cmd.is_empty() || cmd.bytes().any(|b| b.is_ascii_control()) {
         return false;
     }
+    // `do` is accepted only while a LockedDevices session is in config mode,
+    // and only for an independently allowlisted show or the one exact BGP soft
+    // clear shape. It is never a generic escape hatch from the allowlist.
+    if let Some(inner) = cmd.strip_prefix("do ") {
+        return (inner.starts_with("show ") && command_allowed(inner))
+            || matches!(
+                inner.split_whitespace().collect::<Vec<_>>().as_slice(),
+                ["clear", "ip", "bgp", ip, "soft", dir]
+                    if is_ipv4(ip) && matches!(*dir, "in" | "out")
+            );
+    }
     // Peel off an optional output filter at the first pipe.
     let (base, filter) = match cmd.split_once('|') {
         Some((b, f)) => (b.trim(), Some(f.trim())),
@@ -1623,7 +2316,9 @@ fn command_allowed(cmd: &str) -> bool {
         // session / reads
         ["terminal", "length", "0"] => true,
         ["configure", "terminal"] => true,
+        ["configure", "terminal", "lock"] => true,
         ["end"] | ["exit"] => true,
+        ["show", "configuration", "lock"] => true,
         ["show", "clock"] => true,
         ["show", "version"] => true,
         ["show", "running-config"] => true,
@@ -1632,6 +2327,8 @@ fn command_allowed(cmd: &str) -> bool {
         ["show", "ipv6", "route", "summary"] => true,
         ["show", "ipv6", "route", a] => is_ipv6(a) || is_cidr6(a),
         ["show", "ip", "bgp", "summary"] => true,
+        ["show", "ip", "bgp", prefix] => is_ipv4(prefix) || is_cidr(prefix),
+        ["show", "bgp", "ipv6", "unicast", prefix] => is_cidr6(prefix),
         ["show", "ip", "bgp", "neighbors", a] => is_ipv4(a),
         ["show", "ip", "bgp", "neighbors", a, "advertised-routes"] => is_ipv4(a),
         ["show", "interfaces", n] => is_name(n),
@@ -1711,9 +2408,11 @@ fn sequence_safe(commands: &[String]) -> Result<()> {
     for c in commands {
         match c.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["interface", _] => in_interface = true,
-            ["configure", "terminal"] | ["router", "bgp", _] | ["end"] | ["exit"] => {
-                in_interface = false
-            }
+            ["configure", "terminal"]
+            | ["configure", "terminal", "lock"]
+            | ["router", "bgp", _]
+            | ["end"]
+            | ["exit"] => in_interface = false,
             ["shutdown"] | ["no", "shutdown"] if !in_interface => {
                 return Err(anyhow!(
                     "refusing '{}' outside interface config (would affect more than the target interface)",
@@ -1906,10 +2605,34 @@ impl IosSession {
             self.started,
         )
         .await?;
-        Ok(CommandResult {
+        let result = CommandResult {
             command: command.to_string(),
             output: clean_output(&raw, command),
-        })
+        };
+        if let Some(marker) = ios_command_error(&result.output) {
+            return Err(CommandRejected {
+                command: command.to_string(),
+                output: redact_device_output(&result.output),
+                marker,
+            }
+            .into());
+        }
+        Ok(result)
+    }
+
+    async fn acquire_config_lock(&mut self) -> Result<()> {
+        // The status read is mandatory. An image that does not implement native
+        // locking is unsupported for enforced writes and fails before mutation.
+        let _ = self.run("show configuration lock").await?;
+        let _ = self.run("configure terminal lock").await?;
+        Ok(())
+    }
+
+    async fn release_config_lock(&mut self) -> Result<()> {
+        // IOS releases the session-owned lock on `end`/disconnect. We never send
+        // a global unlock command that could target another operator's lock.
+        let _ = self.run("end").await?;
+        Ok(())
     }
 
     /// Best-effort clean exit; errors are ignored (we already have the results).
@@ -1936,7 +2659,14 @@ pub async fn run_on(dev: &DeviceSsh, commands: &[String]) -> Result<SshOutcome> 
     let mut session = IosSession::open(dev).await?;
     let mut results = Vec::with_capacity(commands.len());
     for command in commands {
-        results.push(session.run(command).await?);
+        match session.run(command).await {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                let failure = plan_failure(results, command, &error);
+                session.close().await;
+                return Err(failure.into());
+            }
+        }
     }
     let outcome = session.outcome(results);
     session.close().await;
@@ -2006,8 +2736,9 @@ pub async fn run_on_resolved(
             match session.run(command).await {
                 Ok(r) => results.push(r),
                 Err(e) => {
+                    let failure = plan_failure(results, command, &e);
                     session.close().await;
-                    return Err(e);
+                    return Err(failure.into());
                 }
             }
         }
@@ -2016,6 +2747,50 @@ pub async fn run_on_resolved(
     let outcome = session.outcome(results);
     session.close().await;
     Ok(ResolvedApply { outcome, decision })
+}
+
+fn command_may_change_state(command: &str) -> bool {
+    let command = command.trim();
+    !(command.starts_with("show ")
+        || command.starts_with("do show ")
+        || matches!(
+            command,
+            "terminal length 0" | "configure terminal" | "configure terminal lock" | "end" | "exit"
+        ))
+}
+
+fn plan_failure(
+    completed: Vec<CommandResult>,
+    command: &str,
+    error: &anyhow::Error,
+) -> SshPlanFailure {
+    let rejected = error.downcast_ref::<CommandRejected>();
+    let failed_output = rejected
+        .map(|r| r.output.clone())
+        .or_else(|| {
+            error
+                .downcast_ref::<IncompleteResponse>()
+                .map(|r| redact_device_output(&clean_output(&r.partial, command)))
+        })
+        .unwrap_or_default();
+    // A positive IOS rejection proves that command itself did not apply. A
+    // transport failure after sending a mutating command cannot prove that.
+    let failed_may_have_changed = rejected.is_none() && command_may_change_state(command);
+    let earlier_changed = completed
+        .iter()
+        .any(|r| command_may_change_state(&r.command));
+    let certainty = if failed_may_have_changed || earlier_changed {
+        crate::reroute::device_plan::EffectCertainty::UnknownEffect
+    } else {
+        crate::reroute::device_plan::EffectCertainty::ProvenNoEffect
+    };
+    SshPlanFailure {
+        completed: redact_results(&completed),
+        failed_command: command.to_string(),
+        failed_output,
+        certainty,
+        reason: error.to_string(),
+    }
 }
 
 // ---- Shell I/O helpers ---------------------------------------------------------
@@ -2048,7 +2823,9 @@ async fn read_until(
             Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
                 buf.push_str(&String::from_utf8_lossy(&data));
             }
-            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
+            Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => {
+                return finish_closed_read(buf, done);
+            }
             Ok(Some(_)) => {}
             Err(_) => {
                 // Quiet for READ_CHUNK_TIMEOUT: accept whatever we have if it already
@@ -2064,16 +2841,34 @@ async fn read_until(
                     tail = %tail.escape_debug(),
                     "timed out waiting for device prompt"
                 );
-                return Err(anyhow!("timed out waiting for device prompt"));
+                return Err(IncompleteResponse {
+                    partial: buf,
+                    reason: "timed out waiting for device prompt".into(),
+                }
+                .into());
             }
         }
         if cmd_start.elapsed() > COMMAND_BUDGET || session_start.elapsed() > SESSION_BUDGET {
-            return Err(anyhow!(
-                "device did not return to a prompt within the time budget"
-            ));
+            return Err(IncompleteResponse {
+                partial: buf,
+                reason: "device did not return to a prompt within the time budget".into(),
+            }
+            .into());
         }
     }
     Ok(buf)
+}
+
+fn finish_closed_read(buf: String, done: &mut (dyn FnMut(&str) -> bool + Send)) -> Result<String> {
+    if done(&buf) {
+        Ok(buf)
+    } else {
+        Err(IncompleteResponse {
+            partial: buf,
+            reason: "SSH channel closed before the device returned to its prompt".into(),
+        }
+        .into())
+    }
 }
 
 /// Returns the last line if it looks like a Cisco prompt (`name#`, `name>`,
@@ -2138,6 +2933,147 @@ fn clean_output(raw: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ios_rejections_are_classified_before_verification() {
+        for output in [
+            "% Invalid input detected at '^' marker.",
+            "% Incomplete command.",
+            "% Ambiguous command:  \"sh\"",
+            "Command authorization failed.",
+            "% Configuration locked by user ops",
+        ] {
+            assert!(ios_command_error(output).is_some(), "accepted {output:?}");
+        }
+    }
+
+    #[test]
+    fn channel_close_requires_a_completed_anchored_prompt() {
+        let mut prompt = prompt_matcher("edge-1");
+        let error =
+            finish_closed_read("show ip route\npartial row\n".into(), &mut prompt).unwrap_err();
+        let incomplete = error
+            .downcast_ref::<IncompleteResponse>()
+            .expect("structured incomplete response");
+        assert!(incomplete.partial.contains("partial row"));
+
+        let mut prompt = prompt_matcher("edge-1");
+        assert!(finish_closed_read("show clock\n12:00\nedge-1#".into(), &mut prompt).is_ok());
+    }
+
+    #[test]
+    fn partial_plan_failure_preserves_completed_evidence_and_certainty() {
+        let completed = vec![CommandResult {
+            command: "ip route 192.0.2.0 255.255.255.0 Null0".into(),
+            output: String::new(),
+        }];
+        let rejection: anyhow::Error = CommandRejected {
+            command: "clear ip bgp 203.0.113.1 soft out".into(),
+            output: "% Invalid input".into(),
+            marker: "% Invalid input".into(),
+        }
+        .into();
+        let failure = plan_failure(completed, "clear ip bgp 203.0.113.1 soft out", &rejection);
+        assert_eq!(failure.completed.len(), 1);
+        assert_eq!(
+            failure.certainty,
+            crate::reroute::device_plan::EffectCertainty::UnknownEffect
+        );
+        assert_eq!(failure.failed_output, "% Invalid input");
+    }
+
+    #[test]
+    fn locked_plan_never_releases_between_config_and_soft_clear() {
+        let commands = vec![
+            "configure terminal".into(),
+            "router bgp 65000".into(),
+            "neighbor 192.0.2.1 shutdown".into(),
+            "end".into(),
+            "clear ip bgp 192.0.2.1 soft out".into(),
+        ];
+        let locked = locked_commands(&commands).expect("transform");
+        assert_eq!(
+            locked,
+            vec![
+                "router bgp 65000",
+                "neighbor 192.0.2.1 shutdown",
+                "exit",
+                "do clear ip bgp 192.0.2.1 soft out",
+            ]
+        );
+        assert!(!locked.iter().any(|command| command == "end"));
+        check_allowed(&locked).expect("locked forms stay narrowly allowlisted");
+        assert!(!command_allowed("do configure terminal"));
+        assert!(!command_allowed("do clear ip bgp 192.0.2.1 hard"));
+        assert!(locked_commands(&["ip route 192.0.2.0 255.255.255.0 Null0".into()]).is_err());
+        assert!(locked_commands(&[
+            "configure terminal".into(),
+            "interface Gi0/0".into(),
+            "shutdown".into(),
+        ])
+        .is_err());
+        assert!(
+            locked_commands(&["configure terminal".into(), "end".into(), "end".into(),]).is_err()
+        );
+    }
+
+    #[test]
+    fn one_peer_prefix_list_gate_rejects_shared_and_unclassifiable_consumers() {
+        let direct = "router bgp 65000\n neighbor 192.0.2.1 prefix-list EDGE out";
+        let consumers =
+            ensure_exclusive_prefix_list_consumer(direct, "", direct, "EDGE", "192.0.2.1")
+                .expect("one direct outbound consumer");
+        assert_eq!(consumers.len(), 1);
+
+        let shared = "router bgp 65000\n neighbor 192.0.2.1 prefix-list EDGE out\n neighbor 192.0.2.2 prefix-list EDGE out";
+        assert!(
+            ensure_exclusive_prefix_list_consumer(shared, "", shared, "EDGE", "192.0.2.1").is_err()
+        );
+
+        let group = "router bgp 65000\n neighbor TRANSIT prefix-list EDGE out\n neighbor 192.0.2.1 peer-group TRANSIT";
+        assert!(
+            ensure_exclusive_prefix_list_consumer(group, "", group, "EDGE", "192.0.2.1").is_err()
+        );
+
+        let route_map = "route-map EXPORT permit 10\n match ip address prefix-list EDGE";
+        assert!(ensure_exclusive_prefix_list_consumer(
+            "router bgp 65000",
+            route_map,
+            route_map,
+            "EDGE",
+            "192.0.2.1"
+        )
+        .is_err());
+        let redistributed = "router bgp 65000\n neighbor 192.0.2.1 prefix-list EDGE out\n distribute-list prefix EDGE in";
+        assert!(ensure_exclusive_prefix_list_consumer(
+            redistributed,
+            "",
+            redistributed,
+            "EDGE",
+            "192.0.2.1"
+        )
+        .is_err());
+        let vrf = "router bgp 65000\n address-family ipv4 vrf CUSTOMER\n  neighbor 192.0.2.1 prefix-list EDGE out\n exit-address-family";
+        assert!(ensure_exclusive_prefix_list_consumer(vrf, "", vrf, "EDGE", "192.0.2.1").is_err());
+    }
+
+    #[test]
+    fn announced_network_discovery_includes_canonical_ipv6_prefixes() {
+        let config = "router bgp 65000\n network 198.51.100.99 mask 255.255.255.0\n address-family ipv4 unicast\n  network 192.0.2.9/24 route-map EXPORT\n  network 2001:db8::/32\n exit-address-family\n address-family ipv6 unicast\n  network 2001:db8:1::1234/48\n  network 192.0.2.0/24\n exit-address-family";
+        assert_eq!(
+            parse_network_statements(config),
+            vec!["192.0.2.0/24", "198.51.100.0/24", "2001:db8:1::/48"]
+        );
+    }
+
+    #[test]
+    fn announced_network_discovery_never_promotes_vrf_vpn_or_multicast_space() {
+        let config = "router bgp 65000\n network 203.0.113.99 mask 255.255.255.0\n address-family ipv4 vrf CUSTOMER\n  network 10.10.10.9/24\n exit-address-family\n address-family ipv6 vrf CUSTOMER\n  network 2001:db8:dead::/48\n exit-address-family\n address-family vpnv4\n  network 172.16.0.0/16\n exit-address-family\n address-family ipv4 multicast\n  network 224.0.0.0/4\n exit-address-family\n network 198.18.7.9 mask 255.255.0.0\n network 192.0.2.1 mask 255.0.255.0";
+        assert_eq!(
+            parse_network_statements(config),
+            vec!["198.18.0.0/16", "203.0.113.0/24"]
+        );
+    }
 
     #[test]
     fn caps_summary_flags_denied_commands_and_stays_secret_free() {
