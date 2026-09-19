@@ -146,8 +146,8 @@ Suggested endpoints: cached `GET /api/devices/{id}/routing-policies`, authority-
 - [x] Keyboard plus desktop/mobile visual checks using mocks only.
 - [x] Full software release gate, fresh and upgrade migrations on dedicated schemas,
   MariaDB and MySQL compatibility.
-- [ ] Restorable EMDD backup, versioned conversion, report and missing policy docs.
-- [ ] Release deployed; health/version/schema verified read-only; no actions triggered.
+- [x] Restorable EMDD backup, versioned conversion, report and missing policy docs.
+- [x] Release deployed; health/version/schema verified read-only; no actions triggered.
 
 Baseline frontend:8 tests/typecheck/build passed during planning. Browser sandbox
 prevented rendering then; retry with authorized local mocked test tooling for
@@ -162,7 +162,7 @@ The test harness validates schema/account and serializes cross-process suites.
 Implementation and local acceptance are complete. The frozen release gate passed
 274 Rust tests, 36 frontend tests across 13 files, typecheck, strict Clippy, the
 frontend production build, and the development embed-UI Rust build. The optimized
-release build is still running. The MySQL 8.4 all-target run separately passed all
+release build passed. The MySQL 8.4 all-target run separately passed all
 274 Rust tests with zero failures. The bounded browser confirmation passed nine desktop and
 four mobile routes with no overflow or page errors and truthful outage states.
 
@@ -179,10 +179,18 @@ same one-hour idle timeout. Observe permits only exact-previewed, explicitly
 confirmed manual work; autonomous starts and recovery remain disabled unless
 Enforce, the automatic master switch, and their narrower authority gates agree.
 
-Deployment, the stopped-window production backup/conversion, post-deployment
-read-only verification, and user-owned router activation tests remain pending.
-Test-schema and tunnel cleanup is owned by the parent release session. Source,
-fixtures, and read-only configuration inspection do not certify live actuation.
+Deployment completed from source `77a3f73daa7461ebc67112dab2020e64dca61020`.
+The stopped-window backup, migration, conversion, readiness, executable, public
+frontend, rules and safety state were verified. Observe and automatic-off remain
+in force, with zero reroutes, bundles, locks or deletions. Owned database fixtures,
+grants and tunnel were cleaned up without touching database services or the
+existing MariaDB account. No router action, revert, test or prerequisite
+provisioning occurred; live actuation remains uncertified and user-owned.
+Five public JavaScript/CSS assets also matched the release byte-for-byte. The
+routing-policy cache was empty during an early post-start read within the normal
+scheduled discovery delay; no discovery was forced. Normal inventory refresh and
+the two missing eMA2 lists remain prerequisites for live readiness of the seven
+known dependent steps and the complete preset.
 
 ## Integration review follow-ups (resolved before acceptance)
 
@@ -197,7 +205,8 @@ fixtures, and read-only configuration inspection do not certify live actuation.
   reconstruction, revocation, outage recovery, and the original return route.
 - Rules, supporting pages, doctrine/glossary, conversion and release tooling,
   database compatibility, browser confirmation, and independent Astra review are
-  complete. Production backup/conversion/deployment remains the open delivery step.
+  complete. Production backup, conversion, deployment and read-only verification
+  are also complete; only user-owned live router testing remains outside acceptance.
 
 ## Additional live read authorized by the user
 
@@ -233,17 +242,18 @@ frontend stabilizes, fix findings once, then confirm once.
 - EMDD application source snapshot re-read safely to
   `/tmp/rerouter-workflow-review-20260919/emdd-app-before.json`; conversion fixture
   now uses these real IDs, zero-based positions, ordering and MSS string values.
-- Dedicated MySQL8.4.7 test schemas created by this session:
+- Dedicated MySQL8.4.7 test schemas used by this session were:
   `rerouter_test_wf0919_f3c6ab`, `rerouter_test_wf0919_fresh_f3c6ab`,
   `rerouter_test_wf0919_upgrade_f3c6ab`; restricted account
-  `rrt_test_wf0919_f3c6ab` at localhost/127.0.0.1 has grants only on those schemas.
-  Private URL files and ownership manifest live under the same temporary review
-  directory (`mysql-*-database-url`, `mysql-test-owner.json`). Never print secrets.
-- Task-owned SSH test tunnel: tool session98996, SSH PID1882864, local port13379,
+  `rrt_test_wf0919_f3c6ab` at localhost/127.0.0.1 had grants only on those schemas.
+  Cleanup removed all five task URL credential files. Ownership manifests and
+  non-secret evidence remain in the temporary review directory.
+- The task-owned SSH test tunnel used tool session98996, SSH PID1882864, local port13379,
   control socket `/tmp/rerouter-workflow-review-20260919/mysql-test-ssh.sock`.
-  PID/start/cgroup/argv captured in `mysql-test-tunnel.json`. **Close this owned
-  tunnel using its control socket before final reporting**, then remove only
-  session-owned test schemas/account when verification is finished.
+  PID/start/cgroup/argv captured in `mysql-test-tunnel.json`. Cleanup removed the
+  three MySQL and two MariaDB schemas and added grants, removed the owned MySQL
+  account entries, and closed this tunnel through its control socket. The existing
+  MariaDB account and both database services were preserved.
 - Verified prior release binary SHA256397c689d... copied to
   `/tmp/rerouter-workflow-review-20260919/controller.baseline-5b5326f`; used only
   with --migrate and explicit restricted test URL to create67-migration upgrade
