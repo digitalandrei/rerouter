@@ -9,7 +9,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { RotateCcw, Trash2 } from "lucide-react";
+import { LoaderCircle, RotateCcw, Trash2 } from "lucide-react";
 import { api, type User, ApiError } from "@/lib/api";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/lib/auth";
@@ -74,7 +74,7 @@ export default function Users() {
   const [enrollment, setEnrollment] = useState<{ email: string; code: string } | null>(null);
   // Per-row inline error messages: userId -> message
   const [rowError, setRowError] = useState<Record<number, string>>({});
-  const [rowBusy, setRowBusy] = useState<Record<number, boolean>>({});
+  const [rowBusy, setRowBusy] = useState<Record<number, "role" | "reset" | "delete" | undefined>>({});
   const [pending, setPending] = useState<{ kind: "delete" | "reset"; user: User } | null>(null);
 
   // Defensive gate: redirect away if permission is missing.
@@ -134,13 +134,13 @@ export default function Users() {
       return next;
     });
   }
-  function setRowBusyState(id: number, busy: boolean) {
-    setRowBusy((b) => ({ ...b, [id]: busy }));
+  function setRowBusyState(id: number, operation?: "role" | "reset" | "delete") {
+    setRowBusy((b) => ({ ...b, [id]: operation }));
   }
 
   async function handleRoleChange(user: User, newRole: string) {
     clearRowErr(user.id);
-    setRowBusyState(user.id, true);
+    setRowBusyState(user.id, "role");
     try {
       const updated = await api.users.update(user.id, { role: newRole });
       setUsers((prev) => prev.map((u) => (u.id === updated.id ? updated : u)));
@@ -151,13 +151,13 @@ export default function Users() {
         err instanceof ApiError ? err.message : "Failed to update role",
       );
     } finally {
-      setRowBusyState(user.id, false);
+      setRowBusyState(user.id);
     }
   }
 
   async function doReset2fa(user: User) {
     clearRowErr(user.id);
-    setRowBusyState(user.id, true);
+    setRowBusyState(user.id, "reset");
     try {
       const result = await api.users.reset2fa(user.id);
       setEnrollment({ email: user.email, code: result.enrollment_code });
@@ -165,20 +165,21 @@ export default function Users() {
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Failed to reset 2FA");
     } finally {
-      setRowBusyState(user.id, false);
+      setRowBusyState(user.id);
     }
   }
 
   async function doDelete(user: User) {
     clearRowErr(user.id);
-    setRowBusyState(user.id, true);
+    setRowBusyState(user.id, "delete");
     try {
       await api.users.remove(user.id);
       setUsers((prev) => prev.filter((u) => u.id !== user.id));
       toast.success(`Deleted ${user.email}`);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Failed to delete user");
-      setRowBusyState(user.id, false);
+    } finally {
+      setRowBusyState(user.id);
     }
   }
 
@@ -209,6 +210,7 @@ export default function Users() {
           </CardHeader>
           <CardContent>
             <form onSubmit={handleAdd} className="space-y-4">
+              <fieldset disabled={addBusy} className="min-w-0 space-y-4 border-0 p-0">
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="block space-y-1 text-sm font-medium">
                   Email
@@ -261,9 +263,10 @@ export default function Users() {
                   {addError}
                 </p>
               )}
-              <Button type="submit" disabled={addBusy}>
-                {addBusy ? "Creating…" : "Create user"}
+              <Button type="submit" loading={addBusy} loadingLabel="Creating user…">
+                Create user
               </Button>
+              </fieldset>
             </form>
           </CardContent>
         </Card>
@@ -337,7 +340,7 @@ export default function Users() {
                     <select
                       className="rounded-md border border-input bg-background px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       value={user.role}
-                      disabled={rowBusy[user.id]}
+                      disabled={Boolean(rowBusy[user.id])}
                       onChange={(e) => void handleRoleChange(user, e.target.value)}
                       aria-label={`Role for ${user.email}`}
                     >
@@ -345,23 +348,26 @@ export default function Users() {
                         <option key={value} value={value}>{label}</option>
                       ))}
                     </select>
+                    {rowBusy[user.id] === "role" && <span role="status" className="inline-flex items-center gap-1 text-xs text-muted-foreground"><LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" /> Saving role…</span>}
 
                     <RowActionButton
-                      label={`Reset 2FA for ${user.email}`}
-                      disabled={rowBusy[user.id]}
+                      label={rowBusy[user.id] === "reset" ? `Resetting 2FA for ${user.email}` : `Reset 2FA for ${user.email}`}
+                      disabled={Boolean(rowBusy[user.id])}
+                      loading={rowBusy[user.id] === "reset"}
                       disabledReason="Another action for this user is in progress"
                       onClick={() => setPending({ kind: "reset", user })}
                     >
-                      <RotateCcw className="size-4" />
+                      {rowBusy[user.id] !== "reset" && <RotateCcw className="size-4" />}
                     </RowActionButton>
                     <RowActionButton
-                      label={`Delete ${user.email}`}
+                      label={rowBusy[user.id] === "delete" ? `Deleting ${user.email}` : `Delete ${user.email}`}
                       tone="destructive"
-                      disabled={rowBusy[user.id]}
+                      disabled={Boolean(rowBusy[user.id])}
+                      loading={rowBusy[user.id] === "delete"}
                       disabledReason="Another action for this user is in progress"
                       onClick={() => setPending({ kind: "delete", user })}
                     >
-                      <Trash2 className="size-4" />
+                      {rowBusy[user.id] !== "delete" && <Trash2 className="size-4" />}
                     </RowActionButton>
                   </div>
                   {rowError[user.id] && (
@@ -391,9 +397,9 @@ export default function Users() {
         onConfirm={async () => {
           if (!pending) return;
           const { kind, user } = pending;
-          setPending(null);
           if (kind === "delete") await doDelete(user);
           else await doReset2fa(user);
+          setPending(null);
         }}
       />
     </div>

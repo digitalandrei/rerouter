@@ -200,7 +200,7 @@ function fullRouterSetup(username: string, publicKey: string): string {
 export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved: () => void }) {
   const [form, setForm] = useState<Form>(() => build(device));
   const [busy, setBusy] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [testing, setTesting] = useState<"snmp" | "ssh" | null>(null);
   const [generating, setGenerating] = useState(false);
   const [regenOpen, setRegenOpen] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -208,7 +208,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   const [capsErr, setCapsErr] = useState<string | null>(null);
   const [reachTesting, setReachTesting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const operationBusy = busy || testing || generating || checking || reachTesting;
+  const operationBusy = busy || testing !== null || generating || checking || reachTesting;
 
   // Reset only when navigating to a different device (not on the 30s refresh of
   // the same device, which would wipe in-progress edits).
@@ -296,7 +296,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   }
 
   async function testSnmp() {
-    setTesting(true);
+    setTesting("snmp");
     setActionError(null);
     try {
       const r = await api.devices.test(device.id);
@@ -305,12 +305,12 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
     } catch {
       setActionError("SNMP test failed"); toast.error("SNMP test failed");
     } finally {
-      setTesting(false);
+      setTesting(null);
     }
   }
 
   async function testSsh() {
-    setTesting(true);
+    setTesting("ssh");
     setActionError(null);
     try {
       const r = await api.devices.sshTest(device.id);
@@ -324,7 +324,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
     } catch {
       setActionError("SSH test failed"); toast.error("SSH test failed");
     } finally {
-      setTesting(false);
+      setTesting(null);
     }
   }
 
@@ -366,6 +366,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       </CardHeader>
       <CardContent>
         <form onSubmit={save} className="space-y-4">
+          <fieldset disabled={operationBusy} className="min-w-0 space-y-4 border-0 p-0">
           {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="block space-y-1 text-sm font-medium">
@@ -438,16 +439,16 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                         type="button"
                         variant="outline"
                         size="sm"
-                        disabled={generating}
+                        disabled={operationBusy}
+                        loading={generating}
+                        loadingLabel="Generating…"
                         onClick={() => {
                           if (device.ssh_public_key || device.ssh_configured) setRegenOpen(true);
                           else void generateKey();
                         }}
                       >
                         <KeyRound className="size-4" />
-                        {generating
-                          ? "Generating…"
-                          : device.ssh_public_key
+                        {device.ssh_public_key
                             ? "Regenerate key pair"
                             : "Generate key pair"}
                       </Button>
@@ -552,9 +553,9 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
                 <div className="space-y-2 rounded-md border border-border p-3">
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-medium">Command access</span>
-                    <Button type="button" variant="outline" size="sm" disabled={checking} onClick={() => void checkAccess()}>
+                    <Button type="button" variant="outline" size="sm" disabled={operationBusy} loading={checking} loadingLabel="Checking…" onClick={() => void checkAccess()}>
                       <ShieldCheck className="size-4" />
-                      {checking ? "Checking…" : "Check access"}
+                      Check access
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
@@ -616,14 +617,14 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
           </div>
 
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" disabled={operationBusy}>
-              {busy ? "Saving…" : "Save changes"}
+            <Button type="submit" disabled={operationBusy} loading={busy} loadingLabel="Saving…">
+              Save changes
             </Button>
-            <Button type="button" variant="outline" disabled={operationBusy} onClick={() => void testSnmp()}>
+            <Button type="button" variant="outline" disabled={operationBusy} loading={testing === "snmp"} loadingLabel="Testing SNMP…" onClick={() => void testSnmp()}>
               <Activity className="size-4" />
               Test SNMP
             </Button>
-            <Button type="button" variant="outline" disabled={operationBusy} onClick={() => void testSsh()}>
+            <Button type="button" variant="outline" disabled={operationBusy} loading={testing === "ssh"} loadingLabel="Testing SSH…" onClick={() => void testSsh()}>
               <TerminalSquare className="size-4" />
               Test SSH
             </Button>
@@ -631,12 +632,15 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
               type="button"
               variant="outline"
               disabled={operationBusy}
+              loading={reachTesting}
+              loadingLabel="Testing reachability…"
               onClick={() => void testReachability()}
             >
               <Wifi className="size-4" />
-              {reachTesting ? "Testing…" : "Test reachability"}
+              Test reachability
             </Button>
           </div>
+          </fieldset>
         </form>
       </CardContent>
 

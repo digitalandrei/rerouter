@@ -212,13 +212,13 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   await user.click(screen.getByRole("button", { name: "Refresh" }));
   expect(await screen.findByText(/lab eligibility is unavailable/i)).toBeTruthy();
   expect((screen.getByRole("radio", { name: /configuration-only lab test — ema3 lab/i }) as HTMLInputElement).checked).toBe(true);
-  expect((screen.getByRole("button", { name: "Preview exact plan" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
   expect(preview).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button", { name: "Retry lab eligibility" }));
   await waitFor(() => expect(screen.queryByText(/lab eligibility is unavailable/i)).toBeNull());
-  await user.click(screen.getByRole("button", { name: "Preview exact plan" }));
+  await user.click(screen.getByRole("button", { name: "Preview changes" }));
   await waitFor(() => expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only", revert_after_seconds: undefined })));
-  expect(screen.queryByRole("button", { name: "Confirm and run reviewed plan" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Apply reviewed changes" })).toBeNull();
   await user.click(screen.getByRole("button", { name: "Override action 1" }));
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
   await waitFor(() => expect((screen.getByRole("radio", { name: /normal routing verification/i }) as HTMLInputElement).checked).toBe(true));

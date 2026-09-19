@@ -13,17 +13,19 @@ const preview = { plan_id: 12, preview_token: "token-b", results: [], operating_
 function auth() { vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "trigger_manual_reroute"] }); }
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
-it("ignores a late revert preview after the audit reason changes and confirms the exact new reason", async () => {
+it("shows one honest pending state while preparing and confirming a whole-run revert", async () => {
   auth(); vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 }); vi.spyOn(api.bundles, "get").mockResolvedValue(run);
   let resolveOld!: (value: ManualMitigationPreview) => void;
-  const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve as (value: ManualMitigationPreview) => void; })).mockResolvedValueOnce(preview).mockResolvedValueOnce({ bundle_id: 99, async: true });
+  const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve as (value: ManualMitigationPreview) => void; })).mockResolvedValueOnce({ bundle_id: 99, async: true });
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
   await user.click(await screen.findByRole("button", { name: "Review run 7" }));
-  const reason = await screen.findByLabelText("Audit reason"); await user.type(reason, "Reason A"); await user.click(screen.getByRole("button", { name: "Preview whole-run revert" }));
-  await user.clear(reason); await user.type(reason, "Reason B"); resolveOld({ ...preview, preview_token: "token-a" }); await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(screen.queryByRole("button", { name: "Confirm reviewed revert" })).toBeNull();
-  await user.click(screen.getByRole("button", { name: "Preview whole-run revert" })); await user.click(await screen.findByRole("button", { name: "Confirm reviewed revert" }));
-  expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Reason B", plan_id: 12, preview_token: "token-b" });
+  const reason = await screen.findByLabelText("Audit reason"); await user.type(reason, "Reason A"); await user.click(screen.getByRole("button", { name: "Preview revert" }));
+  const pending = screen.getByRole("button", { name: "Preparing revert preview…" });
+  expect(pending.getAttribute("aria-busy")).toBe("true"); expect((pending as HTMLButtonElement).disabled).toBe(true); expect(pending.querySelector("svg.animate-spin")).not.toBeNull();
+  await user.click(pending); expect(revert).toHaveBeenCalledTimes(1); expect((reason as HTMLInputElement).disabled).toBe(true);
+  resolveOld(preview); await screen.findByRole("button", { name: "Apply reviewed revert" });
+  await user.click(screen.getByRole("button", { name: "Apply reviewed revert" }));
+  expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Reason A", plan_id: 12, preview_token: "token-b" });
 });
 
 it("pages through run history beyond the first fifty records", async () => {

@@ -67,8 +67,8 @@ describe("manual mitigation workflow", () => {
     const rule = { id: 7, name: "Flood response" } as Rule;
     render(<BrowserRouter><ApplyMitigationDialog rule={rule} operatingMode="observe" onClose={() => undefined} /></BrowserRouter>);
     expect(screen.getByText(/automatic response is disabled/i)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Preview exact commands" }));
-    await user.click(await screen.findByRole("button", { name: "Execute reviewed actions" }));
+    await user.click(screen.getByRole("button", { name: "Preview changes" }));
+    await user.click(await screen.findByRole("button", { name: "Apply reviewed changes" }));
     expect(apply).toHaveBeenNthCalledWith(2, 7, expect.objectContaining({ dry_run: false, preview_token: "one-use" }));
   });
 

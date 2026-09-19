@@ -41,6 +41,24 @@ describe("RuleActionsDialog", () => {
     await waitFor(() => expect(save).toHaveBeenCalledWith(9, { revision: 3, actions: [] }));
   });
 
+  it("labels only the complete-set save as pending and prevents a duplicate save", async () => {
+    mocks(["view_asset", "edit_rules"]);
+    let finish!: (value: Rule) => void;
+    const save = vi.spyOn(api.rules, "saveActions").mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const user = userEvent.setup();
+    render(<AuthProvider><RuleActionsDialog rule={rule} onClose={() => undefined} onChanged={() => undefined} /></AuthProvider>);
+    await screen.findByText("Actions and revert");
+    await user.click(screen.getByRole("button", { name: "Remove action 1" }));
+    await user.click(screen.getByRole("button", { name: "Save complete set" }));
+    const pending = await screen.findByRole("button", { name: "Saving…" });
+    expect(pending.getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByRole("button", { name: "Add action" }).getAttribute("aria-busy")).toBeNull();
+    await user.click(pending);
+    expect(save).toHaveBeenCalledTimes(1);
+    finish({ ...rule, actions: [], action_count: 0, actions_revision: 4 });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save complete set" })).toBeTruthy());
+  });
+
   it("shows recovered ownership and offers the original active run instead of another run", async () => {
     mocks(["view_asset", "trigger_manual_reroute"]);
     vi.spyOn(api.rules, "list").mockResolvedValue([{ ...rule, current_state: "recovered_awaiting_revert" }]);

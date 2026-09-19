@@ -180,6 +180,7 @@ export default function Login() {
                     id="email"
                     type="email"
                     required
+                    disabled={busy}
                     autoFocus
                     autoComplete="username"
                     value={email}
@@ -193,6 +194,7 @@ export default function Login() {
                   <Input
                     id="enrollment-code"
                     type="password"
+                    disabled={busy}
                     autoComplete="off"
                     value={enrollmentCode}
                     onChange={(e) => setEnrollmentCode(e.target.value)}
@@ -204,6 +206,7 @@ export default function Login() {
                     id="password"
                     type="password"
                     required
+                    disabled={busy}
                     autoComplete="current-password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -214,6 +217,7 @@ export default function Login() {
                     type="checkbox"
                     className="h-4 w-4 rounded border border-input"
                     checked={remember}
+                    disabled={busy}
                     onChange={(e) => setRemember(e.target.checked)}
                   />
                   <span>
@@ -228,7 +232,7 @@ export default function Login() {
                     {error}
                   </p>
                 )}
-                <Button type="submit" className="w-full" disabled={busy}>
+                <Button type="submit" className="w-full" loading={busy} loadingLabel="Signing in…">
                   Continue
                 </Button>
               </form>
@@ -298,6 +302,7 @@ export default function Login() {
                     inputMode="numeric"
                     autoComplete="one-time-code"
                     required
+                    disabled={busy}
                     value={code}
                     onChange={(e) => setCode(e.target.value)}
                   />
@@ -307,7 +312,7 @@ export default function Login() {
                     {error}
                   </p>
                 )}
-                <Button type="submit" className="w-full" disabled={busy}>
+                <Button type="submit" className="w-full" loading={busy} loadingLabel="Verifying code…">
                   Verify
                 </Button>
               </form>

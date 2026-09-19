@@ -224,6 +224,7 @@ export default function Devices() {
           </CardHeader>
           <CardContent>
             <form onSubmit={handleAdd} className="space-y-4">
+              <fieldset disabled={addBusy} className="min-w-0 space-y-4 border-0 p-0">
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="block space-y-1 text-sm font-medium">
                   Name
@@ -415,9 +416,10 @@ export default function Devices() {
                   {addError}
                 </p>
               )}
-              <Button type="submit" disabled={addBusy}>
-                {addBusy ? "Adding…" : "Add device"}
+              <Button type="submit" loading={addBusy} loadingLabel="Adding device…">
+                Add device
               </Button>
+              </fieldset>
             </form>
           </CardContent>
         </Card>

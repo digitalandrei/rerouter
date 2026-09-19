@@ -64,6 +64,7 @@ export default function DeviceDetail() {
   const [rulesError, setRulesError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  const [interfacesRetrying, setInterfacesRetrying] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const policyInventory = useResource(
     useCallback((_signal: AbortSignal) => api.routingPolicies.get(deviceId), [deviceId]),
@@ -73,20 +74,20 @@ export default function DeviceDetail() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadDevice = useCallback(() => {
-    if (!Number.isFinite(deviceId)) return;
-    api.devices
+    if (!Number.isFinite(deviceId)) return Promise.resolve(false);
+    return api.devices
       .get(deviceId)
-      .then((value) => { setDevice(value); setError(null); })
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load device"))
+      .then((value) => { setDevice(value); setError(null); return true; })
+      .catch((err) => { setError(err instanceof ApiError ? err.message : "Failed to load device"); return false; })
       .finally(() => setLoading(false));
   }, [deviceId]);
 
   const loadInterfaces = useCallback(() => {
-    if (!Number.isFinite(deviceId)) return;
-    api.devices
+    if (!Number.isFinite(deviceId)) return Promise.resolve(false);
+    return api.devices
       .interfaces(deviceId)
-      .then((value) => { setInterfaces(value); setInterfacesError(null); })
-      .catch((err) => setInterfacesError(err instanceof ApiError ? err.message : "Failed to load interfaces"))
+      .then((value) => { setInterfaces(value); setInterfacesError(null); return true; })
+      .catch((err) => { setInterfacesError(err instanceof ApiError ? err.message : "Failed to load interfaces"); return false; })
       .finally(() => setIfLoading(false));
   }, [deviceId]);
 
@@ -96,8 +97,7 @@ export default function DeviceDetail() {
     loadInterfaces();
     api.rules.list().then((value) => { setRules(value); setRulesError(null); }).catch((err) => setRulesError(err instanceof ApiError ? err.message : "Failed to load rules"));
     timerRef.current = setInterval(() => {
-      loadDevice();
-      loadInterfaces();
+      void Promise.allSettled([loadDevice(), loadInterfaces()]);
     }, 30_000);
     return () => {
       if (timerRef.current !== null) clearInterval(timerRef.current);
@@ -121,14 +121,22 @@ export default function DeviceDetail() {
           return;
         }
       }
-      loadDevice();
-      loadInterfaces();
+      const [deviceLoaded, interfacesLoaded] = await Promise.all([loadDevice(), loadInterfaces()]);
       setRefreshKey((k) => k + 1);
       policyInventory.retry();
-      setError(null);
-      toast.success("Refreshed device inventory");
+      if (deviceLoaded && interfacesLoaded) toast.success("Refreshed device inventory");
+      else toast.error("Inventory discovery finished, but the refreshed device data could not be loaded.");
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  async function retryInterfaces() {
+    setInterfacesRetrying(true);
+    try {
+      await loadInterfaces();
+    } finally {
+      setInterfacesRetrying(false);
     }
   }
 
@@ -172,9 +180,9 @@ export default function DeviceDetail() {
           </Badge>
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button size="sm" variant="outline" disabled={refreshing} onClick={() => void refresh()}>
+            <Button size="sm" variant="outline" loading={refreshing} loadingLabel="Refreshing inventory…" onClick={() => void refresh()}>
               <RefreshCw className="size-4" />
-              {refreshing ? "Refreshing…" : "Refresh"}
+              Refresh
             </Button>
             {canManage && (
               <Button
@@ -222,7 +230,7 @@ export default function DeviceDetail() {
         </TabsContent>
 
         <TabsContent value="interfaces" className="mt-4">
-          {interfacesError && <div role="alert" className="mb-3 flex items-center gap-3 text-sm text-destructive"><span>Interfaces could not be refreshed: {interfacesError}</span><Button size="sm" variant="outline" onClick={loadInterfaces}>Try again</Button></div>}
+          {interfacesError && <div role="alert" className="mb-3 flex items-center gap-3 text-sm text-destructive"><span>Interfaces could not be refreshed: {interfacesError}</span><Button size="sm" variant="outline" loading={interfacesRetrying} loadingLabel="Retrying…" onClick={() => void retryInterfaces()}>Try again</Button></div>}
           {rulesError && <p role="alert" className="mb-3 text-sm text-destructive">Rule memberships could not be refreshed: {rulesError}. Counts may be stale.</p>}
           <Card>
             <CardContent className="px-0 py-2">

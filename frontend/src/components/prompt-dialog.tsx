@@ -76,6 +76,7 @@ export function PromptDialog({
               rows={3}
               value={value}
               placeholder={placeholder}
+              disabled={busy}
               autoFocus
               onChange={(e) => setValue(e.target.value)}
             />
@@ -83,6 +84,7 @@ export function PromptDialog({
             <Input
               value={value}
               placeholder={placeholder}
+              disabled={busy}
               autoFocus
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={(e) => {
@@ -95,8 +97,8 @@ export function PromptDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
-          <Button onClick={() => void go()} disabled={busy}>
-            {busy ? "Working…" : submitLabel}
+          <Button onClick={() => void go()} loading={busy} loadingLabel={`${submitLabel}…`}>
+            {submitLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

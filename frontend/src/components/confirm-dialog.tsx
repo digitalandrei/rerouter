@@ -68,6 +68,7 @@ export function ConfirmDialog({
             Type <code>{requireText}</code> to confirm
             <Input
               value={text}
+              disabled={busy}
               autoFocus
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
@@ -84,8 +85,10 @@ export function ConfirmDialog({
             variant={destructive ? "destructive" : "default"}
             disabled={busy || gated}
             onClick={() => void go()}
+            loading={busy}
+            loadingLabel={`${confirmLabel}…`}
           >
-            {busy ? "Working…" : confirmLabel}
+            {confirmLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

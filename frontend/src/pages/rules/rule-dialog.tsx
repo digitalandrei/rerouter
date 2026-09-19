@@ -237,6 +237,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
           <DialogDescription>Configure the detection condition, recovery condition, and separate automatic-revert preference.</DialogDescription>
         </DialogHeader>
         <form id="rule-form" onSubmit={save} className="space-y-4">
+          <fieldset disabled={busy} className="min-w-0 space-y-4 border-0 p-0">
           <label className="block space-y-1 text-sm font-medium">
             Name
             <input required className={inputClass} value={form.name} onChange={(e) => set("name", e.target.value)} />
@@ -554,13 +555,14 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
               {error}
             </p>
           )}
+          </fieldset>
         </form>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button form="rule-form" type="submit" disabled={busy}>
-            {busy ? "Saving…" : isCreate ? "Create rule" : "Save changes"}
+          <Button form="rule-form" type="submit" loading={busy} loadingLabel={isCreate ? "Creating rule…" : "Saving…"}>
+            {isCreate ? "Create rule" : "Save changes"}
           </Button>
         </DialogFooter>
       </DialogContent>

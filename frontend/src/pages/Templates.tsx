@@ -104,6 +104,7 @@ function TemplateCard({ template }: { template: Template }) {
                     <span className="text-muted-foreground">({spec.type})</span>
                     <Input
                       value={values[name] ?? ""}
+                      disabled={busy}
                       placeholder={paramPlaceholder(spec)}
                       onChange={(e) =>
                         { setValues((v) => ({ ...v, [name]: e.target.value })); setPlan(null); setRollbackPlan(null); }
@@ -113,8 +114,8 @@ function TemplateCard({ template }: { template: Template }) {
                 );
               })}
             </div>
-            <Button size="sm" variant="outline" onClick={() => void preview()} disabled={busy}>
-              {busy ? "Rendering…" : "Preview commands"}
+            <Button size="sm" variant="outline" onClick={() => void preview()} loading={busy} loadingLabel="Rendering commands…">
+              Preview commands
             </Button>
             {error && (
               <p className="text-sm text-destructive" role="alert">

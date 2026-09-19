@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, RefreshCw, TriangleAlert } from "lucide-react";
+import { Eye, TriangleAlert } from "lucide-react";
 import { api, ApiError, type ActionDraft, type ActionSetInspection } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,7 +24,7 @@ export function ActionsAndRevert({ actions, deviceNames = {} }: { actions: Actio
   return <Card>
     <CardHeader className="flex-row items-start justify-between gap-3">
       <div><CardTitle className="text-base">Actions and revert</CardTitle><CardDescription>Inspect current configuration and project the complete ordered set. This read-only inspection never executes or authorizes a change.</CardDescription></div>
-      <Button type="button" size="sm" variant="outline" onClick={() => void inspect()} disabled={busy || actions.length === 0}>{busy ? <RefreshCw className="size-4 animate-spin" /> : <Eye className="size-4" />} Inspect</Button>
+      <Button type="button" size="sm" variant="outline" onClick={() => void inspect()} disabled={actions.length === 0} loading={busy} loadingLabel="Inspecting configuration…"><Eye className="size-4" /> Inspect</Button>
     </CardHeader>
     <CardContent className="space-y-4">
       {!inspection && !error && <p className="text-sm text-muted-foreground">No inspection runs when this page opens. Select Inspect to read current configuration and prepare a read-only projection.</p>}

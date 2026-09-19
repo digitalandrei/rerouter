@@ -33,6 +33,8 @@ export function RowActionButton({
   tabIndex,
   type,
   children,
+  loading,
+  loadingLabel: _loadingLabel,
   ...props
 }: RowActionButtonProps) {
   const disabledExplanation = disabledReason ?? "This action is currently unavailable";
@@ -55,6 +57,7 @@ export function RowActionButton({
         }
         onClick?.(event);
       }}
+      loading={loading}
       className={cn(
         "size-10 cursor-pointer bg-background shadow-xs hover:border-foreground/25 hover:bg-accent sm:size-10",
         disabled && "cursor-not-allowed",
@@ -64,7 +67,7 @@ export function RowActionButton({
       )}
       {...props}
     >
-      {children}
+      {loading ? null : children}
     </Button>
   );
 

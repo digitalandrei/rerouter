@@ -501,6 +501,7 @@ export function ApplyMitigationDialog({
         </DialogHeader>
 
         <div className="space-y-2">
+          <p className="text-xs text-muted-foreground">Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions.</p>
           <label className="block space-y-1 text-sm font-medium">
             Reason{" "}
             <span className="font-normal text-muted-foreground">
@@ -509,6 +510,7 @@ export function ApplyMitigationDialog({
             <Input
               className={inputClass}
               value={reason}
+              disabled={busy}
               placeholder="Why are you applying this mitigation?"
               onChange={(e) => setReason(e.target.value)}
               onKeyDown={(e) => {
@@ -532,10 +534,11 @@ export function ApplyMitigationDialog({
           </Button>
           <Button
             variant="outline"
-            disabled={busy}
             onClick={() => void apply(true)}
+            loading={busy}
+            loadingLabel="Preparing exact preview…"
           >
-            {busy ? "Preparing…" : "Preview exact commands"}
+            Preview changes
           </Button>
         </DialogFooter>
       </>
@@ -550,6 +553,7 @@ export function ApplyMitigationDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[60vh] space-y-3 overflow-y-auto">
+          <p className="text-xs text-muted-foreground">Step 2 · Review and explicitly confirm the exact changes.</p>
           {(results ?? []).map((r, i) => (
             <ApplyResultRow key={i} r={r} />
           ))}
@@ -571,8 +575,8 @@ export function ApplyMitigationDialog({
           >
             Back
           </Button>
-          <Button variant="destructive" disabled={busy || !previewToken} onClick={() => void apply(false)}>
-            {busy ? "Applying…" : "Execute reviewed actions"}
+          <Button variant="destructive" disabled={!previewToken} onClick={() => void apply(false)} loading={busy} loadingLabel="Starting mitigation…">
+            Apply reviewed changes
           </Button>
         </DialogFooter>
       </>
@@ -637,7 +641,7 @@ export function ApplyMitigationDialog({
     if (allObserve) {
       summaryText = (
         <span className="text-amber-700 dark:text-amber-400">
-          Preview response — no commands were sent by this request. The plan is shown below.
+          Preview response — no configuration changes were made by this request. The plan is shown below.
         </span>
       );
     } else if (anyFailed) {

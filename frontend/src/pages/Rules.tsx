@@ -510,6 +510,7 @@ export function RuleActionsDialog({
         </DialogHeader>
         {resourcesLoading && <p role="status" className="text-sm text-muted-foreground">Loading action templates and router inventory…</p>}
         {resourcesError && <p role="alert" className="text-sm text-destructive">{resourcesError}. Existing saved actions remain visible, but editing is unavailable until this data loads.</p>}
+        <fieldset disabled={busy} className="contents">
 
         {/* Auto-execution disarmed by the controller (inventory drift). Status
             only — re-arming uses the normal switch below, which still goes
@@ -897,20 +898,17 @@ export function RuleActionsDialog({
           )}
           <Button
             size="sm"
-                  onClick={() => add()}
-                  disabled={!canEdit || busy || plannedCount === 0}
+            onClick={() => add()}
+            disabled={!canEdit || busy || plannedCount === 0}
           >
             <Plus className="size-4" />
-            {busy
-              ? "Adding…"
-              : plannedCount > 1
-                  ? `Add ${plannedCount} actions`
-                  : "Add action"}
+            {plannedCount > 1 ? `Add ${plannedCount} actions` : "Add action"}
           </Button>
         </div>
+        </fieldset>
         <DialogFooter>
           <Button variant="outline" disabled={busy} onClick={() => { if (!dirty || window.confirm("Discard unsaved action changes?")) onClose(); }}>{canEdit ? "Cancel" : "Close"}</Button>
-          {canEdit && <Button disabled={busy || !dirty} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save complete set"}</Button>}
+          {canEdit && <Button disabled={!dirty} loading={busy} loadingLabel="Saving…" onClick={() => void saveDraft()}>Save complete set</Button>}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1068,13 +1066,14 @@ function ClearRuleDialog({ rule, onClose, onChanged }: {
     <DialogContent className="sm:max-w-xl">
       <DialogHeader>
         <DialogTitle>Clear firing rule — {rule.name}</DialogTitle>
-        <DialogDescription>Clearing can roll back successful automatic actions. Review the exact server plan before confirming.</DialogDescription>
+        <DialogDescription>Step 1 · Preview the exact clear/revert plan. This reads current router configuration; no configuration changes are made. Preview time depends on router response times and actions.</DialogDescription>
       </DialogHeader>
       {phase === "reason" && <label className="block space-y-1 text-sm font-medium">
         Reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
-        <Input value={reason} maxLength={500} onChange={(event) => setReason(event.target.value)} />
+        <Input value={reason} maxLength={500} disabled={busy} onChange={(event) => setReason(event.target.value)} />
       </label>}
       {(phase === "preview" || phase === "result") && <div className="max-h-[55vh] space-y-3 overflow-y-auto" aria-live="polite">
+        {phase === "preview" && <p className="text-sm font-medium">Step 2 · Review the exact plan and explicitly confirm.</p>}
         {(response?.results ?? []).map((result, index) => <ApplyResultRow key={index} r={result} />)}
         {phase === "preview" && (response?.results?.length ?? 0) === 0 && <p className="text-sm text-muted-foreground">No router rollback is required. Confirmation will clear only the detection state.</p>}
         {phase === "preview" && !token && (response?.results?.length ?? 0) > 0 && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">The server did not issue confirmation authority for this preview. Refresh the rule and prepare a new exact preview before clearing.</p>}
@@ -1087,8 +1086,8 @@ function ClearRuleDialog({ rule, onClose, onChanged }: {
       {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
       <DialogFooter>
         <Button variant="outline" disabled={busy} onClick={onClose}>{phase === "result" ? "Close" : "Cancel"}</Button>
-        {phase === "reason" && <Button disabled={busy} onClick={() => void submit(true)}>{busy ? "Preparing…" : "Preview clear plan"}</Button>}
-        {phase === "preview" && <Button variant="destructive" disabled={busy || !token} onClick={() => void submit(false)}>{busy ? "Clearing…" : "Confirm reviewed clear"}</Button>}
+        {phase === "reason" && <Button loading={busy} loadingLabel="Preparing clear preview…" onClick={() => void submit(true)}>Preview clear changes</Button>}
+        {phase === "preview" && <Button variant="destructive" disabled={!token} loading={busy} loadingLabel="Starting clear…" onClick={() => void submit(false)}>Confirm reviewed clear</Button>}
       </DialogFooter>
     </DialogContent>
   </Dialog>;
@@ -1205,7 +1204,7 @@ export default function Rules() {
 
       <Input aria-label="Search rules" placeholder="Search rules, devices, interfaces, or metrics…" value={query} onChange={(event) => { const params = new URLSearchParams(searchParams); if (event.target.value) params.set("rule", event.target.value); else params.delete("rule"); setSearchParams(params, { replace: true }); }} />
 
-      {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">Could not refresh rules. {rules.length ? "Showing retained data." : "No rule data is available."} {loadError} <button className="underline" onClick={loadRules}>Try again</button></div>}
+      {loadError && <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"><span>Could not refresh rules. {rules.length ? "Showing retained data." : "No rule data is available."} {loadError}</span><Button size="sm" variant="outline" loading={loading} loadingLabel="Retrying…" onClick={loadRules}>Try again</Button></div>}
 
 
       <Card>

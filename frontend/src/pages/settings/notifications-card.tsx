@@ -32,10 +32,12 @@ function EventPicker({
   all,
   selected,
   onToggle,
+  disabled = false,
 }: {
   all: string[];
   selected: string[];
   onToggle: (e: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="space-y-1">
@@ -47,6 +49,7 @@ function EventPicker({
           <label key={e} className="flex items-center gap-1 text-xs font-normal">
             <input
               type="checkbox"
+              disabled={disabled}
               checked={selected.includes(e)}
               onChange={() => onToggle(e)}
             />
@@ -129,6 +132,62 @@ export function NotificationsCard() {
     }
   }
 
+  async function testRecipient(id: number) {
+    setBusy(`recipient-test-${id}`);
+    try {
+      await api.notifications.testRecipient(id);
+      toast.success("Test email sent");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Test failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeRecipient(id: number) {
+    setBusy(`recipient-remove-${id}`);
+    setMutationError(null);
+    try {
+      await api.notifications.removeRecipient(id);
+      toast.success("Removed");
+      resource.retry();
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Remove failed";
+      toast.error(message);
+      setMutationError(message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function testWebhook(id: number) {
+    setBusy(`webhook-test-${id}`);
+    try {
+      await api.notifications.testWebhook(id);
+      toast.success("Test card sent");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Test failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeWebhook(id: number) {
+    setBusy(`webhook-remove-${id}`);
+    setMutationError(null);
+    try {
+      await api.notifications.removeWebhook(id);
+      toast.success("Removed");
+      resource.retry();
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Remove failed";
+      toast.error(message);
+      setMutationError(message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -160,12 +219,9 @@ export function NotificationsCard() {
                   variant="outline"
                   size="sm"
                   disabled={busy !== null}
-                  onClick={() =>
-                    api.notifications
-                      .testRecipient(r.id)
-                      .then(() => toast.success("Test email sent"))
-                      .catch((e) => toast.error(e instanceof ApiError ? e.message : "Test failed"))
-                  }
+                  loading={busy === `recipient-test-${r.id}`}
+                  loadingLabel="Sending test email…"
+                  onClick={() => void testRecipient(r.id)}
                 >
                   Test
                 </Button>
@@ -175,16 +231,9 @@ export function NotificationsCard() {
                   className="text-destructive hover:text-destructive"
                   aria-label={`Remove email recipient ${r.email}`}
                   disabled={busy !== null}
-                  onClick={() =>
-                    (setBusy(`recipient-remove-${r.id}`), setMutationError(null), api.notifications
-                      .removeRecipient(r.id)
-                      .then(() => {
-                        toast.success("Removed");
-                        resource.retry();
-                      })
-                      .catch((error) => { const message = error instanceof ApiError ? error.message : "Remove failed"; toast.error(message); setMutationError(message); })
-                      .finally(() => setBusy(null)))
-                  }
+                  loading={busy === `recipient-remove-${r.id}`}
+                  loadingLabel="Removing recipient…"
+                  onClick={() => void removeRecipient(r.id)}
                 >
                   Remove
                 </Button>
@@ -199,14 +248,16 @@ export function NotificationsCard() {
               type="email"
               placeholder="alerts@example.com"
               value={email}
+              disabled={busy === "recipient-add"}
               onChange={(e) => setEmail(e.target.value)}
             />
             <EventPicker
               all={eventTypes}
               selected={emailEvents}
+              disabled={busy === "recipient-add"}
               onToggle={(e) => toggle(emailEvents, setEmailEvents, e)}
             />
-            <Button size="sm" disabled={busy !== null} onClick={addRecipient}>
+            <Button size="sm" disabled={busy !== null} loading={busy === "recipient-add"} loadingLabel="Adding recipient…" onClick={addRecipient}>
               Add recipient
             </Button>
           </div>}
@@ -230,12 +281,9 @@ export function NotificationsCard() {
                   variant="outline"
                   size="sm"
                   disabled={busy !== null}
-                  onClick={() =>
-                    api.notifications
-                      .testWebhook(w.id)
-                      .then(() => toast.success("Test card sent"))
-                      .catch((e) => toast.error(e instanceof ApiError ? e.message : "Test failed"))
-                  }
+                  loading={busy === `webhook-test-${w.id}`}
+                  loadingLabel="Sending test card…"
+                  onClick={() => void testWebhook(w.id)}
                 >
                   Test
                 </Button>
@@ -245,16 +293,9 @@ export function NotificationsCard() {
                   className="text-destructive hover:text-destructive"
                   aria-label={`Remove webhook ${w.name}`}
                   disabled={busy !== null}
-                  onClick={() =>
-                    (setBusy(`webhook-remove-${w.id}`), setMutationError(null), api.notifications
-                      .removeWebhook(w.id)
-                      .then(() => {
-                        toast.success("Removed");
-                        resource.retry();
-                      })
-                      .catch((error) => { const message = error instanceof ApiError ? error.message : "Remove failed"; toast.error(message); setMutationError(message); })
-                      .finally(() => setBusy(null)))
-                  }
+                  loading={busy === `webhook-remove-${w.id}`}
+                  loadingLabel="Removing webhook…"
+                  onClick={() => void removeWebhook(w.id)}
                 >
                   Remove
                 </Button>
@@ -268,6 +309,7 @@ export function NotificationsCard() {
               className={inputClass}
               placeholder="Name (e.g. NOC channel)"
               value={hookName}
+              disabled={busy === "webhook-add"}
               onChange={(e) => setHookName(e.target.value)}
             />
             <label htmlFor="notification-hook-url" className="text-sm font-medium">HTTPS webhook URL</label>
@@ -276,14 +318,16 @@ export function NotificationsCard() {
               className={inputClass}
               placeholder="https://outlook.office.com/webhook/…"
               value={hookUrl}
+              disabled={busy === "webhook-add"}
               onChange={(e) => setHookUrl(e.target.value)}
             />
             <EventPicker
               all={eventTypes}
               selected={hookEvents}
+              disabled={busy === "webhook-add"}
               onToggle={(e) => toggle(hookEvents, setHookEvents, e)}
             />
-            <Button size="sm" disabled={busy !== null} onClick={addWebhook}>
+            <Button size="sm" disabled={busy !== null} loading={busy === "webhook-add"} loadingLabel="Adding webhook…" onClick={addWebhook}>
               Add webhook
             </Button>
           </div>}

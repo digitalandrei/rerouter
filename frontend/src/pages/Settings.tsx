@@ -101,6 +101,7 @@ function RtbhCard() {
                     variant="ghost"
                     className="text-destructive hover:text-destructive"
                     disabled={removingId !== null}
+                    loading={removingId === c.id}
                     aria-label={`Remove RTBH community ${c.label}`}
                     onClick={() => {
                       setRemovingId(c.id); setError(null);
@@ -108,7 +109,7 @@ function RtbhCard() {
                     }}
                     title="Remove"
                   >
-                    <X className="size-4" />
+                    {removingId !== c.id && <X className="size-4" />}
                   </Button>
                 )}
               </div>
@@ -117,14 +118,15 @@ function RtbhCard() {
         )}
         {canManage && (
           <div className="grid gap-2 sm:grid-cols-[1fr_1fr_110px_auto]">
-            <Input placeholder="Label" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <Input placeholder="Label" value={label} disabled={busy} onChange={(e) => setLabel(e.target.value)} />
             <Input
               placeholder="65000:666"
               value={community}
+              disabled={busy}
               onChange={(e) => setCommunity(e.target.value)}
             />
-            <Input placeholder="Route tag" value={tag} onChange={(e) => setTag(e.target.value)} />
-            <Button size="sm" disabled={busy} onClick={() => void add()}>
+            <Input placeholder="Route tag" value={tag} disabled={busy} onChange={(e) => setTag(e.target.value)} />
+            <Button size="sm" loading={busy} loadingLabel="Adding community…" onClick={() => void add()}>
               Add
             </Button>
           </div>

@@ -38,48 +38,53 @@ export default function Dashboard() {
   const [recentRuns, setRecentRuns] = useState<RerouteBundle[]>([]);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [loadingAlerts, setLoadingAlerts] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const loadData = useCallback(() => {
-    api
+  const loadData = useCallback((manual = false) => {
+    if (manual) setRefreshing(true);
+    const tasks: Promise<unknown>[] = [];
+    tasks.push(api
       .status()
       .then(setStatus)
       .then(() => setErrors((value) => { const next = { ...value }; delete next.status; return next; }))
       .catch(() => setErrors((value) => ({ ...value, status: "System status could not be refreshed." })))
-      .finally(() => setLoadingStatus(false));
+      .finally(() => setLoadingStatus(false)));
 
-    api.alerts
+    tasks.push(api.alerts
       .list({ limit: 10, exclude_bundled_action_lifecycle: true })
       .then((page) => setAlerts(page.rows))
       .then(() => setErrors((value) => { const next = { ...value }; delete next.alerts; return next; }))
       .catch(() => setErrors((value) => ({ ...value, alerts: "Recent alerts could not be refreshed." })))
-      .finally(() => setLoadingAlerts(false));
+      .finally(() => setLoadingAlerts(false)));
 
-    api.rules
+    tasks.push(api.rules
       .list()
       .then((rules) => setFiringRules(rules.filter((r) => r.current_state === "firing" || r.current_state === "recovered_awaiting_revert")))
       .then(() => setErrors((value) => { const next = { ...value }; delete next.rules; return next; }))
-      .catch(() => setErrors((value) => ({ ...value, rules: "Active rule matches could not be refreshed." })));
+      .catch(() => setErrors((value) => ({ ...value, rules: "Active rule matches could not be refreshed." }))));
 
-    api.settings
+    tasks.push(api.settings
       .get()
       .then(setSettings)
       .then(() => setErrors((value) => { const next = { ...value }; delete next.settings; return next; }))
-      .catch(() => setErrors((value) => ({ ...value, settings: "Operating mode could not be refreshed." })));
+      .catch(() => setErrors((value) => ({ ...value, settings: "Operating mode could not be refreshed." }))));
 
-    api.bundles.list({ lifecycle: "active", page: 1, per_page: 20 }).then((response) => {
+    tasks.push(api.bundles.list({ lifecycle: "active", page: 1, per_page: 20 }).then((response) => {
       setActiveRuns(Array.isArray(response) ? response : response.items);
       setErrors((value) => { const next = { ...value }; delete next.runs; return next; });
-    }).catch(() => setErrors((value) => ({ ...value, runs: "Active mitigation runs could not be refreshed." })));
-    api.bundles.list({ lifecycle: "all", logical_only: true, page: 1, per_page: 10 }).then((response) => {
+    }).catch(() => setErrors((value) => ({ ...value, runs: "Active mitigation runs could not be refreshed." }))));
+    tasks.push(api.bundles.list({ lifecycle: "all", logical_only: true, page: 1, per_page: 10 }).then((response) => {
       setRecentRuns(Array.isArray(response) ? response : response.items);
-    }).catch(() => setErrors((value) => ({ ...value, activity: "Recent mitigation activity could not be refreshed." })));
+      setErrors((value) => { const next = { ...value }; delete next.activity; return next; });
+    }).catch(() => setErrors((value) => ({ ...value, activity: "Recent mitigation activity could not be refreshed." }))));
+    return Promise.allSettled(tasks).then(() => undefined).finally(() => { if (manual) setRefreshing(false); });
   }, []);
 
   useEffect(() => {
-    loadData();
-    const timer = setInterval(loadData, 30_000);
+    void loadData();
+    const timer = setInterval(() => void loadData(), 30_000);
     return () => clearInterval(timer);
   }, [loadData]);
 
@@ -98,7 +103,7 @@ export default function Dashboard() {
         )}
       </div>
 
-      {Object.keys(errors).length > 0 && <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"><span>{Object.values(errors).join(" ")} Existing values may be stale.</span><Button size="sm" variant="outline" onClick={loadData}>Try again</Button></div>}
+      {Object.keys(errors).length > 0 && <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"><span>{Object.values(errors).join(" ")} Existing values may be stale.</span><Button size="sm" variant="outline" loading={refreshing} loadingLabel="Retrying dashboard…" onClick={() => void loadData(true)}>Try again</Button></div>}
 
       {(activeRuns.length > 0 || errors.runs) && <Card>
         <CardHeader><CardTitle className="text-lg">Active mitigations</CardTitle><CardDescription>Router changes that remain active or need operator review.</CardDescription></CardHeader>

@@ -29,7 +29,6 @@ import {
   type SystemSettings,
   type ManualMitigationPreview,
   bundleVerificationMode,
-  configurationOnlyRunStatus,
 } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -64,6 +63,7 @@ import {
 } from "@/components/ui/tabs";
 import { PromptDialog } from "@/components/prompt-dialog";
 import { RowActionButton } from "@/components/row-action-button";
+import { AsyncRetryButton } from "@/components/async-retry-button";
 import { ApplyMitigationDialog, ApplyResultRow, BundleProgressView } from "@/components/apply-mitigation-dialog";
 import { SeverityBadge, StateBadge, ToneBadge, toneClass } from "@/components/status-badge";
 import { humanizeToken, eventTypeLabel, templateLabelFrom, triggerTypeLabel } from "@/lib/labels";
@@ -540,6 +540,8 @@ export function ActiveRunsTab() {
   const [preview, setPreview] = useState<ManualMitigationPreview | null>(null);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"preview_revert" | "confirm_revert" | "take_control" | null>(null);
+  const [openingRunId, setOpeningRunId] = useState<number | null>(null);
   const selectedIdRef = useRef<number | null>(null);
   const closedRunRef = useRef<number | null>(null);
   const lastSelectedRunRef = useRef<number | null>(null);
@@ -574,10 +576,11 @@ export function ActiveRunsTab() {
     else if (lastSelectedRunRef.current !== null) closedRunRef.current = lastSelectedRunRef.current;
   }, [selected]);
 
-  async function open(id: number) { const next = new URLSearchParams(pageParams); next.set("tab", "active"); next.set("run", String(id)); setPageParams(next, { replace: true }); const generation = ++previewGeneration.current; selectedIdRef.current = id; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.get(id); if (generation === previewGeneration.current && selectedIdRef.current === id) setSelected(value); } catch (cause) { toast.error(cause instanceof Error ? cause.message : "Could not load run"); } finally { if (generation === previewGeneration.current) setBusy(false); } }
-  function closeSelectedRun() { previewGeneration.current += 1; closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; setSelected(null); setPreview(null); setPreviewReason(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
-  async function previewRevert() { if (!selected) return; const runId = selected.id; const requestedReason = reason; const generation = ++previewGeneration.current; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.revert(runId, { dry_run: true, reason: requestedReason || undefined }); if (generation === previewGeneration.current && selectedIdRef.current === runId && reason === requestedReason && "plan_id" in value) { setPreview(value); setPreviewReason(requestedReason); } } catch (cause) { if (generation === previewGeneration.current) toast.error(cause instanceof Error ? cause.message : "Revert preview failed"); } finally { if (generation === previewGeneration.current) setBusy(false); } }
-  async function confirmRevert() { if (!selected || !preview?.plan_id || !preview.preview_token || previewReason !== reason) return; setBusy(true); try { const value = await api.bundles.revert(selected.id, { dry_run: false, reason: previewReason || undefined, plan_id: preview.plan_id, preview_token: preview.preview_token }); setPreview(null); setPreviewReason(null); if ("bundle_id" in value) toast.success(`Revert run #${value.bundle_id} started`); await load(); } catch (cause) { setPreview(null); setPreviewReason(null); toast.error(`${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh preview.`); } finally { setBusy(false); } }
+  async function open(id: number) { if (busy || openingRunId !== null) return; setOpeningRunId(id); const next = new URLSearchParams(pageParams); next.set("tab", "active"); next.set("run", String(id)); setPageParams(next, { replace: true }); const generation = ++previewGeneration.current; selectedIdRef.current = id; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.get(id); if (generation === previewGeneration.current && selectedIdRef.current === id) setSelected(value); } catch (cause) { toast.error(cause instanceof Error ? cause.message : "Could not load run"); } finally { if (generation === previewGeneration.current) setBusy(false); setOpeningRunId(null); } }
+  function closeSelectedRun() { previewGeneration.current += 1; closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; setSelected(null); setPreview(null); setPreviewReason(null); setPendingAction(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
+  async function previewRevert() { if (!selected || busy || pendingAction) return; const runId = selected.id; const requestedReason = reason; const generation = ++previewGeneration.current; setBusy(true); setPendingAction("preview_revert"); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.revert(runId, { dry_run: true, reason: requestedReason || undefined }); if (generation === previewGeneration.current && selectedIdRef.current === runId && reason === requestedReason && "plan_id" in value) { setPreview(value); setPreviewReason(requestedReason); } } catch (cause) { if (generation === previewGeneration.current) toast.error(cause instanceof Error ? cause.message : "Revert preview failed"); } finally { if (generation === previewGeneration.current) { setBusy(false); setPendingAction(null); } } }
+  async function confirmRevert() { if (!selected || busy || pendingAction || !preview?.plan_id || !preview.preview_token || previewReason !== reason) return; setBusy(true); setPendingAction("confirm_revert"); try { const value = await api.bundles.revert(selected.id, { dry_run: false, reason: previewReason || undefined, plan_id: preview.plan_id, preview_token: preview.preview_token }); setPreview(null); setPreviewReason(null); if ("bundle_id" in value) toast.success(`Revert run #${value.bundle_id} started`); await load(); } catch (cause) { setPreview(null); setPreviewReason(null); toast.error(`${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh preview.`); } finally { setBusy(false); setPendingAction(null); } }
+  async function takeControl() { if (!selected || busy || pendingAction) return; setBusy(true); setPendingAction("take_control"); try { await api.bundles.takeControl(selected.id); toast.success("Manual control recorded"); await load(); } catch (cause) { toast.error(cause instanceof Error ? cause.message : "Takeover failed"); } finally { setBusy(false); setPendingAction(null); } }
   const filteredRuns = runs.filter((run) => {
     const haystack = `${run.id} ${run.source?.preset_name ?? run.source?.name ?? ""} ${run.trigger_type} ${run.lifecycle_state ?? ""} ${run.triggered_by ?? ""}`.toLowerCase();
     const when = run.created_at ? new Date(run.created_at).getTime() : 0;
@@ -586,18 +589,18 @@ export function ActiveRunsTab() {
   const pageSize = 25; const shown = filteredRuns.slice((page - 1) * pageSize, page * pageSize); const pages = Math.max(1, Math.ceil(filteredRuns.length / pageSize));
 
   return <>
-    {error && <div role="alert" className="mb-3 rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">Refresh failed. Showing retained run data. {error} <button className="underline" onClick={() => void load()}>Try again</button></div>}
+    {error && <div role="alert" className="mb-3 rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">Refresh failed. Showing retained run data. {error} <AsyncRetryButton onRetry={load} /></div>}
     {presetFilter && <p className="text-sm text-muted-foreground">Showing active runs for saved mitigation #{presetFilter}. Choose the exact run to inspect before reverting.</p>}
     {ruleFilter && <p className="text-sm text-muted-foreground">Showing active runs owned by rule #{ruleFilter}. Choose the original run to inspect before reverting.</p>}
     <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6"><Input aria-label="Search active mitigation runs" placeholder="Search run or operator…" value={query} onChange={(event) => setFilter("run_search", event.target.value)} /><select className="rounded-md border bg-background px-3 py-2 text-sm" aria-label="Lifecycle status" value={statusFilter} onChange={(event) => setFilter("status", event.target.value)}><option value="">All statuses</option><option value="active">Active</option><option value="recovery_scheduled">Recovery scheduled</option></select><select className="rounded-md border bg-background px-3 py-2 text-sm" aria-label="Run source" value={sourceFilter} onChange={(event) => setFilter("source", event.target.value)}><option value="">All sources</option><option value="manual">Manual</option><option value="preset">Saved mitigation</option><option value="rule">Rule</option></select><Input aria-label="Filter by device" placeholder="Device name or ID" value={deviceFilter} onChange={(event) => setFilter("device", event.target.value)} /><Input type="date" aria-label="Started after" value={afterFilter} onChange={(event) => setFilter("after", event.target.value)} /><Input type="date" aria-label="Started before" value={beforeFilter} onChange={(event) => setFilter("before", event.target.value)} /></div>
-    <Card><CardContent className="px-0 py-2">{shown.length === 0 && !error ? <p className="px-6 py-5 text-sm text-muted-foreground">No active runs match these filters.</p> : <Table><TableHeader><TableRow><TableHead className="pl-6">Run</TableHead><TableHead>Source</TableHead><TableHead>Operator / started</TableHead><TableHead>Current state</TableHead><TableHead>Changes</TableHead><TableHead className="pr-6 text-right">Action</TableHead></TableRow></TableHeader><TableBody>{shown.map((run) => { const state = presentMitigationRun(run); return <TableRow key={run.id}><TableCell className="pl-6 font-medium tabular-nums">#{run.id}</TableCell><TableCell>{runSourceName(run)}{run.verification_mode === "configuration_only" && <span className="block text-xs text-muted-foreground">Configuration-only test</span>}</TableCell><TableCell className="text-xs">{run.triggered_by ?? "system"}<span className="block text-muted-foreground">{run.created_at ? new Date(run.created_at).toLocaleString() : "—"}</span></TableCell><TableCell><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="block max-w-sm text-xs text-muted-foreground">{state.detail}</span></TableCell><TableCell className="tabular-nums">{state.known} known{state.unknown > 0 && <span className="block text-xs text-destructive">{state.unknown} unknown</span>}</TableCell><TableCell className="pr-6 text-right"><RowActionButton label={`Review run ${run.id}`} onClick={() => void open(run.id)}><Eye className="size-4" /></RowActionButton></TableCell></TableRow>; })}</TableBody></Table>}<div className="flex items-center justify-end gap-2 px-6 py-3 text-sm"><Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setFilter("page", String(page - 1))}>Previous</Button><span>Page {Math.min(page, pages)} of {pages}</span><Button size="sm" variant="outline" disabled={page >= pages} onClick={() => setFilter("page", String(page + 1))}>Next</Button></div></CardContent></Card>
+    <Card><CardContent className="px-0 py-2">{shown.length === 0 && !error ? <p className="px-6 py-5 text-sm text-muted-foreground">No active runs match these filters.</p> : <Table><TableHeader><TableRow><TableHead className="pl-6">Run</TableHead><TableHead>Source</TableHead><TableHead>Operator / started</TableHead><TableHead>Current state</TableHead><TableHead>Changes</TableHead><TableHead className="pr-6 text-right">Action</TableHead></TableRow></TableHeader><TableBody>{shown.map((run) => { const state = presentMitigationRun(run); return <TableRow key={run.id}><TableCell className="pl-6 font-medium tabular-nums">#{run.id}</TableCell><TableCell>{runSourceName(run)}{run.verification_mode === "configuration_only" && <span className="block text-xs text-muted-foreground">Configuration-only test</span>}</TableCell><TableCell className="text-xs">{run.triggered_by ?? "system"}<span className="block text-muted-foreground">{run.created_at ? new Date(run.created_at).toLocaleString() : "—"}</span></TableCell><TableCell><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="block max-w-sm text-xs text-muted-foreground">{state.detail}</span></TableCell><TableCell className="tabular-nums">{state.known} known{state.unknown > 0 && <span className="block text-xs text-destructive">{state.unknown} unknown</span>}</TableCell><TableCell className="pr-6 text-right"><RowActionButton label={openingRunId === run.id ? `Opening run ${run.id}…` : `Review run ${run.id}`} onClick={() => void open(run.id)} disabled={busy || openingRunId !== null} loading={openingRunId === run.id} loadingLabel={`Opening run ${run.id}…`}><Eye className="size-4" /></RowActionButton></TableCell></TableRow>; })}</TableBody></Table>}<div className="flex items-center justify-end gap-2 px-6 py-3 text-sm"><Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setFilter("page", String(page - 1))}>Previous</Button><span>Page {Math.min(page, pages)} of {pages}</span><Button size="sm" variant="outline" disabled={page >= pages} onClick={() => setFilter("page", String(page + 1))}>Next</Button></div></CardContent></Card>
     <Dialog open={selected !== null} onOpenChange={(open) => { if (!open && !busy) closeSelectedRun(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>Mitigation run #{selected?.id}</DialogTitle><DialogDescription>Execution outcome and current router changes are separate. Revert always targets this explicitly selected run.</DialogDescription></DialogHeader>{selected && <div className="max-h-[70vh] space-y-4 overflow-y-auto">
       <div className="grid gap-2 text-sm sm:grid-cols-2"><p>Current state: <ToneBadge tone={presentMitigationRun(selected).tone}>{presentMitigationRun(selected).label}</ToneBadge></p><p>Lifecycle: <strong>{humanizeToken(selected.lifecycle_state ?? "unknown")}</strong></p><p>Known changes: <strong>{selected.remaining_changes ?? selected.remaining_mutations ?? selected.still_applied_reroute_ids.length}</strong></p><p>Unknown effects: <strong>{selected.unknown_effects ?? 0}</strong></p><p>Recovery: {selected.recovery_deadline ? `Revert scheduled for ${new Date(selected.recovery_deadline).toLocaleString()} · pending until automatic recovery is allowed` : selected.automatic_recovery_cancelled_at ? "Manual control" : "Until manually reverted"}</p></div>
       <BundleProgressView bundle={selected} bundleId={selected.id} totalHint={selected.total_actions} pollError={null} />
-      {bundleVerificationMode(selected) === "configuration_only" && <p className="rounded-md border p-3 text-sm font-medium">{configurationOnlyRunStatus(selected.state)}</p>}
-      {preview && <div className="space-y-2 rounded-md border p-3"><strong>Exact whole-run revert preview</strong>{preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}<p className="text-xs text-muted-foreground">The persisted inverses run in reverse order with the original verification scope. Confirmation is required in both Observe and Enforce.</p></div>}
-      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} onChange={(event) => { previewGeneration.current += 1; setReason(event.target.value); setPreview(null); setPreviewReason(null); setBusy(false); }} placeholder="Why is this run being reverted or taken over?" /></label>}
-      <DialogFooter className="gap-2 sm:justify-between">{canAct && selected.recovery_deadline && <Button variant="outline" disabled={busy} onClick={() => void api.bundles.takeControl(selected.id).then(() => { toast.success("Manual control recorded"); return load(); }).catch((cause) => toast.error(cause instanceof Error ? cause.message : "Takeover failed"))}>Take manual control</Button>}<div className="flex gap-2"><Button variant="outline" onClick={closeSelectedRun} disabled={busy}>Close</Button>{canAct && !preview && <Button variant="destructive" onClick={() => void previewRevert()} disabled={busy || selected.revert?.available === false}>Preview whole-run revert</Button>}{canAct && preview && <Button variant="destructive" onClick={() => void confirmRevert()} disabled={busy || !preview.plan_id || !preview.preview_token}>Confirm reviewed revert</Button>}</div></DialogFooter>
+      {!preview && <p className="text-xs text-muted-foreground">Step 1 · Preview revert — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions.</p>}
+      {preview && <div className="space-y-2 rounded-md border p-3"><strong>Step 2 · Review and explicitly confirm the revert</strong>{preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}<p className="text-xs text-muted-foreground">The persisted inverses run in reverse order with the original verification scope. Confirmation is required in both Observe and Enforce.</p></div>}
+      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} disabled={busy} onChange={(event) => { previewGeneration.current += 1; setReason(event.target.value); setPreview(null); setPreviewReason(null); setBusy(false); setPendingAction(null); }} placeholder="Why is this run being reverted or taken over?" /></label>}
+      <DialogFooter className="gap-2 sm:justify-between">{canAct && selected.recovery_deadline && <Button variant="outline" onClick={() => void takeControl()} disabled={busy} loading={pendingAction === "take_control"} loadingLabel="Taking manual control…">Take manual control</Button>}<div className="flex gap-2"><Button variant="outline" onClick={closeSelectedRun} disabled={busy}>Close</Button>{canAct && !preview && <Button variant="outline" onClick={() => void previewRevert()} disabled={busy || selected.revert?.available === false} loading={pendingAction === "preview_revert"} loadingLabel="Preparing revert preview…">Preview revert</Button>}{canAct && preview && <Button variant="destructive" onClick={() => void confirmRevert()} disabled={busy || !preview.plan_id || !preview.preview_token} loading={pendingAction === "confirm_revert"} loadingLabel="Starting revert…">Apply reviewed revert</Button>}</div></DialogFooter>
     </div>}</DialogContent></Dialog>
   </>;
 }
@@ -615,6 +618,7 @@ function RerouteDrawer({
   const [detail, setDetail] = useState<RerouteDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [rollbackPending, setRollbackPending] = useState<"preview" | "confirm" | "cancel" | null>(null);
   const [rollbackOpen, setRollbackOpen] = useState(false);
   const [rollbackPreview, setRollbackPreview] = useState<RerouteResult | null>(null);
   const [rollbackToken, setRollbackToken] = useState<string | null>(null);
@@ -627,14 +631,15 @@ function RerouteDrawer({
   } | null>(null);
 
   const load = useCallback(() => {
-    api.reroutes.get(id).then((value) => { setDetail(value); setDetailError(null); }).catch((cause) => setDetailError(cause instanceof Error ? cause.message : "Could not load mitigation action"));
+    return api.reroutes.get(id).then((value) => { setDetail(value); setDetailError(null); }).catch((cause) => setDetailError(cause instanceof Error ? cause.message : "Could not load mitigation action"));
   }, [id]);
   useEffect(() => {
     load();
   }, [load]);
 
-  async function act(fn: () => Promise<unknown>) {
+  async function act(fn: () => Promise<unknown>, pending?: "cancel") {
     setBusy(true);
+    if (pending) setRollbackPending(pending);
     try {
       await fn();
       load();
@@ -643,12 +648,14 @@ function RerouteDrawer({
       toast.error(e instanceof Error ? e.message : "action failed");
     } finally {
       setBusy(false);
+      if (pending) setRollbackPending(null);
     }
   }
 
   async function previewRollback() {
     if (!detail) return;
     setBusy(true);
+    setRollbackPending("preview");
     try {
       const response = await api.reroutes.rollback(detail.id, { dry_run: true });
       setRollbackPreview(response.result);
@@ -660,6 +667,7 @@ function RerouteDrawer({
       toast.error(e instanceof Error ? e.message : "rollback preview failed");
     } finally {
       setBusy(false);
+      setRollbackPending(null);
     }
   }
 
@@ -674,7 +682,7 @@ function RerouteDrawer({
             </DialogTitle>
           </DialogHeader>
           {detailError ? (
-            <div role="alert" className="text-sm text-destructive">{detailError}. <button className="underline" onClick={load}>Try again</button></div>
+            <div role="alert" className="text-sm text-destructive">{detailError}. <AsyncRetryButton onRetry={load} /></div>
           ) : !detail ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : (
@@ -785,8 +793,9 @@ function RerouteDrawer({
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy}
-                    onClick={() => void act(() => api.reroutes.cancel(detail.id))}
+                    onClick={() => void act(() => api.reroutes.cancel(detail.id), "cancel")}
+                    loading={rollbackPending === "cancel"}
+                    loadingLabel="Cancelling…"
                   >
                     Cancel
                   </Button>
@@ -808,10 +817,11 @@ function RerouteDrawer({
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy}
                     onClick={() => void previewRollback()}
+                    loading={rollbackPending === "preview"}
+                    loadingLabel="Preparing rollback preview…"
                   >
-                    Roll back
+                    Preview rollback
                   </Button>
                 )}
               </div>
@@ -830,11 +840,11 @@ function RerouteDrawer({
           multiline
           submitLabel="Read and reconcile"
           onSubmit={async (note) => {
-            setReconcileOpen(false);
             setBusy(true);
             try {
               const result = await api.reroutes.reconcile(detail.id, note);
               setReconcileResult({ outcome: result.outcome, message: result.message });
+              setReconcileOpen(false);
               load();
               onChanged();
             } catch (error) {
@@ -866,8 +876,9 @@ function RerouteDrawer({
             <DialogHeader>
               <DialogTitle>Review rollback commands</DialogTitle>
               <DialogDescription>
-                The controller prepared this rollback from the original router and
-                parameters. Execution rechecks locks, reachability, and verification.
+                Step 2 · Review and explicitly confirm this rollback. The preview
+                read current router configuration and made no configuration changes. Execution rechecks locks, reachability,
+                and verification.
               </DialogDescription>
             </DialogHeader>
             {rollbackPreview?.would_run ? (
@@ -924,9 +935,12 @@ function RerouteDrawer({
               {!rollbackExecuted && (
                 <Button
                   variant="destructive"
-                  disabled={busy || !rollbackPreview?.would_run || !rollbackToken}
+                  disabled={!rollbackPreview?.would_run || !rollbackToken}
+                  loading={rollbackPending === "confirm"}
+                  loadingLabel="Starting rollback…"
                   onClick={() => {
                     setBusy(true);
+                    setRollbackPending("confirm");
                     void api.reroutes
                       .rollback(detail.id, { preview_token: rollbackToken ?? undefined })
                       .then((response) => {
@@ -943,10 +957,10 @@ function RerouteDrawer({
                           setRollbackError(e instanceof Error ? e.message : "Rollback response was not confirmed.");
                         },
                       )
-                      .finally(() => setBusy(false));
+                      .finally(() => { setBusy(false); setRollbackPending(null); });
                   }}
                 >
-                  {busy ? "Rolling back…" : "Execute reviewed rollback"}
+                  Apply reviewed rollback
                 </Button>
               )}
             </DialogFooter>
@@ -976,9 +990,11 @@ export function HistoryTab({ initialOpenId }: { initialOpenId?: number | null })
   const [openId, setOpenId] = useState<number | null>(initialOpenId ?? null);
 
   const load = useCallback(() => {
-    api.reroutes.list().then((value) => { setReroutes(value); setRerouteError(null); }).catch((cause) => setRerouteError(cause instanceof Error ? cause.message : "Could not load action history"));
-    api.locks.list().then((value) => { setLocks(value); setLockError(null); }).catch((cause) => setLockError(cause instanceof Error ? cause.message : "Could not load safety locks"));
-    api.bundles.list({ lifecycle: "all", page: historyPage, per_page: 50, trigger_type: historyTrigger || undefined, rule_id: historyRule, preset_id: historyPreset }).then((response) => { const items = Array.isArray(response) ? response : response.items; setBundles(items.map(exposeSourceVerificationMode)); setBundleTotal(Array.isArray(response) ? response.length : response.total); setBundleError(null); }).catch((error) => setBundleError(error instanceof Error ? error.message : "Could not load mitigation runs"));
+    return Promise.allSettled([
+      api.reroutes.list().then((value) => { setReroutes(value); setRerouteError(null); }).catch((cause) => setRerouteError(cause instanceof Error ? cause.message : "Could not load action history")),
+      api.locks.list().then((value) => { setLocks(value); setLockError(null); }).catch((cause) => setLockError(cause instanceof Error ? cause.message : "Could not load safety locks")),
+      api.bundles.list({ lifecycle: "all", page: historyPage, per_page: 50, trigger_type: historyTrigger || undefined, rule_id: historyRule, preset_id: historyPreset }).then((response) => { const items = Array.isArray(response) ? response : response.items; setBundles(items.map(exposeSourceVerificationMode)); setBundleTotal(Array.isArray(response) ? response.length : response.total); setBundleError(null); }).catch((error) => setBundleError(error instanceof Error ? error.message : "Could not load mitigation runs")),
+    ]);
   }, [historyPage, historyTrigger, historyRule, historyPreset]);
   useEffect(() => {
     load();
@@ -988,7 +1004,7 @@ export function HistoryTab({ initialOpenId }: { initialOpenId?: number | null })
 
   return (
     <>
-      {(rerouteError || lockError) && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">Some history safety data could not be refreshed. Retained data remains visible. {[lockError, rerouteError].filter(Boolean).join(" · ")} <button className="underline" onClick={load}>Try again</button></div>}
+      {(rerouteError || lockError) && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">Some history safety data could not be refreshed. Retained data remains visible. {[lockError, rerouteError].filter(Boolean).join(" · ")} <AsyncRetryButton onRetry={load} /></div>}
       {safetyLocks.length > 0 && (
         <Card className="border-destructive/50">
           <CardHeader>

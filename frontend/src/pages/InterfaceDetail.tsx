@@ -138,14 +138,15 @@ export default function InterfaceDetail() {
   const [loading, setLoading] = useState(true);
   const [metricsReady, setMetricsReady] = useState(false);
   const [metricsError, setMetricsError] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [smoothing, setSmoothing] = useState<SmoothingWindow>(1);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadInterface = useCallback(() => {
-    if (!Number.isFinite(ifaceId)) return;
-    api.interfaces
+    if (!Number.isFinite(ifaceId)) return Promise.resolve();
+    return api.interfaces
       .get(ifaceId)
       .then((value) => {
         setIface(value);
@@ -158,8 +159,8 @@ export default function InterfaceDetail() {
   }, [ifaceId]);
 
   const loadMetrics = useCallback(() => {
-    if (!Number.isFinite(ifaceId)) return;
-    api.interfaces
+    if (!Number.isFinite(ifaceId)) return Promise.resolve();
+    return api.interfaces
       .metrics(ifaceId, 60)
       .then((data) => {
         setSamples(data);
@@ -199,8 +200,12 @@ export default function InterfaceDetail() {
   }, [loadInterface, loadMetrics]);
 
   async function refreshNow() {
-    loadInterface();
-    loadMetrics();
+    setRefreshing(true);
+    try {
+      await Promise.allSettled([loadInterface(), loadMetrics()]);
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   const chartData = useMemo(
@@ -274,7 +279,7 @@ export default function InterfaceDetail() {
           <Badge variant="outline">adm:{iface.admin_status}</Badge>
 
           <div className="ml-auto flex items-center gap-2">
-            <Button size="sm" variant="outline" onClick={() => void refreshNow()}>
+            <Button size="sm" variant="outline" loading={refreshing} loadingLabel="Refreshing interface…" onClick={() => void refreshNow()}>
               <RefreshCw className="size-4" />
               Refresh
             </Button>
