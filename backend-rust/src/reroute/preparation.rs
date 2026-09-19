@@ -74,9 +74,11 @@ pub async fn validate_drafts(
                 "action {}: template is disabled",
                 position + 1
             );
-            let next = safety_phase(&template.name);
-            ensure!(next >= phase, "action {}: additive and preparation actions must precede withdrawals and shutdowns", position + 1);
-            phase = next;
+            if template.name != "bgp_export_policy_set" {
+                let next = safety_phase(&template.name);
+                ensure!(next >= phase, "action {}: additive and preparation actions must precede withdrawals and shutdowns", position + 1);
+                phase = next;
+            }
         }
         let mut canonical = action.clone();
         if let Some(target) = action.auto_target.as_deref().filter(|v| !v.is_empty()) {
@@ -145,6 +147,38 @@ pub async fn inspect_actions(
     actions: &mut [super::bundle::BundleAction],
     automatic: bool,
 ) -> Result<()> {
+    inspect_actions_inner(pool, actions, automatic, None::<&NoReader>).await
+}
+
+struct NoReader;
+impl super::device_plan::PreparationReader for NoReader {
+    fn read_one<'a>(&'a self, _: u64, _: &'a str) -> crate::ssh::BoxFuture<'a, Result<String>> {
+        Box::pin(async { bail!("reader unavailable") })
+    }
+    fn read_many<'a>(
+        &'a self,
+        _: u64,
+        _: &'a [String],
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async { bail!("reader unavailable") })
+    }
+}
+
+pub async fn inspect_actions_with_reader<R: super::device_plan::PreparationReader>(
+    pool: &MySqlPool,
+    actions: &mut [super::bundle::BundleAction],
+    automatic: bool,
+    reader: &R,
+) -> Result<()> {
+    inspect_actions_inner(pool, actions, automatic, Some(reader)).await
+}
+
+async fn inspect_actions_inner<R: super::device_plan::PreparationReader>(
+    pool: &MySqlPool,
+    actions: &mut [super::bundle::BundleAction],
+    automatic: bool,
+    reader: Option<&R>,
+) -> Result<()> {
     ensure!(!actions.is_empty(), "no enabled actions to prepare");
     let mut phase = 0;
     for action in actions.iter_mut() {
@@ -163,13 +197,15 @@ pub async fn inspect_actions(
             "action {}: template is manual-only",
             action.position + 1
         );
-        let next = safety_phase(&action.template.name);
-        ensure!(
-            next >= phase,
-            "action {}: unsafe action order",
-            action.position + 1
-        );
-        phase = next;
+        if action.template.name != "bgp_export_policy_set" {
+            let next = safety_phase(&action.template.name);
+            ensure!(
+                next >= phase,
+                "action {}: unsafe action order",
+                action.position + 1
+            );
+            phase = next;
+        }
         action.params = templates::canonicalize_inventory_params(
             pool,
             action.device_id,
@@ -204,15 +240,77 @@ pub async fn inspect_actions(
             canonical_params: a.params.clone(),
         })
         .collect();
-    let plans = crate::ssh::RusshExecutor::new(pool.clone())
-        .prepare_actions(&inputs)
-        .await?;
+    let plans = match reader {
+        Some(reader) => {
+            super::device_plan::prepare_actions_read_only_with_reader(pool, &inputs, reader).await?
+        }
+        None => {
+            crate::ssh::RusshExecutor::new(pool.clone())
+                .prepare_actions(&inputs)
+                .await?
+        }
+    };
     ensure!(
         plans.len() == actions.len(),
         "device preparation did not return the complete action set"
     );
+    for (index, left) in plans.iter().enumerate() {
+        for right in plans.iter().skip(index + 1) {
+            if left.device_id != right.device_id {
+                continue;
+            }
+            let legacy = left
+                .after
+                .iter()
+                .chain(right.after.iter())
+                .find_map(|s| match s {
+                    super::device_plan::DeviceStateSnapshot::RouteMapAssignment {
+                        neighbor,
+                        direction,
+                        ..
+                    } => Some((neighbor, direction)),
+                    _ => None,
+                });
+            let export = left
+                .after
+                .iter()
+                .chain(right.after.iter())
+                .find_map(|s| match s {
+                    super::device_plan::DeviceStateSnapshot::ExportPolicyAttachment {
+                        neighbor,
+                        ..
+                    } => Some(neighbor),
+                    _ => None,
+                });
+            if let (Some((legacy_peer, direction)), Some(export_peer)) = (legacy, export) {
+                ensure!(legacy_peer!=export_peer||direction!="out","legacy route-map and export-policy actions overlap the same peer; combine them into one typed export-policy action");
+            }
+        }
+    }
+    phase = 0;
     for (action, plan) in actions.iter_mut().zip(plans) {
         plan.validate()?;
+        let next = if action.template.name == "bgp_export_policy_set" {
+            use super::device_plan::PreparedSafetyEffect::*;
+            match super::device_plan::prepared_safety_effect(&plan)? {
+                Additive => 0,
+                Neutral => 1,
+                Noop => phase,
+                Destructive => 2,
+                Mixed | Unproven => bail!(
+                    "action {}: export policy effect is mixed or cannot be proved",
+                    action.position + 1
+                ),
+            }
+        } else {
+            safety_phase(&action.template.name)
+        };
+        ensure!(
+            next >= phase,
+            "action {}: unsafe prepared action order",
+            action.position + 1
+        );
+        phase = next;
         action.params = plan.canonical_params.clone();
         action.prepared = Some(plan);
     }

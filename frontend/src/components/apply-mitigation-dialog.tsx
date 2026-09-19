@@ -3,16 +3,15 @@
  * mitigation actions.
  *
  * Contract (docs/reroute-engine.md, docs/doctrine.md §8, plans/015):
- * - In observe mode NOTHING executes. Each result carries would_run (the exact
- *   commands) and executed:false. This must look clearly different from real
- *   execution.
+ * - Observe disables automatic response. An authorized operator may still
+ *   execute this exact manual preview after explicit confirmation.
  * - In enforce mode the server runs each action through the full safety gate
  *   (locks, cooldowns, etc). A gate block gives executed:false + blocked_reason.
  * - The UI never hides dangerous reroute details: always show the would-run plan.
  * - Execution consumes the server-issued one-use token for the exact preview.
  *   The three steps (reason -> exact preview -> execute) are a doctrine gate and
  *   are never collapsed.
- * - A confirmed enforce-mode apply answers 202 with a bundle id and runs in the
+ * - A confirmed manual apply answers 202 with a bundle id and runs in the
  *   background (a real mitigation is a dozen-plus SSH sessions). The dialog then
  *   polls GET /api/reroute-bundles/{id} and shows per-action progress until a
  *   terminal state. If the bundle ends with siblings STILL APPLIED, that is
@@ -355,8 +354,7 @@ interface ApplyMitigationDialogProps {
 
 /**
  * Phases: reason -> exact dry-run preview -> execution. The execution phase is
- * either synchronous results (observe mode) or live bundle progress (a confirmed
- * enforce-mode apply, which the API answers 202 + bundle id).
+ * either synchronous preview results or live bundle progress after confirmation.
  */
 export function ApplyMitigationDialog({
   rule,
@@ -422,7 +420,7 @@ export function ApplyMitigationDialog({
         dry_run: dryRun,
         preview_token: dryRun ? undefined : previewToken ?? undefined,
       });
-      // Confirmed enforce-mode apply: 202 + bundle handle, work continues
+      // Confirmed manual apply: 202 + bundle handle, work continues
       // server-side. `results` here carries only the actions that could not be
       // resolved to run at all.
       if (isBundleAccepted(res)) {
@@ -481,8 +479,8 @@ export function ApplyMitigationDialog({
               </p>
               {isObserve ? (
                 <p className="font-medium text-amber-700 dark:text-amber-400">
-                  The controller is in <strong>observe mode</strong>: nothing will
-                  execute. You will see the exact commands that would run.
+                  The controller is in <strong>observe mode</strong>: automatic response
+                  is disabled. This manual run still requires an exact preview and confirmation.
                 </p>
               ) : isUnknown ? (
                 <p className="font-medium text-amber-800 dark:text-amber-300">
@@ -534,11 +532,7 @@ export function ApplyMitigationDialog({
             disabled={busy}
             onClick={() => void apply(true)}
           >
-            {busy
-              ? "Preparing…"
-              : isObserve
-                ? "Preview plan (observe mode)"
-                : "Preview exact commands"}
+            {busy ? "Preparing…" : "Preview exact commands"}
           </Button>
         </DialogFooter>
       </>
@@ -574,7 +568,7 @@ export function ApplyMitigationDialog({
           >
             Back
           </Button>
-          <Button variant="destructive" disabled={busy} onClick={() => void apply(false)}>
+          <Button variant="destructive" disabled={busy || !previewToken} onClick={() => void apply(false)}>
             {busy ? "Applying…" : "Execute reviewed actions"}
           </Button>
         </DialogFooter>
@@ -640,7 +634,7 @@ export function ApplyMitigationDialog({
     if (allObserve) {
       summaryText = (
         <span className="text-amber-700 dark:text-amber-400">
-          Observe mode — no commands were sent. Plan shown below.
+          Preview response — no commands were sent by this request. The plan is shown below.
         </span>
       );
     } else if (anyFailed) {

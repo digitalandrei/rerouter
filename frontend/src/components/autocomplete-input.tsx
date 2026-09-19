@@ -4,7 +4,7 @@
  * sequence counter, so the dropdown always reflects the latest query. Used by
  * the Flows search (source / destination / port).
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 
 interface AutocompleteInputProps {
@@ -16,6 +16,9 @@ interface AutocompleteInputProps {
   placeholder?: string;
   onEnter?: () => void;
   inputMode?: "text" | "numeric";
+  id?: string;
+  "aria-label"?: string;
+  "aria-labelledby"?: string;
 }
 
 export function AutocompleteInput({
@@ -25,12 +28,19 @@ export function AutocompleteInput({
   placeholder,
   onEnter,
   inputMode = "text",
+  id,
+  "aria-label": ariaLabel,
+  "aria-labelledby": ariaLabelledBy,
 }: AutocompleteInputProps) {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [open, setOpen] = useState(false);
   const seqRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const blurRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const generatedId = useId();
+  const inputId = id ?? `autocomplete-${generatedId}`;
+  const listboxId = `${inputId}-listbox`;
+  const [activeIndex, setActiveIndex] = useState(-1);
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -38,7 +48,10 @@ export function AutocompleteInput({
       const seq = ++seqRef.current;
       fetchSuggestions(value)
         .then((vals) => {
-          if (seq === seqRef.current) setSuggestions(vals);
+          if (seq === seqRef.current) {
+            setSuggestions(vals);
+            setActiveIndex(-1);
+          }
         })
         .catch(() => {
           if (seq === seqRef.current) setSuggestions([]);
@@ -64,6 +77,14 @@ export function AutocompleteInput({
   return (
     <div className="relative">
       <Input
+        id={inputId}
+        role="combobox"
+        aria-label={ariaLabel ?? (ariaLabelledBy ? undefined : placeholder ?? "Search suggestions")}
+        aria-labelledby={ariaLabelledBy}
+        aria-autocomplete="list"
+        aria-expanded={showList}
+        aria-controls={listboxId}
+        aria-activedescendant={activeIndex >= 0 ? `${inputId}-option-${activeIndex}` : undefined}
         value={value}
         inputMode={inputMode}
         placeholder={placeholder}
@@ -78,29 +99,42 @@ export function AutocompleteInput({
           blurRef.current = setTimeout(() => setOpen(false), 150);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            setOpen(true);
+            const direction = e.key === "ArrowDown" ? 1 : -1;
+            setActiveIndex((current) => {
+              if (suggestions.length === 0) return -1;
+              if (current < 0) return direction > 0 ? 0 : suggestions.length - 1;
+              return (current + direction + suggestions.length) % suggestions.length;
+            });
+          } else if (e.key === "Enter" && activeIndex >= 0) {
+            e.preventDefault();
+            pick(suggestions[activeIndex]);
+          } else if (e.key === "Enter") {
             setOpen(false);
             onEnter?.();
           } else if (e.key === "Escape") {
+            setOpen(false);
+            setActiveIndex(-1);
+          } else if (e.key === "Tab") {
             setOpen(false);
           }
         }}
       />
       {showList && (
-        <ul className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-sm shadow-md">
-          {suggestions.map((s) => (
-            <li key={s}>
-              <button
-                type="button"
-                className="block w-full rounded px-2 py-1 text-left font-mono hover:bg-accent hover:text-accent-foreground"
-                // onMouseDown (not onClick) so it fires before the input blur.
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  pick(s);
-                }}
-              >
-                {s}
-              </button>
+        <ul id={listboxId} role="listbox" className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-sm shadow-md">
+          {suggestions.map((s, index) => (
+            <li
+              id={`${inputId}-option-${index}`}
+              role="option"
+              aria-selected={index === activeIndex}
+              key={s}
+              className={`cursor-default rounded px-2 py-1 font-mono ${index === activeIndex ? "bg-accent text-accent-foreground" : ""}`}
+              onMouseEnter={() => setActiveIndex(index)}
+              onMouseDown={(event) => { event.preventDefault(); pick(s); }}
+            >
+              {s}
             </li>
           ))}
         </ul>

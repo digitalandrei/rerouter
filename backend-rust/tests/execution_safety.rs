@@ -666,12 +666,14 @@ async fn prepared_inverse_uses_persisted_effective_params_not_mutable_catalog_in
         local_asn: 65_000,
         neighbor: "192.0.2.1".into(),
         direction: "out".into(),
+        address_family: None,
         route_map: Some("RM_MIT".into()),
     };
     let restore = device_plan::DeviceStateSnapshot::RouteMapAssignment {
         local_asn: 65_000,
         neighbor: "192.0.2.1".into(),
         direction: "out".into(),
+        address_family: None,
         route_map: Some("RM_OLD".into()),
     };
     let inverse = device_plan::PreparedInverse {

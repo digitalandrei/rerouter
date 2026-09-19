@@ -9,6 +9,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Waves } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
 import {
   api,
   type Device,
@@ -42,22 +43,23 @@ import { fmtBps, fmtPps } from "@/lib/telemetry";
 import { FlowsTab } from "@/pages/device-detail/flows-tab";
 import { protoName } from "@/pages/device-detail/flows-tab";
 
-const WINDOW_MINUTES = 60;
-
 /** Native styled <select> for picking a device (avoids a new UI dependency). */
 function DeviceSelect({
   devices,
   value,
   onChange,
   allowAll,
+  id,
 }: {
   devices: Device[];
   value: number | null;
   onChange: (id: number | null) => void;
   allowAll?: boolean;
+  id?: string;
 }) {
   return (
     <select
+      id={id}
       className="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
@@ -73,9 +75,12 @@ function DeviceSelect({
 }
 
 export default function Flows() {
+  const [params, setParams] = useSearchParams();
+  const tab = params.get("tab") === "search" ? "search" : "top";
   const [devices, setDevices] = useState<Device[]>([]);
+  const [devicesError, setDevicesError] = useState(false);
   useEffect(() => {
-    api.devices.list().then(setDevices).catch(() => setDevices([]));
+    api.devices.list().then((value) => { setDevices(value); setDevicesError(false); }).catch(() => setDevicesError(true));
   }, []);
 
   return (
@@ -85,7 +90,9 @@ export default function Flows() {
         <h1 className="text-2xl font-bold tracking-tight">Flows</h1>
       </div>
 
-      <Tabs defaultValue="top">
+      {devicesError && <p role="alert" className="text-sm text-destructive">Devices could not be loaded. Device filters and top statistics are unavailable.</p>}
+
+      {!devicesError && <Tabs value={tab} onValueChange={(value) => setParams((previous) => { const next = new URLSearchParams(previous); if (value === "top") next.delete("tab"); else next.set("tab", value); return next; })}>
         <TabsList>
           <TabsTrigger value="top">Top statistics</TabsTrigger>
           <TabsTrigger value="search">Search</TabsTrigger>
@@ -97,7 +104,7 @@ export default function Flows() {
         <TabsContent value="search" className="mt-4">
           <SearchTab devices={devices} />
         </TabsContent>
-      </Tabs>
+      </Tabs>}
     </div>
   );
 }
@@ -116,8 +123,8 @@ function TopStatsTab({ devices }: { devices: Device[] }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
-        <Label>Device</Label>
-        <DeviceSelect devices={devices} value={deviceId} onChange={setDeviceId} />
+        <Label htmlFor="top-flow-device">Device</Label>
+        <DeviceSelect id="top-flow-device" devices={devices} value={deviceId} onChange={setDeviceId} />
       </div>
       {deviceId !== null && <FlowsTab deviceId={deviceId} refreshKey={0} />}
     </div>
@@ -125,17 +132,22 @@ function TopStatsTab({ devices }: { devices: Device[] }) {
 }
 
 function SearchTab({ devices }: { devices: Device[] }) {
-  const [deviceId, setDeviceId] = useState<number | null>(null);
-  const [src, setSrc] = useState("");
-  const [dst, setDst] = useState("");
-  const [port, setPort] = useState("");
-  const [proto, setProto] = useState(""); // "" = any; else IP protocol number
-  const [metric, setMetric] = useState<"bytes" | "pkts">("bytes");
+  const [params, setParams] = useSearchParams();
+  const numberParam = (name: string) => { const raw = params.get(name); const value = raw === null ? NaN : Number(raw); return Number.isSafeInteger(value) && value >= 0 ? value : null; };
+  const deviceId = numberParam("device");
+  const src = params.get("src") ?? "";
+  const dst = params.get("dst") ?? "";
+  const port = params.get("port") ?? "";
+  const proto = params.get("protocol") ?? "";
+  const metric: "bytes" | "pkts" = params.get("metric") === "pkts" ? "pkts" : "bytes";
+  const minutes = [15, 60, 360, 1440].includes(numberParam("minutes") ?? 60) ? (numberParam("minutes") ?? 60) : 60;
+  const limit = [25, 50, 100].includes(numberParam("limit") ?? 50) ? (numberParam("limit") ?? 50) : 50;
+  const setFilter = (name: string, value: string) => setParams((previous) => { const next = new URLSearchParams(previous); if (value) next.set(name, value); else next.delete(name); return next; }, { replace: true });
   const [rows, setRows] = useState<FlowTopRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FlowTopRow | null>(null);
-  const [ifIndex, setIfIndex] = useState(""); // "" = all interfaces
+  const ifIndex = params.get("interface") ?? "";
   const [interfaces, setInterfaces] = useState<SelectOption[]>([]);
   const seqRef = useRef(0);
 
@@ -163,16 +175,17 @@ function SearchTab({ devices }: { devices: Device[] }) {
     () => (ifIndex === "" ? undefined : parseInt(ifIndex, 10)),
     [ifIndex],
   );
+  const portInvalid = port.trim() !== "" && (portNum === undefined || portNum < 0 || portNum > 65535);
 
   // Load the selected device's interfaces for the interface filter dropdown.
   useEffect(() => {
     if (deviceId === null) {
       setInterfaces([]);
-      setIfIndex("");
+      setFilter("interface", "");
       return;
     }
     let cancelled = false;
-    setIfIndex(""); // reset the interface filter when the device changes
+    setFilter("interface", ""); // reset the interface filter when the device changes
     api.devices
       .interfaces(deviceId)
       .then((ifs) => {
@@ -196,6 +209,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
   // slower earlier response can't overwrite a newer one.
   useEffect(() => {
     const t = setTimeout(() => {
+      if (portInvalid) { setError("Enter a port from 0 to 65535."); return; }
       const seq = ++seqRef.current;
       setLoading(true);
       api.flows
@@ -207,7 +221,8 @@ function SearchTab({ devices }: { devices: Device[] }) {
           protocol: protoNum,
           ifIndex: ifIndexNum,
           metric,
-          limit: 100,
+          minutes,
+          limit,
         })
         .then((res) => {
           if (seq !== seqRef.current) return;
@@ -217,62 +232,63 @@ function SearchTab({ devices }: { devices: Device[] }) {
         .catch((e) => {
           if (seq !== seqRef.current) return;
           setError(e instanceof ApiError ? e.message : "Search failed");
-          setRows([]);
         })
         .finally(() => {
           if (seq === seqRef.current) setLoading(false);
         });
     }, 350);
     return () => clearTimeout(t);
-  }, [deviceId, src, dst, portNum, protoNum, ifIndexNum, metric]);
+  }, [deviceId, src, dst, portNum, protoNum, ifIndexNum, metric, minutes, limit, portInvalid]);
 
-  const windowSecs = WINDOW_MINUTES * 60;
+  const windowSecs = minutes * 60;
   const rate = (r: FlowTopRow) =>
     metric === "bytes" ? fmtBps((r.est_bytes * 8) / windowSecs) : fmtPps(r.est_pkts / windowSecs);
-
-  const portInvalid = port.trim() !== "" && portNum === undefined;
 
   return (
     <div className="space-y-4">
       <Card>
         <CardContent className="grid grid-cols-1 gap-4 py-4 md:grid-cols-3 xl:grid-cols-7">
           <div className="space-y-1">
-            <Label>Device</Label>
-            <DeviceSelect devices={devices} value={deviceId} onChange={setDeviceId} allowAll />
+            <Label htmlFor="flow-device">Device</Label>
+            <DeviceSelect id="flow-device" devices={devices} value={deviceId} onChange={(value) => setFilter("device", value === null ? "" : String(value))} allowAll />
           </div>
           <div className="space-y-1">
-            <Label>Interface</Label>
+            <Label htmlFor="flow-interface">Interface</Label>
             <SearchableSelect
+              id="flow-interface"
               options={[{ value: "", label: "All interfaces" }, ...interfaces]}
               value={ifIndex}
-              onChange={setIfIndex}
+              onChange={(value) => setFilter("interface", value)}
               placeholder={deviceId === null ? "Select a device first" : "All interfaces"}
               disabled={deviceId === null}
             />
           </div>
           <div className="space-y-1">
-            <Label>Source</Label>
+            <Label htmlFor="flow-source">Source</Label>
             <AutocompleteInput
+              id="flow-source"
               value={src}
-              onChange={setSrc}
+              onChange={(value) => setFilter("src", value)}
               fetchSuggestions={fetchSrc}
               placeholder="e.g. 192.168.200.92 (partial ok)"
             />
           </div>
           <div className="space-y-1">
-            <Label>Destination</Label>
+            <Label htmlFor="flow-destination">Destination</Label>
             <AutocompleteInput
+              id="flow-destination"
               value={dst}
-              onChange={setDst}
+              onChange={(value) => setFilter("dst", value)}
               fetchSuggestions={fetchDst}
               placeholder="e.g. 23.45.23.208 (partial ok)"
             />
           </div>
           <div className="space-y-1">
-            <Label>Port</Label>
+            <Label htmlFor="flow-port">Port</Label>
             <AutocompleteInput
+              id="flow-port"
               value={port}
-              onChange={setPort}
+              onChange={(value) => setFilter("port", value)}
               fetchSuggestions={fetchPort}
               placeholder="e.g. 53"
               inputMode="numeric"
@@ -280,11 +296,12 @@ function SearchTab({ devices }: { devices: Device[] }) {
             {portInvalid && <p className="text-xs text-destructive">Enter a numeric port</p>}
           </div>
           <div className="space-y-1">
-            <Label>Protocol</Label>
+            <Label htmlFor="flow-protocol">Protocol</Label>
             <SearchableSelect
+              id="flow-protocol"
               options={PROTOCOLS}
               value={proto}
-              onChange={setProto}
+              onChange={(value) => setFilter("protocol", value)}
               placeholder="Any protocol"
             />
           </div>
@@ -294,19 +311,22 @@ function SearchTab({ devices }: { devices: Device[] }) {
               <Button
                 size="sm"
                 variant={metric === "bytes" ? "default" : "outline"}
-                onClick={() => setMetric("bytes")}
+                onClick={() => setFilter("metric", "bytes")}
               >
                 Traffic
               </Button>
               <Button
                 size="sm"
                 variant={metric === "pkts" ? "default" : "outline"}
-                onClick={() => setMetric("pkts")}
+                onClick={() => setFilter("metric", "pkts")}
               >
                 Packets
               </Button>
             </div>
           </div>
+          <div className="space-y-1"><Label htmlFor="flow-window">Time window</Label><select id="flow-window" className="h-9 rounded-md border bg-background px-2 text-sm" value={minutes} onChange={(event) => setFilter("minutes", event.target.value)}><option value="15">15 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">24 hours</option></select></div>
+          <div className="space-y-1"><Label htmlFor="flow-limit">Top results</Label><select id="flow-limit" className="h-9 rounded-md border bg-background px-2 text-sm" value={limit} onChange={(event) => setFilter("limit", event.target.value)}><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></div>
+          <div className="flex items-end"><Button type="button" variant="outline" onClick={() => setParams({ tab: "search" }, { replace: true })}>Clear filters</Button></div>
         </CardContent>
       </Card>
 
@@ -318,7 +338,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
             <p className="px-6 py-4 text-sm text-muted-foreground">Searching…</p>
           ) : rows.length === 0 ? (
             <p className="px-6 py-4 text-sm text-muted-foreground">
-              No matching flows in the last {WINDOW_MINUTES} min.
+              No matching flows in the last {minutes} min.
             </p>
           ) : (
             <Table>
@@ -329,16 +349,12 @@ function SearchTab({ devices }: { devices: Device[] }) {
                   <TableHead>Proto</TableHead>
                   <TableHead className="text-right">{metric === "bytes" ? "Rate" : "Packets/s"}</TableHead>
                   <TableHead className="pr-6">Sampling</TableHead>
+                  <TableHead className="pr-6 text-right">Details</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {rows.map((r, i) => (
-                  <TableRow
-                    key={i}
-                    className="cursor-pointer"
-                    onClick={() => setSelected(r)}
-                    title="View flow details"
-                  >
+                  <TableRow key={i}>
                     <TableCell className="pl-6 font-mono text-xs">
                       {r.src_addr}
                       {r.src_port != null && `:${r.src_port}`}
@@ -362,6 +378,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
                         )}
                       </div>
                     </TableCell>
+                    <TableCell className="pr-6 text-right"><Button type="button" size="sm" variant="outline" onClick={() => setSelected(r)}>View</Button></TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -373,7 +390,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
       <FlowDetailDialog
         row={selected}
         deviceId={deviceId ?? undefined}
-        windowMinutes={WINDOW_MINUTES}
+        windowMinutes={minutes}
         onClose={() => setSelected(null)}
       />
     </div>

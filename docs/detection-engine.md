@@ -124,7 +124,7 @@ rule's switch — the rule's actions:
   mitigation out to several routers.
 - in **observe** mode (the shipped default — see
   [reroute-engine.md](reroute-engine.md) "Operating mode"), **or** for any rule
-  whose `automatic_reroute_enabled` is off: nothing executes; each action is
+  whose `automatic_reroute_enabled` is off: no autonomous action executes; each action is
   rendered to its exact would-run commands and attached to the alert
   (`would_run_actions`);
 - in **enforce** mode, and only when the rule's `automatic_reroute_enabled` is on:

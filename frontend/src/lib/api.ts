@@ -22,6 +22,8 @@ export class ApiError extends Error {
   }
 }
 
+export const AUTH_RETURN_TO_KEY = "rerouter.auth.returnTo";
+
 // ---------------------------------------------------------------------------
 // Domain types — exact field names from the API contract
 // ---------------------------------------------------------------------------
@@ -61,9 +63,8 @@ export interface TotpResponse {
 
 /**
  * Operating mode (docs/reroute-engine.md "Operating mode"):
- * - "observe" (default): safe read-only / alert-only — NO reroute executes,
- *   automatic or manual; alerts carry the actions that WOULD have run. The UI
- *   must show a persistent observe-mode banner.
+ * - "observe" (default): autonomous response is disabled. Authorized manual
+ *   runs and reverts still require an exact preview and explicit confirmation.
  * - "enforce": execution allowed, still gated by every other safety rule.
  */
 export type OperatingMode = "observe" | "enforce";
@@ -445,6 +446,9 @@ export interface Rule {
   severity: string;
   enabled: boolean;
   automatic_reroute_enabled: boolean;
+  /** Whether a recovered rule may autonomously revert the run it owns. Clear
+   *  detection criteria remain configured independently in recovery_mode. */
+  automatic_revert_enabled: boolean;
   /** Opt-in: operators may manually apply this rule's actions from a firing alert
    *  (off by default). Still gated like any manual reroute at apply time. */
   manual_apply_enabled: boolean;
@@ -456,7 +460,7 @@ export interface Rule {
   // Resolved target labels + live evaluation snapshot (from rule_states).
   interface_name?: string | null;
   device_name?: string | null;
-  current_state?: "clear" | "matching" | "firing" | null;
+  current_state?: "clear" | "matching" | "firing" | "recovered_awaiting_revert" | null;
   current_value?: number | null;
   last_evaluated_at?: string | null;
   // Live progression toward firing (from rule_states).
@@ -588,7 +592,7 @@ export interface ManualReroutePayload {
 
 export interface ActionResultsResponse {
   results: RerouteResult[];
-  /** Present only for an enforce-mode dry run; short-lived and single-use. */
+  /** Short-lived, actor-bound, single-use authority in either operating mode. */
   preview_token?: string | null;
 }
 
@@ -638,6 +642,8 @@ export interface MitigationPreset {
   recent_runs?: Array<{ bundle_id: number; state: string; created_at: string }>;
   validation_status?: "needs_preview" | "valid" | "invalid";
   validation_error?: string | null;
+  definition_status?: "draft" | "needs_setup" | "ready";
+  missing_references?: string[];
   checked_at?: string | null;
 }
 
@@ -648,6 +654,8 @@ export interface ManualMitigationPreview {
   source?: ActionSource | null;
   expires_at?: string | null;
   operating_mode: "observe" | "enforce";
+  projections?: DeviceProjection[];
+  revert_after_seconds?: number | null;
 }
 
 export interface ManualMitigationAccepted {
@@ -658,7 +666,7 @@ export interface ManualMitigationAccepted {
 // ---------------------------------------------------------------------------
 // Ordered mitigation bundles (plans/015)
 //
-// One authorized activation of one rule's ordered action set. An enforce-mode
+// One authorized activation of one rule's ordered action set. A confirmed
 // apply no longer blocks on ~2 SSH sessions per action: the API returns 202 with
 // a bundle id and the run continues server-side. Progress is polled from
 // GET /api/reroute-bundles/{id} until the state is terminal.
@@ -723,6 +731,47 @@ export interface RerouteBundle {
   source?: ActionSource | null;
   created_at?: string;
   triggered_by?: string | null;
+  execution_state?: string;
+  lifecycle_state?: string;
+  active?: boolean;
+  remaining_mutations?: number;
+  recovery_deadline?: string | null;
+  automatic_recovery_cancelled_at?: string | null;
+  revert?: { available: boolean; block_reasons: string[]; noop?: boolean };
+}
+
+export interface RerouteBundlePage {
+  items: RerouteBundle[];
+  page: number;
+  per_page: number;
+  total: number;
+}
+
+export interface DeviceProjection {
+  device_id: number;
+  before_config: unknown;
+  after_config: unknown;
+  revert_config: unknown;
+  changes: Array<{ action_index: number; template_name: string; effect: "change" | "already_satisfied" }>;
+  completeness: string;
+  blockers: string[];
+  read_at: string;
+}
+
+export interface ActionSetInspection {
+  devices: DeviceProjection[];
+  blockers: string[];
+  prepared_actions: Array<Record<string, unknown>>;
+}
+
+export interface RoutingPolicyInventory {
+  device_id: number;
+  read_at: string | null;
+  completeness: "complete" | "partial" | "stale";
+  blockers: string[];
+  prefix_lists: Array<{ name: string; entries: Array<{ sequence: number; action: "permit" | "deny"; prefix: string; ge?: number; le?: number }>; referenced_by: string[] }>;
+  route_maps: Array<{ name: string; clauses: Array<{ sequence: number; action: string; matches: Array<{ kind: string; value: string }>; sets: Array<{ kind: string; value: string }> }>; references: string[] }>;
+  peer_bindings: Array<{ neighbor_ip: string; local_asn: number; address_family: "ipv4"; direction: "out"; policy_kind: string; policy_name: string; scope: "direct" | "inherited" | "ambiguous" }>;
 }
 
 export interface ActionSource {
@@ -734,7 +783,7 @@ export interface ActionSource {
   name?: string | null;
 }
 
-/** 202 from a confirmed enforce-mode rule apply: the bundle runs in background. */
+/** 202 from a confirmed manual rule apply: the bundle runs in background. */
 export interface BundleAcceptedResponse {
   bundle_id: number;
   async: true;
@@ -745,8 +794,8 @@ export interface BundleAcceptedResponse {
   results: RerouteResult[];
 }
 
-/** A rule apply answers either synchronously (preview / observe mode) or with a
- *  bundle handle (confirmed enforce-mode execution). */
+/** A rule apply answers either with a synchronous preview or a bundle handle
+ *  after token-bound manual confirmation. */
 export type RuleApplyResponse = ActionResultsResponse | BundleAcceptedResponse;
 
 export function isBundleAccepted(
@@ -866,9 +915,9 @@ const NO_REDIRECT_PATHS = [
 
 async function request<T>(
   path: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
 ): Promise<T> {
-  const { method = "GET", body } = options;
+  const { method = "GET", body, signal } = options;
 
   const res = await fetch(path, {
     method,
@@ -878,6 +927,7 @@ async function request<T>(
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal,
   });
 
   if (
@@ -887,7 +937,9 @@ async function request<T>(
   ) {
     // Session expired or revoked: leave the app entirely. (Never redirect when
     // already on /login — that would loop.)
-    window.location.assign("/login");
+    const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    try { window.sessionStorage.setItem(AUTH_RETURN_TO_KEY, returnTo); } catch { /* storage may be disabled */ }
+    window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
     throw new ApiError(401, "Session expired");
   }
 
@@ -1104,11 +1156,9 @@ export const api = {
         method: "POST",
         body: body ?? {},
       }),
-    /** Manually apply a firing rule's configured actions (the supervised
-     *  alternative to automatic execution). Gated server-side: requires the
-     *  rule's manual_apply_enabled, the rule to be firing, and (to actually
-     *  execute) enforce mode + trigger_manual_reroute. In observe mode each
-     *  result carries the would-run plan and nothing executes. */
+    /** Manually apply a firing rule's configured actions. Both operating modes
+     *  require the actor-bound one-use preview token; Observe only disables
+     *  autonomous execution. */
     apply: (
       id: number,
       body?: { reason?: string; dry_run?: boolean; preview_token?: string },
@@ -1188,6 +1238,7 @@ export const api = {
       preset_revision?: number;
       actions: ActionDraft[];
       reason?: string;
+      revert_after_seconds?: number;
     }) =>
       request<ManualMitigationPreview>("/api/manual-mitigations/preview", {
         method: "POST",
@@ -1200,10 +1251,25 @@ export const api = {
       }),
   },
 
-  /** Progress of an ordered mitigation bundle (async enforce-mode rule apply). */
+  /** Progress and lifecycle of an ordered mitigation bundle. */
   bundles: {
-    list: () => request<RerouteBundle[]>("/api/reroute-bundles"),
+    list: (opts?: { page?: number; per_page?: number; lifecycle?: "active" | "inactive" | "all"; trigger_type?: string; rule_id?: number; preset_id?: number }) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(opts ?? {})) if (value !== undefined) query.set(key, String(value));
+      return request<RerouteBundlePage | RerouteBundle[]>(`/api/reroute-bundles${query.size ? `?${query}` : ""}`);
+    },
     get: (id: number) => request<RerouteBundle>(`/api/reroute-bundles/${id}`),
+    revert: (id: number, body: { dry_run: boolean; reason?: string; plan_id?: number; preview_token?: string }) =>
+      request<ManualMitigationPreview | ManualMitigationAccepted>(`/api/reroute-bundles/${id}/revert`, { method: "POST", body }),
+    takeControl: (id: number) => request<{ ok: true; bundle_id: number; automatic_recovery_cancelled: true }>(`/api/reroute-bundles/${id}/take-control`, { method: "POST" }),
+  },
+
+  actionSets: {
+    inspect: (actions: ActionDraft[]) => request<ActionSetInspection>("/api/action-sets/inspect", { method: "POST", body: { actions } }),
+  },
+
+  routingPolicies: {
+    get: (deviceId: number) => request<RoutingPolicyInventory>(`/api/devices/${deviceId}/routing-policies`),
   },
 
   templates: {
@@ -1290,6 +1356,14 @@ export const api = {
 
   audit: {
     list: () => request<AuditEntry[]>("/api/audit"),
+    listPage: (
+      params: { actor?: string; action?: string; entity?: string; after?: string; before?: string; page?: number; limit?: number } = {},
+      signal?: AbortSignal,
+    ) => {
+      const query = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== "") query.set(key, String(value));
+      return request<{ rows: AuditEntry[]; page: number; limit: number; has_more: boolean }>(`/api/audit${query.size ? `?${query}` : ""}`, { signal });
+    },
   },
 
   notifications: {

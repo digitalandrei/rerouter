@@ -29,6 +29,7 @@ pub const PREPARED_TEMPLATE_NAMES: &[&str] = &[
     "bgp_advertise_remove",
     "bgp_route_map_set",
     "bgp_route_map_unset",
+    "bgp_export_policy_set",
     "iface_tcp_adjust_mss",
     "iface_tcp_adjust_mss_remove",
     "iface_shutdown",
@@ -47,6 +48,144 @@ pub struct DeviceTransportIdentity {
 pub enum PreparedEffect {
     Change,
     AlreadySatisfied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparedSafetyEffect {
+    Additive,
+    Neutral,
+    Destructive,
+    Mixed,
+    Noop,
+    Unproven,
+}
+
+pub fn prepared_safety_effect(action: &PreparedDeviceAction) -> Result<PreparedSafetyEffect> {
+    if action.effect == PreparedEffect::AlreadySatisfied {
+        return Ok(PreparedSafetyEffect::Noop);
+    }
+    if action.template_name != "bgp_export_policy_set" {
+        return Ok(PreparedSafetyEffect::Unproven);
+    }
+    let kind = action
+        .canonical_params
+        .get("policy_kind")
+        .and_then(Value::as_str);
+    let route_map_safe = |states: &[DeviceStateSnapshot]| -> bool {
+        states
+            .iter()
+            .find_map(|state| match state {
+                DeviceStateSnapshot::ExportPolicyAttachment {
+                    route_map,
+                    route_maps,
+                    ..
+                } => Some(match route_map {
+                    None => true,
+                    Some(name) => route_maps
+                        .iter()
+                        .find(|m| m.name == *name)
+                        .is_some_and(|map| {
+                            !map.clauses.is_empty()
+                                && map.clauses.iter().all(|clause| {
+                                    clause.action == crate::reroute::policy::PermitDeny::Permit
+                                        && clause.matches.is_empty()
+                                        && clause.sets.iter().all(|term| {
+                                            term.value.starts_with("as-path prepend ")
+                                                || term.value.starts_with("metric ")
+                                                || term.value.starts_with("local-preference ")
+                                        })
+                                })
+                        }),
+                }),
+                _ => None,
+            })
+            .unwrap_or(false)
+    };
+    let extract=|states:&[DeviceStateSnapshot]|->Result<(Option<String>,Vec<crate::reroute::policy::NamedPrefixList>)>{states.iter().find_map(|state|match state{DeviceStateSnapshot::ExportPolicyAttachment{prefix_list,prefix_lists,..}=>Some((prefix_list.clone(),prefix_lists.clone())),_=>None}).ok_or_else(||anyhow::anyhow!("export policy safety evidence is incomplete"))};
+    if kind == Some("route_map") {
+        let extract_map = |states: &[DeviceStateSnapshot]| -> Result<(
+            Option<String>,
+            Vec<crate::reroute::policy::NamedRouteMap>,
+        )> {
+            states
+                .iter()
+                .find_map(|state| match state {
+                    DeviceStateSnapshot::ExportPolicyAttachment {
+                        route_map,
+                        route_maps,
+                        ..
+                    } => Some((route_map.clone(), route_maps.clone())),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("export policy safety evidence is incomplete"))
+        };
+        let safe = |name: Option<String>, maps: Vec<crate::reroute::policy::NamedRouteMap>| {
+            let Some(name) = name else { return true };
+            maps.iter().find(|m| m.name == name).is_some_and(|map| {
+                !map.clauses.is_empty()
+                    && map.clauses.iter().all(|clause| {
+                        clause.action == crate::reroute::policy::PermitDeny::Permit
+                            && clause.matches.is_empty()
+                            && clause.sets.iter().all(|term| {
+                                term.value.starts_with("as-path prepend ")
+                                    || term.value.starts_with("metric ")
+                                    || term.value.starts_with("local-preference ")
+                            })
+                    })
+            })
+        };
+        let before = extract_map(&action.before).is_ok_and(|(name, maps)| safe(name, maps));
+        let after = extract_map(&action.after).is_ok_and(|(name, maps)| safe(name, maps));
+        return Ok(if before && after {
+            PreparedSafetyEffect::Neutral
+        } else {
+            PreparedSafetyEffect::Unproven
+        });
+    }
+    if kind != Some("prefix_list") {
+        return Ok(PreparedSafetyEffect::Unproven);
+    }
+    if !route_map_safe(&action.before) || !route_map_safe(&action.after) {
+        return Ok(PreparedSafetyEffect::Unproven);
+    }
+    let (before_name, before_lists) = match extract(&action.before) {
+        Ok(v) => v,
+        Err(_) => return Ok(PreparedSafetyEffect::Unproven),
+    };
+    let (after_name, after_lists) = match extract(&action.after) {
+        Ok(v) => v,
+        Err(_) => return Ok(PreparedSafetyEffect::Unproven),
+    };
+    let permitted = |name: Option<String>,
+                     lists: Vec<crate::reroute::policy::NamedPrefixList>|
+     -> Result<std::collections::BTreeSet<String>> {
+        let Some(name) = name else {
+            bail!("absence of an outbound prefix-list is unrestricted")
+        };
+        let list = lists
+            .into_iter()
+            .find(|list| list.name == name)
+            .ok_or_else(|| anyhow::anyhow!("selected prefix-list definition missing"))?;
+        exact_permitted_prefixes_from_list(&list)
+    };
+    let before = match permitted(before_name, before_lists) {
+        Ok(v) => v,
+        Err(_) => return Ok(PreparedSafetyEffect::Unproven),
+    };
+    let after = match permitted(after_name, after_lists) {
+        Ok(v) => v,
+        Err(_) => return Ok(PreparedSafetyEffect::Unproven),
+    };
+    Ok(if before == after {
+        PreparedSafetyEffect::Noop
+    } else if before.is_subset(&after) {
+        PreparedSafetyEffect::Additive
+    } else if after.is_subset(&before) {
+        PreparedSafetyEffect::Destructive
+    } else {
+        PreparedSafetyEffect::Mixed
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +285,20 @@ pub enum DeviceStateSnapshot {
         neighbor: String,
         direction: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        address_family: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         route_map: Option<String>,
+    },
+    ExportPolicyAttachment {
+        local_asn: u32,
+        neighbor: String,
+        address_family: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_list: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_map: Option<String>,
+        prefix_lists: Vec<crate::reroute::policy::NamedPrefixList>,
+        route_maps: Vec<crate::reroute::policy::NamedRouteMap>,
     },
     InterfaceAdmin {
         interface: String,
@@ -683,6 +835,7 @@ pub async fn verify_current(
                 local_asn,
                 neighbor,
                 direction,
+                address_family,
                 route_map,
             } => {
                 let output = locked
@@ -692,8 +845,72 @@ pub async fn verify_current(
                     .output
                     .lines()
                     .any(|line| line.trim() == format!("router bgp {local_asn}"));
-                let actual = parse_route_map_assignment(&output.output, neighbor, direction)?;
-                has_router && actual == *route_map
+                let actual = address_family
+                    .as_deref()
+                    .map(|family| {
+                        parse_route_map_assignment_scoped(
+                            &output.output,
+                            neighbor,
+                            direction,
+                            family,
+                        )
+                    })
+                    .transpose()?;
+                has_router && actual.flatten() == *route_map && address_family.is_some()
+            }
+            DeviceStateSnapshot::ExportPolicyAttachment {
+                local_asn,
+                neighbor,
+                address_family,
+                prefix_list,
+                route_map,
+                prefix_lists,
+                route_maps,
+            } => {
+                let bgp = locked
+                    .read(device_id, "show running-config | section ^router bgp")
+                    .await?;
+                let rm = locked
+                    .read(device_id, "show running-config | section ^route-map")
+                    .await?;
+                let pl = locked
+                    .read(device_id, "show running-config | section ^ip prefix-list")
+                    .await?;
+                let inventory = crate::reroute::policy::parse_inventory(
+                    device_id,
+                    &bgp.output,
+                    &rm.output,
+                    &pl.output,
+                    Utc::now(),
+                );
+                let direct = inventory
+                    .peer_bindings
+                    .iter()
+                    .filter(|b| {
+                        b.neighbor_ip == *neighbor
+                            && b.local_asn == *local_asn
+                            && b.address_family == *address_family
+                            && b.direction == "out"
+                            && b.scope == crate::reroute::policy::BindingScope::Direct
+                    })
+                    .collect::<Vec<_>>();
+                let actual_prefix = direct
+                    .iter()
+                    .find(|b| b.policy_kind == crate::reroute::policy::PolicyKind::PrefixList)
+                    .map(|b| b.policy_name.clone());
+                let actual_map = direct
+                    .iter()
+                    .find(|b| b.policy_kind == crate::reroute::policy::PolicyKind::RouteMap)
+                    .map(|b| b.policy_name.clone());
+                let (actual_lists, actual_maps) = policy_definitions_without_references(
+                    inventory.prefix_lists,
+                    inventory.route_maps,
+                );
+                inventory.blockers.is_empty()
+                    && actual_prefix == *prefix_list
+                    && actual_map == *route_map
+                    && actual_lists == *prefix_lists
+                    && actual_maps == *route_maps
             }
             DeviceStateSnapshot::InterfaceAdmin {
                 interface,
@@ -781,6 +998,44 @@ pub async fn prepare_inverse_sequence_read_only(
 ) -> Result<()> {
     let mut port = ReadOnlySnapshotPort { pool: pool.clone() };
     reconcile_inverse_sequence(&mut port, actions).await
+}
+
+struct ReaderSnapshotPort<'a, R> {
+    reader: &'a R,
+}
+impl<R: PreparationReader> crate::ssh::LockedDeviceSetPort for ReaderSnapshotPort<'_, R> {
+    fn device_ids(&self) -> Vec<u64> {
+        vec![]
+    }
+    fn read<'a>(
+        &'a mut self,
+        device_id: u64,
+        command: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<crate::ssh::CommandResult>> {
+        Box::pin(async move {
+            Ok(crate::ssh::CommandResult {
+                command: command.into(),
+                output: self.reader.read_one(device_id, command).await?,
+            })
+        })
+    }
+    fn execute<'a>(
+        &'a mut self,
+        _: u64,
+        _: &'a [String],
+    ) -> crate::ssh::BoxFuture<'a, Result<crate::ssh::SshOutcome>> {
+        Box::pin(async { bail!("read-only preparation port cannot execute") })
+    }
+    fn unlock_all(self: Box<Self>) -> crate::ssh::BoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub async fn prepare_inverse_sequence_read_only_with_reader<R: PreparationReader>(
+    reader: &R,
+    actions: &mut [PreparedDeviceAction],
+) -> Result<()> {
+    reconcile_inverse_sequence(&mut ReaderSnapshotPort { reader }, actions).await
 }
 
 pub async fn reconcile_inverse_sequence(
@@ -1077,9 +1332,50 @@ fn ipv4_network_mask(prefix: &str) -> Result<(String, String)> {
 /// Prepare an ordered action list without acquiring configuration locks or
 /// sending writes. Later actions on the same prefix-list see the projected
 /// after-state of earlier actions, matching ordered bundle semantics.
+pub trait PreparationReader: Send + Sync {
+    fn read_one<'a>(
+        &'a self,
+        device_id: u64,
+        command: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<String>>;
+    fn read_many<'a>(
+        &'a self,
+        device_id: u64,
+        commands: &'a [String],
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<String>>>;
+}
+
+struct RusshPreparationReader<'a> {
+    pool: &'a MySqlPool,
+}
+impl PreparationReader for RusshPreparationReader<'_> {
+    fn read_one<'a>(
+        &'a self,
+        device_id: u64,
+        command: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<String>> {
+        Box::pin(async move { read_one(self.pool, device_id, command).await })
+    }
+    fn read_many<'a>(
+        &'a self,
+        device_id: u64,
+        commands: &'a [String],
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move { read_many(self.pool, device_id, commands).await })
+    }
+}
+
 pub async fn prepare_actions_read_only(
     pool: &MySqlPool,
     inputs: &[PrepareInput],
+) -> Result<Vec<PreparedDeviceAction>> {
+    prepare_actions_read_only_with_reader(pool, inputs, &RusshPreparationReader { pool }).await
+}
+
+pub async fn prepare_actions_read_only_with_reader<R: PreparationReader>(
+    pool: &MySqlPool,
+    inputs: &[PrepareInput],
+    reader: &R,
 ) -> Result<Vec<PreparedDeviceAction>> {
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut projected_prefix_lists: HashMap<(u64, String), String> = HashMap::new();
@@ -1136,7 +1432,7 @@ pub async fn prepare_actions_read_only(
                 if projected_list.is_none() {
                     commands.push(format!("show ip prefix-list {list}"));
                 }
-                let reads = read_many(pool, input.device_id, &commands).await?;
+                let reads = reader.read_many(input.device_id, &commands).await?;
                 let mut read_index = 3;
                 let neighbor_output = match projected_neighbor {
                     Some(DeviceStateSnapshot::BgpNeighborState {
@@ -1178,7 +1474,8 @@ pub async fn prepare_actions_read_only(
             }
             _ => {
                 let action =
-                    prepare_catalog_action(pool, input, &template, &projected_states).await?;
+                    prepare_catalog_action(pool, input, &template, &projected_states, reader)
+                        .await?;
                 for state in &action.after {
                     if let Some(key) = state_key(input.device_id, state) {
                         projected_states.insert(key, state.clone());
@@ -1196,6 +1493,7 @@ async fn prepare_catalog_action(
     input: &PrepareInput,
     template: &super::templates::Template,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let subst =
         super::templates::validate_and_expand(&template.parameter_schema, &input.canonical_params)?;
@@ -1203,24 +1501,373 @@ async fn prepare_catalog_action(
         "null_route_prefix" | "null_route_withdraw" | "blackhole_prefix"
         | "blackhole_withdraw" | "null_route_prefix_v6" | "null_route_withdraw_v6"
         | "blackhole_prefix_v6" | "blackhole_withdraw_v6" => {
-            prepare_static_route(pool, input, template, &subst, projected).await
+            prepare_static_route(pool, input, template, &subst, projected,reader).await
         }
         "bgp_session_enable" | "bgp_session_disable" => {
-            prepare_neighbor_shutdown(pool, input, template, &subst, projected).await
+            prepare_neighbor_shutdown(pool, input, template, &subst, projected,reader).await
         }
         "bgp_route_map_set" | "bgp_route_map_unset" => {
-            prepare_route_map(pool, input, template, &subst, projected).await
+            prepare_route_map(pool, input, template, &subst, projected,reader).await
+        }
+        "bgp_export_policy_set" => {
+            prepare_export_policy(pool, input, template, &subst, projected,reader).await
         }
         "iface_tcp_adjust_mss" | "iface_tcp_adjust_mss_remove" => {
-            prepare_interface_mss(pool, input, template, &subst, projected).await
+            prepare_interface_mss(pool, input, template, &subst, projected,reader).await
         }
         "iface_shutdown" | "iface_no_shutdown" => {
-            prepare_interface_admin(pool, input, template, &subst, projected).await
+            prepare_interface_admin(pool, input, template, &subst, projected,reader).await
         }
         other => bail!(
             "template '{other}' has no structured read-only preparation implementation; enforced execution is unavailable"
         ),
     }
+}
+
+async fn prepare_export_policy(
+    _pool: &MySqlPool,
+    input: &PrepareInput,
+    _template: &super::templates::Template,
+    subst: &serde_json::Map<String, Value>,
+    projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
+) -> Result<PreparedDeviceAction> {
+    use crate::reroute::policy::{BindingScope, PolicyKind};
+    let neighbor = subst_string(subst, "neighbor_ip")?;
+    let kind = match subst_string(subst, "policy_kind")?.as_str() {
+        "prefix_list" => PolicyKind::PrefixList,
+        "route_map" => PolicyKind::RouteMap,
+        other => bail!("unsupported export policy kind '{other}'"),
+    };
+    let desired_name = subst_string(subst, "policy_name")?;
+    let projected_state = projected.iter().find_map(|(key, state)| {
+        (key.starts_with(&format!("{}:export_policy:{neighbor}:", input.device_id)))
+            .then_some(state.clone())
+    });
+    let before = if let Some(state) = projected_state {
+        state
+    } else {
+        let reads = reader
+            .read_many(
+                input.device_id,
+                &[
+                    "show running-config | section ^router bgp".into(),
+                    "show running-config | section ^route-map".into(),
+                    "show running-config | section ^ip prefix-list".into(),
+                ],
+            )
+            .await?;
+        let inventory = crate::reroute::policy::parse_inventory(
+            input.device_id,
+            &reads[0],
+            &reads[1],
+            &reads[2],
+            Utc::now(),
+        );
+        if !inventory.blockers.is_empty() {
+            bail!(
+                "routing-policy inventory is incomplete: {}",
+                inventory.blockers.join(", ")
+            );
+        }
+        let (local_asn, family) = prove_neighbor_context(&reads[0], &neighbor)?;
+        let matching = inventory
+            .peer_bindings
+            .iter()
+            .filter(|b| {
+                b.neighbor_ip == neighbor && b.address_family == family && b.direction == "out"
+            })
+            .collect::<Vec<_>>();
+        if matching.iter().any(|b| b.scope != BindingScope::Direct) {
+            bail!("peer {neighbor} export policy is inherited or ambiguous; direct attachment required");
+        }
+        if matching
+            .iter()
+            .filter(|b| b.policy_kind == PolicyKind::PrefixList)
+            .count()
+            > 1
+            || matching
+                .iter()
+                .filter(|b| b.policy_kind == PolicyKind::RouteMap)
+                .count()
+                > 1
+        {
+            bail!("peer {neighbor} has ambiguous duplicate direct outbound policy bindings");
+        }
+        let prefix_list = matching
+            .iter()
+            .find(|b| b.policy_kind == PolicyKind::PrefixList)
+            .map(|b| b.policy_name.clone());
+        let route_map = matching
+            .iter()
+            .find(|b| b.policy_kind == PolicyKind::RouteMap)
+            .map(|b| b.policy_name.clone());
+        let (prefix_lists, route_maps) =
+            policy_definitions_without_references(inventory.prefix_lists, inventory.route_maps);
+        DeviceStateSnapshot::ExportPolicyAttachment {
+            local_asn,
+            neighbor: neighbor.clone(),
+            address_family: family,
+            prefix_list,
+            route_map,
+            prefix_lists,
+            route_maps,
+        }
+    };
+    let (local_asn, family, current_prefix, current_map, prefix_lists, route_maps) = match &before {
+        DeviceStateSnapshot::ExportPolicyAttachment {
+            local_asn,
+            address_family,
+            prefix_list,
+            route_map,
+            prefix_lists,
+            route_maps,
+            ..
+        } => (
+            *local_asn,
+            address_family.clone(),
+            prefix_list.clone(),
+            route_map.clone(),
+            prefix_lists.clone(),
+            route_maps.clone(),
+        ),
+        _ => bail!("projected export-policy state has the wrong type"),
+    };
+    let exists = match kind {
+        PolicyKind::PrefixList => prefix_lists.iter().any(|p| p.name == desired_name),
+        PolicyKind::RouteMap => route_maps.iter().any(|p| p.name == desired_name),
+    };
+    if !exists {
+        bail!("selected export policy '{desired_name}' was not present in the complete snapshot");
+    }
+    let (desired_prefix, desired_map, current_name) = match kind {
+        PolicyKind::PrefixList => (
+            Some(desired_name.clone()),
+            current_map.clone(),
+            current_prefix.clone(),
+        ),
+        PolicyKind::RouteMap => (
+            current_prefix.clone(),
+            Some(desired_name.clone()),
+            current_map.clone(),
+        ),
+    };
+    let after = DeviceStateSnapshot::ExportPolicyAttachment {
+        local_asn,
+        neighbor: neighbor.clone(),
+        address_family: family.clone(),
+        prefix_list: desired_prefix,
+        route_map: desired_map,
+        prefix_lists: prefix_lists.clone(),
+        route_maps: route_maps.clone(),
+    };
+    let effect = if before == after {
+        PreparedEffect::AlreadySatisfied
+    } else {
+        PreparedEffect::Change
+    };
+    let noun = match kind {
+        PolicyKind::PrefixList => "prefix-list",
+        PolicyKind::RouteMap => "route-map",
+    };
+    let attach = format!("neighbor {neighbor} {noun} {desired_name} out");
+    let restore = match current_name {
+        Some(ref name) => format!("neighbor {neighbor} {noun} {name} out"),
+        None => format!("no neighbor {neighbor} {noun} {desired_name} out"),
+    };
+    let mut desired_verify = vec![after.clone()];
+    let mut restore_verify = vec![before.clone()];
+    if kind == PolicyKind::PrefixList {
+        let desired = exact_permitted_prefixes(&desired_name, &prefix_lists)?;
+        let prior = current_name
+            .as_deref()
+            .map(|name| exact_permitted_prefixes(name, &prefix_lists))
+            .transpose()?
+            .unwrap_or_default();
+        for prefix in desired.union(&prior) {
+            desired_verify.push(DeviceStateSnapshot::BgpAdvertisement {
+                neighbor: neighbor.clone(),
+                prefix: prefix.clone(),
+                present: desired.contains(prefix),
+                community: None,
+            });
+            restore_verify.push(DeviceStateSnapshot::BgpAdvertisement {
+                neighbor: neighbor.clone(),
+                prefix: prefix.clone(),
+                present: prior.contains(prefix),
+                community: None,
+            });
+        }
+    } else if let Some(prefix_list) = current_prefix.as_deref() {
+        // Attribute-only route-map replacement must preserve reachability
+        // selected by the complementary prefix-list. Bind that actual routing
+        // proof into both apply and restore verification.
+        for prefix in exact_permitted_prefixes(prefix_list, &prefix_lists)? {
+            let proof = DeviceStateSnapshot::BgpAdvertisement {
+                neighbor: neighbor.clone(),
+                prefix,
+                present: true,
+                community: None,
+            };
+            desired_verify.push(proof.clone());
+            restore_verify.push(proof);
+        }
+    }
+    finish_prepared(
+        input,
+        effect,
+        export_attachment_commands(local_asn, &family, &neighbor, attach),
+        vec![before.clone()],
+        desired_verify.clone(),
+        desired_verify.clone(),
+        Some(PreparedInverse {
+            expected_current: desired_verify,
+            restore: restore_verify.clone(),
+            commands: export_attachment_commands(local_asn, &family, &neighbor, restore),
+            verify: restore_verify,
+        }),
+    )
+}
+
+fn exact_permitted_prefixes(
+    name: &str,
+    lists: &[crate::reroute::policy::NamedPrefixList],
+) -> Result<std::collections::BTreeSet<String>> {
+    let list = lists
+        .iter()
+        .find(|list| list.name == name)
+        .ok_or_else(|| anyhow::anyhow!("prefix-list {name} definition missing"))?;
+    exact_permitted_prefixes_from_list(list)
+}
+
+fn exact_permitted_prefixes_from_list(
+    list: &crate::reroute::policy::NamedPrefixList,
+) -> Result<std::collections::BTreeSet<String>> {
+    use crate::reroute::policy::PermitDeny;
+    let mut entries = list.entries.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|e| e.sequence);
+    if entries
+        .iter()
+        .any(|e| e.action == PermitDeny::Permit && (e.ge.is_some() || e.le.is_some()))
+    {
+        bail!("prefix-list {} has ranged permit semantics", list.name)
+    }
+    let candidates = entries
+        .iter()
+        .filter(|e| e.action == PermitDeny::Permit)
+        .map(|e| e.prefix.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut allowed = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let child_len = candidate
+            .rsplit_once('/')
+            .and_then(|(_, n)| n.parse::<u8>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid candidate prefix"))?;
+        let decision = entries
+            .iter()
+            .find(|entry| {
+                let base_len = entry
+                    .prefix
+                    .rsplit_once('/')
+                    .and_then(|(_, n)| n.parse::<u8>().ok())
+                    .unwrap_or(255);
+                let min = entry.ge.unwrap_or(base_len);
+                let max = entry
+                    .le
+                    .unwrap_or(if entry.ge.is_some() { 32 } else { base_len });
+                child_len >= min
+                    && child_len <= max
+                    && super::templates::cidr_contains(&entry.prefix, &candidate).unwrap_or(false)
+            })
+            .map(|entry| entry.action);
+        if decision == Some(PermitDeny::Permit) {
+            allowed.insert(candidate);
+        }
+    }
+    Ok(allowed)
+}
+
+fn export_attachment_commands(
+    local_asn: u32,
+    family: &str,
+    neighbor: &str,
+    line: String,
+) -> Vec<String> {
+    let mut commands = vec![
+        "configure terminal".into(),
+        format!("router bgp {local_asn}"),
+    ];
+    if family == "ipv4" {
+        commands.push("address-family ipv4".into())
+    }
+    commands.push(line);
+    if family == "ipv4" {
+        commands.push("exit-address-family".into())
+    }
+    commands.extend(["end".into(), format!("clear ip bgp {neighbor} soft out")]);
+    commands
+}
+
+fn prove_neighbor_context(config: &str, neighbor: &str) -> Result<(u32, String)> {
+    let local_asn = config
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("router bgp ")?.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("local BGP ASN is unproven"))?;
+    let mut family = "default_ipv4";
+    let mut found = std::collections::BTreeSet::new();
+    let mut global_declared = false;
+    for line in config.lines() {
+        let s = line.trim();
+        if let Some(v) = s.strip_prefix("address-family ") {
+            family = if v == "ipv4" || v == "ipv4 unicast" {
+                "ipv4"
+            } else {
+                "unsupported"
+            };
+            continue;
+        }
+        if s == "exit-address-family" {
+            family = "default_ipv4";
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix(&format!("neighbor {neighbor} ")) {
+            if family == "default_ipv4" {
+                global_declared = true;
+            } else if rest == "activate"
+                || rest.starts_with("prefix-list ")
+                || rest.starts_with("route-map ")
+            {
+                found.insert(family.to_string());
+            }
+        }
+    }
+    if found.is_empty() && global_declared {
+        found.insert("default_ipv4".into());
+    }
+    if found.len() != 1 {
+        bail!("peer {neighbor} was not proven in exactly one supported IPv4 configuration scope")
+    }
+    let family = found.into_iter().next().unwrap();
+    if family == "unsupported" {
+        bail!("peer {neighbor} is in an unsupported address family")
+    }
+    Ok((local_asn, family))
+}
+
+fn policy_definitions_without_references(
+    mut lists: Vec<crate::reroute::policy::NamedPrefixList>,
+    mut maps: Vec<crate::reroute::policy::NamedRouteMap>,
+) -> (
+    Vec<crate::reroute::policy::NamedPrefixList>,
+    Vec<crate::reroute::policy::NamedRouteMap>,
+) {
+    for list in &mut lists {
+        list.referenced_by.clear()
+    }
+    for map in &mut maps {
+        map.references.clear()
+    }
+    (lists, maps)
 }
 
 fn subst_string(subst: &serde_json::Map<String, Value>, name: &str) -> Result<String> {
@@ -1237,6 +1884,7 @@ async fn prepare_static_route(
     template: &super::templates::Template,
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let prefix = subst_string(subst, "prefix")?;
     let v6 = prefix.contains(':');
@@ -1266,7 +1914,7 @@ async fn prepare_static_route(
     let projected_before = projected.get(&key);
     let before = match projected_before {
         Some(state) => state.clone(),
-        None => read_static_route(pool, input.device_id, &desired).await?,
+        None => read_static_route(reader, input.device_id, &desired).await?,
     };
     let currently_present = static_present(&before)?;
     if desired_present
@@ -1282,7 +1930,7 @@ async fn prepare_static_route(
     if desired_present && !currently_present && projected_before.is_none() {
         // Refuse a same-prefix static with different next-hop/tag. Adding a
         // second path or replacing an operator-owned route is outside the plan.
-        ensure_no_conflicting_static(pool, input.device_id, &desired).await?;
+        ensure_no_conflicting_static(reader, input.device_id, &desired).await?;
     }
     let effect = if currently_present == desired_present {
         PreparedEffect::AlreadySatisfied
@@ -1299,7 +1947,7 @@ async fn prepare_static_route(
         state_key(input.device_id, &desired_resolution).expect("route resolution has key");
     let before_resolution = match projected.get(&resolution_key) {
         Some(state) => state.clone(),
-        None => read_route_resolution(pool, input.device_id, &prefix, "Null0").await?,
+        None => read_route_resolution(reader, input.device_id, &prefix, "Null0").await?,
     };
     let mut before_states = vec![before.clone(), before_resolution.clone()];
     let mut after_states = vec![after.clone(), desired_resolution.clone()];
@@ -1332,7 +1980,7 @@ async fn prepare_static_route(
                 } else {
                     format!("show ip bgp {prefix}")
                 };
-                let bgp_output = read_one(pool, input.device_id, &bgp_command).await?;
+                let bgp_output = reader.read_one(input.device_id, &bgp_command).await?;
                 let bgp_present = has_exact_cidr(&bgp_output, &prefix);
                 if bgp_present && !has_exact_bgp_route(&bgp_output, &prefix, Some(&community)) {
                     bail!("the existing exact BGP route does not carry the catalogued RTBH community; refusing an unclassifiable restore state");
@@ -1373,14 +2021,14 @@ async fn prepare_static_route(
 }
 
 async fn read_static_route(
-    pool: &MySqlPool,
+    reader: &impl PreparationReader,
     device_id: u64,
     desired: &DeviceStateSnapshot,
 ) -> Result<DeviceStateSnapshot> {
     let mut absent = desired.clone();
     set_static_present(&mut absent, false)?;
     let command = static_config_read_command(desired)?;
-    let output = read_one(pool, device_id, &command).await?;
+    let output = reader.read_one(device_id, &command).await?;
     if static_snapshot_matches(&output, desired)? {
         let mut present = desired.clone();
         set_static_present(&mut present, true)?;
@@ -1391,7 +2039,7 @@ async fn read_static_route(
 }
 
 async fn read_route_resolution(
-    pool: &MySqlPool,
+    reader: &impl PreparationReader,
     device_id: u64,
     prefix: &str,
     next_hop: &str,
@@ -1406,7 +2054,7 @@ async fn read_route_resolution(
     } else {
         format!("show ip route {network}")
     };
-    let output = read_one(pool, device_id, &command).await?;
+    let output = reader.read_one(device_id, &command).await?;
     Ok(DeviceStateSnapshot::RouteResolution {
         prefix: normalized.clone(),
         next_hop: next_hop.to_string(),
@@ -1415,7 +2063,7 @@ async fn read_route_resolution(
 }
 
 async fn ensure_no_conflicting_static(
-    pool: &MySqlPool,
+    reader: &impl PreparationReader,
     device_id: u64,
     desired: &DeviceStateSnapshot,
 ) -> Result<()> {
@@ -1432,12 +2080,12 @@ async fn ensure_no_conflicting_static(
         }
         _ => bail!("not a static route snapshot"),
     };
-    let output = read_one(
-        pool,
-        device_id,
-        &format!("show running-config | include ^{prefix} "),
-    )
-    .await?;
+    let output = reader
+        .read_one(
+            device_id,
+            &format!("show running-config | include ^{prefix} "),
+        )
+        .await?;
     if output.lines().any(|line| !line.trim().is_empty()) {
         bail!("a different same-prefix static route already exists; refusing to change operator-owned routing state");
     }
@@ -1477,7 +2125,7 @@ fn same_static_prefix(a: &DeviceStateSnapshot, b: &DeviceStateSnapshot) -> bool 
     }
 }
 
-fn static_config_line(state: &DeviceStateSnapshot) -> Result<String> {
+pub(crate) fn static_config_line(state: &DeviceStateSnapshot) -> Result<String> {
     match state {
         DeviceStateSnapshot::Ipv4StaticRoute {
             prefix,
@@ -1578,11 +2226,12 @@ fn static_route_commands(
 }
 
 async fn prepare_neighbor_shutdown(
-    pool: &MySqlPool,
+    _pool: &MySqlPool,
     input: &PrepareInput,
     template: &super::templates::Template,
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let neighbor = subst_string(subst, "neighbor_ip")?;
     let local_asn = subst_string(subst, "local_asn")?.parse::<u32>()?;
@@ -1596,12 +2245,9 @@ async fn prepare_neighbor_shutdown(
     let before = match projected.get(&key) {
         Some(state) => state.clone(),
         None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                "show running-config | section ^router bgp",
-            )
-            .await?;
+            let output = reader
+                .read_one(input.device_id, "show running-config | section ^router bgp")
+                .await?;
             let router_line = format!("router bgp {local_asn}");
             let peer_prefix = format!("neighbor {neighbor} ");
             if !output.lines().any(|line| line.trim() == router_line)
@@ -1631,12 +2277,12 @@ async fn prepare_neighbor_shutdown(
     let before_operational = match projected.get(&operational_key) {
         Some(state) => state.clone(),
         None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                &format!("show ip bgp neighbors {neighbor}"),
-            )
-            .await?;
+            let output = reader
+                .read_one(
+                    input.device_id,
+                    &format!("show ip bgp neighbors {neighbor}"),
+                )
+                .await?;
             let parsed = parse_bgp_neighbor_state(&output, &neighbor)?;
             DeviceStateSnapshot::BgpNeighborState {
                 neighbor: neighbor.clone(),
@@ -1690,116 +2336,141 @@ async fn prepare_neighbor_shutdown(
 }
 
 async fn prepare_route_map(
-    pool: &MySqlPool,
+    _pool: &MySqlPool,
     input: &PrepareInput,
     template: &super::templates::Template,
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let neighbor = subst_string(subst, "neighbor_ip")?;
     let local_asn = subst_string(subst, "local_asn")?.parse::<u32>()?;
     let direction = subst_string(subst, "direction")?;
     let requested = subst_string(subst, "route_map")?;
+    let output = reader
+        .read_one(input.device_id, "show running-config | section ^router bgp")
+        .await?;
+    let (proved_asn, family) = prove_neighbor_context(&output, &neighbor)?;
+    anyhow::ensure!(
+        proved_asn == local_asn,
+        "requested ASN differs from fresh BGP scope"
+    );
     let desired_map = (template.name == "bgp_route_map_set").then_some(requested.clone());
     let desired = DeviceStateSnapshot::RouteMapAssignment {
         local_asn,
         neighbor: neighbor.clone(),
         direction: direction.clone(),
+        address_family: Some(family.clone()),
         route_map: desired_map.clone(),
     };
     let key = state_key(input.device_id, &desired).unwrap();
     let before = match projected.get(&key) {
         Some(state) => state.clone(),
-        None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                "show running-config | section ^router bgp",
-            )
-            .await?;
-            let router_line = format!("router bgp {local_asn}");
-            let peer_prefix = format!("neighbor {neighbor} ");
-            if !output.lines().any(|line| line.trim() == router_line)
-                || !output
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(&peer_prefix))
-            {
-                bail!("fresh running-config did not prove BGP neighbor {neighbor} under AS {local_asn}");
-            }
-            let actual = parse_route_map_assignment(&output, &neighbor, &direction)?;
-            DeviceStateSnapshot::RouteMapAssignment {
-                local_asn,
-                neighbor: neighbor.clone(),
-                direction: direction.clone(),
-                route_map: actual,
-            }
-        }
+        None => DeviceStateSnapshot::RouteMapAssignment {
+            local_asn,
+            neighbor: neighbor.clone(),
+            direction: direction.clone(),
+            address_family: Some(family.clone()),
+            route_map: parse_route_map_assignment_scoped(&output, &neighbor, &direction, &family)?,
+        },
     };
     let current = match &before {
-        DeviceStateSnapshot::RouteMapAssignment { route_map, .. } => route_map.clone(),
-        _ => bail!("projected route-map state has the wrong type"),
+        DeviceStateSnapshot::RouteMapAssignment {
+            address_family: Some(scope),
+            route_map,
+            ..
+        } if scope == &family => route_map.clone(),
+        _ => bail!("route-map scope evidence is incomplete"),
     };
-    if template.name == "bgp_route_map_unset"
-        && current.as_deref().is_some_and(|map| map != requested)
+    if template.name == "bgp_route_map_unset" && current.as_deref().is_some_and(|m| m != requested)
     {
-        bail!(
-            "peer {neighbor} currently uses route-map {}; refusing to remove requested map {requested}",
-            current.as_deref().unwrap_or("")
-        );
+        bail!("peer currently uses a different route-map")
     }
     let effect = if current == desired_map {
         PreparedEffect::AlreadySatisfied
     } else {
         PreparedEffect::Change
     };
-    let commands = super::templates::render(template, &input.canonical_params)?.commands;
-    let restore_command = match &current {
+    let apply = match &desired_map {
+        Some(map) => format!("neighbor {neighbor} route-map {map} {direction}"),
+        None => format!("no neighbor {neighbor} route-map {requested} {direction}"),
+    };
+    let restore = match &current {
         Some(map) => format!("neighbor {neighbor} route-map {map} {direction}"),
         None => format!("no neighbor {neighbor} route-map {requested} {direction}"),
     };
     finish_prepared(
         input,
         effect,
-        commands,
+        scoped_route_map_commands(local_asn, &family, &neighbor, &direction, apply),
         vec![before.clone()],
         vec![desired.clone()],
         vec![desired.clone()],
         Some(PreparedInverse {
             expected_current: vec![desired],
             restore: vec![before.clone()],
-            commands: vec![
-                "configure terminal".into(),
-                format!("router bgp {local_asn}"),
-                restore_command,
-                "end".into(),
-                format!("clear ip bgp {neighbor} soft {direction}"),
-            ],
+            commands: scoped_route_map_commands(local_asn, &family, &neighbor, &direction, restore),
             verify: vec![before],
         }),
     )
 }
 
-fn parse_route_map_assignment(
+fn scoped_route_map_commands(
+    local_asn: u32,
+    family: &str,
+    neighbor: &str,
+    direction: &str,
+    line: String,
+) -> Vec<String> {
+    let mut out = vec![
+        "configure terminal".into(),
+        format!("router bgp {local_asn}"),
+    ];
+    if family != "default_ipv4" {
+        out.push(format!("address-family {family}"));
+    }
+    out.push(line);
+    if family != "default_ipv4" {
+        out.push("exit-address-family".into());
+    }
+    out.push("end".into());
+    out.push(format!("clear ip bgp {neighbor} soft {direction}"));
+    out
+}
+
+fn parse_route_map_assignment_scoped(
     output: &str,
     neighbor: &str,
     direction: &str,
+    wanted: &str,
 ) -> Result<Option<String>> {
-    let mut matches = output.lines().filter_map(|line| {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        match tokens.as_slice() {
-            ["neighbor", found, "route-map", map, found_direction]
-                if *found == neighbor && *found_direction == direction =>
-            {
-                Some((*map).to_string())
-            }
-            _ => None,
+    let mut family = "default_ipv4";
+    let mut found = Vec::new();
+    for line in output.lines() {
+        let s = line.trim();
+        if let Some(v) = s.strip_prefix("address-family ") {
+            family = if v == "ipv4" || v == "ipv4 unicast" {
+                "ipv4"
+            } else {
+                "unsupported"
+            };
+            continue;
         }
-    });
-    let first = matches.next();
-    if matches.next().is_some() {
-        bail!("neighbor {neighbor} has multiple {direction} route-map assignments");
+        if s == "exit-address-family" {
+            family = "default_ipv4";
+            continue;
+        }
+        let t = s.split_whitespace().collect::<Vec<_>>();
+        if let ["neighbor", peer, "route-map", map, dir] = t.as_slice() {
+            if *peer == neighbor && *dir == direction && family == wanted {
+                found.push((*map).to_string());
+            }
+        }
     }
-    Ok(first)
+    if found.len() > 1 {
+        bail!("multiple route-map assignments in proved scope")
+    }
+    Ok(found.pop())
 }
 
 struct ParsedBgpNeighborState {
@@ -1833,11 +2504,12 @@ fn parse_bgp_neighbor_state(output: &str, neighbor: &str) -> Result<ParsedBgpNei
 }
 
 async fn prepare_interface_mss(
-    pool: &MySqlPool,
+    _pool: &MySqlPool,
     input: &PrepareInput,
     template: &super::templates::Template,
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let interface = subst_string(subst, "interface")?;
     let desired_mss = if template.name == "iface_tcp_adjust_mss" {
@@ -1853,12 +2525,12 @@ async fn prepare_interface_mss(
     let before = match projected.get(&key) {
         Some(state) => state.clone(),
         None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                &format!("show running-config interface {interface}"),
-            )
-            .await?;
+            let output = reader
+                .read_one(
+                    input.device_id,
+                    &format!("show running-config interface {interface}"),
+                )
+                .await?;
             if !output
                 .lines()
                 .any(|line| line.trim() == format!("interface {interface}"))
@@ -1912,11 +2584,12 @@ async fn prepare_interface_mss(
 }
 
 async fn prepare_interface_admin(
-    pool: &MySqlPool,
+    _pool: &MySqlPool,
     input: &PrepareInput,
     template: &super::templates::Template,
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
+    reader: &impl PreparationReader,
 ) -> Result<PreparedDeviceAction> {
     let interface = subst_string(subst, "interface")?;
     let desired_shutdown = template.name == "iface_shutdown";
@@ -1928,12 +2601,12 @@ async fn prepare_interface_admin(
     let before = match projected.get(&key) {
         Some(state) => state.clone(),
         None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                &format!("show running-config interface {interface}"),
-            )
-            .await?;
+            let output = reader
+                .read_one(
+                    input.device_id,
+                    &format!("show running-config interface {interface}"),
+                )
+                .await?;
             if !output
                 .lines()
                 .any(|line| line.trim() == format!("interface {interface}"))
@@ -1958,12 +2631,9 @@ async fn prepare_interface_admin(
     let before_operational = match projected.get(&operational_key) {
         Some(state) => state.clone(),
         None => {
-            let output = read_one(
-                pool,
-                input.device_id,
-                &format!("show interfaces {interface}"),
-            )
-            .await?;
+            let output = reader
+                .read_one(input.device_id, &format!("show interfaces {interface}"))
+                .await?;
             if !output
                 .lines()
                 .any(|line| line.trim_start().starts_with(&format!("{interface} is ")))
@@ -2079,8 +2749,16 @@ fn state_key(device_id: u64, state: &DeviceStateSnapshot) -> Option<String> {
         DeviceStateSnapshot::RouteMapAssignment {
             neighbor,
             direction,
+            address_family,
             ..
-        } => format!("route_map:{neighbor}:{direction}"),
+        } => format!("route_map:{neighbor}:{direction}:{address_family:?}"),
+        DeviceStateSnapshot::ExportPolicyAttachment {
+            neighbor,
+            address_family,
+            ..
+        } => {
+            format!("export_policy:{neighbor}:{address_family}")
+        }
         DeviceStateSnapshot::InterfaceAdmin { interface, .. } => {
             format!("interface_admin:{interface}")
         }
@@ -2262,13 +2940,13 @@ mod tests {
     }
 
     #[test]
-    fn prepared_catalog_covers_the_eighteen_seeded_action_types_once() {
+    fn prepared_catalog_covers_the_nineteen_seeded_action_types_once() {
         let unique = PREPARED_TEMPLATE_NAMES
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(PREPARED_TEMPLATE_NAMES.len(), 18);
-        assert_eq!(unique.len(), 18);
+        assert_eq!(PREPARED_TEMPLATE_NAMES.len(), 19);
+        assert_eq!(unique.len(), 19);
         for required in [
             "iface_tcp_adjust_mss",
             "bgp_route_map_set",
@@ -2499,6 +3177,7 @@ mod tests {
                 local_asn: 65000,
                 neighbor: "192.0.2.1".into(),
                 direction: "out".into(),
+                address_family: Some("default_ipv4".into()),
                 route_map: Some("EXPORT".into()),
             },
             DeviceStateSnapshot::InterfaceAdmin {
@@ -2515,6 +3194,16 @@ mod tests {
             },
         ];
         assert!(verify_current(&mut fake, 1, &expected).await.unwrap());
+        let legacy_scopeless = DeviceStateSnapshot::RouteMapAssignment {
+            local_asn: 65000,
+            neighbor: "192.0.2.1".into(),
+            direction: "out".into(),
+            address_family: None,
+            route_map: Some("EXPORT".into()),
+        };
+        assert!(!verify_current(&mut fake, 1, &[legacy_scopeless])
+            .await
+            .unwrap());
 
         let wrong_tag = DeviceStateSnapshot::Ipv4StaticRoute {
             prefix: "203.0.113.0/24".into(),
@@ -2640,5 +3329,286 @@ mod tests {
             prepared_at: Utc::now(),
         };
         assert!(!verify_projected_after(&mut fake, &[action]).await.unwrap());
+    }
+
+    #[test]
+    fn export_attachment_commands_keep_the_proven_scope() {
+        let af = export_attachment_commands(
+            34501,
+            "ipv4",
+            "192.0.2.1",
+            "neighbor 192.0.2.1 prefix-list P out".into(),
+        );
+        assert_eq!(
+            af,
+            vec![
+                "configure terminal",
+                "router bgp 34501",
+                "address-family ipv4",
+                "neighbor 192.0.2.1 prefix-list P out",
+                "exit-address-family",
+                "end",
+                "clear ip bgp 192.0.2.1 soft out"
+            ]
+        );
+        let global = export_attachment_commands(
+            34501,
+            "default_ipv4",
+            "192.0.2.1",
+            "neighbor 192.0.2.1 route-map R out".into(),
+        );
+        assert!(!global.iter().any(|line| line.starts_with("address-family")));
+        assert_eq!(global[2], "neighbor 192.0.2.1 route-map R out");
+    }
+
+    #[test]
+    fn neighbor_context_is_exact_and_ambiguous_context_refuses() {
+        let config="router bgp 34501\n neighbor 192.0.2.1 remote-as 64500\n address-family ipv4\n neighbor 192.0.2.10 remote-as 64501\n exit-address-family";
+        assert_eq!(
+            prove_neighbor_context(config, "192.0.2.1").unwrap(),
+            (34501, "default_ipv4".into())
+        );
+        let normal="router bgp 34501\n neighbor 192.0.2.1 remote-as 64500\n address-family ipv4\n neighbor 192.0.2.1 activate\n neighbor 192.0.2.1 prefix-list pfx-to-viva out\n exit-address-family";
+        assert_eq!(
+            prove_neighbor_context(normal, "192.0.2.1").unwrap(),
+            (34501, "ipv4".into())
+        );
+    }
+
+    #[test]
+    fn emdd_second_prefix_makes_replacement_additive_not_destructive() {
+        use crate::reroute::policy::{NamedPrefixList, PermitDeny};
+        let entry = |sequence: u32, prefix: &str| PrefixListSnapshotEntry {
+            sequence,
+            permit: true,
+            prefix: prefix.into(),
+            ge: None,
+            le: None,
+        };
+        let named = |name: &str, entries: Vec<PrefixListSnapshotEntry>| NamedPrefixList {
+            name: name.into(),
+            entries: entries
+                .into_iter()
+                .map(|e| crate::reroute::policy::PrefixListEntry {
+                    sequence: e.sequence,
+                    action: PermitDeny::Permit,
+                    prefix: e.prefix,
+                    ge: e.ge,
+                    le: e.le,
+                })
+                .collect(),
+            referenced_by: vec![],
+        };
+        let lists = vec![
+            named("eMA1", vec![entry(5, "194.105.142.0/24")]),
+            named(
+                "eMA2",
+                vec![entry(5, "194.105.142.0/24"), entry(10, "194.102.117.0/24")],
+            ),
+        ];
+        let state = |name: &str| DeviceStateSnapshot::ExportPolicyAttachment {
+            local_asn: 34501,
+            neighbor: "192.0.2.1".into(),
+            address_family: "ipv4".into(),
+            prefix_list: Some(name.into()),
+            route_map: None,
+            prefix_lists: lists.clone(),
+            route_maps: vec![],
+        };
+        let action = PreparedDeviceAction {
+            schema_version: 1,
+            device_id: 1,
+            template_id: 1,
+            template_name: "bgp_export_policy_set".into(),
+            canonical_params: serde_json::json!({"policy_kind":"prefix_list"}),
+            commands: vec!["x".into()],
+            before: vec![state("eMA1")],
+            after: vec![state("eMA2")],
+            verify: vec![state("eMA2")],
+            effect: PreparedEffect::Change,
+            inverse: None,
+            prepared_at: Utc::now(),
+        };
+        assert_eq!(
+            prepared_safety_effect(&action).unwrap(),
+            PreparedSafetyEffect::Additive
+        );
+        let mut complemented = action.clone();
+        let attribute_map = crate::reroute::policy::NamedRouteMap {
+            name: "prepend-3".into(),
+            references: vec![],
+            clauses: vec![crate::reroute::policy::RouteMapClause {
+                sequence: 10,
+                action: PermitDeny::Permit,
+                matches: vec![],
+                sets: vec![crate::reroute::policy::PolicyTerm {
+                    kind: "as-path_prepend".into(),
+                    value: "as-path prepend 34501".into(),
+                }],
+            }],
+        };
+        for state in complemented
+            .before
+            .iter_mut()
+            .chain(complemented.after.iter_mut())
+        {
+            if let DeviceStateSnapshot::ExportPolicyAttachment {
+                route_map,
+                route_maps,
+                ..
+            } = state
+            {
+                *route_map = Some("prepend-3".into());
+                *route_maps = vec![attribute_map.clone()];
+            }
+        }
+        assert_eq!(
+            prepared_safety_effect(&complemented).unwrap(),
+            PreparedSafetyEffect::Additive
+        );
+        if let DeviceStateSnapshot::ExportPolicyAttachment { route_maps, .. } =
+            &mut complemented.after[0]
+        {
+            route_maps[0].clauses[0]
+                .matches
+                .push(crate::reroute::policy::PolicyTerm {
+                    kind: "ip_address".into(),
+                    value: "ip address 10".into(),
+                });
+        }
+        assert_eq!(
+            prepared_safety_effect(&complemented).unwrap(),
+            PreparedSafetyEffect::Unproven
+        );
+        let reverse = PreparedDeviceAction {
+            before: action.after.clone(),
+            after: action.before.clone(),
+            verify: action.before.clone(),
+            ..action
+        };
+        assert_eq!(
+            prepared_safety_effect(&reverse).unwrap(),
+            PreparedSafetyEffect::Destructive
+        );
+        let mut unrestricted = reverse.clone();
+        if let DeviceStateSnapshot::ExportPolicyAttachment { prefix_list, .. } =
+            &mut unrestricted.before[0]
+        {
+            *prefix_list = None;
+        }
+        assert_eq!(
+            prepared_safety_effect(&unrestricted).unwrap(),
+            PreparedSafetyEffect::Unproven
+        );
+    }
+
+    #[test]
+    fn attribute_only_permit_all_route_map_is_proven_neutral() {
+        use crate::reroute::policy::{NamedRouteMap, PermitDeny, PolicyTerm, RouteMapClause};
+        let safe = NamedRouteMap {
+            name: "PREPEND".into(),
+            references: vec![],
+            clauses: vec![RouteMapClause {
+                sequence: 10,
+                action: PermitDeny::Permit,
+                matches: vec![],
+                sets: vec![PolicyTerm {
+                    kind: "as-path_prepend".into(),
+                    value: "as-path prepend 65001 65001".into(),
+                }],
+            }],
+        };
+        let state = |name: Option<&str>| DeviceStateSnapshot::ExportPolicyAttachment {
+            local_asn: 34501,
+            neighbor: "192.0.2.1".into(),
+            address_family: "ipv4".into(),
+            prefix_list: Some("EMDD".into()),
+            route_map: name.map(Into::into),
+            prefix_lists: vec![],
+            route_maps: vec![safe.clone()],
+        };
+        let action = PreparedDeviceAction {
+            schema_version: 1,
+            device_id: 1,
+            template_id: 1,
+            template_name: "bgp_export_policy_set".into(),
+            canonical_params: serde_json::json!({"policy_kind":"route_map"}),
+            commands: vec!["x".into()],
+            before: vec![state(None)],
+            after: vec![state(Some("PREPEND"))],
+            verify: vec![state(Some("PREPEND"))],
+            effect: PreparedEffect::Change,
+            inverse: None,
+            prepared_at: Utc::now(),
+        };
+        assert_eq!(
+            prepared_safety_effect(&action).unwrap(),
+            PreparedSafetyEffect::Neutral
+        );
+        let mut unsafe_action = action.clone();
+        if let DeviceStateSnapshot::ExportPolicyAttachment { route_maps, .. } =
+            &mut unsafe_action.after[0]
+        {
+            route_maps[0].clauses[0].matches.push(PolicyTerm {
+                kind: "ip_address".into(),
+                value: "ip address prefix-list FILTER".into(),
+            });
+        }
+        assert_eq!(
+            prepared_safety_effect(&unsafe_action).unwrap(),
+            PreparedSafetyEffect::Unproven
+        );
+        let mut unsafe_before = action.clone();
+        if let DeviceStateSnapshot::ExportPolicyAttachment {
+            route_map,
+            route_maps,
+            ..
+        } = &mut unsafe_before.before[0]
+        {
+            *route_map = Some("PREPEND".into());
+            route_maps[0].clauses[0].action = PermitDeny::Deny;
+        }
+        assert_eq!(
+            prepared_safety_effect(&unsafe_before).unwrap(),
+            PreparedSafetyEffect::Unproven
+        );
+    }
+
+    #[test]
+    fn exact_policy_evaluator_supports_terminal_deny_and_respects_early_shadow() {
+        use crate::reroute::policy::{NamedPrefixList, PermitDeny, PrefixListEntry};
+        let entry = |sequence, action, prefix: &str, le| PrefixListEntry {
+            sequence,
+            action,
+            prefix: prefix.into(),
+            ge: None,
+            le,
+        };
+        let valid = NamedPrefixList {
+            name: "EMDD".into(),
+            referenced_by: vec![],
+            entries: vec![
+                entry(5, PermitDeny::Permit, "194.105.142.0/24", None),
+                entry(10, PermitDeny::Deny, "0.0.0.0/0", Some(32)),
+            ],
+        };
+        assert_eq!(
+            exact_permitted_prefixes_from_list(&valid)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["194.105.142.0/24"]
+        );
+        let shadowed = NamedPrefixList {
+            name: "BAD".into(),
+            referenced_by: vec![],
+            entries: vec![
+                entry(1, PermitDeny::Deny, "194.105.0.0/16", Some(24)),
+                entry(5, PermitDeny::Permit, "194.105.142.0/24", None),
+            ],
+        };
+        assert!(exact_permitted_prefixes_from_list(&shadowed)
+            .unwrap()
+            .is_empty());
     }
 }

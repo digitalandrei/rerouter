@@ -23,6 +23,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { toast } from "sonner";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   api,
   type Rule,
@@ -39,11 +40,12 @@ import { ActionParamsForm } from "@/components/action-params-form";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ApplyMitigationDialog, ApplyResultRow } from "@/components/apply-mitigation-dialog";
 import { OrderedActionSetEditor } from "@/components/ordered-action-set-editor";
+import { ActionsAndRevert } from "@/components/actions-and-revert";
 import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
 import { metricLabel, isFlowMetric } from "./rules/rule-constants";
-import { templateLabel, templateLabelFrom, timeAgo } from "@/lib/labels";
+import { orderTemplatesForChoice, templateGuidance, templateLabel, templateLabelFrom, timeAgo } from "@/lib/labels";
 import { useAuth } from "@/lib/auth";
 import { expandBulkActions, importActionCopies } from "@/lib/action-sets";
 import { Badge } from "@/components/ui/badge";
@@ -147,7 +149,7 @@ const DISARM_CONSEQUENCE =
   "Detection and alerting still run; automatic mitigation does not. " +
   "Manual execution is still possible but will be refused until the parameters are fixed.";
 
-function RuleActionsDialog({
+export function RuleActionsDialog({
   rule,
   onClose,
   onChanged,
@@ -156,7 +158,10 @@ function RuleActionsDialog({
   onClose: () => void;
   onChanged: (updated: Rule) => void;
 }) {
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission("edit_rules");
   const [current, setCurrent] = useState<Rule>(rule);
+  const [draftActions, setDraftActions] = useState<RuleAction[]>(rule.actions ?? []);
   const [allTemplates, setAllTemplates] = useState<Template[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [presets, setPresets] = useState<MitigationPreset[]>([]);
@@ -176,6 +181,8 @@ function RuleActionsDialog({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [resourcesLoading, setResourcesLoading] = useState(true);
+  const [resourcesError, setResourcesError] = useState<string | null>(null);
   /** Set when the operator starts fixing a drifted action: the add form is
    *  primed with that action's template + router and this says what to re-pick. */
   const [fixHint, setFixHint] = useState<string | null>(null);
@@ -200,18 +207,9 @@ function RuleActionsDialog({
   const BGP_ADVERTISE_REMOVE = "bgp_advertise_remove";
 
   useEffect(() => {
-    api.templates
-      .list()
-      .then((ts) => setAllTemplates(ts.filter((t) => t.provider_type === "device_cli" && t.enabled)))
-      .catch(() => setAllTemplates([]));
-    api.devices
-      .list()
-      .then(setDevices)
-      .catch(() => setDevices([]));
-    api.mitigationPresets
-      .list()
-      .then((items) => setPresets(items.filter((item) => !item.archived_at)))
-      .catch(() => setPresets([]));
+    let cancelled = false; setResourcesLoading(true);
+    Promise.all([api.templates.list(), api.devices.list(), api.mitigationPresets.list()]).then(([templates, loadedDevices, loadedPresets]) => { if (cancelled) return; setAllTemplates(templates.filter((item) => item.provider_type === "device_cli" && item.enabled)); setDevices(loadedDevices); setPresets(loadedPresets.filter((item) => !item.archived_at)); setResourcesError(null); }).catch((cause) => { if (!cancelled) setResourcesError(cause instanceof Error ? cause.message : "Supporting action data unavailable"); }).finally(() => { if (!cancelled) setResourcesLoading(false); });
+    return () => { cancelled = true; };
   }, []);
 
   // Per-device inventory needed by the bulk form: announced prefixes (the
@@ -246,7 +244,7 @@ function RuleActionsDialog({
   }, [deviceIds]);
 
   // Templates shown in the dropdown: hide MSS templates (they're only used via the bundle).
-  const visibleTemplates = allTemplates.filter((t) => !MSS_TEMPLATE_NAMES.includes(t.name));
+  const visibleTemplates = orderTemplatesForChoice(allTemplates.filter((t) => !MSS_TEMPLATE_NAMES.includes(t.name)));
 
   const template = allTemplates.find((t) => String(t.id) === templateId) ?? null;
   const schema = template?.parameter_schema ?? {};
@@ -294,7 +292,8 @@ function RuleActionsDialog({
       .sort((a, b) => a.prefix.localeCompare(b.prefix));
   })();
 
-  const actions = current.actions ?? [];
+  const actions = draftActions;
+  const dirty = JSON.stringify(actions.map(actionDraft)) !== JSON.stringify((rule.actions ?? []).map(actionDraft));
   /** Server-reported disarm (null once the rule is armed again). */
   const disarmed = autoDisarm(current);
   /** Next free rank. Order is a safety property — additive actions (advertise)
@@ -355,19 +354,6 @@ function RuleActionsDialog({
     setMssValue("1436");
   }
 
-  /** Re-read the rule so the list always shows what is really persisted, never
-   *  what this component hoped happened (audit finding FE-06). */
-  async function reconcile(fallback: Rule) {
-    try {
-      const fresh = await api.rules.get(current.id);
-      setCurrent(fresh);
-      onChanged(fresh);
-    } catch {
-      setCurrent(fallback);
-      onChanged(fallback);
-    }
-  }
-
   /** Build the routers x prefixes product for the current form. */
   function buildPlan(): PlannedAction[] | string {
     if (!template) return "Pick a template and at least one target router.";
@@ -406,61 +392,38 @@ function RuleActionsDialog({
     }));
   }
 
-  async function add() {
+  function add() {
     const plan = buildPlan();
     if (typeof plan === "string") {
       setError(plan);
       return;
     }
-    setBusy(true);
     setError(null);
     setNotice(null);
-    try {
-      const updated = await api.rules.saveActions(current.id, {
-        revision: current.actions_revision ?? 0,
-        actions: [
-          ...actions.map(actionDraft),
-          ...plan.map((item) => ({
+    setDraftActions((existing) => [
+          ...existing,
+          ...plan.map((item, index) => ({
+            id: -(Date.now() + index),
             reroute_template_id: item.reroute_template_id,
             device_id: item.device_id,
             params: item.params,
             enabled: true,
             auto_target: item.auto_target ?? null,
+            position: existing.length + index,
+            template_name: allTemplates.find((template) => template.id === item.reroute_template_id)?.name ?? "",
+            template_display_name: allTemplates.find((template) => template.id === item.reroute_template_id)?.display_name ?? null,
+            device_name: devices.find((device) => device.id === item.device_id)?.name ?? `device ${item.device_id}`,
           })),
-        ],
-      });
-      setCurrent(updated);
-      onChanged(updated);
+        ] as RuleAction[]);
       resetAddForm();
       setNotice(
-        `Added ${plan.length} action${plan.length === 1 ? "" : "s"} at position ${nextPosition}+.`,
+        `Added ${plan.length} draft action${plan.length === 1 ? "" : "s"}. Save the complete set to apply these changes.`,
       );
-    } catch (e) {
-      setError(
-        `${e instanceof ApiError ? e.message : "Save failed"}. No action was added; ` +
-          "the server saves and validates the complete ordered set atomically.",
-      );
-      await reconcile(current);
-    } finally {
-      setBusy(false);
-    }
   }
 
-  async function remove(index: number) {
-    const next = actions.filter((_, itemIndex) => itemIndex !== index).map(actionDraft);
-    setBusy(true);
-    setError(null);
-    try {
-      const updated = await api.rules.saveActions(current.id, {
-        revision: current.actions_revision ?? 0,
-        actions: next,
-      });
-      setCurrent(updated);
-      onChanged(updated);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Could not remove action");
-      await reconcile(current);
-    } finally { setBusy(false); }
+  function remove(index: number) {
+    setDraftActions((existing) => existing.filter((_, itemIndex) => itemIndex !== index));
+    setEditActionIndex(null);
   }
 
   /**
@@ -469,57 +432,37 @@ function RuleActionsDialog({
    * could. On failure the rule is re-read, so the list is always the persisted
    * truth rather than an optimistic guess.
    */
-  async function move(index: number, delta: -1 | 1) {
+  function move(index: number, delta: -1 | 1) {
     const target = index + delta;
     if (target < 0 || target >= actions.length || busy) return;
     const desired = [...actions];
     const [moved] = desired.splice(index, 1);
     desired.splice(target, 0, moved);
 
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const updated = await api.rules.saveActions(current.id, {
-        revision: current.actions_revision ?? 0,
-        actions: desired.map(actionDraft),
-      });
-      setCurrent(updated);
-      onChanged(updated);
-    } catch (e) {
-      setError(
-        `Reorder failed: ${e instanceof ApiError ? e.message : "request failed"}. ` +
-          `The list above is the real saved state.`,
-      );
-      await reconcile(current);
-    } finally {
-      setBusy(false);
-    }
+    setDraftActions(desired);
+    setEditActionIndex(target);
   }
 
-  async function importPreset() {
+  function importPreset() {
     const preset = presets.find((item) => String(item.id) === presetImportId);
     if (!preset) return;
-    setBusy(true);
     setError(null);
     setNotice(null);
-    try {
-      const updated = await api.rules.saveActions(current.id, {
-        revision: current.actions_revision ?? 0,
-        actions: importActionCopies(actions.map(actionDraft), preset.actions, importMode),
-        preset_id: preset.id,
-        preset_revision: preset.revision,
-      });
-      setCurrent(updated);
-      onChanged(updated);
+      setDraftActions(importActionCopies(actions.map(actionDraft), preset.actions, importMode).map((action, index) => ({ ...action, id: action.id ?? -(Date.now() + index), position: index, template_name: allTemplates.find((item) => item.id === action.reroute_template_id)?.name ?? "", template_display_name: allTemplates.find((item) => item.id === action.reroute_template_id)?.display_name ?? null, device_name: devices.find((item) => item.id === action.device_id)?.name ?? `device ${action.device_id}` })) as RuleAction[]);
       setPresetImportId("");
       setNotice(
-        `Imported an independent copy of “${preset.name}”. Future preset edits will not change this rule. Automatic execution was disarmed for review.`,
+        `Imported a draft copy of “${preset.name}”. Save the complete set when review is finished.`,
       );
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Preset import failed");
-      await reconcile(current);
-    } finally { setBusy(false); }
+  }
+
+  async function saveDraft() {
+    setBusy(true); setError(null);
+    try {
+      const updated = await api.rules.saveActions(current.id, { revision: current.actions_revision ?? 0, actions: actions.map(actionDraft) });
+      setCurrent(updated); setDraftActions(updated.actions ?? []); onChanged(updated);
+      setNotice("Complete ordered action set saved atomically. Automatic execution was disarmed for review.");
+    } catch (cause) { setError(cause instanceof ApiError ? cause.message : "Complete action set could not be saved"); }
+    finally { setBusy(false); }
   }
 
   async function toggleAuto() {
@@ -554,16 +497,18 @@ function RuleActionsDialog({
   })();
 
   return (
-    <Dialog open onOpenChange={(v) => !v && !busy && onClose()}>
+    <Dialog open onOpenChange={(v) => { if (!v && !busy && (!dirty || window.confirm("Discard unsaved action changes?"))) onClose(); }}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Mitigation actions — {current.name}</DialogTitle>
           <DialogDescription>
             When this rule fires (its sliding window holds), these mitigations run
             on the selected routers, <strong>in the order shown</strong>. Observe
-            mode always renders a plan only.
+            mode disables automatic response; explicit manual runs still require a preview and confirmation.
           </DialogDescription>
         </DialogHeader>
+        {resourcesLoading && <p role="status" className="text-sm text-muted-foreground">Loading action templates and router inventory…</p>}
+        {resourcesError && <p role="alert" className="text-sm text-destructive">{resourcesError}. Existing saved actions remain visible, but editing is unavailable until this data loads.</p>}
 
         {/* Auto-execution disarmed by the controller (inventory drift). Status
             only — re-arming uses the normal switch below, which still goes
@@ -593,13 +538,13 @@ function RuleActionsDialog({
             <div className="text-xs text-muted-foreground">
               In <strong>enforce</strong> mode, execute these actions the moment
               the rule fires (gated by device locks &amp; cooldowns). In observe
-              mode nothing runs. Off = the operator runs them manually.
+              mode automatic execution is paused. Off = the operator runs them manually.
             </div>
           </div>
           <Switch
             checked={current.automatic_reroute_enabled}
             onCheckedChange={() => void toggleAuto()}
-            disabled={actions.length === 0}
+            disabled={!canEdit || actions.length === 0 || dirty}
             aria-label="Toggle automatic execution"
             title={
               actions.length === 0
@@ -615,14 +560,14 @@ function RuleActionsDialog({
             <div className="font-medium">Allow manual apply</div>
             <div className="text-xs text-muted-foreground">
               Operators can manually apply this rule's actions from a firing alert.
-              Independent of automatic execution; still blocked in observe mode
-              and gated by the manual-reroute permission, locks and cooldowns.
+              Independent of automatic execution and available in Observe after
+              an exact preview; still gated by permission, locks and cooldowns.
             </div>
           </div>
           <Switch
             checked={current.manual_apply_enabled}
             onCheckedChange={() => void toggleManualApply()}
-            disabled={actions.length === 0}
+            disabled={!canEdit || actions.length === 0 || dirty}
             aria-label="Toggle manual apply"
             title={
               actions.length === 0
@@ -638,7 +583,7 @@ function RuleActionsDialog({
             <Info className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
             <p className="text-xs text-muted-foreground">
               Execution order matters: put additive actions before destructive ones.
-              Every reorder, add, remove, or import now saves the complete set atomically.
+              Reorder, add, remove, and import stay in this draft until Save writes the complete set atomically.
             </p>
           </div>
           <OrderedActionSetEditor
@@ -652,13 +597,15 @@ function RuleActionsDialog({
             templates={allTemplates}
             devices={devices}
             busy={busy}
-            onMove={(index, delta) => void move(index, delta)}
-            onRemove={(index) => void remove(index)}
+            readOnly={!canEdit || Boolean(resourcesError)}
+            onMove={canEdit ? (index, delta) => move(index, delta) : undefined}
+            onRemove={canEdit ? (index) => remove(index) : undefined}
             selectedIndex={editActionIndex}
             onSelect={setEditActionIndex}
             emptyMessage="No actions attached yet. Add actions or import a saved manual mitigation."
           />
-          {editActionIndex !== null && actions[editActionIndex] && (() => {
+          <ActionsAndRevert actions={actions.map(actionDraft)} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} />
+          {canEdit && editActionIndex !== null && actions[editActionIndex] && (() => {
             const action = actions[editActionIndex];
             const actionTemplate = allTemplates.find((item) => item.id === action.reroute_template_id);
             if (!actionTemplate) return null;
@@ -667,14 +614,12 @@ function RuleActionsDialog({
             return <div className="space-y-3 rounded-md border border-border bg-muted/30 p-3">
               <div><div className="text-sm font-medium">Edit action {editActionIndex + 1}</div><p className="text-xs text-muted-foreground">Changing the router clears inventory-bound parameters. Save validates and replaces the complete set atomically.</p></div>
               <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={action.device_id} onChange={(event) => {
-                const next = [...actions]; next[editActionIndex] = { ...action, device_id: Number(event.target.value), params: {} }; setCurrent({ ...current, actions: next });
+                const next = [...actions]; next[editActionIndex] = { ...action, device_id: Number(event.target.value), params: {} }; setDraftActions(next);
               }}>{devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
               <ActionParamsForm schema={actionTemplate.parameter_schema} deviceId={action.device_id} values={values} omitParams={omit} onChange={(nextValues) => {
-                const next = [...actions]; next[editActionIndex] = { ...action, params: Object.fromEntries(Object.entries(nextValues).filter(([, value]) => value.trim() !== "")) }; setCurrent({ ...current, actions: next });
+                const next = [...actions]; next[editActionIndex] = { ...action, params: Object.fromEntries(Object.entries(nextValues).filter(([, value]) => value.trim() !== "")) }; setDraftActions(next);
               }} />
-              <div className="flex justify-end gap-2"><Button variant="outline" size="sm" onClick={() => { setEditActionIndex(null); void reconcile(rule); }}>Cancel</Button><Button size="sm" disabled={busy} onClick={async () => {
-                setBusy(true); setError(null); try { const updated = await api.rules.saveActions(current.id, { revision: current.actions_revision ?? 0, actions: (current.actions ?? []).map(actionDraft) }); setCurrent(updated); onChanged(updated); setEditActionIndex(null); setNotice("Action updated; automatic execution was disarmed for review."); } catch (error) { setError(error instanceof ApiError ? error.message : "Action update failed"); await reconcile(rule); } finally { setBusy(false); }
-              }}>Save complete set</Button></div>
+              <div className="flex justify-end"><Button variant="outline" size="sm" onClick={() => setEditActionIndex(null)}>Done editing step</Button></div>
             </div>;
           })()}
           {driftedActions(current).map((action) => (
@@ -689,7 +634,7 @@ function RuleActionsDialog({
           ))}
         </div>
 
-        {presets.length > 0 && (
+        {canEdit && presets.length > 0 && (
           <div className="space-y-3 rounded-md border border-border p-3">
             <div>
               <div className="text-sm font-medium">Import saved manual mitigation</div>
@@ -706,7 +651,7 @@ function RuleActionsDialog({
                 <option value="append">Append</option>
                 <option value="replace">Replace all</option>
               </select>
-              <Button variant="outline" onClick={() => void importPreset()} disabled={busy || !presetImportId}>
+              <Button variant="outline" onClick={() => importPreset()} disabled={!canEdit || busy || !presetImportId}>
                 Import copy
               </Button>
             </div>
@@ -714,7 +659,7 @@ function RuleActionsDialog({
         )}
 
         {/* Add actions (bulk: routers x prefixes) */}
-        <div ref={addFormRef} className="space-y-3 rounded-md border border-dashed border-border p-3">
+        <div ref={addFormRef} className={canEdit ? "space-y-3 rounded-md border border-dashed border-border p-3" : "hidden"}>
           {/* Where a drifted action gets fixed: same template + router, params
               re-picked from freshly discovered inventory. */}
           {fixHint && (
@@ -745,6 +690,7 @@ function RuleActionsDialog({
                 </option>
               ))}
             </select>
+            {template && templateGuidance(template.name) && <span className="block text-xs font-normal text-muted-foreground">{templateGuidance(template.name)}</span>}
           </label>
 
           {/* Target routers — multi-select */}
@@ -950,8 +896,8 @@ function RuleActionsDialog({
           )}
           <Button
             size="sm"
-            onClick={() => void add()}
-            disabled={busy || plannedCount === 0}
+                  onClick={() => add()}
+                  disabled={!canEdit || busy || plannedCount === 0}
           >
             <Plus className="size-4" />
             {busy
@@ -961,6 +907,10 @@ function RuleActionsDialog({
                   : "Add action"}
           </Button>
         </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => { if (!dirty || window.confirm("Discard unsaved action changes?")) onClose(); }}>{canEdit ? "Cancel" : "Close"}</Button>
+          {canEdit && <Button disabled={busy || !dirty} onClick={() => void saveDraft()}>{busy ? "Saving…" : "Save complete set"}</Button>}
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -974,7 +924,7 @@ const inputClass =
 
 /** Human-readable condition string: "rx_bps > 8000000000" */
 function conditionLabel(rule: Rule): string {
-  return `${metricLabel(rule.metric)} ${rule.operator} ${rule.threshold_value.toLocaleString()}`;
+  return `${metricLabel(rule.metric)} ${rule.operator} ${fmtMetric(rule.metric, rule.threshold_value)}`;
 }
 
 /** Format a metric value with its natural unit. */
@@ -1126,7 +1076,7 @@ function ClearRuleDialog({ rule, onClose, onChanged }: {
       {(phase === "preview" || phase === "result") && <div className="max-h-[55vh] space-y-3 overflow-y-auto" aria-live="polite">
         {(response?.results ?? []).map((result, index) => <ApplyResultRow key={index} r={result} />)}
         {phase === "preview" && (response?.results?.length ?? 0) === 0 && <p className="text-sm text-muted-foreground">No router rollback is required. Confirmation will clear only the detection state.</p>}
-        {phase === "preview" && !token && (response?.results?.length ?? 0) > 0 && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode cannot reverse the actions still applied by this rule. Switch to enforce mode and prepare a fresh rollback preview before clearing it.</p>}
+        {phase === "preview" && !token && (response?.results?.length ?? 0) > 0 && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">The server did not issue confirmation authority for this preview. Refresh the rule and prepare a new exact preview before clearing.</p>}
         {phase === "result" && <div className={`rounded-md border p-3 text-sm ${response?.cleared ? "border-border" : "border-destructive bg-destructive/10 text-destructive"}`} role="status">
           {response?.cleared
             ? "The server confirmed that the rule is clear. Review any rollback results above before closing."
@@ -1146,6 +1096,7 @@ function ClearRuleDialog({ rule, onClose, onChanged }: {
 type SortDir = "asc" | "desc";
 
 export default function Rules() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("edit_rules");
   const canApply = hasPermission("trigger_manual_reroute");
@@ -1154,6 +1105,7 @@ export default function Rules() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [manageRule, setManageRule] = useState<Rule | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
@@ -1163,14 +1115,16 @@ export default function Rules() {
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
   const [clearRuleTarget, setClearRuleTarget] = useState<Rule | null>(null);
 
-  const [nameSortDir, setNameSortDir] = useState<SortDir | null>(null);
+  const initialSort = searchParams.get("sort");
+  const [nameSortDir, setNameSortDir] = useState<SortDir | null>(initialSort === "asc" || initialSort === "desc" ? initialSort : null);
+  const query = searchParams.get("rule") ?? "";
 
   function loadRules() {
     setLoading(true);
     api.rules
       .list()
-      .then(setRules)
-      .catch(() => setRules([]))
+      .then((value) => { setRules(value); setLoadError(null); })
+      .catch((cause) => setLoadError(cause instanceof Error ? cause.message : "Rules could not be loaded"))
       .finally(() => setLoading(false));
   }
 
@@ -1180,7 +1134,7 @@ export default function Rules() {
       .list()
       .then(setDevices)
       .catch(() => setDevices([]));
-    // Operating mode drives the mitigation dialog's copy (observe = nothing runs).
+    // Operating mode drives the supervised manual-run copy.
     api.settings
       .get()
       .then(setSettings)
@@ -1221,17 +1175,23 @@ export default function Rules() {
 
   function toggleNameSort() {
     setNameSortDir((d) => {
-      if (d === null || d === "desc") return "asc";
-      return "desc";
+      const next = d === null || d === "desc" ? "asc" : "desc";
+      const params = new URLSearchParams(searchParams); params.set("sort", next); setSearchParams(params, { replace: true });
+      return next;
     });
   }
 
+  const filtered = rules.filter((rule) => {
+    const device = searchParams.get("device");
+    const iface = searchParams.get("interface");
+    return (!device || String(rule.device_id) === device) && (!iface || String(rule.interface_id) === iface || rule.member_interface_ids?.includes(Number(iface))) && (!query || `${rule.name} ${rule.device_name ?? ""} ${rule.interface_name ?? ""} ${metricLabel(rule.metric)}`.toLowerCase().includes(query.toLowerCase()));
+  });
   const sorted = nameSortDir
-    ? [...rules].sort((a, b) => {
+    ? [...filtered].sort((a, b) => {
         const cmp = a.name.localeCompare(b.name);
         return nameSortDir === "asc" ? cmp : -cmp;
       })
-    : rules;
+    : filtered;
 
   return (
     <div className="space-y-6">
@@ -1242,6 +1202,10 @@ export default function Rules() {
         </Button>
       </div>
 
+      <Input aria-label="Search rules" placeholder="Search rules, devices, interfaces, or metrics…" value={query} onChange={(event) => { const params = new URLSearchParams(searchParams); if (event.target.value) params.set("rule", event.target.value); else params.delete("rule"); setSearchParams(params, { replace: true }); }} />
+
+      {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">Could not refresh rules. {rules.length ? "Showing retained data." : "No rule data is available."} {loadError} <button className="underline" onClick={loadRules}>Try again</button></div>}
+
 
       <Card>
         <CardHeader>
@@ -1250,7 +1214,7 @@ export default function Rules() {
         <CardContent className="px-0 pb-0">
           {loading ? (
             <p className="px-6 pb-6 text-sm text-muted-foreground">Loading…</p>
-          ) : rules.length === 0 ? (
+          ) : !loadError && rules.length === 0 ? (
             <p className="px-6 pb-6 text-sm text-muted-foreground">
               No rules yet. Add a threshold rule to start monitoring interfaces.
             </p>
@@ -1258,18 +1222,15 @@ export default function Rules() {
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead
-                    className="cursor-pointer select-none pl-6"
-                    onClick={toggleNameSort}
-                  >
-                    Name
+                  <TableHead className="pl-6">
+                    <button type="button" className="inline-flex items-center font-medium hover:underline" onClick={toggleNameSort} aria-label={`Sort rules by name ${nameSortDir === "asc" ? "descending" : "ascending"}`}>Name
                     {nameSortDir === null ? (
                       <ChevronsUpDown className="ml-1 inline-block size-3.5 text-muted-foreground" />
                     ) : nameSortDir === "asc" ? (
                       <ArrowUp className="ml-1 inline-block size-3.5" />
                     ) : (
                       <ArrowDown className="ml-1 inline-block size-3.5" />
-                    )}
+                    )}</button>
                   </TableHead>
                   <TableHead>Target</TableHead>
                   <TableHead>Condition</TableHead>
@@ -1295,16 +1256,14 @@ export default function Rules() {
                         <div className="flex items-center gap-2">
                           <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
                           <span className="font-medium">{rule.name}</span>
+                          {rule.current_state === "recovered_awaiting_revert" && <Badge variant="outline" className="border-amber-400 text-amber-800 dark:text-amber-300">recovered · awaiting revert</Badge>}
                         </div>
                       </TableCell>
 
                       {/* Target — interface name (+ device) */}
                       <TableCell className="text-xs">
                         <div className="flex flex-col">
-                          <span className="font-mono">
-                            {rule.interface_name ||
-                              (rule.interface_id ? `interface #${rule.interface_id}` : "interface")}
-                          </span>
+                          <span className="font-mono">{rule.metric_aggregation === "sum" ? `Sum of ${rule.member_interface_ids?.length ?? 0} interfaces` : rule.interface_name || (rule.interface_id ? `interface #${rule.interface_id}` : "interface")}</span>
                           {rule.device_name && (
                             <span className="text-[11px] text-muted-foreground">
                               {rule.device_name}
@@ -1361,8 +1320,7 @@ export default function Rules() {
                             variant="outline"
                             className="h-7 gap-1.5"
                             onClick={() => setManageRule(rule)}
-                            disabled={!canEdit}
-                            title={canEdit ? "Manage mitigation actions" : "Requires edit_rules"}
+                            title={canEdit ? "Manage mitigation actions" : "Inspect mitigation actions"}
                           >
                             <Workflow className="size-3.5 text-muted-foreground" />
                             {rule.action_count
@@ -1462,12 +1420,13 @@ export default function Rules() {
                                 size="sm"
                                 variant="destructive"
                                 className="h-7"
-                                title="Apply this rule's configured actions (exact preview first; observe mode executes nothing)"
+                                title="Apply this rule's configured actions after an exact preview and confirmation"
                                 onClick={() => setApplyRule(rule)}
                               >
                                 Mitigate
                               </Button>
                             )}
+                          {rule.current_state === "recovered_awaiting_revert" && <Button size="sm" variant="outline" className="h-7" asChild><Link to={`/mitigations?tab=active&rule_id=${rule.id}`}>View active run / revert</Link></Button>}
                           {canEdit && rule.current_state === "firing" && (
                             <Button
                               size="sm"

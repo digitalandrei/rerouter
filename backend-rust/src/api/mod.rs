@@ -9,6 +9,7 @@
 //! CF-Connecting-IP, forwarded by Nginx; trusted because only Cloudflare can
 //! reach Nginx and only Nginx can reach us.
 
+pub mod action_inspection;
 pub mod alerts;
 pub mod audit;
 pub mod devices;
@@ -20,6 +21,7 @@ pub mod manual_mitigations;
 pub mod mitigation_presets;
 pub mod notifications;
 pub mod reroutes;
+pub mod routing_policies;
 pub mod rtbh;
 pub mod rules;
 pub mod settings;
@@ -355,6 +357,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/templates", get(templates::list))
         .route("/api/templates/{id}", get(templates::show))
         .route("/api/templates/{id}/render", post(templates::render))
+        .route("/api/action-sets/inspect", post(action_inspection::inspect))
+        .route(
+            "/api/devices/{id}/routing-policies",
+            get(routing_policies::get),
+        )
         // global RTBH community catalog (blackhole tag picker)
         .route("/api/rtbh-communities", get(rtbh::list).post(rtbh::create))
         .route("/api/rtbh-communities/{id}", delete(rtbh::remove))
@@ -371,6 +378,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reroutes/{id}/reconcile", post(reroutes::reconcile))
         // Progress of an ordered mitigation bundle (async rule apply).
         .route("/api/reroute-bundles/{id}", get(reroutes::bundle_show))
+        .route(
+            "/api/reroute-bundles/{id}/revert",
+            post(reroutes::bundle_revert),
+        )
+        .route(
+            "/api/reroute-bundles/{id}/take-control",
+            post(reroutes::bundle_take_control),
+        )
         .route("/api/reroute-bundles", get(reroutes::bundle_list))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))

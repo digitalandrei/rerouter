@@ -64,6 +64,7 @@ export default function Users() {
 
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState<AddUserForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
@@ -83,10 +84,11 @@ export default function Users() {
 
   function loadUsers() {
     setLoading(true);
+    setLoadError(null);
     api.users
       .list()
       .then(setUsers)
-      .catch(() => setUsers([]))
+      .catch((e) => setLoadError(e instanceof ApiError ? e.message : "Failed to load users"))
       .finally(() => setLoading(false));
   }
 
@@ -140,6 +142,7 @@ export default function Users() {
     try {
       const updated = await api.users.update(user.id, { role: newRole });
       setUsers((prev) => prev.map((u) => (u.id === updated.id ? updated : u)));
+      toast.success(`Role updated for ${user.email}`);
     } catch (err) {
       setRowErr(
         user.id,
@@ -300,6 +303,8 @@ export default function Users() {
         <CardContent>
           {loading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : loadError ? (
+            <div role="alert" className="flex items-center gap-3 text-sm text-destructive"><span>Users could not be loaded: {loadError}</span><Button size="sm" variant="outline" onClick={loadUsers}>Try again</Button></div>
           ) : users.length === 0 ? (
             <p className="text-sm text-muted-foreground">No users found.</p>
           ) : (

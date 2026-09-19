@@ -61,7 +61,7 @@ pub async fn status(
             scalar(&state.pool, "SELECT COUNT(*) FROM device_interfaces").await?;
         let active_rule_matches = scalar(
             &state.pool,
-            "SELECT COUNT(*) FROM rule_states WHERE current_state = 'firing'",
+            "SELECT COUNT(*) FROM rule_states WHERE current_state IN ('firing','recovered_awaiting_revert')",
         )
         .await?;
         let alerts_24h = scalar(

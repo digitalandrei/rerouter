@@ -2,7 +2,7 @@
 
 A safety-critical DDoS-mitigation controller: it ingests traffic telemetry,
 detects attacks, and moves production traffic by pushing validated commands to
-network devices. It ships read-only by default. `docs/doctrine.md` is the source
+network devices. It ships with autonomous execution disabled. `docs/doctrine.md` is the source
 of truth; this file is only the shared vocabulary the codebase and the agent
 skills should use consistently.
 
@@ -23,9 +23,10 @@ is never a first-class feature.
 _Avoid_: command, script, playbook.
 
 **Operating Mode**:
-`observe` (default) means read-only / alert-only — *nothing* executes, manual or
-automatic; a fired rule renders the plan it *would* have run. `enforce` means
-reroutes may execute. Mode flips are admin-only and audited.
+`observe` (default) disables autonomous execution while permitting an authorized
+operator to confirm an exact prepared Manual Run or Manual Revert. `enforce`
+permits autonomous execution when the Automatic Master Switch is also armed.
+Mode flips are admin-only and audited.
 _Avoid_: read-only-mode (say observe), live-mode (say enforce).
 
 **Rerouter**:
@@ -85,9 +86,14 @@ _Avoid_: debounce, throttle, backoff.
 
 **Preview Token**:
 A short-lived, single-use server credential bound to the exact rendered action
-plan, audit reason, operator, and action scope. Enforce-mode manual actions,
-rule applies, and rollbacks must consume one immediately before execution.
+plan, audit reason, operator, and action scope. Manual Runs, supervised rule
+applies, and Manual Reverts consume one immediately before execution in either mode.
 _Avoid_: confirmation flag, UI confirmation.
+
+**Automatic Master Switch**:
+The independent global arm for autonomous starts, condition recovery, and timed
+recovery. It grants authority only together with Enforce and every narrower Gate.
+_Avoid_: automation toggle, auto mode.
 
 **Protected Interface**:
 A management / transit / SSH path flagged so disruptive interface actions on it

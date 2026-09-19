@@ -9,7 +9,7 @@
  * button for rules that have manual_apply_enabled.
  */
 import { useEffect, useState, useCallback } from "react";
-import { api, type SystemStatus, type Alert, type Rule, type SystemSettings } from "@/lib/api";
+import { api, type SystemStatus, type Alert, type Rule, type SystemSettings, type RerouteBundle } from "@/lib/api";
 import { eventTypeLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -23,6 +23,7 @@ import {
 import { SeverityBadge } from "@/components/status-badge";
 import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
 import { useAuth } from "@/lib/auth";
+import { Link } from "react-router-dom";
 
 export default function Dashboard() {
   const { hasPermission } = useAuth();
@@ -32,32 +33,43 @@ export default function Dashboard() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [firingRules, setFiringRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [activeRuns, setActiveRuns] = useState<RerouteBundle[]>([]);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
   const loadData = useCallback(() => {
     api
       .status()
       .then(setStatus)
-      .catch(() => setStatus(null))
+      .then(() => setErrors((value) => { const next = { ...value }; delete next.status; return next; }))
+      .catch(() => setErrors((value) => ({ ...value, status: "System status could not be refreshed." })))
       .finally(() => setLoadingStatus(false));
 
     api.alerts
       .list({ limit: 10 })
       .then((page) => setAlerts(page.rows))
-      .catch(() => setAlerts([]))
+      .then(() => setErrors((value) => { const next = { ...value }; delete next.alerts; return next; }))
+      .catch(() => setErrors((value) => ({ ...value, alerts: "Recent alerts could not be refreshed." })))
       .finally(() => setLoadingAlerts(false));
 
     api.rules
       .list()
-      .then((rules) => setFiringRules(rules.filter((r) => r.current_state === "firing")))
-      .catch(() => setFiringRules([]));
+      .then((rules) => setFiringRules(rules.filter((r) => r.current_state === "firing" || r.current_state === "recovered_awaiting_revert")))
+      .then(() => setErrors((value) => { const next = { ...value }; delete next.rules; return next; }))
+      .catch(() => setErrors((value) => ({ ...value, rules: "Active rule matches could not be refreshed." })));
 
     api.settings
       .get()
       .then(setSettings)
-      .catch(() => setSettings(null));
+      .then(() => setErrors((value) => { const next = { ...value }; delete next.settings; return next; }))
+      .catch(() => setErrors((value) => ({ ...value, settings: "Operating mode could not be refreshed." })));
+
+    api.bundles.list({ lifecycle: "active", page: 1, per_page: 20 }).then((response) => {
+      setActiveRuns(Array.isArray(response) ? response : response.items);
+      setErrors((value) => { const next = { ...value }; delete next.runs; return next; });
+    }).catch(() => setErrors((value) => ({ ...value, runs: "Active mitigation runs could not be refreshed." })));
   }, []);
 
   useEffect(() => {
@@ -80,6 +92,17 @@ export default function Dashboard() {
           </Badge>
         )}
       </div>
+
+      {Object.keys(errors).length > 0 && <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"><span>{Object.values(errors).join(" ")} Existing values may be stale.</span><Button size="sm" variant="outline" onClick={loadData}>Try again</Button></div>}
+
+      {(activeRuns.length > 0 || firingRules.length > 0 || errors.runs || errors.rules) && <Card>
+        <CardHeader><CardTitle className="text-lg text-destructive">Unresolved operational incidents</CardTitle><CardDescription>Active router changes and detection rules requiring operator attention.</CardDescription></CardHeader>
+        <CardContent className="space-y-3">
+          {errors.runs && <p className="text-sm text-destructive">Active runs are unavailable; this is not confirmation that no changes remain.</p>}
+          {activeRuns.map((run) => <div key={run.id} className="flex flex-wrap items-center gap-2 text-sm"><strong>{run.source?.preset_name ?? run.source?.name ?? `Run #${run.id}`}</strong><Badge variant="outline">{run.remaining_mutations ?? run.still_applied_reroute_ids?.length ?? 0} changes remain</Badge><Button asChild size="sm" variant="outline" className="ml-auto"><Link to={`/manual-mitigations?bundle=${run.id}`}>View run</Link></Button></div>)}
+          {firingRules.map((rule) => <div key={rule.id} className="flex flex-wrap items-center gap-2 text-sm"><SeverityBadge severity={rule.severity} /><strong>{rule.name}</strong><Badge variant="outline">{rule.current_state === "recovered_awaiting_revert" ? "recovered · awaiting revert" : "firing"}</Badge><Button asChild size="sm" variant="outline" className="ml-auto"><Link to={`/rules?rule_id=${rule.id}`}>View rule</Link></Button></div>)}
+        </CardContent>
+      </Card>}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <Card>
@@ -180,24 +203,25 @@ export default function Dashboard() {
       </div>
 
       {/* Active matches — firing rules; apply mitigation for eligible ones */}
-      {firingRules.length > 0 && (
+      {(firingRules.length > 0 || errors.rules) && (
         <Card>
           <CardHeader>
             <CardTitle className="text-lg text-destructive">
-              Active matches ({firingRules.length})
+              Active and held matches ({firingRules.length})
             </CardTitle>
             <CardDescription>
-              Rules currently in the firing state. Apply mitigation to manually
-              run a rule's configured actions (where enabled).
+              Rules currently firing or recovered while router changes still await revert.
+              Manual apply is available only for firing rules where enabled.
             </CardDescription>
           </CardHeader>
           <CardContent>
+            {errors.rules && <p className="text-sm text-destructive">Active matches are unavailable; this is not confirmation that no rules are firing.</p>}
             <ul className="divide-y">
               {firingRules.map((rule) => {
                 const target =
                   rule.interface_name ?? (rule.interface_id != null ? `iface #${rule.interface_id}` : null);
                 const device = rule.device_name ?? (rule.device_id != null ? `device #${rule.device_id}` : null);
-                const canShowApply = canApply && rule.manual_apply_enabled;
+                const canShowApply = canApply && rule.manual_apply_enabled && rule.current_state === "firing";
                 return (
                   <li key={rule.id} className="flex flex-wrap items-center gap-2 py-3 text-sm">
                     <SeverityBadge severity={rule.severity} />
@@ -251,12 +275,12 @@ export default function Dashboard() {
                   <span className="text-xs font-medium">{eventTypeLabel(alert.event_type)}</span>
                   {alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">
-                      device #{alert.device_id}
+                      <Link to={`/devices/${alert.device_id}`} className="hover:underline">device #{alert.device_id}</Link>
                     </span>
                   )}
-                  {alert.interface_id !== null && (
+                  {alert.interface_id !== null && alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">
-                      iface #{alert.interface_id}
+                      <Link to={`/devices/${alert.device_id}/interfaces/${alert.interface_id}`} className="hover:underline">interface #{alert.interface_id}</Link>
                     </span>
                   )}
                   <span className="flex-1" />

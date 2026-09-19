@@ -1,0 +1,390 @@
+{
+  "preset": {
+    "id": 1,
+    "name": "e-manuel-apply",
+    "revision": 3,
+    "archived_at": null,
+    "description": "advertise prefix 194.105.142.0/24 to Akamai, remove prefix 194.105.142.0/24 from on-prem ISP and mss clamp to 1436."
+  },
+  "actions": [
+    {
+      "id": 31,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.197",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 0,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 32,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.209",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 1,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 33,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.199",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 2,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 34,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.211",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 3,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 35,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.201",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 4,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 36,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.213",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 5,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 37,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.203",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 6,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 38,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.215",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 7,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 39,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.205",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 8,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 40,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.217",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 9,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 41,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.219",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 10,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 42,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "23.45.23.207",
+        "prefix_list_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 11,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_add",
+      "reroute_template_id": 10
+    },
+    {
+      "id": 43,
+      "params": {
+        "mss": "1436",
+        "interface": "Po1"
+      },
+      "enabled": 1,
+      "position": 12,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "iface_tcp_adjust_mss",
+      "reroute_template_id": 12
+    },
+    {
+      "id": 44,
+      "params": {
+        "mss": "1436",
+        "interface": "Po1"
+      },
+      "enabled": 1,
+      "position": 13,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "iface_tcp_adjust_mss",
+      "reroute_template_id": 12
+    },
+    {
+      "id": 45,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "213.249.122.145",
+        "prefix_list_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 14,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_advertise_remove",
+      "reroute_template_id": 11
+    },
+    {
+      "id": 46,
+      "params": {
+        "prefix": "194.105.142.0/24",
+        "neighbor_ip": "213.249.122.169",
+        "prefix_list_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 15,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_advertise_remove",
+      "reroute_template_id": 11
+    }
+  ],
+  "templates": [
+    {
+      "id": 4,
+      "name": "null_route_prefix",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 5,
+      "name": "null_route_withdraw",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 6,
+      "name": "bgp_session_enable",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 7,
+      "name": "bgp_session_disable",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 8,
+      "name": "blackhole_prefix",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 9,
+      "name": "blackhole_withdraw",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 10,
+      "name": "bgp_advertise_add",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 11,
+      "name": "bgp_advertise_remove",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 12,
+      "name": "iface_tcp_adjust_mss",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 13,
+      "name": "iface_tcp_adjust_mss_remove",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 14,
+      "name": "iface_shutdown",
+      "enabled": 1,
+      "automatic_allowed": 0
+    },
+    {
+      "id": 15,
+      "name": "iface_no_shutdown",
+      "enabled": 1,
+      "automatic_allowed": 0
+    },
+    {
+      "id": 16,
+      "name": "null_route_prefix_v6",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 17,
+      "name": "null_route_withdraw_v6",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 18,
+      "name": "blackhole_prefix_v6",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 19,
+      "name": "blackhole_withdraw_v6",
+      "enabled": 1,
+      "automatic_allowed": 1
+    },
+    {
+      "id": 20,
+      "name": "bgp_route_map_set",
+      "enabled": 1,
+      "automatic_allowed": 0
+    },
+    {
+      "id": 21,
+      "name": "bgp_route_map_unset",
+      "enabled": 1,
+      "automatic_allowed": 0
+    }
+  ],
+  "devices": [
+    {
+      "id": 1,
+      "name": "eMA2"
+    },
+    {
+      "id": 2,
+      "name": "eMA1"
+    },
+    {
+      "id": 3,
+      "name": "eMA3"
+    }
+  ],
+  "rule_count": 13,
+  "active_runs": 0,
+  "reroute_count": 0,
+  "device_locks": 0,
+  "lock_columns": [
+    "id",
+    "scope",
+    "scope_ref",
+    "reroute_id",
+    "reason",
+    "kind",
+    "created_by",
+    "created_at",
+    "cleared_by",
+    "cleared_at"
+  ],
+  "migrations": 67
+}

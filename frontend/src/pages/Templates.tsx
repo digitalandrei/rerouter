@@ -14,10 +14,11 @@ import {
   type RenderedPlan,
   type TemplateParamSpec,
 } from "@/lib/api";
-import { templateLabel, providerTypeLabel } from "@/lib/labels";
+import { templateGuidance, templateLabel, providerTypeLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ApiError } from "@/lib/api";
 import {
   Card,
   CardContent,
@@ -84,6 +85,7 @@ function TemplateCard({ template }: { template: Template }) {
         {template.description && (
           <CardDescription>{template.description}</CardDescription>
         )}
+        {templateGuidance(template.name) && <CardDescription>{templateGuidance(template.name)}</CardDescription>}
       </CardHeader>
       <CardContent className="space-y-3">
         {!isDeviceCli ? (
@@ -104,7 +106,7 @@ function TemplateCard({ template }: { template: Template }) {
                       value={values[name] ?? ""}
                       placeholder={paramPlaceholder(spec)}
                       onChange={(e) =>
-                        setValues((v) => ({ ...v, [name]: e.target.value }))
+                        { setValues((v) => ({ ...v, [name]: e.target.value })); setPlan(null); setRollbackPlan(null); }
                       }
                     />
                   </label>
@@ -136,7 +138,7 @@ function TemplateCard({ template }: { template: Template }) {
                   </div>
                 )}
                 <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Rollback (to undo by hand)
+                  Defined inverse preview
                 </div>
                 {rollbackPlan ? (
                   <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-xs">
@@ -144,7 +146,7 @@ function TemplateCard({ template }: { template: Template }) {
                   </pre>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    No rollback defined for this template.
+                    No inverse template is defined. This preview does not create an undo operation.
                   </p>
                 )}
               </div>
@@ -159,12 +161,15 @@ function TemplateCard({ template }: { template: Template }) {
 export default function Templates() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<number | null>(null);
 
   useEffect(() => {
     api.templates
       .list()
-      .then(setTemplates)
-      .catch(() => setTemplates([]))
+      .then((items) => { setTemplates(items); setLoadError(null); })
+      .catch((e) => setLoadError(e instanceof ApiError ? e.message : "Failed to load templates"))
       .finally(() => setLoading(false));
   }, []);
 
@@ -173,6 +178,8 @@ export default function Templates() {
     if (a.provider_type === b.provider_type) return a.name.localeCompare(b.name);
     return a.provider_type === "device_cli" ? -1 : b.provider_type === "device_cli" ? 1 : 0;
   });
+  const filtered = ordered.filter((template) => `${template.name} ${template.display_name ?? ""} ${template.description ?? ""}`.toLowerCase().includes(search.toLowerCase()));
+  const selected = templates.find((template) => template.id === selectedId) ?? null;
 
   return (
     <div className="space-y-6">
@@ -185,13 +192,18 @@ export default function Templates() {
       </div>
       {loading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : loadError ? (
+        <p role="alert" className="text-sm text-destructive">Templates could not be loaded: {loadError}</p>
       ) : ordered.length === 0 ? (
         <p className="text-sm text-muted-foreground">No templates.</p>
       ) : (
-        <div className="grid gap-4 lg:grid-cols-2">
-          {ordered.map((t) => (
-            <TemplateCard key={t.id} template={t} />
-          ))}
+        <div className="grid gap-4 lg:grid-cols-[minmax(16rem,22rem)_1fr]">
+          <Card><CardHeader><CardTitle className="text-base">Catalog</CardTitle></CardHeader><CardContent className="space-y-3">
+            <label className="space-y-1 text-sm font-medium" htmlFor="template-search">Search templates</label><Input id="template-search" value={search} onChange={(event) => setSearch(event.target.value)} />
+            <div className="max-h-[32rem] space-y-1 overflow-auto">{filtered.map((template) => <Button key={template.id} type="button" variant={selectedId === template.id ? "secondary" : "ghost"} className="h-auto w-full justify-start whitespace-normal py-2 text-left" onClick={() => setSelectedId(template.id)}>{templateLabel(template)}</Button>)}</div>
+            {filtered.length === 0 && <p className="text-sm text-muted-foreground">No templates match this search.</p>}
+          </CardContent></Card>
+          {selected ? <TemplateCard key={selected.id} template={selected} /> : <div className="rounded-md border border-dashed p-6 text-sm text-muted-foreground">Select a template to inspect its parameters and render a preview.</div>}
         </div>
       )}
     </div>

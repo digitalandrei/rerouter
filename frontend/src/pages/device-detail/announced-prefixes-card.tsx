@@ -15,12 +15,13 @@ export function AnnouncedPrefixesCard({
   refreshKey: number;
 }) {
   const [networks, setNetworks] = useState<BgpNetwork[] | null>(null);
+  const [loadError, setLoadError] = useState(false);
 
   const load = useCallback(() => {
     api.devices
       .bgpNetworks(deviceId)
-      .then(setNetworks)
-      .catch(() => setNetworks([]));
+      .then((value) => { setNetworks(value); setLoadError(false); })
+      .catch(() => setLoadError(true));
   }, [deviceId]);
   useEffect(() => {
     load();
@@ -38,7 +39,9 @@ export function AnnouncedPrefixesCard({
         </CardTitle>
       </CardHeader>
       <CardContent>
-        {networks === null ? (
+        {loadError ? (
+          <p role="alert" className="text-sm text-destructive">Announced prefixes could not be loaded. Existing entries may be stale.</p>
+        ) : networks === null ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : networks.length === 0 ? (
           <p className="text-sm text-muted-foreground">

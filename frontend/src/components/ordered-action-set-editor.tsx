@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, GripVertical, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, RotateCcw, Trash2 } from "lucide-react";
 import type { ActionDraft, Device, Template } from "@/lib/api";
 import { templateLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +49,7 @@ export function OrderedActionSetEditor({
         const template = templates.find((item) => item.id === action.reroute_template_id);
         const device = devices.find((item) => item.id === action.device_id);
         const params = Object.entries(action.params ?? {});
+        const isPolicyChange = template?.name === "bgp_export_policy_set";
         const selected = selectedIndex === index;
         return (
           <li
@@ -58,7 +59,6 @@ export function OrderedActionSetEditor({
             }`}
           >
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <GripVertical className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
               <span className="inline-flex size-6 shrink-0 items-center justify-center rounded bg-muted text-xs font-semibold tabular-nums">
                 {index + 1}
               </span>
@@ -136,21 +136,22 @@ export function OrderedActionSetEditor({
                 </Button>
               )}
             </div>
-            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 pl-12 text-xs text-muted-foreground">
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 pl-8 text-xs text-muted-foreground">
               {action.auto_target === "flow_dst_host" && (
                 <span className="font-medium text-amber-800 dark:text-amber-300">
                   target resolved from rule flows
                 </span>
               )}
-              {params.map(([name, value]) => (
+              {isPolicyChange && <span><span className="font-medium text-foreground">Peer {String(action.params.neighbor_ip ?? "not selected")}</span> · {action.params.policy_kind === "route_map" ? "route map" : "prefix list"} {String(action.params.policy_name ?? "not selected")}</span>}
+              {!isPolicyChange && params.map(([name, value]) => (
                 <span key={name} className="break-all">
-                  <span className="font-medium text-foreground">{name}</span>={String(value)}
+                  <span className="font-medium text-foreground">{template?.parameter_schema[name]?.label ?? name.replaceAll("_", " ")}</span>: {typeof value === "boolean" ? (value ? "Yes" : "No") : String(value)}
                 </span>
               ))}
               {params.length === 0 && !action.auto_target && <span>No parameters saved</span>}
             </div>
             {action.warning && (
-              <p className="mt-2 break-words pl-12 text-xs text-amber-800 dark:text-amber-300" role="status">
+              <p className="mt-2 break-words pl-8 text-xs text-amber-800 dark:text-amber-300" role="status">
                 {action.warning}
               </p>
             )}

@@ -54,6 +54,11 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
         let cfg = cfg.clone();
         move || evaluate_aggregate_loop(pool.clone(), cfg.clone())
     });
+    spawn_supervised("scheduled_recovery", {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        move || scheduled_recovery_loop(pool.clone(), cfg.clone())
+    });
     // NetFlow v9/sFlow v5 collector — a second, passive telemetry source. No-op
     // unless [flow].enabled; binds its own UDP socket (see docs/flow-telemetry.md).
     spawn_supervised("flow_collector", {
@@ -69,6 +74,17 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
         "scheduler supervisor spawned (per-device SNMP poll loops)"
     );
     Ok(())
+}
+
+async fn scheduled_recovery_loop(pool: MySqlPool, cfg: Arc<Config>) {
+    loop {
+        match crate::reroute::recovery::process_one_due(&pool, &cfg).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => tracing::error!(event_type="scheduled_recovery_failed",error=%e),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 fn spawn_supervised<F, Fut>(name: &'static str, factory: F)

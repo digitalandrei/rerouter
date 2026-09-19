@@ -10,9 +10,11 @@ import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { api, type Rule, type RuleOperator, type Device, type Interface, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -63,6 +65,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
       rule?.recovery_window_seconds != null ? String(rule.recovery_window_seconds / 60) : "",
     recovery_consecutive_samples:
       rule?.recovery_consecutive_samples != null ? String(rule.recovery_consecutive_samples) : "",
+    automatic_revert_enabled: rule?.automatic_revert_enabled ?? false,
     severity: rule?.severity ?? "warning",
   });
   const [deviceInterfaces, setDeviceInterfaces] = useState<Interface[]>([]);
@@ -184,6 +187,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
         form.recovery_mode === "threshold" && !isFlow && form.recovery_consecutive_samples
           ? Math.max(1, parseInt(form.recovery_consecutive_samples, 10))
           : null,
+      automatic_revert_enabled: form.automatic_revert_enabled,
       severity: form.severity,
     };
 
@@ -230,6 +234,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{isCreate ? "New detection rule" : `Edit rule — ${rule!.name}`}</DialogTitle>
+          <DialogDescription>Configure the detection condition, recovery condition, and separate automatic-revert preference.</DialogDescription>
         </DialogHeader>
         <form id="rule-form" onSubmit={save} className="space-y-4">
           <label className="block space-y-1 text-sm font-medium">
@@ -469,7 +474,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
           </div>
 
           {/* Recovery — full width, with the two threshold values below it. */}
-          <label className="block space-y-1 text-sm font-medium">
+          <label htmlFor="recovery-mode" className="block space-y-1 text-sm font-medium">
             <span className="inline-flex items-center gap-1">
               Recovery{" "}
               <InfoHint
@@ -485,6 +490,7 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
               />
             </span>
             <select
+              id="recovery-mode"
               className={inputClass}
               value={form.recovery_mode}
               onChange={(e) => set("recovery_mode", e.target.value as typeof form.recovery_mode)}
@@ -537,6 +543,11 @@ export function RuleDialog({ rule, devices, onClose, onSaved }: RuleDialogProps)
               )}
             </div>
           )}
+
+          <div className="flex items-center justify-between gap-3 rounded-md border p-3">
+            <div><p className="text-sm font-medium">Automatically revert owned changes after recovery</p><p className="text-xs text-muted-foreground">Separate from the clear condition above. Off keeps recovered changes active until an operator reviews and reverts the original run.</p></div>
+            <Switch checked={form.automatic_revert_enabled} onCheckedChange={(checked) => set("automatic_revert_enabled", checked)} aria-label="Automatically revert after recovery" />
+          </div>
 
           {error && (
             <p className="text-sm text-destructive" role="alert">

@@ -174,7 +174,11 @@ pub async fn canonicalize_inventory_params(
                 .bind(SNMP_INVENTORY_MAX_AGE_HOURS)
                 .fetch_optional(pool)
                 .await?;
-                row.and_then(|(name, descr)| name.or(descr))
+                row.and_then(|(name, descr)| {
+                    descr
+                        .filter(|value| valid_cli_interface_identity(value))
+                        .or_else(|| name.filter(|value| valid_cli_interface_identity(value)))
+                })
             }
             "bgp_peer" => {
                 sqlx::query_scalar::<_, String>(
@@ -247,6 +251,42 @@ pub async fn canonicalize_inventory_params(
                 .fetch_optional(pool)
                 .await?
             }
+            "routing_export_policy" => {
+                let row: Option<(sqlx::types::Json<Value>, String, chrono::DateTime<chrono::Utc>)> =
+                    sqlx::query_as(
+                        "SELECT inventory_json, completeness, read_at FROM routing_policy_snapshots \
+                         WHERE device_id = ? AND read_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? HOUR)",
+                    )
+                    .bind(device_id)
+                    .bind(ROUTING_INVENTORY_MAX_AGE_HOURS)
+                    .fetch_optional(pool)
+                    .await?;
+                let (inventory, completeness, _) = row.ok_or_else(|| {
+                    anyhow!("routing-policy inventory is missing or stale for device {device_id}")
+                })?;
+                if completeness != "complete" {
+                    bail!("routing-policy inventory is incomplete for device {device_id}");
+                }
+                let kind = canonical
+                    .get("policy_kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("policy_kind is required"))?;
+                let collection = match kind {
+                    "prefix_list" => "prefix_lists",
+                    "route_map" => "route_maps",
+                    _ => bail!("unsupported export policy kind '{kind}'"),
+                };
+                let exists = inventory
+                    .0
+                    .get(collection)
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item.get("name").and_then(Value::as_str) == Some(value))
+                    });
+                exists.then(|| value.to_string())
+            }
             // Direction is already constrained by the schema enum.
             "bgp_direction" => Some(value.to_string()),
             "rtbh_tag" => {
@@ -317,6 +357,18 @@ pub async fn canonicalize_inventory_params(
     }
 
     Ok(Value::Object(canonical))
+}
+
+fn valid_cli_interface_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 191
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | ':' | '_'))
 }
 
 /// Templates whose `prefix` parameter must fall inside the device's freshly

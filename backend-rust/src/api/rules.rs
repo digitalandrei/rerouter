@@ -81,6 +81,7 @@ struct RuleRow {
     severity: String,
     enabled: bool,
     automatic_reroute_enabled: bool,
+    automatic_revert_enabled: bool,
     manual_apply_enabled: bool,
     reroute_template_id: Option<u64>,
     // Resolved target labels + live evaluation state (for the list UI).
@@ -107,7 +108,7 @@ const RULE_SELECT: &str =
      r.operator, r.threshold_value, r.duration_seconds, r.consecutive_samples, \
      r.recovery_mode, r.recovery_threshold_value, r.recovery_window_seconds, \
      r.recovery_consecutive_samples, r.severity, r.enabled, \
-     r.automatic_reroute_enabled, r.manual_apply_enabled, r.reroute_template_id, \
+     r.automatic_reroute_enabled, r.automatic_revert_enabled, r.manual_apply_enabled, r.reroute_template_id, \
      r.auto_disarmed_at, r.auto_disarmed_reason, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
@@ -143,6 +144,7 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
         "severity": r.severity,
         "enabled": r.enabled,
         "automatic_reroute_enabled": r.automatic_reroute_enabled,
+        "automatic_revert_enabled": r.automatic_revert_enabled,
         "auto_disarmed_at": r.auto_disarmed_at.map(|t| t.to_rfc3339()),
         "auto_disarmed_reason": r.auto_disarmed_reason,
         "manual_apply_enabled": r.manual_apply_enabled,
@@ -308,6 +310,8 @@ pub struct RuleBody {
     enabled: bool,
     #[serde(default)]
     automatic_reroute_enabled: bool,
+    #[serde(default)]
+    automatic_revert_enabled: bool,
     /// Opt-in: allow operators to manually apply this rule's actions from a
     /// firing alert. Off by default. Gated like any manual reroute at apply time.
     #[serde(default)]
@@ -535,9 +539,9 @@ pub async fn create(
             operator, threshold_value, \
             duration_seconds, consecutive_samples, recovery_mode, recovery_threshold_value, \
             recovery_window_seconds, recovery_consecutive_samples, \
-            severity, enabled, automatic_reroute_enabled, manual_apply_enabled, \
+            severity, enabled, automatic_reroute_enabled, automatic_revert_enabled, manual_apply_enabled, \
             reroute_template_id, created_by, updated_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&body.name)
     .bind(interface_id)
@@ -559,6 +563,7 @@ pub async fn create(
     .bind(&body.severity)
     .bind(body.enabled)
     .bind(body.automatic_reroute_enabled)
+    .bind(body.automatic_revert_enabled)
     .bind(body.manual_apply_enabled)
     .bind(body.reroute_template_id)
     .bind(g.session.user_id)
@@ -663,6 +668,7 @@ pub struct RuleUpdate {
     severity: Option<String>,
     enabled: Option<bool>,
     automatic_reroute_enabled: Option<bool>,
+    automatic_revert_enabled: Option<bool>,
     manual_apply_enabled: Option<bool>,
     #[serde(default, deserialize_with = "present_nullable")]
     reroute_template_id: Option<Option<u64>>,
@@ -827,8 +833,10 @@ pub async fn update(
         || body.flow_protocol.is_some()
         || body.flow_port.is_some()
         || body.flow_port_kind.is_some();
-    if existing.current_state.as_deref() == Some("firing")
-        && (condition_changed || body.enabled == Some(false))
+    if matches!(
+        existing.current_state.as_deref(),
+        Some("firing" | "recovered_awaiting_revert")
+    ) && (condition_changed || body.enabled == Some(false))
     {
         return err(
             StatusCode::CONFLICT,
@@ -887,6 +895,9 @@ pub async fn update(
     }
     if body.automatic_reroute_enabled.is_some() {
         sets.push("automatic_reroute_enabled = ?");
+    }
+    if body.automatic_revert_enabled.is_some() {
+        sets.push("automatic_revert_enabled = ?");
     }
     if body.automatic_reroute_enabled == Some(true) {
         // A human re-armed it through the normal gate, so the auto-disarm record
@@ -959,6 +970,9 @@ pub async fn update(
         q = q.bind(v);
     }
     if let Some(v) = body.automatic_reroute_enabled {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.automatic_revert_enabled {
         q = q.bind(v);
     }
     if let Some(v) = body.manual_apply_enabled {
@@ -1042,7 +1056,10 @@ pub async fn remove(
         Ok(value) => value.flatten(),
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
-    if firing.as_deref() == Some("firing") {
+    if matches!(
+        firing.as_deref(),
+        Some("firing" | "recovered_awaiting_revert")
+    ) {
         return err(
             StatusCode::CONFLICT,
             "clear the firing rule and complete its rollback before deleting it",
@@ -1144,13 +1161,11 @@ pub async fn clear(
                 "trigger_manual_reroute is required to reverse the rule's actions",
             );
         }
-        let enforce =
-            crate::api::settings::operating_mode(&state.pool, &state.config).await == "enforce";
         let actions = match crate::reroute::preparation::prepare_rollbacks(
             &state.pool,
             &originals,
             &reason,
-            enforce,
+            true,
         )
         .await
         {
@@ -1168,6 +1183,7 @@ pub async fn clear(
             source,
             reason.clone(),
             json!({"rule_id":id,"reason":reason}),
+            None,
         )
         .await;
         response["ok"] = json!(status.is_success());
@@ -1347,9 +1363,7 @@ pub async fn apply(
     Json(body): Json<ApplyBody>,
 ) -> JsonResp {
     use super::manual_mitigations as manual;
-    if !body.dry_run
-        && crate::api::settings::operating_mode(&state.pool, &state.config).await == "enforce"
-    {
+    if !body.dry_run && body.preview_token.is_some() {
         let Some(token) = body.preview_token.as_deref() else {
             return err(StatusCode::CONFLICT, "preview_required");
         };
@@ -1495,6 +1509,7 @@ pub async fn apply(
         source,
         reason,
         request,
+        None,
     )
     .await
 }

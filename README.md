@@ -65,19 +65,21 @@ topology): [docs/deployment.md](docs/deployment.md).
 - [docs/manual-mitigations.md](docs/manual-mitigations.md) — named action sets, shared Rules execution, preview authorization and recovery.
 - [docs/email-alerts.md](docs/email-alerts.md) — alert channel and triggers.
 - [docs/operations-runbook.md](docs/operations-runbook.md) — day-2 operations.
+- [docs/operator-workflows.md](docs/operator-workflows.md) — current manual authority, automation, recovery, and EMDD prerequisites.
+- [docs/release-workflows-20260919.md](docs/release-workflows-20260919.md) — accepted workflow release, conversion report, and pending deployment checks.
 
 ## Safety
 
-Rerouter ships in **observe mode** — a safe read-only / alert-only posture in
-which **no reroute executes, automatic or manual**. Detection runs fully, and
-when a threshold crosses above or below for the configured duration, the email
-alert includes the exact actions that *would* have run. An admin must explicitly
-flip the operating mode to `enforce` (audited) before Rerouter ever acts.
+Rerouter ships in **observe mode** with autonomous execution disabled. Detection
+runs fully. An authorized operator may execute a manual run or revert only after
+reviewing an exact server preview and explicitly confirming its one-use authority.
+Autonomous starts and recovery require `enforce`, the automatic master switch,
+and every narrower safety gate.
 
 Beyond that, automatic reroutes are **disabled by default** even in enforce
 mode. Every reroute must be defined as an action template and is allowlisted,
 rate-limited, cooled down, audited, and verified while native router configuration
-locks remain held across the complete set. Enforce-mode manual actions, rule applies, and rollbacks require a short-lived,
+locks remain held across the complete set. Manual actions, supervised rule applies, and rollbacks require a short-lived,
 single-use token bound to the exact server-rendered preview. Fresh device
 inventory bounds every new target; interface shutdown and route-map changes are
 manual-only. Any action left unresolved by a crash is marked `uncertain` and

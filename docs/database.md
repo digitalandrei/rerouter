@@ -435,8 +435,8 @@ acknowledgement cannot clear an unrelated manual lock.
 
 ## action_previews
 
-Short-lived confirmation records for enforce-mode manual actions, rule applies,
-and rollbacks.
+Short-lived confirmation records for manual actions, supervised rule applies,
+and rollbacks in either operating mode.
 Only token and plan hashes are stored; a token is user/scope bound, expires after
 five minutes, and is atomically marked used once.
 

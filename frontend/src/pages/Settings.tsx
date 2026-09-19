@@ -37,9 +37,14 @@ function RtbhCard() {
   const [tag, setTag] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [removingId, setRemovingId] = useState<number | null>(null);
 
   function load() {
-    api.rtbh.list().then(setItems).catch(() => setItems([]));
+    setError(null);
+    api.rtbh.list().then(setItems).catch((e) => {
+      setItems(null);
+      setError(e instanceof ApiError ? e.message : "Failed to load RTBH communities");
+    });
   }
   useEffect(load, []);
 
@@ -95,7 +100,12 @@ function RtbhCard() {
                     size="icon-sm"
                     variant="ghost"
                     className="text-destructive hover:text-destructive"
-                    onClick={() => void api.rtbh.remove(c.id).then(load).catch(() => {})}
+                    disabled={removingId !== null}
+                    aria-label={`Remove RTBH community ${c.label}`}
+                    onClick={() => {
+                      setRemovingId(c.id); setError(null);
+                      void api.rtbh.remove(c.id).then(load).catch((e) => setError(e instanceof ApiError ? e.message : "Failed to remove RTBH community")).finally(() => setRemovingId(null));
+                    }}
                     title="Remove"
                   >
                     <X className="size-4" />
@@ -126,8 +136,13 @@ function RtbhCard() {
 }
 
 export default function Settings() {
+  const { user, hasPermission } = useAuth();
+  const canAdmin = user?.roles.some((role) => role === "admin" || role === "superadmin") ?? false;
+  const canManageLocks = hasPermission("manage_locks");
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   // Confirmation gate for the dangerous direction of a safety switch (the
   // control looks uniform now, so the deliberate/audited friction lives here).
   const [confirm, setConfirm] = useState<{
@@ -145,10 +160,11 @@ export default function Settings() {
 
   function loadSettings() {
     setLoading(true);
+    setLoadError(null);
     api.settings
       .get()
       .then(setSettings)
-      .catch(() => setSettings(null))
+      .catch((e) => setLoadError(e instanceof ApiError ? e.message : "Failed to load settings"))
       .finally(() => setLoading(false));
   }
 
@@ -162,20 +178,22 @@ export default function Settings() {
         <p className="text-sm text-muted-foreground">Loading settings…</p>
       )}
 
-      <Card>
+      {!loading && loadError && <div role="alert" className="flex items-center gap-3 text-sm text-destructive"><span>Settings could not be loaded: {loadError}</span><Button size="sm" variant="outline" onClick={loadSettings}>Try again</Button></div>}
+      {mutationError && <p role="alert" className="text-sm text-destructive">{mutationError}</p>}
+
+      {settings && <Card>
         <CardHeader>
           <CardTitle className="text-lg">Operating mode</CardTitle>
           <CardDescription>
-            <strong>observe</strong> (the shipped default) — safe read-only /
-            alert-only: no reroute executes, manual or automatic; alerts show
-            the actions that would have run. Flipping to enforce is admin-only
-            and audited (doctrine §8, gate 0).
+            <strong>observe</strong> (the shipped default) blocks autonomous reroutes.
+            Authorized manual runs remain available after an exact server preview and explicit
+            confirmation. Flipping to enforce is admin-only and audited.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
           <Switch
             checked={settings?.operating_mode === "enforce"}
-            disabled={loading || settings === null}
+            disabled={loading || settings === null || !canAdmin}
             aria-label="Toggle enforce mode"
             onCheckedChange={(v) => {
               if (v) {
@@ -192,7 +210,7 @@ export default function Settings() {
                       .then(setSettings),
                 });
               } else {
-                void api.settings.put({ operating_mode: "observe" }).then(setSettings);
+                setMutationError(null); void api.settings.put({ operating_mode: "observe" }).then(setSettings).catch((e) => setMutationError(e instanceof ApiError ? e.message : "Failed to change operating mode"));
               }
             }}
           />
@@ -202,9 +220,9 @@ export default function Settings() {
               : "Observe — read-only / alert-only"}
           </span>
         </CardContent>
-      </Card>
+      </Card>}
 
-      <Card>
+      {settings && <Card>
         <CardHeader>
           <CardTitle className="text-lg">Automatic reroutes</CardTitle>
           <CardDescription>
@@ -212,14 +230,14 @@ export default function Settings() {
             OFF, admin-only and audited). Automatic execution requires{" "}
             <strong>all</strong> of: enforce mode, this switch ON, and the firing
             rule's own <strong>Auto</strong> toggle — plus the executor's device
-            locks &amp; cooldowns. Manual reroutes are unaffected. In observe mode
-            nothing runs.
+            locks &amp; cooldowns. Previewed, explicitly confirmed manual reroutes
+            remain available in either operating mode.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-center gap-3">
           <Switch
             checked={!!settings?.automatic_actions_enabled}
-            disabled={loading || settings === null}
+            disabled={loading || settings === null || !canAdmin}
             aria-label="Toggle automatic reroutes"
             onCheckedChange={(v) => {
               if (v) {
@@ -236,9 +254,9 @@ export default function Settings() {
                       .then(setSettings),
                 });
               } else {
-                void api.settings
+                setMutationError(null); void api.settings
                   .put({ automatic_actions_enabled: false })
-                  .then(setSettings);
+                  .then(setSettings).catch((e) => setMutationError(e instanceof ApiError ? e.message : "Failed to disable automatic reroutes"));
               }
             }}
           />
@@ -248,9 +266,9 @@ export default function Settings() {
               : "Automatic reroutes disabled"}
           </span>
         </CardContent>
-      </Card>
+      </Card>}
 
-      <Card>
+      {settings && <Card>
         <CardHeader>
           <CardTitle className="text-lg">Global maintenance lock</CardTitle>
           <CardDescription>
@@ -260,11 +278,11 @@ export default function Settings() {
         <CardContent className="flex flex-wrap items-center gap-3">
           <Switch
             checked={!!settings?.global_lock}
-            disabled={loading || settings === null}
+            disabled={loading || settings === null || !canManageLocks}
             aria-label="Toggle maintenance lock"
             onCheckedChange={(v) => {
               if (v) {
-                void api.settings.put({ global_lock: true }).then(setSettings);
+                setMutationError(null); void api.settings.put({ global_lock: true }).then(setSettings).catch((e) => setMutationError(e instanceof ApiError ? e.message : "Failed to engage maintenance lock"));
               } else {
                 setConfirm({
                   title: "Clear the maintenance lock?",
@@ -284,7 +302,7 @@ export default function Settings() {
               : "No maintenance lock"}
           </span>
         </CardContent>
-      </Card>
+      </Card>}
 
       <RtbhCard />
 

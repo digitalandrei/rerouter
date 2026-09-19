@@ -62,9 +62,8 @@ shut / no-shut. This is an in-house operator tool, so there is no typed-text
 confirmation or per-action password/TOTP gate; the safety comes from
 layered, fail-closed controls rather than per-click friction:
 
-- **observe by default** — the shipped operating mode is `observe`
-  (read-only / alert-only); nothing executes, automatic or manual, until an
-  admin flips to `enforce`;
+- **observe by default** — the shipped operating mode disables autonomous work;
+  authorized manual work still requires exact one-use preview authority;
 - **template-only, allowlisted commands** — actions are rendered from validated
   templates, and the device-CLI layer enforces a fail-closed command allowlist
   covering only the catalogued `show`, Null0 route, BGP neighbor/prefix-list/
@@ -73,7 +72,7 @@ layered, fail-closed controls rather than per-click friction:
 - **authorized identity** — a manual reroute must carry an authenticated session
   with the `trigger_manual_reroute` permission and an optional free-text reason
   for the audit log;
-- **server-bound preview** — enforce-mode manual actions and rollbacks consume a
+- **server-bound preview** — manual actions and rollbacks in either mode consume a
   five-minute, single-use token bound to the exact server-rendered plan, audit
   reason, user, and action scope. Request changes, target drift, expiry, and
   replay are refused;
@@ -93,8 +92,8 @@ layered, fail-closed controls rather than per-click friction:
 
 Flipping the global operating mode (`observe` → `enforce`, see
 [reroute-engine.md](reroute-engine.md) "Operating mode") is itself a dangerous
-action: admin-only, audited, and alerted. The shipped default is `observe`
-(read-only / alert-only — no reroute executes, automatic or manual).
+action: admin-only, audited, and alerted. The shipped default is `observe`, with
+automatic execution independently off.
 
 ## Credentials & secrets
 

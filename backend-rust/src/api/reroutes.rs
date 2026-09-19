@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -20,6 +20,25 @@ use super::{client_ip, err, user_agent, AppState};
 use crate::auth::rbac::{markers, RequirePermission};
 
 type JsonResp = (StatusCode, Json<Value>);
+
+fn pagination_bounds(total: i64, requested: u32, per_page: u32) -> (u64, u64) {
+    let pages = (total.max(0) as u64).div_ceil(per_page as u64).max(1);
+    let page = (requested.max(1) as u64).min(pages);
+    (page, page.saturating_sub(1).saturating_mul(per_page as u64))
+}
+fn bundle_list_payload(
+    items: Vec<Value>,
+    page: u64,
+    per_page: u32,
+    total: i64,
+    legacy: bool,
+) -> Value {
+    if legacy {
+        json!(items)
+    } else {
+        json!({"items":items,"page":page,"per_page":per_page,"total":total})
+    }
+}
 
 #[derive(sqlx::FromRow)]
 struct RerouteRow {
@@ -214,11 +233,9 @@ pub async fn manual(
             auto_target: None,
         })
         .collect();
-    let request =
-        json!({"actions":actions,"preset_id":null,"preset_revision":null,"reason":reason});
-    if body.dry_run
-        || crate::api::settings::operating_mode(&state.pool, &state.config).await != "enforce"
-    {
+    let request = json!({"actions":actions,"preset_id":null,"preset_revision":null,
+        "reason":reason,"revert_after_seconds":null});
+    if body.dry_run || body.preview_token.is_none() {
         return manual::preview_manual(
             &state,
             &g.session,
@@ -227,6 +244,7 @@ pub async fn manual(
                 preset_revision: None,
                 actions,
                 reason: Some(reason),
+                revert_after_seconds: None,
             },
             "legacy_manual",
         )
@@ -469,20 +487,14 @@ pub async fn rollback(
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("manual rollback of reroute #{id}"));
-    let enforce =
-        crate::api::settings::operating_mode(&state.pool, &state.config).await == "enforce";
-    if body.dry_run || !enforce {
-        let actions = match crate::reroute::preparation::prepare_rollbacks(
-            &state.pool,
-            &[id],
-            &reason,
-            enforce,
-        )
-        .await
-        {
-            Ok(actions) => actions,
-            Err(e) => return err(StatusCode::CONFLICT, &format!("{e:#}")),
-        };
+    if body.dry_run || body.preview_token.is_none() {
+        let actions =
+            match crate::reroute::preparation::prepare_rollbacks(&state.pool, &[id], &reason, true)
+                .await
+            {
+                Ok(actions) => actions,
+                Err(e) => return err(StatusCode::CONFLICT, &format!("{e:#}")),
+            };
         if actions.is_empty() {
             return (
                 StatusCode::OK,
@@ -500,6 +512,7 @@ pub async fn rollback(
             json!({"kind":"rollback","original_reroute_id":id}),
             reason.clone(),
             json!({"original_reroute_id":id,"reason":reason}),
+            None,
         )
         .await;
         if status.is_success() {
@@ -579,9 +592,20 @@ pub async fn rollback(
 /// when compensation could not finish.
 /// Include runs that failed before creating any child reroute, so a lost HTTP
 /// response can always be reconciled through the shared execution history.
+#[derive(Default, Deserialize)]
+pub struct BundleListQuery {
+    page: Option<u32>,
+    per_page: Option<u32>,
+    lifecycle: Option<String>,
+    trigger_type: Option<String>,
+    rule_id: Option<u64>,
+    preset_id: Option<u64>,
+}
+
 pub async fn bundle_list(
     _g: RequirePermission<markers::ViewAsset>,
     State(state): State<AppState>,
+    Query(query): Query<BundleListQuery>,
 ) -> JsonResp {
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -598,17 +622,56 @@ pub async fn bundle_list(
         created_at: DateTime<Utc>,
         source_json: Option<sqlx::types::Json<Value>>,
         triggered_by: Option<String>,
+        lifecycle_state: String,
+        remaining_mutations: u32,
+        recovery_deadline: Option<DateTime<Utc>>,
     }
+    let legacy = query.page.is_none()
+        && query.per_page.is_none()
+        && query.lifecycle.is_none()
+        && query.trigger_type.is_none()
+        && query.rule_id.is_none()
+        && query.preset_id.is_none();
+    let requested_page = query.page.unwrap_or(1).max(1);
+    let per_page = query
+        .per_page
+        .unwrap_or(if legacy { 100 } else { 50 })
+        .clamp(1, 200);
+    let lifecycle = query.lifecycle.as_deref().filter(|v| *v != "all");
+    let total:i64=match sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundles b WHERE \
+        (? IS NULL OR (?='active' AND (b.remaining_mutations>0 OR b.state IN ('planned','running','compensating') OR b.lifecycle_state<>'inactive')) \
+          OR (?='inactive' AND b.remaining_mutations=0 AND b.state NOT IN ('planned','running','compensating') AND b.lifecycle_state='inactive') OR b.lifecycle_state=?) \
+        AND (? IS NULL OR b.trigger_type=?) AND (? IS NULL OR b.rule_id=?) \
+        AND (? IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.preset_id'))=CAST(? AS CHAR))")
+        .bind(lifecycle).bind(lifecycle).bind(lifecycle).bind(lifecycle)
+        .bind(query.trigger_type.as_deref()).bind(query.trigger_type.as_deref())
+        .bind(query.rule_id).bind(query.rule_id).bind(query.preset_id).bind(query.preset_id)
+        .fetch_one(&state.pool).await {Ok(v)=>v,Err(_)=>return err(StatusCode::INTERNAL_SERVER_ERROR,"could not count mitigation runs")};
+    let (page, offset) = pagination_bounds(total, requested_page, per_page);
     match sqlx::query_as::<_,Row>("SELECT b.id,b.rule_id,b.trigger_type,b.state,b.reason,b.total_actions,b.completed_actions, \
-        b.failure_reason,b.started_at,b.finished_at,b.created_at,b.source_json,u.email AS triggered_by \
-        FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id ORDER BY b.id DESC LIMIT 200")
-        .fetch_all(&state.pool).await {
-        Ok(rows)=>(StatusCode::OK,Json(json!(rows.into_iter().map(|r|json!({
-            "id":r.id,"rule_id":r.rule_id,"trigger_type":r.trigger_type,"state":r.state,"reason":r.reason,
+        b.failure_reason,b.started_at,b.finished_at,b.created_at,b.source_json,u.email AS triggered_by, \
+        b.lifecycle_state,b.remaining_mutations,b.recovery_deadline \
+        FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id WHERE \
+        (? IS NULL OR (?='active' AND (b.remaining_mutations>0 OR b.state IN ('planned','running','compensating') OR b.lifecycle_state<>'inactive')) \
+          OR (?='inactive' AND b.remaining_mutations=0 AND b.state NOT IN ('planned','running','compensating') AND b.lifecycle_state='inactive') OR b.lifecycle_state=?) \
+        AND (? IS NULL OR b.trigger_type=?) AND (? IS NULL OR b.rule_id=?) \
+        AND (? IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.preset_id'))=CAST(? AS CHAR)) \
+        ORDER BY b.id DESC LIMIT ? OFFSET ?")
+        .bind(lifecycle).bind(lifecycle).bind(lifecycle).bind(lifecycle)
+        .bind(query.trigger_type.as_deref()).bind(query.trigger_type.as_deref())
+        .bind(query.rule_id).bind(query.rule_id).bind(query.preset_id).bind(query.preset_id)
+        .bind(per_page).bind(offset).fetch_all(&state.pool).await {
+        Ok(rows)=>{
+            let items=rows.into_iter().map(|r|json!({
+            "id":r.id,"rule_id":r.rule_id,"trigger_type":r.trigger_type,"state":r.state.clone(),"execution_state":r.state,"reason":r.reason,
             "total_actions":r.total_actions,"completed_actions":r.completed_actions,"failure_reason":r.failure_reason,
             "started_at":r.started_at,"finished_at":r.finished_at,"created_at":r.created_at,
             "source":r.source_json.map(|s|s.0),"triggered_by":r.triggered_by,
-        })).collect::<Vec<_>>()))),
+            "lifecycle_state":r.lifecycle_state,"remaining_mutations":r.remaining_mutations,
+            "active":r.remaining_mutations>0,"recovery_deadline":r.recovery_deadline,
+            })).collect::<Vec<_>>();
+            (StatusCode::OK,Json(bundle_list_payload(items,page,per_page,total,legacy)))
+        },
         Err(_)=>err(StatusCode::INTERNAL_SERVER_ERROR,"could not load mitigation runs"),
     }
 }
@@ -632,9 +695,15 @@ pub async fn bundle_show(
         source_json: Option<sqlx::types::Json<Value>>,
         triggered_by_user_id: Option<u64>,
         triggered_by: Option<String>,
+        lifecycle_state: String,
+        remaining_mutations: u32,
+        recovery_deadline: Option<DateTime<Utc>>,
+        automatic_recovery_cancelled_at: Option<DateTime<Utc>>,
+        automatic_recovery_block_reason: Option<String>,
     }
     let row=match sqlx::query_as::<_,BundleRow>("SELECT b.rule_id,b.trigger_type,b.state,b.failure_policy,b.total_actions,b.completed_actions, \
-        b.failure_reason,b.started_at,b.finished_at,b.source_json,b.triggered_by_user_id,u.email AS triggered_by \
+        b.failure_reason,b.started_at,b.finished_at,b.source_json,b.triggered_by_user_id,u.email AS triggered_by, \
+        b.lifecycle_state,b.remaining_mutations,b.recovery_deadline,b.automatic_recovery_cancelled_at,b.automatic_recovery_block_reason \
         FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id WHERE b.id=?")
         .bind(id).fetch_optional(&state.pool).await {
         Ok(Some(row))=>row, Ok(None)=>return err(StatusCode::NOT_FOUND,"bundle not found"),
@@ -652,11 +721,15 @@ pub async fn bundle_show(
         template_snapshot_json: Option<sqlx::types::Json<Value>>,
         params: Option<sqlx::types::Json<Value>>,
         original_reroute_id: Option<u64>,
+        prepared_action_json: Option<sqlx::types::Json<Value>>,
+        rendered_plan_json: Option<sqlx::types::Json<Value>>,
+        rendered_rollback_json: Option<sqlx::types::Json<Value>>,
     }
     let rows=sqlx::query_as::<_,ActionRow>("SELECT a.reroute_id,a.position,a.device_id,d.name AS device_name, \
         COALESCE(r.state,a.state) AS state, COALESCE(r.mutation_effect,a.mutation_effect) AS mutation_effect, \
         COALESCE(r.failure_reason,a.failure_reason) AS failure_reason, a.template_snapshot_json, \
-        a.canonical_params_json AS params, COALESCE(r.rollback_of_reroute_id,a.original_reroute_id) AS original_reroute_id \
+        a.canonical_params_json AS params, COALESCE(r.rollback_of_reroute_id,a.original_reroute_id) AS original_reroute_id, \
+        a.prepared_action_json,a.rendered_plan_json,a.rendered_rollback_json \
         FROM reroute_bundle_actions a LEFT JOIN reroutes r ON r.id=a.reroute_id LEFT JOIN devices d ON d.id=a.device_id \
         WHERE a.bundle_id=? ORDER BY a.position,a.id")
         .bind(id).fetch_all(&state.pool).await;
@@ -672,17 +745,43 @@ pub async fn bundle_show(
     if rows.is_empty() && row.total_actions > 0 {
         rows=match sqlx::query_as::<_,ActionRow>("SELECT r.id AS reroute_id,r.bundle_position AS position,r.device_id,d.name AS device_name, \
             r.state,r.mutation_effect,r.failure_reason,r.template_snapshot_json,r.parameters_json AS params, \
-            r.rollback_of_reroute_id AS original_reroute_id FROM reroutes r LEFT JOIN devices d ON d.id=r.device_id \
+            r.rollback_of_reroute_id AS original_reroute_id,NULL AS prepared_action_json,NULL AS rendered_plan_json,NULL AS rendered_rollback_json \
+            FROM reroutes r LEFT JOIN devices d ON d.id=r.device_id \
             WHERE r.bundle_id=? ORDER BY r.bundle_position,r.id")
             .bind(id).fetch_all(&state.pool).await {Ok(rows)=>rows,Err(_)=>return err(StatusCode::INTERNAL_SERVER_ERROR,"could not load legacy action history")};
     }
+    let prepared = match rows
+        .iter()
+        .filter_map(|action| action.prepared_action_json.as_ref())
+        .map(|value| serde_json::from_value(value.0.clone()))
+        .collect::<Result<Vec<crate::reroute::device_plan::PreparedDeviceAction>, _>>()
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored action evidence is invalid",
+            )
+        }
+    };
+    let projections = match crate::reroute::projection::project_action_set(&prepared) {
+        Ok(value) => value,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored action projection is invalid",
+            )
+        }
+    };
     let terminal = !matches!(row.state.as_str(), "planned" | "running" | "compensating");
     let actions:Vec<_>=rows.into_iter().map(|a| {
         let template=a.template_snapshot_json.map(|v|v.0).unwrap_or(Value::Null);
         json!({"reroute_id":a.reroute_id,"position":a.position,"device_id":a.device_id,"device_name":a.device_name,
             "state":if terminal && a.state=="queued" {"not_run"} else {&a.state},"mutation_effect":a.mutation_effect,
             "failure_reason":a.failure_reason,"template_name":template["name"],"template_display_name":template["display_name"],
-            "params":a.params.map(|v|v.0),"original_reroute_id":a.original_reroute_id})
+            "params":a.params.map(|v|v.0),"original_reroute_id":a.original_reroute_id,
+            "prepared_evidence":a.prepared_action_json.map(|v|v.0),"rendered_plan":a.rendered_plan_json.map(|v|v.0),
+            "rendered_revert":a.rendered_rollback_json.map(|v|v.0)})
     }).collect();
     let source = row.source_json.map(|v| v.0).unwrap_or(Value::Null);
     let mut originals: Vec<u64> = source
@@ -720,7 +819,164 @@ pub async fn bundle_show(
             json!({"id":id,"rule_id":row.rule_id,"trigger_type":row.trigger_type,"state":row.state,
         "failure_policy":row.failure_policy,"total_actions":row.total_actions,"completed_actions":row.completed_actions,
         "failure_reason":row.failure_reason,"started_at":row.started_at,"finished_at":row.finished_at,"source":source,
-        "triggered_by_user_id":row.triggered_by_user_id,"triggered_by":row.triggered_by,"actions":actions,"still_applied_reroute_ids":still}),
+        "execution_state":row.state,"lifecycle_state":row.lifecycle_state,"remaining_mutations":row.remaining_mutations,
+        "active":row.remaining_mutations>0,"recovery_deadline":row.recovery_deadline,
+        "automatic_recovery_cancelled_at":row.automatic_recovery_cancelled_at,
+        "revert":{"available":row.remaining_mutations>0 && row.automatic_recovery_block_reason.is_none(),
+          "block_reasons":row.automatic_recovery_block_reason.into_iter().collect::<Vec<_>>()},
+        "triggered_by_user_id":row.triggered_by_user_id,"triggered_by":row.triggered_by,"actions":actions,
+        "projections":projections,"still_applied_reroute_ids":still}),
         ),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleRevertBody {
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    plan_id: Option<u64>,
+    #[serde(default)]
+    preview_token: Option<String>,
+}
+
+/// Preview or confirm the inverse of every mutation owned by a run. Originals
+/// are loaded from durable snapshots in reverse bundle order; caller input can
+/// never select or rewrite individual siblings.
+pub async fn bundle_revert(
+    g: RequirePermission<markers::TriggerManualReroute>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<BundleRevertBody>,
+) -> JsonResp {
+    use super::manual_mitigations as manual;
+    let reason = body
+        .reason
+        .unwrap_or_else(|| format!("revert mitigation run #{id}"));
+    if body.dry_run || body.preview_token.is_none() {
+        let originals = match crate::reroute::recovery::owned_original_ids(&state.pool, id).await {
+            Ok(ids) => ids,
+            Err(_) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not establish run ownership",
+                )
+            }
+        };
+        if originals.is_empty() {
+            return (
+                StatusCode::OK,
+                Json(
+                    json!({"results":[],"revert":{"available":false,"block_reasons":[],"noop":true}}),
+                ),
+            );
+        }
+        let actions = match crate::reroute::preparation::prepare_rollbacks(
+            &state.pool,
+            &originals,
+            &reason,
+            true,
+        )
+        .await
+        {
+            Ok(actions) => actions,
+            Err(e) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    &format!("whole-run revert refused: {e:#}"),
+                )
+            }
+        };
+        return manual::preview_actions(
+            &state, &g.session, "bundle_revert", Some(id), actions,
+            json!({"kind":"bundle_revert","original_bundle_id":id,"original_reroute_ids":originals}),
+            reason.clone(), json!({"original_bundle_id":id,"reason":reason}), None,
+        ).await;
+    }
+    let (Some(plan_id), Some(token)) = (body.plan_id, body.preview_token.as_deref()) else {
+        return err(StatusCode::CONFLICT, "preview_required");
+    };
+    let accepted = match manual::accept_plan(
+        &state,
+        &g.session,
+        plan_id,
+        token,
+        "bundle_revert",
+        Some(id),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(e) => return err(StatusCode::CONFLICT, &format!("{e:#}")),
+    };
+    let recovery_id = accepted.bundle_id;
+    if !accepted.already_accepted {
+        manual::spawn_accepted(&state, &g.session, accepted);
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"bundle_id":recovery_id,"async":true})),
+    )
+}
+
+/// Cancel a future timer/recovery claim. Once recovery is in flight it cannot
+/// be converted to manual ownership underneath the runner.
+pub async fn bundle_take_control(
+    g: RequirePermission<markers::TriggerManualReroute>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> JsonResp {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let changed = match sqlx::query("UPDATE reroute_bundles SET automatic_recovery_cancelled_at=UTC_TIMESTAMP(), \
+        automatic_recovery_cancelled_by=?, recovery_deadline=NULL, lifecycle_state=IF(remaining_mutations>0,'active','inactive') \
+        WHERE id=? AND lifecycle_state IN ('active','recovery_scheduled') AND recovery_claim_token IS NULL")
+        .bind(g.session.user_id).bind(id).execute(&mut *tx).await {
+            Ok(result) => result.rows_affected(), Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR,"db_error")
+        };
+    if changed != 1 {
+        return err(
+            StatusCode::CONFLICT,
+            "automatic recovery is absent, claimed, or already in flight",
+        );
+    }
+    if super::audit_mutation_on(
+        &mut tx,
+        &g.session,
+        "reroute_bundle_manual_takeover",
+        "reroute_bundle",
+        id,
+        "operator cancelled future automatic recovery; existing mutation ownership remains",
+    )
+    .await
+    .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "takeover_commit_unknown");
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok":true,"bundle_id":id,"automatic_recovery_cancelled":true})),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn maximum_page_is_clamped_without_offset_wrap() {
+        assert_eq!(super::pagination_bounds(401, u32::MAX, 200), (3, 400));
+        assert_eq!(super::pagination_bounds(0, u32::MAX, 200), (1, 0));
+    }
+    #[test]
+    fn bundle_list_keeps_legacy_array_only_without_query_contract() {
+        assert!(super::bundle_list_payload(vec![], 1, 100, 0, true).is_array());
+        let paged = super::bundle_list_payload(vec![], 1, 50, 0, false);
+        assert!(paged.is_object());
+        assert_eq!(paged["page"], 1);
+    }
 }

@@ -29,6 +29,8 @@ pub(crate) struct RunSnapshot {
     /// The immutable caller inputs used by compatibility endpoints to reject a
     /// token presented alongside a different request.
     pub request: Value,
+    #[serde(default)]
+    pub revert_after_seconds: Option<u32>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -41,6 +43,8 @@ pub struct PreviewBody {
     pub actions: Vec<ActionDraft>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub revert_after_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +78,15 @@ pub(crate) async fn preview_manual(
         return err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "provide an audit reason of 1–4000 characters",
+        );
+    }
+    if body
+        .revert_after_seconds
+        .is_some_and(|seconds| !(60..=604_800).contains(&seconds))
+    {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "revert_after_seconds must be null or 60–604800",
         );
     }
     let source = if let Some(id) = body.preset_id {
@@ -133,7 +146,7 @@ pub(crate) async fn preview_manual(
             original_reroute_id: None,
         })
         .collect();
-    let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason});
+    let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason,"revert_after_seconds":body.revert_after_seconds});
     preview_actions(
         state,
         actor,
@@ -143,6 +156,7 @@ pub(crate) async fn preview_manual(
         source,
         reason,
         request,
+        body.revert_after_seconds,
     )
     .await
 }
@@ -161,10 +175,39 @@ pub(crate) async fn preview_actions(
     actor: &Session,
     scope: &str,
     scope_id: Option<u64>,
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    revert_after_seconds: Option<u32>,
+) -> JsonResp {
+    preview_actions_core(
+        state,
+        actor,
+        scope,
+        scope_id,
+        actions,
+        source,
+        reason,
+        request,
+        revert_after_seconds,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preview_actions_core(
+    state: &AppState,
+    actor: &Session,
+    scope: &str,
+    scope_id: Option<u64>,
     mut actions: Vec<BundleAction>,
     mut source: Value,
     reason: String,
     request: Value,
+    revert_after_seconds: Option<u32>,
+    inverse_already_inspected: bool,
 ) -> JsonResp {
     let clear_only =
         actions.is_empty() && source.get("kind").and_then(Value::as_str) == Some("rule_clear");
@@ -175,15 +218,11 @@ pub(crate) async fn preview_actions(
         );
     }
     let enforce = super::settings::operating_mode(&state.pool, &state.config).await == "enforce";
-    let _policy = if enforce {
-        match guard::policy_fence(&state.pool).await {
-            Ok(fence) => Some(fence),
-            Err(e) => return err(StatusCode::CONFLICT, &format!("preview policy busy: {e}")),
-        }
-    } else {
-        None
+    let _policy = match guard::policy_fence(&state.pool).await {
+        Ok(fence) => Some(fence),
+        Err(e) => return err(StatusCode::CONFLICT, &format!("preview policy busy: {e}")),
     };
-    if enforce && actions.iter().any(|a| a.prepared.is_none()) {
+    if actions.iter().any(|a| a.prepared.is_none()) {
         if let Err(e) = inspect_actions(&state.pool, &mut actions).await {
             return err(
                 StatusCode::CONFLICT,
@@ -191,9 +230,9 @@ pub(crate) async fn preview_actions(
             );
         }
     }
-    if enforce {
+    {
         let mut concrete: Vec<_> = actions.iter().filter_map(|a| a.prepared.clone()).collect();
-        if actions.iter().any(|a| a.original_reroute_id.is_some()) {
+        if !inverse_already_inspected && actions.iter().any(|a| a.original_reroute_id.is_some()) {
             match crate::reroute::device_plan::prepare_inverse_sequence_read_only(
                 &state.pool,
                 &mut concrete,
@@ -227,6 +266,20 @@ pub(crate) async fn preview_actions(
         }
     }
     let mut results = Vec::with_capacity(actions.len());
+    let projections = match crate::reroute::projection::project_action_set(
+        &actions
+            .iter()
+            .filter_map(|action| action.prepared.clone())
+            .collect::<Vec<_>>(),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            return err(
+                StatusCode::CONFLICT,
+                &format!("complete projection refused: {e:#}"),
+            )
+        }
+    };
     for action in &actions {
         let name: Option<String> = sqlx::query_scalar("SELECT name FROM devices WHERE id = ?")
             .bind(action.device_id)
@@ -266,7 +319,7 @@ pub(crate) async fn preview_actions(
         };
         results.push(json!({
             "executed":false, "reroute_id":null, "state":null, "device_id":action.device_id, "device_name":name,
-            "message":if enforce {"Prepared; confirmation required"} else {"Observe mode: nothing will execute"},
+            "message":"Prepared; explicit confirmation required",
             "would_run":plan, "would_run_rollback":inverse, "before_state":before, "after_state":after,
             "mutation_effect":effect, "predicted_noop":effect=="noop", "bundle_position":action.position,
             "verification_states":action.prepared.as_ref().map(|p| &p.verify),
@@ -274,20 +327,13 @@ pub(crate) async fn preview_actions(
             "auto_target":action.auto_target, "auto_target_low_confidence":action.auto_target_low_confidence,
         }));
     }
-    if !enforce && !clear_only {
-        return (
-            StatusCode::OK,
-            Json(
-                json!({"plan_id":null,"preview_token":null,"results":results,"source":source,"operating_mode":"observe"}),
-            ),
-        );
-    }
     let snapshot = RunSnapshot {
         device_actions: actions.iter().filter_map(|a| a.prepared.clone()).collect(),
         actions,
         source: source.clone(),
         reason: reason.clone(),
         request,
+        revert_after_seconds,
     };
     let snapshot_json = match serde_json::to_value(&snapshot) {
         Ok(value) => value,
@@ -309,7 +355,7 @@ pub(crate) async fn preview_actions(
         Ok(row) => (
             StatusCode::OK,
             Json(
-                json!({"plan_id":row.last_insert_id(),"preview_token":token,"results":results,
+                json!({"plan_id":row.last_insert_id(),"preview_token":token,"results":results,"projections":projections,"revert_after_seconds":revert_after_seconds,
             "source":source,"expires_at":Utc::now()+chrono::Duration::minutes(5),"operating_mode":if enforce {"enforce"} else {"observe"}}),
             ),
         ),
@@ -320,14 +366,73 @@ pub(crate) async fn preview_actions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn preview_actions_with_reader<R: crate::reroute::device_plan::PreparationReader>(
+    state: &AppState,
+    actor: &Session,
+    scope: &str,
+    scope_id: Option<u64>,
+    mut actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    revert_after_seconds: Option<u32>,
+    reader: &R,
+) -> JsonResp {
+    if !actions.iter().any(|a| a.original_reroute_id.is_some()) {
+        if let Err(e) =
+            preparation::inspect_actions_with_reader(&state.pool, &mut actions, false, reader).await
+        {
+            return err(
+                StatusCode::CONFLICT,
+                &format!("complete mitigation preparation refused; nothing was executed: {e:#}"),
+            );
+        }
+    }
+    if actions.iter().any(|a| a.original_reroute_id.is_some()) {
+        let mut concrete = actions
+            .iter()
+            .filter_map(|a| a.prepared.clone())
+            .collect::<Vec<_>>();
+        if let Err(e) = crate::reroute::device_plan::prepare_inverse_sequence_read_only_with_reader(
+            reader,
+            &mut concrete,
+        )
+        .await
+        {
+            return err(
+                StatusCode::CONFLICT,
+                &format!("inverse preconditions could not be proved: {e:#}"),
+            );
+        }
+        for (action, plan) in actions.iter_mut().zip(concrete) {
+            action.prepared = Some(plan);
+        }
+    }
+    preview_actions_core(
+        state,
+        actor,
+        scope,
+        scope_id,
+        actions,
+        source,
+        reason,
+        request,
+        revert_after_seconds,
+        true,
+    )
+    .await
+}
+
 pub(crate) fn hash_snapshot(value: &Value) -> String {
     hex::encode(Sha256::digest(value.to_string().as_bytes()))
 }
 
-pub(crate) struct AcceptedPlan {
+#[doc(hidden)]
+pub struct AcceptedPlan {
     pub bundle_id: u64,
     pub plan_id: u64,
-    pub snapshot: RunSnapshot,
+    pub(crate) snapshot: RunSnapshot,
     pub already_accepted: bool,
 }
 
@@ -344,13 +449,38 @@ struct PlanRow {
     bundle_id: Option<u64>,
 }
 
-pub(crate) async fn accept_plan(
+#[doc(hidden)]
+pub async fn accept_plan(
     state: &AppState,
     actor: &Session,
     plan_id: u64,
     token: &str,
     scope: &str,
     scope_id: Option<u64>,
+) -> anyhow::Result<AcceptedPlan> {
+    accept_plan_inner(state, actor, plan_id, token, scope, scope_id, false).await
+}
+
+#[doc(hidden)]
+pub async fn accept_plan_with_persist_failure_for_test(
+    state: &AppState,
+    actor: &Session,
+    plan_id: u64,
+    token: &str,
+    scope: &str,
+    scope_id: Option<u64>,
+) -> anyhow::Result<AcceptedPlan> {
+    accept_plan_inner(state, actor, plan_id, token, scope, scope_id, true).await
+}
+
+async fn accept_plan_inner(
+    state: &AppState,
+    actor: &Session,
+    plan_id: u64,
+    token: &str,
+    scope: &str,
+    scope_id: Option<u64>,
+    force_persist_failure: bool,
 ) -> anyhow::Result<AcceptedPlan> {
     let _policy_fence = guard::policy_fence(&state.pool).await?;
     let mut tx = state.pool.begin().await?;
@@ -383,6 +513,10 @@ pub(crate) async fn accept_plan(
             .source
             .get("original_reroute_id")
             .and_then(Value::as_u64),
+        ("bundle_revert", Some("bundle_revert")) => snapshot
+            .source
+            .get("original_bundle_id")
+            .and_then(Value::as_u64),
         _ => anyhow::bail!("preview source does not match its authorization scope"),
     };
     ensure!(
@@ -411,11 +545,7 @@ pub(crate) async fn accept_plan(
     )
     .fetch_optional(&mut *tx)
     .await?;
-    ensure!(
-        mode.as_deref() == Some("enforce")
-            || (snapshot.actions.is_empty() && snapshot.source["kind"] == "rule_clear"),
-        "observe mode: execution refused"
-    );
+    let _mode = mode;
     if let Some(preset_id) = snapshot.source.get("preset_id").and_then(Value::as_u64) {
         let source: Option<(u64, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT revision, archived_at FROM mitigation_presets WHERE id = ? FOR UPDATE",
@@ -426,6 +556,23 @@ pub(crate) async fn accept_plan(
         ensure!(
             matches!(source, Some((revision, None)) if Some(revision) == snapshot.source.get("preset_revision").and_then(Value::as_u64)),
             "template_changed_or_archived; prepare a fresh preview"
+        );
+    }
+    if scope == "bundle_revert" {
+        let original_bundle_id = row.scope_id.context("bundle revert has no source run")?;
+        let expected = snapshot
+            .source
+            .get("original_reroute_ids")
+            .and_then(Value::as_array)
+            .context("bundle revert snapshot has no original set")?
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect::<Vec<_>>();
+        let current =
+            crate::reroute::recovery::owned_original_ids(&state.pool, original_bundle_id).await?;
+        ensure!(
+            current == expected,
+            "run ownership changed; prepare a fresh whole-run revert preview"
         );
     }
     let rule_id = snapshot.source.get("rule_id").and_then(Value::as_u64);
@@ -458,11 +605,30 @@ pub(crate) async fn accept_plan(
             "execution snapshot order or prepared action changed"
         );
     }
-    let row = sqlx::query("INSERT INTO reroute_bundles (rule_id, trigger_type, triggered_by_user_id, reason, state, failure_policy, total_actions, source_json) \
-        VALUES (?, 'manual', ?, ?, 'planned', 'abort_and_compensate', ?, ?)")
+    let parent_bundle_id = if scope == "bundle_revert" {
+        row.scope_id
+    } else {
+        None
+    };
+    if let Some(parent_id) = parent_bundle_id {
+        let claimed=sqlx::query("UPDATE reroute_bundles SET recovery_claim_token=?,recovery_claimed_at=UTC_TIMESTAMP(),lifecycle_state='recovery_claimed' \
+            WHERE id=? AND recovery_claim_token IS NULL AND lifecycle_state NOT IN ('recovery_claimed','recovery_running')")
+            .bind(format!("manual:plan:{plan_id}")).bind(parent_id).execute(&mut *tx).await?;
+        ensure!(
+            claimed.rows_affected() == 1,
+            "run recovery was already claimed or started"
+        );
+    }
+    let row = sqlx::query("INSERT INTO reroute_bundles (parent_bundle_id, rule_id, trigger_type, triggered_by_user_id, reason, state, failure_policy, total_actions, source_json) \
+        VALUES (?, ?, 'manual', ?, ?, 'planned', 'abort_and_compensate', ?, ?)")
+        .bind(parent_bundle_id)
         .bind(rule_id).bind(actor.user_id).bind(&snapshot.reason).bind(snapshot.actions.len() as u32)
         .bind(sqlx::types::Json(&snapshot.source)).execute(&mut *tx).await?;
     let bundle_id = row.last_insert_id();
+    if let Some(seconds) = snapshot.revert_after_seconds {
+        sqlx::query("UPDATE reroute_bundles SET source_json = JSON_SET(COALESCE(source_json, JSON_OBJECT()), '$.revert_after_seconds', ?) WHERE id = ?")
+            .bind(seconds).bind(bundle_id).execute(&mut *tx).await?;
+    }
     sqlx::query("UPDATE execution_plans SET consumed_at = UTC_TIMESTAMP(), bundle_id = ? WHERE id = ? AND consumed_at IS NULL")
         .bind(bundle_id).bind(plan_id).execute(&mut *tx).await?;
     super::audit_mutation_on(
@@ -480,6 +646,9 @@ pub(crate) async fn accept_plan(
     let admitted = async {
         if snapshot.actions.is_empty() {
             return Ok(());
+        }
+        if force_persist_failure {
+            anyhow::bail!("injected action-ledger persistence failure")
         }
         bundle::persist_actions(&state.pool, bundle_id, &snapshot.actions).await?;
         if snapshot
@@ -502,6 +671,15 @@ pub(crate) async fn accept_plan(
     if let Err(error) = admitted {
         sqlx::query("UPDATE reroute_bundles SET state = 'failed', finished_at = UTC_TIMESTAMP(), failure_reason = ? WHERE id = ? AND state = 'planned'")
             .bind(format!("admission refused before any router write: {error:#}")).bind(bundle_id).execute(&state.pool).await?;
+        if let Some(parent_id) = parent_bundle_id {
+            crate::reroute::recovery::release_claim_if_proven_no_write(
+                &state.pool,
+                parent_id,
+                Some(bundle_id),
+                &format!("admission refused: {error:#}"),
+            )
+            .await?;
+        }
         return Err(error.context(format!(
             "bundle #{bundle_id} was not admitted; no router command was sent"
         )));
@@ -520,9 +698,26 @@ pub(crate) fn spawn_accepted(state: &AppState, actor: &Session, accepted: Accept
     }
     let pool = state.pool.clone();
     let cfg = state.config.clone();
+    let source_bundle_id = accepted
+        .snapshot
+        .source
+        .get("original_bundle_id")
+        .and_then(Value::as_u64);
     let run = run_context(actor, &accepted);
     tokio::spawn(async move {
-        bundle::run(&pool, &cfg, run, accepted.snapshot.actions).await;
+        let outcome = bundle::run(&pool, &cfg, run, accepted.snapshot.actions).await;
+        if outcome.state != "succeeded" {
+            if let Some(source_id) = source_bundle_id {
+                let reason = outcome
+                    .failure_reason
+                    .unwrap_or_else(|| format!("revert ended {}", outcome.state));
+                match crate::reroute::recovery::release_claim_if_proven_no_write(&pool,source_id,Some(outcome.bundle_id),&reason).await {
+                    Ok(true)=>{},
+                    Ok(false)=>if let Err(e)=sqlx::query("UPDATE reroute_bundles SET lifecycle_state='recovery_blocked',automatic_recovery_block_reason=? WHERE id=?").bind(reason).bind(source_id).execute(&pool).await {tracing::error!(event_type="source_recovery_finalize_failed",source_bundle_id=source_id,error=%e);},
+                    Err(e)=>tracing::error!(event_type="source_recovery_finalize_failed",source_bundle_id=source_id,error=%e),
+                }
+            }
+        }
     });
 }
 

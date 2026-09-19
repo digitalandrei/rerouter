@@ -1166,6 +1166,7 @@ async fn discover_prefixes_and_store_inner(pool: &MySqlPool, device_id: u64) -> 
     // discovery and leaves the previous route-context snapshot untouched.
     let rm_cmd = "show running-config | section ^route-map".to_string();
     let pl_cmd = "show running-config | section ^ip prefix-list".to_string();
+    let mut typed_policy_inventory = None;
     let route_context: std::result::Result<RouteContextSnapshot, &'static str> = match run_commands(
         pool,
         device_id,
@@ -1186,6 +1187,14 @@ async fn discover_prefixes_and_store_inner(pool: &MySqlPool, device_id: u64) -> 
                     } else {
                         match resolve_route_context(output, &rm.output, &pl.output) {
                             Ok(snapshot) => {
+                                typed_policy_inventory =
+                                    Some(crate::reroute::policy::parse_inventory(
+                                        device_id,
+                                        output,
+                                        &rm.output,
+                                        &pl.output,
+                                        chrono::Utc::now(),
+                                    ));
                                 for name in &snapshot.ambiguous_route_maps {
                                     tracing::warn!(event_type = "route_map_ambiguous", device_id, route_map = %name, "route-map has no single unambiguous outbound prefix-list — no prefix-list stored for its peers");
                                 }
@@ -1220,6 +1229,27 @@ async fn discover_prefixes_and_store_inner(pool: &MySqlPool, device_id: u64) -> 
     // route maps must not remain eligible forever after they disappear from the
     // router, and a partial DB write must never look like a successful refresh.
     let mut tx = pool.begin().await?;
+    if let Some(inventory) = &typed_policy_inventory {
+        let completeness = match inventory.completeness {
+            crate::reroute::policy::InventoryCompleteness::Complete => "complete",
+            crate::reroute::policy::InventoryCompleteness::Partial => "partial",
+            crate::reroute::policy::InventoryCompleteness::Stale => "stale",
+        };
+        sqlx::query(
+            "INSERT INTO routing_policy_snapshots \
+             (device_id, inventory_json, completeness, blockers_json, read_at) \
+             VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+             inventory_json=VALUES(inventory_json), completeness=VALUES(completeness), \
+             blockers_json=VALUES(blockers_json), read_at=VALUES(read_at)",
+        )
+        .bind(device_id)
+        .bind(sqlx::types::Json(inventory))
+        .bind(completeness)
+        .bind(sqlx::types::Json(&inventory.blockers))
+        .bind(inventory.read_at)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query("UPDATE device_bgp_networks SET last_discovered_at = NULL WHERE device_id = ?")
         .bind(device_id)
         .execute(&mut *tx)
@@ -2361,6 +2391,8 @@ fn command_allowed(cmd: &str) -> bool {
         ["no", "ipv6", "route", p, "Null0", "tag", tag] => is_cidr6(p) && is_u32(tag),
         // BGP session shut / no-shut
         ["router", "bgp", asn] => is_u32(asn),
+        ["address-family", "ipv4"] | ["address-family", "ipv4", "unicast"] => true,
+        ["exit-address-family"] => true,
         ["neighbor", ip, "shutdown"] => is_ipv4(ip),
         ["no", "neighbor", ip, "shutdown"] => is_ipv4(ip),
         // BGP per-peer advertisement via outbound prefix-list (+ soft clear).
@@ -2386,6 +2418,8 @@ fn command_allowed(cmd: &str) -> bool {
         ["no", "neighbor", ip, "route-map", name, dir] => {
             is_ipv4(ip) && is_name(name) && matches!(*dir, "in" | "out")
         }
+        ["neighbor", ip, "prefix-list", name, "out"] => is_ipv4(ip) && is_name(name),
+        ["no", "neighbor", ip, "prefix-list", name, "out"] => is_ipv4(ip) && is_name(name),
         // interface-scoped actions: MSS clamp + shutdown / no shutdown
         ["interface", n] => is_name(n),
         ["ip", "tcp", "adjust-mss", mss] => is_u32(mss),

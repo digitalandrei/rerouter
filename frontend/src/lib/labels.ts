@@ -9,6 +9,15 @@ const ACRONYMS: Record<string, string> = {
   acl: "ACL", cli: "CLI", rx: "Rx", tx: "Tx", id: "ID", url: "URL", api: "API",
 };
 const WORDS: Record<string, string> = { iface: "Interface" };
+const TEMPLATE_LABELS: Record<string, string> = {
+  bgp_advertise_add: "Add prefix-list entry (legacy)",
+  bgp_advertise_remove: "Remove prefix-list entry (legacy)",
+};
+const TEMPLATE_GUIDANCE: Record<string, string> = {
+  bgp_advertise_add: "Edits entries inside the peer’s attached prefix list. For new work, use Change BGP export policy to change the peer attachment.",
+  bgp_advertise_remove: "Removes entries inside the peer’s attached prefix list. For new work, use Change BGP export policy to change the peer attachment.",
+  bgp_export_policy_set: "Changes which existing prefix list or route map is attached outbound to the selected peer; it does not edit policy contents.",
+};
 
 /** snake_case / kebab / space token -> human Title Case, respecting acronyms
  *  (bgp -> BGP, mss -> MSS, iface -> Interface). Empty input -> "". */
@@ -29,7 +38,7 @@ export function humanizeToken(raw: string | null | undefined): string {
 
 /** Friendly template label: curated display_name, else humanized machine name. */
 export function templateLabel(t: { display_name?: string | null; name: string }): string {
-  return t.display_name?.trim() || humanizeToken(t.name);
+  return TEMPLATE_LABELS[t.name] ?? t.display_name?.trim() ?? humanizeToken(t.name);
 }
 
 /** Same, from separate fields (reroute rows / rule actions). Falls back to "—". */
@@ -37,7 +46,14 @@ export function templateLabelFrom(
   displayName: string | null | undefined,
   name: string | null | undefined,
 ): string {
-  return displayName?.trim() || (name ? humanizeToken(name) : "—");
+  return (name ? TEMPLATE_LABELS[name] : undefined) ?? displayName?.trim() ?? (name ? humanizeToken(name) : "—");
+}
+
+export function templateGuidance(name: string): string | null { return TEMPLATE_GUIDANCE[name] ?? null; }
+
+export function orderTemplatesForChoice<T extends { name: string }>(templates: T[]): T[] {
+  const rank = (name: string) => name === "bgp_export_policy_set" ? 0 : name === "bgp_advertise_add" || name === "bgp_advertise_remove" ? 2 : 1;
+  return [...templates].sort((a, b) => rank(a.name) - rank(b.name));
 }
 
 /** Tone + label for a device's SSH reachability status (devices.ssh_status).

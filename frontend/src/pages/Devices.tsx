@@ -101,6 +101,7 @@ export default function Devices() {
 
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState<AddDeviceForm>(DEFAULT_FORM);
   const [addError, setAddError] = useState<string | null>(null);
@@ -111,10 +112,11 @@ export default function Devices() {
 
   function loadDevices() {
     setLoading(true);
+    setLoadError(null);
     api.devices
       .list()
       .then(setDevices)
-      .catch(() => setDevices([]))
+      .catch((error) => setLoadError(error instanceof ApiError ? error.message : "Failed to load devices"))
       .finally(() => setLoading(false));
   }
 
@@ -427,6 +429,11 @@ export default function Devices() {
         <CardContent className="px-0 pb-0">
           {loading ? (
             <p className="px-6 pb-6 text-sm text-muted-foreground">Loading…</p>
+          ) : loadError ? (
+            <div role="alert" className="flex flex-wrap items-center gap-3 px-6 pb-6 text-sm text-destructive">
+              <span>Devices could not be loaded: {loadError}</span>
+              <Button type="button" size="sm" variant="outline" onClick={loadDevices}>Try again</Button>
+            </div>
           ) : devices.length === 0 ? (
             <p className="px-6 pb-6 text-sm text-muted-foreground">
               No devices enrolled yet. Use "Add device" to enroll your first
@@ -436,22 +443,18 @@ export default function Devices() {
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead
-                    className="cursor-pointer select-none pl-6"
-                    onClick={() => toggleSort("name")}
-                  >
-                    Name
-                    <SortIcon field="name" active={sortField} dir={sortDir} />
+                  <TableHead className="pl-6" aria-sort={sortField === "name" ? (sortDir === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" className="-ml-2 rounded px-2 py-1 font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => toggleSort("name")}>
+                      Name <SortIcon field="name" active={sortField} dir={sortDir} />
+                    </button>
                   </TableHead>
                   <TableHead>Vendor / Model</TableHead>
                   <TableHead>Interfaces</TableHead>
                   <TableHead>SNMP / SSH</TableHead>
-                  <TableHead
-                    className="cursor-pointer select-none"
-                    onClick={() => toggleSort("status")}
-                  >
-                    Status
-                    <SortIcon field="status" active={sortField} dir={sortDir} />
+                  <TableHead aria-sort={sortField === "status" ? (sortDir === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" className="rounded px-2 py-1 font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => toggleSort("status")}>
+                      Status <SortIcon field="status" active={sortField} dir={sortDir} />
+                    </button>
                   </TableHead>
                   <TableHead className="pr-6 text-right">Actions</TableHead>
                 </TableRow>

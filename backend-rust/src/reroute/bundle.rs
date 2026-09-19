@@ -162,7 +162,20 @@ pub async fn persist_actions(
                 "sequence_pending": false,
             })
         });
-        let (phase, rank) = safety_phase(&action.template.name);
+        let (phase, rank) = if action.template.name == "bgp_export_policy_set" {
+            use crate::reroute::device_plan::PreparedSafetyEffect::*;
+            match crate::reroute::device_plan::prepared_safety_effect(prepared_action)? {
+                Additive => ("additive", 0),
+                Neutral => ("neutral", 1),
+                Noop => ("neutral", last_phase),
+                Destructive => ("destructive", 2),
+                Mixed | Unproven => {
+                    anyhow::bail!("export policy effect is mixed or cannot be proved")
+                }
+            }
+        } else {
+            safety_phase(&action.template.name)
+        };
         anyhow::ensure!(
             rank >= last_phase,
             "unsafe action order: '{}' appears after a more destructive phase",
@@ -421,6 +434,20 @@ impl BundleRun {
         }
     }
 
+    pub fn scheduled_recovery(bundle_id: u64, policy: FailurePolicy) -> Self {
+        Self {
+            bundle_id,
+            policy,
+            rule_id: None,
+            rule_event_id: None,
+            user_id: None,
+            actor_context: None,
+            trigger_type: "recovery",
+            authorization_plan_id: None,
+            owner_token: format!("recovery:bundle:{bundle_id}"),
+        }
+    }
+
     pub fn with_authorization(
         mut self,
         plan_id: Option<u64>,
@@ -662,8 +689,17 @@ pub async fn run_with_ssh<S: SshExecutor>(
             .prepared
             .clone()
             .expect("persist_actions required a prepared action");
-        let destructive_forward = matches!(trigger_type, "manual" | "automatic")
-            && safety_phase(&action.template.name).1 == 2;
+        let prepared_rank = if action.template.name == "bgp_export_policy_set" {
+            match crate::reroute::device_plan::prepared_safety_effect(&prepared_for_proof) {
+                Ok(crate::reroute::device_plan::PreparedSafetyEffect::Destructive) => 2,
+                Ok(crate::reroute::device_plan::PreparedSafetyEffect::Additive) => 0,
+                _ => 1,
+            }
+        } else {
+            safety_phase(&action.template.name).1
+        };
+        let destructive_forward =
+            matches!(trigger_type, "manual" | "automatic") && prepared_rank == 2;
         if destructive_forward && !succeeded_prepared.is_empty() {
             match locked_ssh.verify_projected_after(&succeeded_prepared).await {
                 Ok(true) => {}
@@ -916,6 +952,9 @@ pub async fn run_with_ssh<S: SshExecutor>(
             finish_and_release(pool, bundle_id, "succeeded", None, &owner_token).await
         {
             tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        }
+        if let Err(e) = super::recovery::schedule_if_eligible(pool, bundle_id).await {
+            tracing::error!(event_type="bundle_lifecycle_refresh_failed",bundle_id,error=%e);
         }
         drop(locked_ssh);
         let _ = native_locks.unlock_all().await;
@@ -1209,6 +1248,7 @@ async fn finish_and_release(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    super::recovery::refresh(pool, bundle_id).await?;
     Ok(())
 }
 
@@ -1397,6 +1437,14 @@ pub async fn settle_source_activations(
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        super::recovery::refresh(pool, source_bundle).await?;
+        sqlx::query(
+            "UPDATE reroute_bundles SET lifecycle_state='inactive',remaining_mutations=0, \
+                recovery_claim_token=NULL,automatic_recovery_block_reason=NULL WHERE id=?",
+        )
+        .bind(source_bundle)
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -1441,6 +1489,10 @@ pub async fn recover_on_startup(pool: &MySqlPool) -> anyhow::Result<()> {
             updated.rows_affected() == 1,
             "bundle changed during recovery"
         );
+        sqlx::query("UPDATE reroute_bundles parent JOIN reroute_bundles child ON child.parent_bundle_id=parent.id \
+            SET parent.lifecycle_state='recovery_blocked',parent.automatic_recovery_block_reason=? \
+            WHERE child.id=?")
+            .bind(reason).bind(bundle_id).execute(&mut *tx).await?;
 
         if blocked {
             let owner_token = format!("recovery:bundle:{bundle_id}");

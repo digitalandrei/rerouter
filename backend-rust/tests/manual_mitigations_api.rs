@@ -236,11 +236,8 @@ async fn presets_are_atomic_revisioned_copies_and_observe_runs_do_not_mutate_the
     overrides[0]["params"]["prefix"] = json!("192.0.2.99/32");
     let (status,preview)=request(&app,Some(&operator_cookie),"POST","/api/manual-mitigations/preview",
         json!({"preset_id":preset,"preset_revision":2,"actions":overrides,"reason":"Preview override"})).await;
-    assert_eq!(status, StatusCode::OK, "{preview}");
-    assert!(preview["preview_token"].is_null());
-    assert!(preview["results"][0]["would_run"]["commands"]
-        .to_string()
-        .contains("192.0.2.99"));
+    assert_eq!(status, StatusCode::CONFLICT, "{preview}");
+    assert!(preview["error"].as_str().unwrap().contains("SSH username"));
     let (_, saved) = request(&app, Some(&operator_cookie), "GET", &path, Value::Null).await;
     assert_eq!(saved["actions"][0]["params"]["prefix"], "192.0.2.3/32");
     overrides.reverse();

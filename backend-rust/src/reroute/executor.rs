@@ -3,7 +3,8 @@
 //! See ../docs/reroute-engine.md.
 //!
 //! Gate order (device_cli, device-scoped — any failure aborts and is logged):
-//!   GATE 0 — operating_mode == enforce. In `observe` mode NOTHING executes;
+//!   GATE 0 — unattended execution requires operating_mode == enforce. Manual
+//!   apply/revert remains available only through an actor-bound preview token.
 //!   `execute` returns the would-run plan instead. Then: not dry-run | no global
 //!   maintenance lock | device not locked | no action already running on the
 //!   device | no unresolved `uncertain` on the device | not in cooldown. The
@@ -334,7 +335,8 @@ pub(crate) async fn execute_with<S: SshExecutor>(
         );
     }
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
-    if mode != "enforce" || dry_run {
+    let unattended = authority_is_unattended(pool, req.authorization.as_ref()).await;
+    if dry_run || (mode != "enforce" && unattended) {
         // Preview-only compatibility path. Real execution below never re-renders
         // or mutates parameters; it consumes the authorized prepared snapshot.
         if req.trigger_type != "rollback" {
@@ -363,10 +365,10 @@ pub(crate) async fn execute_with<S: SshExecutor>(
         let would_run_rollback =
             crate::reroute::rollback::render_rollback_plan(pool, req.template.id, &req.params)
                 .await;
-        let message = if mode != "enforce" {
-            "observe mode: NOT executed — this is the plan that would run"
-        } else {
+        let message = if dry_run {
             "dry run: rendered plan only, nothing executed"
+        } else {
+            "observe mode blocks unattended execution"
         };
         return ExecOutcome {
             executed: false,
@@ -394,11 +396,25 @@ pub(crate) async fn execute_with<S: SshExecutor>(
             )
         }
     };
-    if crate::api::settings::operating_mode(pool, cfg).await != "enforce" {
+    if unattended && crate::api::settings::operating_mode(pool, cfg).await != "enforce" {
         return blocked(
             &req,
             device_name,
             "operating mode changed to observe before execution".into(),
+        );
+    }
+    if unattended
+        && !crate::api::settings::bool_setting(
+            pool,
+            "automatic_actions_enabled",
+            cfg.safety.automatic_actions_enabled,
+        )
+        .await
+    {
+        return blocked(
+            &req,
+            device_name,
+            "automatic actions are globally disabled".into(),
         );
     }
     if let Err(e) = validate_execution_authorization(pool, &req).await {
@@ -750,21 +766,22 @@ async fn validate_execution_authorization(
                 .rollback_of_reroute_id
                 .ok_or_else(|| anyhow::anyhow!("recovery has no original reroute"))?;
             let valid: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) \
-                   FROM reroute_bundles b \
-                   JOIN rules rule_row ON rule_row.id = b.rule_id \
-                   JOIN rule_states rs ON rs.rule_id = rule_row.id \
-                   JOIN reroutes original ON original.id = ? \
-                  WHERE b.id = ? AND b.trigger_type = 'automatic' \
-                    AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.kind')) = 'recovery' \
-                    AND rs.current_state = 'firing' \
-                    AND original.rule_id = b.rule_id \
-                    AND original.trigger_type = 'automatic' \
-                    AND original.mutation_effect = 'changed' \
-                    AND NOT EXISTS ( \
-                        SELECT 1 FROM reroutes inverse \
-                         WHERE inverse.rollback_of_reroute_id = original.id \
-                           AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
+                "SELECT COUNT(*) FROM reroute_bundles b \
+                   JOIN reroute_bundle_actions ba ON ba.bundle_id=b.id AND ba.original_reroute_id=? \
+                   JOIN reroutes original ON original.id=ba.original_reroute_id \
+                   JOIN reroute_bundles source_owner ON source_owner.id=original.bundle_id \
+                   LEFT JOIN rules rule_row ON rule_row.id=b.rule_id \
+                   LEFT JOIN rule_states rs ON rs.rule_id=rule_row.id \
+                  WHERE b.id=? AND b.trigger_type='automatic' AND b.state IN ('planned','running') \
+                    AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.kind'))='recovery' \
+                    AND original.mutation_effect='changed' \
+                    AND source_owner.automatic_recovery_cancelled_at IS NULL \
+                    AND source_owner.recovery_claim_token IS NOT NULL \
+                    AND source_owner.recovery_bundle_id=b.id \
+                    AND (b.rule_id IS NULL OR (original.rule_id=b.rule_id \
+                         AND rule_row.automatic_revert_enabled=1 AND rs.current_state IN ('firing','recovered_awaiting_revert'))) \
+                    AND NOT EXISTS (SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=original.id \
+                         AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
             )
             .bind(original_id)
             .bind(bundle_id)
@@ -832,6 +849,47 @@ async fn validate_execution_authorization(
         "device change window belongs to another activation"
     );
     Ok(())
+}
+
+#[doc(hidden)]
+pub async fn validate_execution_authorization_for_test(
+    pool: &MySqlPool,
+    req: &ActionRequest,
+) -> anyhow::Result<()> {
+    validate_execution_authorization(pool, req).await
+}
+
+#[doc(hidden)]
+pub async fn authority_is_unattended(
+    pool: &MySqlPool,
+    auth: Option<&ExecutionAuthorization>,
+) -> bool {
+    match auth {
+        Some(auth)
+            if matches!(
+                auth.kind,
+                ExecutionAuthorityKind::Automatic | ExecutionAuthorityKind::Recovery
+            ) =>
+        {
+            true
+        }
+        Some(auth) if auth.kind == ExecutionAuthorityKind::Compensation => match auth.bundle_id {
+            Some(id) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT trigger_type FROM reroute_bundles WHERE id=?",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                    == Some("automatic")
+            }
+            None => true,
+        },
+        _ => false,
+    }
 }
 
 async fn load_prepared_action(

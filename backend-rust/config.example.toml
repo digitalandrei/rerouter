@@ -50,9 +50,9 @@ default_consecutive_samples = 3
 default_min_duration_seconds = 30
 
 [safety]
-# Operating mode: "observe" (default) = safe read-only / alert-only — NO reroute
-# executes, automatic or manual; rule fires alert with the actions that WOULD
-# have run. "enforce" allows execution (still gated by every other safety rule).
+# Operating mode: "observe" (default) disables autonomous execution. Authorized
+# manual runs/reverts still require an exact preview and explicit confirmation.
+# "enforce" plus the master switch allows autonomous work, subject to all gates.
 # This is only the startup fallback: the authoritative runtime value is
 # system_settings.operating_mode, changed from /settings by an admin (audited).
 operating_mode = "observe"

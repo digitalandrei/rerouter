@@ -84,6 +84,8 @@ struct InterfaceRule {
     /// the firing edge. "The rule decides" — this is the only auto gate besides
     /// enforce mode + the executor's locks/cooldowns.
     automatic_reroute_enabled: bool,
+    /// Recovery condition is independent from permission to mutate routers.
+    automatic_revert_enabled: bool,
 }
 
 /// The latest derived metrics for an interface (only the columns rules read).
@@ -177,7 +179,7 @@ pub async fn evaluate_device(pool: &MySqlPool, cfg: &Config, device_id: u64) -> 
                 duration_seconds, consecutive_samples, \
                 recovery_mode, recovery_threshold_value, recovery_window_seconds, \
                 recovery_consecutive_samples, severity, \
-                automatic_reroute_enabled \
+                automatic_reroute_enabled, automatic_revert_enabled \
          FROM rules \
          WHERE enabled = 1 AND metric_aggregation = 'single' \
                AND interface_id IS NOT NULL AND device_id = ? \
@@ -213,7 +215,7 @@ pub async fn evaluate_aggregate_rules(pool: &MySqlPool, cfg: &Config) -> Result<
                 duration_seconds, consecutive_samples, \
                 recovery_mode, recovery_threshold_value, recovery_window_seconds, \
                 recovery_consecutive_samples, severity, \
-                automatic_reroute_enabled \
+                automatic_reroute_enabled, automatic_revert_enabled \
          FROM rules \
          WHERE enabled = 1 AND metric_aggregation = 'sum' \
          ORDER BY CASE severity \
@@ -343,13 +345,35 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
     sqlx::query("INSERT INTO rule_states(rule_id,last_observation_json,last_observation_at) VALUES(?,?,?) \
         ON DUPLICATE KEY UPDATE last_observation_json=VALUES(last_observation_json),last_observation_at=VALUES(last_observation_at)")
         .bind(rule.id).bind(sqlx::types::Json(&obs.evidence)).bind(now).execute(pool).await?;
-    let prev_state = prev.current_state.as_deref().unwrap_or("clear");
+    let mut prev_state = prev.current_state.clone().unwrap_or_else(|| "clear".into());
+    if prev_state == "recovered_awaiting_revert"
+        && rule_owned_changes(pool, rule.id, false).await? == 0
+    {
+        clear_state(pool, rule.id, value).await?;
+        prev_state = "clear".into();
+        prev.first_matched_at = None;
+        prev.consecutive_match_count = 0;
+    }
 
     if matched {
         let consecutive = prev.consecutive_match_count.saturating_add(1);
         // first_matched_at is the start of the current matching streak.
         let first_matched = prev.first_matched_at.unwrap_or(now);
         let held_secs = (now - first_matched).num_seconds();
+        if prev_state == "recovered_awaiting_revert" {
+            upsert_state(
+                pool,
+                rule.id,
+                "firing",
+                Some(first_matched),
+                sampled_at,
+                consecutive,
+                value,
+            )
+            .await?;
+            set_recovery_progress(pool, rule.id, None, 0).await?;
+            return Ok(false);
+        }
 
         // Persistence: each control is OPT-IN (0 = disabled). The rule fires only
         // when EVERY enabled control is satisfied; with none set it fires on the
@@ -506,6 +530,22 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             }
             return Ok(false);
         }
+    }
+
+    if prev_state == "recovered_awaiting_revert" {
+        // Router ownership outlives the recovered condition. Quiet samples must
+        // never clear that ownership marker; only a verified inverse may do so.
+        upsert_state(
+            pool,
+            rule.id,
+            "recovered_awaiting_revert",
+            None,
+            sampled_at,
+            0,
+            value,
+        )
+        .await?;
+        return Ok(false);
     }
 
     // Was matching but the condition dropped before firing, or already clear.
@@ -1497,6 +1537,24 @@ async fn recover_and_clear(
     value: f64,
     sampled_at: Option<Ts>,
 ) -> Result<()> {
+    let all_owned = rule_owned_changes(pool, rule.id, false).await?;
+    if !rule.automatic_revert_enabled {
+        if all_owned == 0 {
+            clear_state(pool, rule.id, value).await?;
+            record_event(pool, rule, "cleared", value, sampled_at).await?;
+            return Ok(());
+        }
+        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert', \
+                recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?")
+            .bind(value).bind(rule.id).execute(pool).await?;
+        record_event(pool, rule, "recovered_awaiting_revert", value, sampled_at).await?;
+        return Ok(());
+    }
+    if all_owned > 0 && rule_owned_changes(pool, rule.id, true).await? == 0 {
+        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert',recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?")
+            .bind(value).bind(rule.id).execute(pool).await?;
+        return Ok(());
+    }
     if !run_recovery_rollback(pool, cfg, rule.id, &rule.name, None, None).await? {
         tracing::warn!(
             event_type = "rule_recovery_pending",
@@ -1505,9 +1563,18 @@ async fn recover_and_clear(
         );
         return Ok(());
     }
+    if rule_owned_changes(pool, rule.id, false).await? > 0 {
+        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert',recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?").bind(value).bind(rule.id).execute(pool).await?;
+        return Ok(());
+    }
     clear_state(pool, rule.id, value).await?;
     record_event(pool, rule, "cleared", value, sampled_at).await?;
     Ok(())
+}
+
+async fn rule_owned_changes(pool: &MySqlPool, rule_id: u64, eligible_only: bool) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM reroutes r LEFT JOIN reroute_bundles owner ON owner.id=r.bundle_id WHERE r.rule_id=? AND r.rollback_of_reroute_id IS NULL AND r.mutation_effect IN ('changed','unknown') AND (?=0 OR (r.trigger_type='automatic' AND owner.automatic_recovery_cancelled_at IS NULL)) AND NOT EXISTS(SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=r.id AND inverse.state='succeeded' AND inverse.mutation_effect IN ('changed','noop'))")
+        .bind(rule_id).bind(eligible_only).fetch_one(pool).await?)
 }
 
 /// Roll back successful automatic reroutes from the latest firing event, in
@@ -1529,6 +1596,7 @@ async fn run_recovery_rollback(
     // Ownership is the durable action ledger, not the latest retained event.
     let unresolved: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reroutes r WHERE r.rule_id = ? AND r.trigger_type = 'automatic' \
+         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND owner.automatic_recovery_cancelled_at IS NOT NULL) \
          AND (r.state IN ('planned','pending','running','verifying','uncertain') \
               OR (r.state = 'succeeded' AND r.mutation_effect IN ('pending','unknown'))) \
          AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded')")
@@ -1538,6 +1606,7 @@ async fn run_recovery_rollback(
     }
     let originals: Vec<u64> = sqlx::query_scalar(
         "SELECT r.id FROM reroutes r WHERE r.rule_id = ? AND r.trigger_type = 'automatic' \
+         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND owner.automatic_recovery_cancelled_at IS NOT NULL) \
          AND r.mutation_effect = 'changed' AND r.state IN ('succeeded','failed') \
          AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded') ORDER BY r.id DESC")
         .bind(rule_id).fetch_all(pool).await?;
@@ -1547,7 +1616,26 @@ async fn run_recovery_rollback(
     if crate::api::settings::operating_mode(pool, cfg).await != "enforce" {
         return Ok(false);
     }
+    if !crate::api::settings::bool_setting(
+        pool,
+        "automatic_actions_enabled",
+        cfg.safety.automatic_actions_enabled,
+    )
+    .await
+    {
+        return Ok(false);
+    }
     let policy_fence = crate::reroute::guard::policy_fence(pool).await?;
+    let source_bundles:Vec<u64>=sqlx::query_scalar("SELECT DISTINCT original.bundle_id FROM reroutes original JOIN reroute_bundles owner ON owner.id=original.bundle_id WHERE original.rule_id=? AND original.trigger_type='automatic' AND original.mutation_effect='changed' AND owner.automatic_recovery_cancelled_at IS NULL AND NOT EXISTS(SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id=original.id AND rb.state='succeeded') AND original.bundle_id IS NOT NULL ORDER BY original.bundle_id")
+        .bind(rule_id).fetch_all(pool).await?;
+    let claim_token = format!("rule-recovery:{}", crate::auth::sessions::generate_token());
+    if let Err(e) =
+        crate::reroute::recovery::claim_source_bundles(pool, &source_bundles, &claim_token).await
+    {
+        policy_fence.release().await?;
+        tracing::warn!(event_type="automatic_recovery_claim_refused",rule_id,error=%e);
+        return Ok(false);
+    }
     let reason = format!("automatic recovery of rule '{rule_name}'");
     let actions = match crate::reroute::preparation::prepare_rollbacks(
         pool, &originals, &reason, true,
@@ -1556,20 +1644,50 @@ async fn run_recovery_rollback(
     {
         Ok(actions) => actions,
         Err(e) => {
+            crate::reroute::recovery::release_unstarted_source_claims(
+                pool,
+                &source_bundles,
+                &claim_token,
+                &format!("{e:#}"),
+            )
+            .await?;
+            policy_fence.release().await?;
             tracing::warn!(event_type="automatic_recovery_refused",rule_id,error=%e,"recovery remains pending");
             return Ok(false);
         }
     };
     if actions.is_empty() {
+        crate::reroute::recovery::release_unstarted_source_claims(
+            pool,
+            &source_bundles,
+            &claim_token,
+            "no owned inverse remained",
+        )
+        .await?;
+        policy_fence.release().await?;
         return Ok(true);
     }
     let device_ids: Vec<_> = actions.iter().map(|a| a.device_id).collect();
-    let identities = crate::ssh::RusshExecutor::new(pool.clone())
+    let identities = match crate::ssh::RusshExecutor::new(pool.clone())
         .transport_identities(&device_ids)
-        .await?;
+        .await
+    {
+        Ok(value) => value,
+        Err(e) => {
+            crate::reroute::recovery::release_unstarted_source_claims(
+                pool,
+                &source_bundles,
+                &claim_token,
+                &format!("{e:#}"),
+            )
+            .await?;
+            policy_fence.release().await?;
+            return Ok(false);
+        }
+    };
     policy_fence.release().await?;
     let policy = crate::reroute::bundle::FailurePolicy::AbortAndCompensate;
-    let bundle_id = crate::reroute::bundle::create(
+    let bundle_id = match crate::reroute::bundle::create(
         pool,
         Some(rule_id),
         None,
@@ -1579,10 +1697,39 @@ async fn run_recovery_rollback(
         policy,
         actions.len() as u32,
     )
-    .await?;
-    sqlx::query("UPDATE reroute_bundles SET source_json = ? WHERE id = ?")
-        .bind(sqlx::types::Json(json!({"kind":"recovery","rule_id":rule_id,"original_reroute_ids":originals,"transport_identities":identities}))).bind(bundle_id).execute(pool).await?;
-    crate::reroute::bundle::persist_actions(pool, bundle_id, &actions).await?;
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            crate::reroute::recovery::release_unstarted_source_claims(
+                pool,
+                &source_bundles,
+                &claim_token,
+                &format!("{e:#}"),
+            )
+            .await?;
+            return Err(e);
+        }
+    };
+    let setup=async {
+        for source_id in &source_bundles {sqlx::query("UPDATE reroute_bundles SET recovery_bundle_id=?,recovery_started_at=UTC_TIMESTAMP(),lifecycle_state='recovery_running' WHERE id=? AND recovery_claim_token=?")
+            .bind(bundle_id).bind(source_id).bind(&claim_token).execute(pool).await?;}
+        sqlx::query("UPDATE reroute_bundles SET source_json = ? WHERE id = ?")
+            .bind(sqlx::types::Json(json!({"kind":"recovery","rule_id":rule_id,"original_reroute_ids":originals,"transport_identities":identities}))).bind(bundle_id).execute(pool).await?;
+        crate::reroute::bundle::persist_actions(pool,bundle_id,&actions).await
+    }.await;
+    if let Err(e) = setup {
+        for source_id in &source_bundles {
+            crate::reroute::recovery::release_claim_if_proven_no_write(
+                pool,
+                *source_id,
+                Some(bundle_id),
+                &format!("{e:#}"),
+            )
+            .await?;
+        }
+        return Err(e);
+    }
     let result = crate::reroute::bundle::run(
         pool,
         cfg,
@@ -1590,6 +1737,19 @@ async fn run_recovery_rollback(
         actions,
     )
     .await;
+    if result.state != "succeeded" {
+        let reason = result
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| format!("automatic recovery ended {}", result.state));
+        crate::reroute::recovery::settle_failed_recovery_sources(
+            pool,
+            &source_bundles,
+            bundle_id,
+            &reason,
+        )
+        .await?;
+    }
     Ok(result.state == "succeeded")
 }
 
@@ -1780,6 +1940,7 @@ mod tests {
             recovery_consecutive_samples: None,
             severity: "warning".into(),
             automatic_reroute_enabled: false,
+            automatic_revert_enabled: false,
         };
         let cfg = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
             .expect("load test config");

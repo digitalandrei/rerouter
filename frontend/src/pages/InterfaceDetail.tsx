@@ -367,7 +367,8 @@ export default function InterfaceDetail() {
 
       {/* ---- Detection rules card ---- */}
       {(() => {
-        const ifaceRules = rules.filter((r) => r.interface_id === ifaceId);
+        const ifaceRules = rules.filter((r) => r.interface_id === ifaceId || r.member_interface_ids?.includes(ifaceId));
+        const rulesHref = `/rules?device_id=${deviceId}&interface_id=${ifaceId}`;
         return (
           <Card>
             <CardHeader>
@@ -381,7 +382,7 @@ export default function InterfaceDetail() {
                 <p className="text-sm text-muted-foreground">
                   No detection rules target this interface yet.{" "}
                   <Link
-                    to="/rules"
+                    to={rulesHref}
                     className="text-primary underline-offset-4 hover:underline"
                   >
                     Go to Rules
@@ -395,6 +396,7 @@ export default function InterfaceDetail() {
                       className="flex flex-wrap items-center gap-3 rounded-md border border-border px-3 py-2 text-sm"
                     >
                       <span className="font-medium">{rule.name}</span>
+                      {rule.metric_aggregation === "sum" && <Badge variant="outline">summed membership</Badge>}
                       <code className="text-xs text-muted-foreground">
                         {conditionLabel(rule)}
                       </code>
@@ -406,7 +408,7 @@ export default function InterfaceDetail() {
                   ))}
                   <p className="pt-1 text-xs text-muted-foreground">
                     <Link
-                      to="/rules"
+                      to={rulesHref}
                       className="text-primary underline-offset-4 hover:underline"
                     >
                       Manage in Rules

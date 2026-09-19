@@ -207,6 +207,8 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   const [caps, setCaps] = useState<CapabilityCheck[] | null>(null);
   const [capsErr, setCapsErr] = useState<string | null>(null);
   const [reachTesting, setReachTesting] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const operationBusy = busy || testing || generating || checking || reachTesting;
 
   // Reset only when navigating to a different device (not on the 30s refresh of
   // the same device, which would wipe in-progress edits).
@@ -222,6 +224,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
   async function save(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
+    setActionError(null);
     try {
       const payload: Record<string, unknown> = {
         name: form.name.trim(),
@@ -245,7 +248,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       toast.success("Device updated");
       onSaved();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Failed to update device");
+      const message = err instanceof ApiError ? err.message : "Failed to update device"; setActionError(message); toast.error(message);
     } finally {
       setBusy(false);
     }
@@ -253,6 +256,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
 
   async function generateKey() {
     setGenerating(true);
+    setActionError(null);
     try {
       const r = await api.devices.generateKey(device.id);
       toast.success("SSH key pair generated", {
@@ -263,7 +267,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       onSaved();
       return r;
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Key generation failed");
+      const message = err instanceof ApiError ? err.message : "Key generation failed"; setActionError(message); toast.error(message);
     } finally {
       setGenerating(false);
     }
@@ -293,12 +297,13 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
 
   async function testSnmp() {
     setTesting(true);
+    setActionError(null);
     try {
       const r = await api.devices.test(device.id);
       if (r.ok) toast.success(`SNMP OK: ${[r.vendor, r.model].filter(Boolean).join(" / ") || "reachable"}`);
       else toast.error(`SNMP failed: ${r.error ?? "unknown"}`);
     } catch {
-      toast.error("SNMP test failed");
+      setActionError("SNMP test failed"); toast.error("SNMP test failed");
     } finally {
       setTesting(false);
     }
@@ -306,6 +311,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
 
   async function testSsh() {
     setTesting(true);
+    setActionError(null);
     try {
       const r = await api.devices.sshTest(device.id);
       if (r.ok) {
@@ -316,7 +322,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
         toast.error(`SSH failed: ${r.error ?? "unknown"}`);
       }
     } catch {
-      toast.error("SSH test failed");
+      setActionError("SSH test failed"); toast.error("SSH test failed");
     } finally {
       setTesting(false);
     }
@@ -328,6 +334,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
    *  ok but can't run a required command) / unreachable. */
   async function testReachability() {
     setReachTesting(true);
+    setActionError(null);
     try {
       const r = await api.devices.reachabilityTest(device.id);
       const recent = r.via_recency ? " (recent)" : "";
@@ -346,7 +353,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
         toast.error("SSH unreachable", { description: r.ssh_error ?? "no SSH response" });
       }
     } catch {
-      toast.error("Reachability test failed");
+      setActionError("Reachability test failed"); toast.error("Reachability test failed");
     } finally {
       setReachTesting(false);
     }
@@ -359,6 +366,7 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
       </CardHeader>
       <CardContent>
         <form onSubmit={save} className="space-y-4">
+          {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="block space-y-1 text-sm font-medium">
               Name
@@ -608,21 +616,21 @@ export function DeviceSettingsTab({ device, onSaved }: { device: Device; onSaved
           </div>
 
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" disabled={busy}>
+            <Button type="submit" disabled={operationBusy}>
               {busy ? "Saving…" : "Save changes"}
             </Button>
-            <Button type="button" variant="outline" disabled={testing} onClick={() => void testSnmp()}>
+            <Button type="button" variant="outline" disabled={operationBusy} onClick={() => void testSnmp()}>
               <Activity className="size-4" />
               Test SNMP
             </Button>
-            <Button type="button" variant="outline" disabled={testing} onClick={() => void testSsh()}>
+            <Button type="button" variant="outline" disabled={operationBusy} onClick={() => void testSsh()}>
               <TerminalSquare className="size-4" />
               Test SSH
             </Button>
             <Button
               type="button"
               variant="outline"
-              disabled={reachTesting}
+              disabled={operationBusy}
               onClick={() => void testReachability()}
             >
               <Wifi className="size-4" />

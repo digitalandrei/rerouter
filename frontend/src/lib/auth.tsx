@@ -21,6 +21,8 @@ import { api, ApiError, type LoginResponse, type SessionUser } from "./api";
 
 export type AuthStage =
   | "loading" // initial "do I have a session?" probe
+  | "unavailable" // initial probe failed without proving the session absent
+  | "reconnecting" // a known authenticated session is being revalidated
   | "anonymous" // no session; show password step
   | "totp" // password accepted; TOTP code (or enrollment) required
   | "recovery" // first enrollment complete; recovery codes must be acknowledged
@@ -32,6 +34,8 @@ export interface AuthState {
   /** Present during the `totp` stage on first login only. */
   enrollment: LoginResponse["totp_enrollment"] | null;
   recoveryCodes: string[];
+  authError: string | null;
+  retrySession: () => void;
   login: (
     email: string,
     password: string,
@@ -53,27 +57,50 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [enrollment, setEnrollment] =
     useState<LoginResponse["totp_enrollment"] | null>(null);
   const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [probeVersion, setProbeVersion] = useState(0);
 
   // Probe for an existing session on mount via GET /api/auth/me.
   // A 200 means the cookie is valid and returns the SessionUser.
   // A 401 means no session — go to anonymous/login.
   useEffect(() => {
     let cancelled = false;
-    api.auth
-      .me()
-      .then((sessionUser) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const probe = async (attempt = 0) => {
+      if (user) setStage("reconnecting");
+      try {
+        const sessionUser = await api.auth.me();
         if (!cancelled) {
           setUser(sessionUser);
+          setAuthError(null);
           setStage("authenticated");
         }
-      })
-      .catch(() => {
-        if (!cancelled) setStage("anonymous");
-      });
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof ApiError && error.status === 401) {
+          setUser(null);
+          setAuthError(null);
+          setStage("anonymous");
+          return;
+        }
+        if (attempt < 2) {
+          timer = setTimeout(() => void probe(attempt + 1), 500 * 2 ** attempt);
+          return;
+        }
+        setAuthError("The controller is unavailable. Your session has not been signed out.");
+        setStage(user ? "reconnecting" : "unavailable");
+      }
+    };
+
+    void probe();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
-  }, []);
+  }, [probeVersion]); // A manual retry starts a fresh, bounded probe sequence.
+
+  const retrySession = useCallback(() => setProbeVersion((value) => value + 1), []);
 
   const login = useCallback(
     async (
@@ -114,15 +141,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await api.auth.logout();
     } catch (err) {
-      // Even if the server call fails, drop local state; the redirect to
-      // /login keeps no operational data on screen.
-      if (!(err instanceof ApiError)) throw err;
-    } finally {
-      setUser(null);
-      setEnrollment(null);
-      setRecoveryCodes([]);
-      setStage("anonymous");
+      // A failed mutation does not prove revocation. Keep the authenticated
+      // shell and let the caller offer a deliberate retry.
+      if (!(err instanceof ApiError && err.status === 401)) throw err;
     }
+    setUser(null);
+    setEnrollment(null);
+    setRecoveryCodes([]);
+    setStage("anonymous");
   }, []);
 
   const hasPermission = useCallback(
@@ -136,6 +162,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       enrollment,
       recoveryCodes,
+      authError,
+      retrySession,
       login,
       submitTotp,
       finishRecoveryCodes,
@@ -147,6 +175,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       enrollment,
       recoveryCodes,
+      authError,
+      retrySession,
       login,
       submitTotp,
       finishRecoveryCodes,

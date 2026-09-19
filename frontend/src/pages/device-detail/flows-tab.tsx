@@ -90,7 +90,7 @@ export function FlowsTab({ deviceId, refreshKey }: FlowsTabProps) {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <p className="text-sm text-muted-foreground">
-          Last {WINDOW_MINUTES} min · sampled flow telemetry. Read-only — flows never trigger reroutes.
+          Last {WINDOW_MINUTES} min · sampled flow telemetry. This view is read-only; eligible flow rules can participate in reroutes when their confidence and automation gates are satisfied.
         </p>
         <div className="flex items-center gap-1">
           <Button

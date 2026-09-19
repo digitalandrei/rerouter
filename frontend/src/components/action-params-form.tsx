@@ -24,7 +24,9 @@ import {
   type BgpNetwork,
   type RtbhCommunity,
   type Interface,
+  type RoutingPolicyInventory,
 } from "@/lib/api";
+import { RoutingPolicyInventoryView } from "@/components/routing-policy-inventory";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
@@ -74,10 +76,13 @@ export function ActionParamsForm({
   const [rtbh, setRtbh] = useState<RtbhCommunity[]>([]);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
   const [routeMaps, setRouteMaps] = useState<string[]>([]);
+  const [policyInventory, setPolicyInventory] = useState<RoutingPolicyInventory | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const isExportPolicy = "neighbor_ip" in schema && "policy_kind" in schema && "policy_name" in schema;
 
   useEffect(() => {
-    api.rtbh.list().then(setRtbh).catch(() => setRtbh([]));
-  }, []);
+    if (!isExportPolicy) api.rtbh.list().then(setRtbh).catch(() => setRtbh([]));
+  }, [isExportPolicy]);
 
   useEffect(() => {
     // Clear FIRST: `deviceId` mutates on a mounted form (ManualReroute's router
@@ -89,7 +94,7 @@ export function ActionParamsForm({
     setNetworks([]);
     setInterfaces([]);
     setRouteMaps([]);
-    if (!deviceId) return;
+    if (!deviceId || isExportPolicy) return;
     let cancelled = false;
     api.devices
       .bgpPeers(deviceId)
@@ -126,7 +131,15 @@ export function ActionParamsForm({
     return () => {
       cancelled = true;
     };
-  }, [deviceId]);
+  }, [deviceId, isExportPolicy]);
+
+  useEffect(() => {
+    setPolicyInventory(null); setPolicyError(null);
+    if (!deviceId || !isExportPolicy) return;
+    let cancelled = false;
+    api.routingPolicies.get(deviceId).then((value) => { if (!cancelled) setPolicyInventory(value); }).catch((cause: unknown) => { if (!cancelled) setPolicyError(cause instanceof Error ? cause.message : "Policy inventory unavailable"); });
+    return () => { cancelled = true; };
+  }, [deviceId, isExportPolicy]);
 
   const localAsns = Array.from(
     new Set(peers.map((p) => p.local_as).filter((a): a is number => a != null)),
@@ -178,6 +191,25 @@ export function ActionParamsForm({
       }
     }
     onChange(next);
+  }
+
+  if (isExportPolicy) {
+    const peer = values.neighbor_ip ?? "";
+    const kind = values.policy_kind ?? "prefix_list";
+    const name = values.policy_name ?? "";
+    const peers = Array.from(new Set(policyInventory?.peer_bindings.map((binding) => binding.neighbor_ip) ?? []));
+    const names = kind === "route_map" ? policyInventory?.route_maps.map((item) => item.name) ?? [] : policyInventory?.prefix_lists.map((item) => item.name) ?? [];
+    const visibleNames = name && !names.includes(name) ? [name, ...names] : names;
+    return <div className="space-y-3 sm:col-span-2">
+      <div className="grid gap-3 sm:grid-cols-3">
+        <label className="space-y-1 text-sm font-medium">Peer<select className={inputClass} value={peer} onChange={(event) => onChange({ ...values, neighbor_ip: event.target.value })}><option value="">Select peer…</option>{peer && !peers.includes(peer) && <option value={peer}>{peer} (missing)</option>}{peers.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        <label className="space-y-1 text-sm font-medium">Policy type<select className={inputClass} value={kind} onChange={(event) => onChange({ ...values, policy_kind: event.target.value, policy_name: "" })}><option value="prefix_list">Prefix list</option><option value="route_map">Route map</option></select></label>
+        <label className="space-y-1 text-sm font-medium">Outbound policy<select className={inputClass} value={name} onChange={(event) => onChange({ ...values, policy_name: event.target.value })}><option value="">Select policy…</option>{visibleNames.map((item) => <option key={item} value={item}>{item}{!names.includes(item) ? " (missing)" : ""}</option>)}</select></label>
+      </div>
+      {policyError && <p role="alert" className="text-sm text-destructive">{policyError}</p>}
+      {!policyInventory && !policyError && <p role="status" className="text-sm text-muted-foreground">Loading cached routing policy inventory…</p>}
+      {policyInventory && <RoutingPolicyInventoryView inventory={policyInventory} selectedPeer={peer} selectedKind={kind} selectedName={name} />}
+    </div>;
   }
 
   return (

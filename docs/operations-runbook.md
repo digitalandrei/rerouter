@@ -86,14 +86,14 @@ accepted.
 
 ## Global safety switches
 
-- **Operating mode (read-only / alert-only):** `operating_mode = observe` in
+- **Operating mode:** `operating_mode = observe` in
   `system_settings` (UI: `/settings`, admin-only, audited) is the shipped
-  default. In observe mode **no reroute executes — automatic or manual**;
-  fired rules alert with the rendered plan of the actions that *would* have
-  run. Flip to `enforce` only when you are ready for Rerouter to act.
+  default. Observe disables autonomous work; authorized manual runs and reverts
+  still require an exact server preview and explicit confirmation. Flip to
+  `enforce` only when you are ready to arm autonomous behavior.
 - **Disable all automatic reroutes:** set `automatic_actions_enabled = false` in
   `system_settings` (UI: `/settings`) — takes effect on next evaluation
-  (applies in enforce mode; observe mode already blocks everything).
+  Autonomous execution and recovery require both this switch and Enforce.
 - **Global maintenance lock:** `POST /api/locks/global` (UI button). Blocks every
   reroute until cleared. Use during planned upstream maintenance.
 - **Rate budget vs bundle size:** `global_action_rate_limit_count` (default **3**

@@ -96,8 +96,11 @@ require `actions_revision`. Stale writes return conflict without partial saves.
 Manual apply returns `202` with a bundle ID; the compatibility single-template
 endpoint preserves its result shape while using the shared engine. Manual clear
 and rollback require previews too. Clearing detection without any router changes
-can be confirmed in observe mode; clearing a rule that still owns mutations
-requires enforce-mode verified recovery.
+can be confirmed in observe mode. A human-confirmed recovery that still owns
+mutations may also run in Observe with exact preview authority. Autonomous
+condition or timed recovery requires Enforce plus the automatic master switch.
+Compensation already authorized for a manual-origin failure policy may finish;
+an autonomous-origin compensation is blocked after disarm.
 
 ## Release boundary
 

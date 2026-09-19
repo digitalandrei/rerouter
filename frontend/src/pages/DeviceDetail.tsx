@@ -22,6 +22,9 @@ import { FlowsTab } from "./device-detail/flows-tab";
 import { BgpSessionsCard } from "./device-detail/bgp-sessions-card";
 import { AnnouncedPrefixesCard } from "./device-detail/announced-prefixes-card";
 import { DeviceSettingsTab } from "./device-detail/device-settings-tab";
+import { RoutingPolicyInventoryView } from "@/components/routing-policy-inventory";
+import { DataState } from "@/components/data-state";
+import { useResource } from "@/lib/resource-state";
 
 export default function DeviceDetail() {
   const { hasPermission } = useAuth();
@@ -57,9 +60,15 @@ export default function DeviceDetail() {
   const [loading, setLoading] = useState(true);
   const [ifLoading, setIfLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [interfacesError, setInterfacesError] = useState<string | null>(null);
+  const [rulesError, setRulesError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const policyInventory = useResource(
+    useCallback((_signal: AbortSignal) => api.routingPolicies.get(deviceId), [deviceId]),
+    [deviceId],
+  );
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -67,7 +76,7 @@ export default function DeviceDetail() {
     if (!Number.isFinite(deviceId)) return;
     api.devices
       .get(deviceId)
-      .then(setDevice)
+      .then((value) => { setDevice(value); setError(null); })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load device"))
       .finally(() => setLoading(false));
   }, [deviceId]);
@@ -76,15 +85,16 @@ export default function DeviceDetail() {
     if (!Number.isFinite(deviceId)) return;
     api.devices
       .interfaces(deviceId)
-      .then(setInterfaces)
-      .catch(() => setInterfaces([]))
+      .then((value) => { setInterfaces(value); setInterfacesError(null); })
+      .catch((err) => setInterfacesError(err instanceof ApiError ? err.message : "Failed to load interfaces"))
       .finally(() => setIfLoading(false));
   }, [deviceId]);
 
   useEffect(() => {
+    setDevice(null); setInterfaces([]); setRules([]); setError(null); setInterfacesError(null); setRulesError(null); setLoading(true); setIfLoading(true);
     loadDevice();
     loadInterfaces();
-    api.rules.list().then(setRules).catch(() => setRules([]));
+    api.rules.list().then((value) => { setRules(value); setRulesError(null); }).catch((err) => setRulesError(err instanceof ApiError ? err.message : "Failed to load rules"));
     timerRef.current = setInterval(() => {
       loadDevice();
       loadInterfaces();
@@ -100,15 +110,22 @@ export default function DeviceDetail() {
     setRefreshing(true);
     try {
       if (canManage) {
-        await Promise.allSettled([
+        const discoveries = await Promise.allSettled([
           api.devices.discover(deviceId),
           api.devices.discoverBgp(deviceId),
           api.devices.discoverPrefixes(deviceId),
         ]);
+        const failed = discoveries.filter((result) => result.status === "rejected");
+        if (failed.length > 0) {
+          toast.error(`Inventory refresh incomplete: ${failed.length} discovery request${failed.length === 1 ? "" : "s"} failed`);
+          return;
+        }
       }
       loadDevice();
       loadInterfaces();
       setRefreshKey((k) => k + 1);
+      policyInventory.retry();
+      setError(null);
       toast.success("Refreshed device inventory");
     } finally {
       setRefreshing(false);
@@ -150,8 +167,8 @@ export default function DeviceDetail() {
           ) : (
             <ToneBadge tone="bad">unreachable</ToneBadge>
           )}
-          <Badge variant="secondary" title="SNMP is read-only telemetry; Rerouter only polls this device.">
-            Read-only · SNMP
+          <Badge variant="secondary" title="This badge describes telemetry only; configured mitigations use separately gated SSH.">
+            SNMP telemetry · read-only
           </Badge>
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -191,9 +208,22 @@ export default function DeviceDetail() {
           <OverviewTab device={device} />
           <BgpSessionsCard deviceId={deviceId} canManage={canManage} refreshKey={refreshKey} />
           <AnnouncedPrefixesCard deviceId={deviceId} refreshKey={refreshKey} />
+          <Card>
+            <CardContent className="pt-6">
+              <DataState
+                state={policyInventory.state}
+                retry={policyInventory.retry}
+                loadingLabel="Loading cached routing policy inventory…"
+              >
+                {(inventory) => <RoutingPolicyInventoryView inventory={inventory} />}
+              </DataState>
+            </CardContent>
+          </Card>
         </TabsContent>
 
         <TabsContent value="interfaces" className="mt-4">
+          {interfacesError && <div role="alert" className="mb-3 flex items-center gap-3 text-sm text-destructive"><span>Interfaces could not be refreshed: {interfacesError}</span><Button size="sm" variant="outline" onClick={loadInterfaces}>Try again</Button></div>}
+          {rulesError && <p role="alert" className="mb-3 text-sm text-destructive">Rule memberships could not be refreshed: {rulesError}. Counts may be stale.</p>}
           <Card>
             <CardContent className="px-0 py-2">
               <InterfacesTab

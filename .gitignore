@@ -5,6 +5,10 @@ backend-rust/target/
 frontend/node_modules/
 frontend/dist/
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Secrets / local
 *.env
 !deploy/env/rerouter.example.env

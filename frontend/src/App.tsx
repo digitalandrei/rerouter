@@ -17,7 +17,7 @@
  * small; each page's chunk loads on navigation behind the <Suspense> fallback.
  */
 import { lazy, Suspense } from "react";
-import { BrowserRouter, Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { createBrowserRouter, Navigate, Outlet, RouterProvider, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
 import { Toaster } from "@/components/ui/toaster";
 import { AuthenticatedLayout } from "@/components/layout/authenticated-layout";
@@ -52,9 +52,10 @@ function RequirePermission({ permission }: { permission: string }) {
 }
 
 function RequireAuth() {
-  const { stage } = useAuth();
+  const { stage, user, authError, retrySession } = useAuth();
+  const location = useLocation();
 
-  if (stage === "loading") {
+  if (stage === "loading" || (stage === "reconnecting" && !user)) {
     return (
       <div className="flex min-h-screen items-center justify-center text-muted-foreground">
         Checking session…
@@ -62,51 +63,31 @@ function RequireAuth() {
     );
   }
 
-  if (stage !== "authenticated") {
-    return <Navigate to="/login" replace />;
+  if (stage === "unavailable") {
+    return <Navigate to="/login" replace state={{ returnTo: location.pathname + location.search }} />;
   }
 
-  return <AuthenticatedLayout />;
+  if (stage !== "authenticated" && stage !== "reconnecting") {
+    return <Navigate to="/login" replace state={{ returnTo: location.pathname + location.search }} />;
+  }
+
+  return <AuthenticatedLayout connectionIssue={stage === "reconnecting" ? authError : null} onRetryConnection={retrySession} />;
 }
 
-export default function App() {
-  return (
-    <AuthProvider>
-      <Toaster />
-      <BrowserRouter>
-        <Suspense fallback={PageFallback}>
-          <Routes>
-            <Route path="/login" element={<Login />} />
-            <Route element={<RequireAuth />}>
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/devices" element={<Devices />} />
-              <Route path="/devices/:id" element={<DeviceDetail />} />
-              <Route
-                path="/devices/:deviceId/interfaces/:ifaceId"
-                element={<InterfaceDetail />}
-              />
-              <Route path="/rules" element={<Rules />} />
-              <Route path="/templates" element={<Templates />} />
-              <Route path="/mitigations" element={<Mitigations />} />
-              <Route path="/manual-mitigations" element={<ManualReroute />} />
-              <Route
-                path="/mitigations/manual"
-                element={<Navigate to="/manual-mitigations" replace />}
-              />
-              <Route path="/flows" element={<Flows />} />
-              {/* /alerts redirects to the Mitigations page Alerts tab */}
-              <Route path="/alerts" element={<Navigate to="/mitigations?tab=alerts" replace />} />
-              <Route path="/audit" element={<Audit />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="/documentation" element={<Documentation />} />
-              <Route element={<RequirePermission permission="manage_users" />}>
-                <Route path="/users" element={<Users />} />
-              </Route>
-            </Route>
-            <Route path="*" element={<Navigate to="/dashboard" replace />} />
-          </Routes>
-        </Suspense>
-      </BrowserRouter>
-    </AuthProvider>
-  );
-}
+const router = createBrowserRouter([
+  { path: "/login", element: <Login /> },
+  { element: <RequireAuth />, children: [
+    { path: "/dashboard", element: <Dashboard /> }, { path: "/devices", element: <Devices /> },
+    { path: "/devices/:id", element: <DeviceDetail /> }, { path: "/devices/:deviceId/interfaces/:ifaceId", element: <InterfaceDetail /> },
+    { path: "/rules", element: <Rules /> }, { path: "/templates", element: <Templates /> }, { path: "/mitigations", element: <Mitigations /> },
+    { path: "/manual-mitigations", element: <ManualReroute /> }, { path: "/manual-mitigations/new", element: <ManualReroute /> },
+    { path: "/manual-mitigations/:id", element: <ManualReroute /> }, { path: "/manual-mitigations/:id/edit", element: <ManualReroute /> },
+    { path: "/manual-mitigations/:id/run", element: <ManualReroute /> }, { path: "/mitigations/manual", element: <Navigate to="/manual-mitigations" replace /> },
+    { path: "/flows", element: <Flows /> }, { path: "/alerts", element: <Navigate to="/mitigations?tab=alerts" replace /> },
+    { path: "/audit", element: <Audit /> }, { path: "/settings", element: <Settings /> }, { path: "/documentation", element: <Documentation /> },
+    { element: <RequirePermission permission="manage_users" />, children: [{ path: "/users", element: <Users /> }] },
+  ]},
+  { path: "*", element: <Navigate to="/dashboard" replace /> },
+]);
+
+export default function App() { return <AuthProvider><Toaster /><Suspense fallback={PageFallback}><RouterProvider router={router} /></Suspense></AuthProvider>; }

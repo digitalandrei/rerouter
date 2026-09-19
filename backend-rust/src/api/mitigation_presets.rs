@@ -64,7 +64,7 @@ pub(crate) async fn load_actions(pool: &MySqlPool, id: u64) -> anyhow::Result<Ve
 pub(crate) async fn fetch(
     pool: &MySqlPool,
     id: u64,
-    detailed: bool,
+    _detailed: bool,
 ) -> anyhow::Result<Option<Value>> {
     let row = sqlx::query_as::<_, PresetRow>(
         "SELECT id, name, description, revision, archived_at, created_at, updated_at \
@@ -93,13 +93,15 @@ pub(crate) async fn fetch(
             auto_target: None,
         })
         .collect();
-    let (validation_status, validation_error) = if detailed && row.archived_at.is_none() {
+    let (definition_status, validation_error) = if drafts.is_empty() {
+        ("draft", None)
+    } else if row.archived_at.is_none() {
         match validate_drafts(pool, &drafts, false).await {
-            Ok(_) => ("valid", None),
-            Err(e) => ("invalid", Some(format!("{e:#}"))),
+            Ok(_) => ("ready", None),
+            Err(e) => ("needs_setup", Some(format!("{e:#}"))),
         }
     } else {
-        ("needs_preview", None)
+        ("needs_setup", None)
     };
     let recent_runs = sqlx::query_as::<_, (u64, String, DateTime<Utc>)>(
         "SELECT id, state, created_at FROM reroute_bundles \
@@ -112,7 +114,8 @@ pub(crate) async fn fetch(
         "id": row.id, "name": row.name, "description": row.description,
         "revision": row.revision, "archived_at": row.archived_at,
         "created_at": row.created_at, "updated_at": row.updated_at,
-        "validation_status": validation_status, "validation_error": validation_error,
+        "definition_status": definition_status,
+        "validation_status": definition_status, "validation_error": validation_error,
         "actions": actions.into_iter().map(|a| json!({
             "id": a.id, "reroute_template_id": a.reroute_template_id,
             "template_name": a.template_name, "template_display_name": a.template_display_name,
@@ -233,10 +236,45 @@ async fn save(
     if let Err(message) = validate_name(&body) {
         return err(StatusCode::UNPROCESSABLE_ENTITY, message);
     }
-    let actions = match validate_drafts(&state.pool, &body.actions, false).await {
-        Ok(actions) => actions.into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
-        Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e:#}")),
-    };
+    if body.actions.len() > 256 {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a mitigation may contain at most 256 actions",
+        );
+    }
+    // A saved definition is allowed to be an incomplete draft. Its identities
+    // must still be real foreign keys; full parameter, policy, order and
+    // inventory validation happens when reporting readiness and again before
+    // every run. Never discard an invalid sibling while saving.
+    for (position, action) in body.actions.iter().enumerate() {
+        let template: Option<u64> =
+            match sqlx::query_scalar("SELECT id FROM reroute_templates WHERE id = ?")
+                .bind(action.reroute_template_id)
+                .fetch_optional(&state.pool)
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            };
+        let device: Option<u64> = match sqlx::query_scalar("SELECT id FROM devices WHERE id = ?")
+            .bind(action.device_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
+        if template.is_none() || device.is_none() {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "action {} references an unavailable template or router",
+                    position + 1
+                ),
+            );
+        }
+    }
+    let actions = body.actions;
     let Ok(mut tx) = state.pool.begin().await else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     };

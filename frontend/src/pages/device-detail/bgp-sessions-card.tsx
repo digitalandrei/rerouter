@@ -13,6 +13,8 @@ import {
 } from "@/components/ui/table";
 import { StatusBadge } from "@/components/status-badge";
 import { PromptDialog } from "@/components/prompt-dialog";
+import { toast } from "sonner";
+import { ApiError } from "@/lib/api";
 
 function adminLabel(s: string | null) {
   return s === "stop" ? "shutdown" : s === "start" ? "up" : "?";
@@ -31,12 +33,13 @@ export function BgpSessionsCard({
 }) {
   const [peers, setPeers] = useState<BgpPeer[] | null>(null);
   const [labelPeer, setLabelPeer] = useState<BgpPeer | null>(null);
+  const [loadError, setLoadError] = useState(false);
 
   const load = useCallback(() => {
     api.devices
       .bgpPeers(deviceId)
-      .then(setPeers)
-      .catch(() => setPeers([]));
+      .then((value) => { setPeers(value); setLoadError(false); })
+      .catch(() => setLoadError(true));
   }, [deviceId]);
   useEffect(() => {
     load();
@@ -55,7 +58,9 @@ export function BgpSessionsCard({
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {peers === null ? (
+          {loadError ? (
+            <p role="alert" className="text-sm text-destructive">BGP sessions could not be loaded. The list may be stale.</p>
+          ) : peers === null ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : peers.length === 0 ? (
             <p className="text-sm text-muted-foreground">No BGP sessions discovered yet.</p>
@@ -115,9 +120,12 @@ export function BgpSessionsCard({
           placeholder="e.g. Scrubber-A GRE"
           onSubmit={async (value) => {
             const id = labelPeer.id;
-            setLabelPeer(null);
-            await api.devices.updateBgpPeer(deviceId, id, value.trim() || null).catch(() => {});
-            load();
+            try {
+              await api.devices.updateBgpPeer(deviceId, id, value.trim() || null);
+              setLabelPeer(null); load(); toast.success("Neighbor label saved");
+            } catch (error) {
+              toast.error(error instanceof ApiError ? error.message : "Failed to save neighbor label");
+            }
           }}
         />
       )}

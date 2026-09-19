@@ -14,11 +14,11 @@ action path as dangerous by default.
 
 ## Hard rules
 
-- The controller ships in **observe mode** (read-only / alert-only):
-  `system_settings.operating_mode = 'observe'`. In observe mode **no reroute
-  executes — automatic or manual**; a fired rule alerts with the rendered plan
-  of the actions that *would* have run. Mode flips are admin-only and audited.
-  Never weaken this default.
+- The controller ships in **observe mode** with
+  `system_settings.operating_mode = 'observe'`. Observe permits only an
+  authorized, exact-previewed and explicitly confirmed manual run or revert.
+  Autonomous starts, condition recovery, and timers require Enforce plus the
+  automatic master switch. Preserve the Observe and auto-off defaults.
 - **Never** add arbitrary command/route execution as a first-class feature.
   All reroutes go through validated **action templates** with parameter schemas.
 - **Never** enable automatic reroutes by default. Automatic execution requires an

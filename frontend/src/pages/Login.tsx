@@ -15,10 +15,10 @@
  * unchanged.
  */
 import { useState, type FormEvent } from "react";
-import { Navigate, useNavigate } from "react-router-dom";
+import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { useAuth } from "@/lib/auth";
-import { ApiError } from "@/lib/api";
+import { ApiError, AUTH_RETURN_TO_KEY } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -38,8 +38,24 @@ export default function Login() {
     login,
     submitTotp,
     finishRecoveryCodes,
+    authError,
+    retrySession,
   } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const statePath = (location.state as { returnTo?: unknown } | null)?.returnTo;
+  const queryPath = new URLSearchParams(location.search).get("returnTo");
+  let storedPath: string | null = null;
+  try { storedPath = window.sessionStorage.getItem(AUTH_RETURN_TO_KEY); } catch { /* storage may be disabled */ }
+  const requestedPath = statePath ?? queryPath ?? storedPath;
+  const returnTo =
+    typeof requestedPath === "string" &&
+    requestedPath.startsWith("/") &&
+    !requestedPath.startsWith("//") &&
+    requestedPath !== "/login"
+      ? requestedPath
+      : "/dashboard";
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -52,7 +68,8 @@ export default function Login() {
   const [codesStored, setCodesStored] = useState(false);
 
   if (stage === "authenticated") {
-    return <Navigate to="/dashboard" replace />;
+    try { window.sessionStorage.removeItem(AUTH_RETURN_TO_KEY); } catch { /* storage may be disabled */ }
+    return <Navigate to={returnTo} replace />;
   }
 
   async function handlePassword(e: FormEvent) {
@@ -75,7 +92,7 @@ export default function Login() {
     try {
       const next = await submitTotp(code);
       if (next === "authenticated") {
-        navigate("/dashboard", { replace: true });
+        navigate(returnTo, { replace: true });
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Invalid code");
@@ -87,7 +104,25 @@ export default function Login() {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-background px-4">
       <Card className="w-full max-w-md">
-        {stage === "recovery" ? (
+        {stage === "unavailable" || stage === "loading" ? (
+          <>
+            <CardHeader className="text-center">
+              <CardTitle className="text-2xl">{stage === "loading" ? "Checking session" : "Controller unavailable"}</CardTitle>
+              <CardDescription aria-live="polite">
+                {stage === "loading"
+                  ? "Checking whether this browser already has a session…"
+                  : authError}
+              </CardDescription>
+            </CardHeader>
+            {stage === "unavailable" && (
+              <CardContent>
+                <Button type="button" className="w-full" onClick={retrySession}>
+                  Try again
+                </Button>
+              </CardContent>
+            )}
+          </>
+        ) : stage === "recovery" ? (
           <>
             <CardHeader className="text-center">
               <CardTitle className="text-2xl">Recovery codes</CardTitle>
@@ -124,7 +159,7 @@ export default function Login() {
                 disabled={!codesStored}
                 onClick={() => {
                   finishRecoveryCodes();
-                  navigate("/dashboard", { replace: true });
+                  navigate(returnTo, { replace: true });
                 }}
               >
                 Continue
@@ -181,7 +216,12 @@ export default function Login() {
                     checked={remember}
                     onChange={(e) => setRemember(e.target.checked)}
                   />
-                  Remember me for 7 days
+                  <span>
+                    Remember this browser (up to 7 days)
+                    <span className="block text-muted-foreground">
+                      You’ll still be signed out after 1 hour without activity.
+                    </span>
+                  </span>
                 </label>
                 {error && (
                   <p className="text-sm text-destructive" role="alert">

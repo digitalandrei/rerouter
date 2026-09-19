@@ -390,24 +390,24 @@ Safety is the most important part of this project. Full detail in
 
 **Operating mode.** The controller has a global operating mode with two values:
 
-- `observe` (**the shipped default**) — safe read-only / alert-only. Telemetry
-  and detection run fully, but **no reroute executes — automatic or manual**.
-  When a rule fires, the alert and rule event carry the rendered plan of the
-  actions that *would* have run, so operators can validate thresholds and
-  templates risk-free before ever letting Rerouter act.
-- `enforce` — reroutes may execute, still gated by every rule below.
+- `observe` (**the shipped default**) — telemetry and detection run fully and
+  autonomous work is disabled. An authorized operator may confirm an exact,
+  one-use preview for a manual run or revert.
+- `enforce` — autonomous work may execute only while the independent automatic
+  master switch and every narrower gate also permit it.
 
 Only an admin can flip the mode (from `/settings`), and **arming** the system
 (observe→enforce, or enabling automatic actions) additionally requires **step-up
 re-authentication** — a fresh password + TOTP at the moment of the change — so a
 stolen admin session alone cannot arm it. The change is audited and alerted.
-Gate 0 of every execution path checks the mode.
+Every execution path checks mode together with its authority source.
 
 Global safety rules — the executor re-checks every gate at execution time, in
 order. The live gates are **device-scoped** (in `enforce` mode):
 
-- **GATE 0** — `operating_mode == enforce`. In `observe`, `execute` returns the
-  would-run plan and runs nothing;
+- **GATE 0** — autonomous starts, condition recovery, and timers require
+  `operating_mode == enforce` plus the automatic master switch. Manual work in
+  either mode requires exact one-use preview authority;
 - not a dry-run;
 - no automatic reroute unless explicitly enabled (global **and** per-rule);
 - no automatic reroute unless the template explicitly has
@@ -434,9 +434,8 @@ order. The live gates are **device-scoped** (in `enforce` mode):
 - (manual triggers additionally require the `trigger_manual_reroute`
   permission, enforced by the API before `execute` is called).
 
-Interface shutdown is the most destructive template in the catalog. It is
-blocked entirely in `observe`, protected-interface guarded in `enforce`, and
-**manual-only** (`automatic_allowed = false`). Never weaken these defaults.
+Interface shutdown is protected-interface guarded and **manual-only**
+(`automatic_allowed = false`) in either mode. Never weaken these defaults.
 
 The per-template "safety level", the provider/asset-reachability gate, the
 telemetry-stale gate, and the newly-discovered-asset gate were **de-scoped** with

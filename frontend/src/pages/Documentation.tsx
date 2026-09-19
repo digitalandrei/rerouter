@@ -429,10 +429,9 @@ export default function Documentation() {
                 ))}
               </div>
               <Callout tone="safe" title="The default is observation, not execution">
-                Rerouter ships in <strong>observe</strong> mode. Collection and detection work,
-                but no manual or automatic mitigation runs. Fired-rule alerts include the exact
-                plan that would have run, letting you validate the system against live traffic
-                without changing routing.
+                Rerouter ships in <strong>observe</strong> mode. Collection and detection work and
+                autonomous mitigation is disabled. Authorized manual runs and reverts still require
+                an exact server preview and explicit one-use confirmation.
               </Callout>
               <H3>What it controls</H3>
               <Bullets>
@@ -466,8 +465,8 @@ export default function Documentation() {
                   <tr>
                     <td className={tdClass}>Operating mode</td>
                     <td className={tdClass}>
-                      <Code>observe</Code> renders plans only; <Code>enforce</Code> permits execution
-                      if every remaining gate passes.
+                      <Code>observe</Code> disables autonomous execution; <Code>enforce</Code> plus
+                      the automatic master switch permits it if every remaining gate passes.
                     </td>
                     <td className={tdClass}>Observe</td>
                   </tr>
@@ -520,10 +519,10 @@ export default function Documentation() {
               </Callout>
               <H3>Exact-preview binding</H3>
               <p>
-                In enforce mode, manual execution, supervised rule apply, and rollback start with a
+                In either mode, manual execution, supervised rule apply, and rollback start with a
                 server-rendered dry run. The server returns a five-minute, single-use token bound to
                 the user, action scope, reason, targets, parameters, and exact plan. A changed or
-                replayed request is refused. Observe-mode previews do not grant execution.
+                replayed request is refused. A preview alone never grants execution.
               </p>
               <H3>Success means verified state</H3>
               <p>
@@ -1028,6 +1027,12 @@ export default function Documentation() {
                 confidence/corroboration gates. A blocked action is recorded and included in the
                 fired-rule event; detection continues.
               </p>
+              <p>
+                Condition and timed recovery separately require Enforce, the automatic master
+                switch, recorded recovery authority, eligible owned changes, and the recovery
+                gates. A persisted inverse may correct a manual-only activation; a template&apos;s
+                automatic-allowed flag restricts new automatic activation, not owned recovery.
+              </p>
               <H3>State machine</H3>
               <div className="rounded-lg border bg-muted/20 p-4 text-center font-mono text-xs md:text-sm">
                 planned → pending → running → verifying → succeeded
@@ -1141,8 +1146,8 @@ export default function Documentation() {
             >
               <H3>Operating mode</H3>
               <p>
-                Observe is read-only/alert-only for mitigation execution. Switching to Enforce makes
-                execution possible but does not bypass any other gate. Arming from Observe to Enforce
+                Observe disables autonomous mitigation while retaining explicitly confirmed manual
+                work from an exact preview. Switching to Enforce does not bypass any other gate. Arming from Observe to Enforce
                 requires fresh password and TOTP in the same request. Returning to Observe is an
                 immediate disarm and does not require step-up.
               </p>
@@ -1150,7 +1155,7 @@ export default function Documentation() {
               <p>
                 The global switch is the master permission for rule-driven automatic actions. Turning
                 it on requires fresh password and TOTP. Turning it off does not affect deliberate
-                manual actions, but Observe mode blocks those too.
+                manual actions. Manual actions remain available in Observe through exact preview authority.
               </p>
               <H3>Global maintenance lock</H3>
               <p>
