@@ -31,3 +31,21 @@ proved the exact desktop/mobile state: one spinner, `aria-busy=true`, disabled
 reason and preview controls, no confirmation control before preview completion,
 no horizontal overflow, and no request other than the mocked read-only preview.
 Evidence is under `/tmp/rerouter-workflow-review-20260919/loading-states/`.
+
+## Deployment result
+
+Frontend source `9193046c4a4128db4cf29541674db28e886bf83e` is deployed
+on EMDD. The public and server index SHA-256 is
+`0433004b3a25f3bb6dcb3738c49725753a5728df94a095db8077b56ecbd5eb53`.
+
+This was a static-only swap. The controller process remained running with
+backend release `3276418925c6dde0e6cf9fae809b5ffc4b3846cd`; its binary,
+configuration, database ledger, and service PID were unchanged across the
+deployment guard. Run 1 remains `succeeded`, lifecycle `active`, with 8/8
+actions complete and eight owned changes, no recovery child or claim, and zero
+active locks.
+
+No preview, mitigation, revert, notification test, database write, service
+restart, or router connection occurred during deployment. The previous static
+frontend and marker are backed up at
+`/root/rerouter-backups/loading-states-9193046c4a41`.
