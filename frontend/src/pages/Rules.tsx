@@ -41,6 +41,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ApplyMitigationDialog, ApplyResultRow } from "@/components/apply-mitigation-dialog";
 import { OrderedActionSetEditor } from "@/components/ordered-action-set-editor";
 import { ActionsAndRevert } from "@/components/actions-and-revert";
+import { RowActionButton } from "@/components/row-action-button";
 import { Switch } from "@/components/ui/switch";
 import { SeverityBadge, toneClass } from "@/components/status-badge";
 import { RuleDialog } from "./rules/rule-dialog";
@@ -601,7 +602,7 @@ export function RuleActionsDialog({
             onMove={canEdit ? (index, delta) => move(index, delta) : undefined}
             onRemove={canEdit ? (index) => remove(index) : undefined}
             selectedIndex={editActionIndex}
-            onSelect={setEditActionIndex}
+            onSelect={canEdit && !resourcesError ? setEditActionIndex : undefined}
             emptyMessage="No actions attached yet. Add actions or import a saved manual mitigation."
           />
           <ActionsAndRevert actions={actions.map(actionDraft)} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} />
@@ -1440,25 +1441,19 @@ export default function Rules() {
                           )}
                           {canEdit && (
                             <>
-                              <Button
-                                size="icon-sm"
-                                variant="ghost"
-                                title="Edit rule"
+                              <RowActionButton
+                                label={`Edit ${rule.name}`}
                                 onClick={() => setEditRule(rule)}
                               >
                                 <Pencil className="size-4" />
-                                <span className="sr-only">Edit</span>
-                              </Button>
-                              <Button
-                                size="icon-sm"
-                                variant="ghost"
-                                title="Delete rule"
-                                className="text-destructive hover:text-destructive"
+                              </RowActionButton>
+                              <RowActionButton
+                                label={`Delete ${rule.name}`}
+                                tone="destructive"
                                 onClick={() => setDeleteTarget(rule)}
                               >
                                 <Trash2 className="size-4" />
-                                <span className="sr-only">Delete</span>
-                              </Button>
+                              </RowActionButton>
                             </>
                           )}
                         </div>

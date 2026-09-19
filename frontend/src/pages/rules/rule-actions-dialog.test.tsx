@@ -25,7 +25,8 @@ describe("RuleActionsDialog", () => {
     expect(await screen.findByText("Actions and revert")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Inspect" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Save complete set" })).toBeNull();
-    expect(screen.queryByTitle("Remove action")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit action 1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove action 1" })).toBeNull();
   });
 
   it("keeps removals local until one atomic complete-set save", async () => {
@@ -34,7 +35,7 @@ describe("RuleActionsDialog", () => {
     const user = userEvent.setup();
     render(<AuthProvider><RuleActionsDialog rule={rule} onClose={() => undefined} onChanged={() => undefined} /></AuthProvider>);
     await screen.findByText("Actions and revert");
-    await user.click(screen.getByTitle("Remove action"));
+    await user.click(screen.getByRole("button", { name: "Remove action 1" }));
     expect(save).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Save complete set" }));
     await waitFor(() => expect(save).toHaveBeenCalledWith(9, { revision: 3, actions: [] }));

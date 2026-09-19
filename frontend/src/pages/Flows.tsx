@@ -8,7 +8,7 @@
  * flow-action gate, device allowlist, and fresh SNMP corroboration all pass.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Waves } from "lucide-react";
+import { Eye, Waves } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import {
   api,
@@ -21,6 +21,7 @@ import { SearchableSelect, type SelectOption } from "@/components/searchable-sel
 import { PROTOCOLS } from "@/lib/protocols";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { RowActionButton } from "@/components/row-action-button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -378,7 +379,7 @@ function SearchTab({ devices }: { devices: Device[] }) {
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="pr-6 text-right"><Button type="button" size="sm" variant="outline" onClick={() => setSelected(r)}>View</Button></TableCell>
+                    <TableCell className="pr-6 text-right"><RowActionButton label={`View flow to ${r.dst_addr}`} onClick={() => setSelected(r)}><Eye className="size-4" /></RowActionButton></TableCell>
                   </TableRow>
                 ))}
               </TableBody>

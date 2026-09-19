@@ -1,10 +1,12 @@
 import { useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
+import { Eye } from "lucide-react";
 import { api } from "@/lib/api";
 import { humanizeToken } from "@/lib/labels";
 import { useResource } from "@/lib/resource-state";
 import { DataState } from "@/components/data-state";
 import { Button } from "@/components/ui/button";
+import { RowActionButton } from "@/components/row-action-button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -50,7 +52,7 @@ export default function Audit() {
     <Card><CardHeader><CardTitle className="text-lg">Entries</CardTitle></CardHeader><CardContent>
       <DataState state={resource.state} retry={resource.retry} loadingLabel="Loading audit entries…" empty={(result) => result.rows.length === 0} emptyContent={<p className="text-sm text-muted-foreground">No audit entries match these filters.</p>}>
         {(result) => <><Table><TableHeader><TableRow><TableHead>When</TableHead><TableHead>Actor</TableHead><TableHead>Action</TableHead><TableHead>Subject</TableHead><TableHead>IP</TableHead><TableHead>Details</TableHead></TableRow></TableHeader>
-          <TableBody>{result.rows.map((entry) => <TableRow key={entry.id}><TableCell className="whitespace-nowrap text-xs text-muted-foreground">{new Date(entry.created_at).toLocaleString()}</TableCell><TableCell className="max-w-56 break-words">{entry.actor}</TableCell><TableCell>{humanizeToken(entry.action)}</TableCell><TableCell className="max-w-56 break-words">{entry.subject}</TableCell><TableCell><code className="text-xs">{entry.ip || "—"}</code></TableCell><TableCell><details><summary className="cursor-pointer text-sm text-primary">View</summary><pre className="mt-2 max-w-md overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 text-xs">{JSON.stringify(entry.details, null, 2)}</pre></details></TableCell></TableRow>)}</TableBody></Table>
+          <TableBody>{result.rows.map((entry) => <TableRow key={entry.id}><TableCell className="whitespace-nowrap text-xs text-muted-foreground">{new Date(entry.created_at).toLocaleString()}</TableCell><TableCell className="max-w-56 break-words">{entry.actor}</TableCell><TableCell>{humanizeToken(entry.action)}</TableCell><TableCell className="max-w-56 break-words">{entry.subject}</TableCell><TableCell><code className="text-xs">{entry.ip || "—"}</code></TableCell><TableCell><details><RowActionButton asChild label={`View audit details for ${humanizeToken(entry.action)}`}><summary><Eye className="size-4" /></summary></RowActionButton><pre className="mt-2 max-w-md overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 text-xs">{JSON.stringify(entry.details, null, 2)}</pre></details></TableCell></TableRow>)}</TableBody></Table>
           <div className="mt-4 flex items-center justify-between"><Button type="button" variant="outline" disabled={result.page <= 1} onClick={() => update("page", String(result.page - 1))}>Previous</Button><span className="text-sm text-muted-foreground">Page {result.page}</span><Button type="button" variant="outline" disabled={!result.has_more} onClick={() => update("page", String(result.page + 1))}>Next</Button></div></>}
       </DataState>
     </CardContent></Card>

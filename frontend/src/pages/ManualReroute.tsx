@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useBlocker, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Archive, CopyPlus, Play, Plus, RefreshCw, Save, ShieldCheck } from "lucide-react";
+import { Archive, CopyPlus, Eye, Pencil, Play, Plus, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import {
   api,
@@ -32,6 +32,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { RowActionButton } from "@/components/row-action-button";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -91,6 +92,7 @@ export default function ManualReroute() {
   const [activeByPreset, setActiveByPreset] = useState<Record<number, number>>({});
   const requestGeneration = useRef(0);
   const loadGeneration = useRef(0);
+  const allowNavigation = useRef(false);
 
   const selectedPreset = presets.find((preset) => preset.id === selectedId) ?? null;
   const presetInvalid = Boolean(selectedPreset && (selectedPreset.definition_status ?? selectedPreset.validation_status) !== "ready" && selectedPreset.validation_status !== "valid");
@@ -109,7 +111,7 @@ export default function ManualReroute() {
       JSON.stringify(actions.map(actionDraftPayload)) !==
         JSON.stringify(selectedPreset.actions.map(actionDraftPayload))
     : name.length > 0 || description.length > 0 || actions.length > 0;
-  const blocker = useBlocker(editorMode && dirty);
+  const blocker = useBlocker(() => editorMode && dirty && !allowNavigation.current);
 
   function invalidatePreview() {
     requestGeneration.current += 1;
@@ -161,7 +163,9 @@ export default function ManualReroute() {
       if (generation !== loadGeneration.current) return;
       const available = saved.filter((preset) => !preset.archived_at);
       setPresets(available);
-      setTemplates(actionTemplates.filter((template) => template.enabled && template.provider_type === "device_cli"));
+      // Keep disabled/legacy templates visible so an existing needs-setup action
+      // can still be inspected and repaired. New actions only offer enabled ones.
+      setTemplates(actionTemplates.filter((template) => template.provider_type === "device_cli"));
       setDevices(routers);
       const initialId = bundleId !== null ? undefined : routeId ?? undefined;
       if (initialId) {
@@ -177,6 +181,8 @@ export default function ManualReroute() {
   }
 
   useEffect(() => { void load(); return () => { loadGeneration.current += 1; }; }, [routeId, location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { allowNavigation.current = false; }, [location.pathname]);
 
   useEffect(() => {
     if (!listMode) return;
@@ -294,6 +300,7 @@ export default function ManualReroute() {
         : [...current, saved].sort((a, b) => a.name.localeCompare(b.name)));
       selectPreset(saved);
       toast.success(selectedPreset ? "Manual mitigation saved" : "Manual mitigation created");
+      allowNavigation.current = true;
       navigate(`/manual-mitigations/${saved.id}`);
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : "Save failed");
@@ -358,11 +365,48 @@ export default function ManualReroute() {
       ? "Flow auto-target has no standalone rule context. Replace it with a concrete prefix override before preview."
       : null,
   }));
-  const selectedRunAction = selectedAction === null ? null : effectiveActions[selectedAction];
-  const selectedBaseAction = selectedAction === null ? null : actions[selectedAction];
-  const selectedRunTemplate = selectedRunAction
-    ? templates.find((template) => template.id === selectedRunAction.reroute_template_id) ?? null
-    : null;
+  function renderActionEditor(index: number) {
+    const baseAction = actions[index];
+    if (!baseAction) return null;
+    const effectiveAction = effectiveActions[index] ?? baseAction;
+    const action = runMode ? effectiveAction : baseAction;
+    const template = templates.find((item) => item.id === action.reroute_template_id) ?? null;
+
+    if (runMode) {
+      if (!template) return <p className="mt-3 border-t border-border pt-3 text-sm text-destructive">This action template is unavailable, so its temporary values cannot be changed.</p>;
+      return <div className="mt-3 space-y-3 border-t border-border pt-3">
+        <div><h3 className="text-sm font-semibold">Temporary override for action {index + 1}</h3>
+          <p className="text-xs text-muted-foreground">Only this run uses these values. The saved action stays unchanged.</p></div>
+        <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={action.device_id}
+          onChange={(event) => setOverride(index, { device_id: Number(event.target.value), params: {} })}>
+          {devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+        </select></label>
+        <ActionParamsForm schema={template.parameter_schema} deviceId={action.device_id}
+          values={stringValues(action.params)} onChange={(values) => setOverride(index, { device_id: action.device_id, params: cleanValues(values) })} />
+      </div>;
+    }
+
+    return <div className="mt-3 space-y-3 border-t border-border pt-3">
+      <div><h3 className="text-sm font-semibold">Edit action {index + 1}</h3>
+        <p className="text-xs text-muted-foreground">Changes remain in this draft until you save the mitigation.</p></div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="block space-y-1 text-sm font-medium">Action template<select className={inputClass} value={baseAction.reroute_template_id}
+          onChange={(event) => { const next = [...actions]; next[index] = { ...baseAction, reroute_template_id: Number(event.target.value), params: {} }; setActions(next); invalidatePreview(); }}>
+          {orderTemplatesForChoice(templates).map((item) => <option key={item.id} value={item.id}>{templateLabel(item)}{item.enabled ? "" : " (unavailable for new actions)"}</option>)}
+        </select></label>
+        <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={baseAction.device_id}
+          onChange={(event) => { const next = [...actions]; next[index] = { ...baseAction, device_id: Number(event.target.value), params: {} }; setActions(next); invalidatePreview(); }}>
+          {devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+        </select></label>
+      </div>
+      <label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={baseAction.enabled ?? true}
+        onChange={(event) => { const next = [...actions]; next[index] = { ...baseAction, enabled: event.target.checked }; setActions(next); invalidatePreview(); }} />Enabled</label>
+      {template
+        ? <ActionParamsForm schema={template.parameter_schema} deviceId={baseAction.device_id}
+            values={stringValues(baseAction.params)} onChange={(values) => { const next = [...actions]; next[index] = { ...baseAction, params: cleanValues(values) }; setActions(next); invalidatePreview(); }} />
+        : <p className="text-sm text-destructive">The saved template is unavailable. Choose another template to repair this action.</p>}
+    </div>;
+  }
   const readiness = (preset: MitigationPreset) => preset.definition_status ?? (preset.actions.length === 0 ? "draft" : preset.validation_status === "valid" ? "ready" : "needs_setup");
   const shownPresets = presets.filter((preset) => `${preset.name} ${preset.description ?? ""}`.toLowerCase().includes(search.trim().toLowerCase()));
 
@@ -370,7 +414,13 @@ export default function ManualReroute() {
     <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1><p className="mt-1 text-sm text-muted-foreground">Saved ordered action sets. Archiving a definition never reverts an active run.</p></div><div className="flex gap-2">{canRun && <Button variant="outline" asChild><Link to="/manual-mitigations/new?run=once"><Play className="size-4" /> Run once</Link></Button>}{canEdit && <Button asChild><Link to="/manual-mitigations/new"><Plus className="size-4" /> Add</Link></Button>}</div></div>
     <Input aria-label="Search manual mitigations" placeholder="Search by name or description…" value={search} onChange={(event) => setSearch(event.target.value)} />
     {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{loadError} <button className="underline" onClick={() => void load()}>Try again</button></div>}
-    <div className="overflow-x-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50 text-left"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">Readiness</th><th className="px-3 py-2">Routers</th><th className="px-3 py-2">Steps</th><th className="px-3 py-2">Active runs</th><th className="px-3 py-2">Last result</th><th className="px-3 py-2 text-right">Actions</th></tr></thead><tbody>{shownPresets.map((preset) => <tr key={preset.id} className="border-t"><td className="px-3 py-3"><Link className="font-medium hover:underline" to={`/manual-mitigations/${preset.id}`}>{preset.name}</Link><p className="max-w-xl truncate text-xs text-muted-foreground">{preset.description || "No description"}</p></td><td className="px-3 py-3"><Badge variant={readiness(preset) === "ready" ? "outline" : readiness(preset) === "needs_setup" ? "destructive" : "secondary"}>{readiness(preset).replace("_", " ")}</Badge></td><td className="px-3 py-3">{new Set(preset.actions.map((action) => action.device_id)).size}</td><td className="px-3 py-3 tabular-nums">{preset.actions.length}</td><td className="px-3 py-3 tabular-nums">{activeByPreset[preset.id] ?? 0}</td><td className="px-3 py-3">{preset.recent_runs?.[0]?.state ?? "Never run"}</td><td className="px-3 py-3"><div className="flex justify-end gap-1">{canRun && readiness(preset) === "ready" ? <Button size="sm" variant="ghost" asChild><Link to={`/manual-mitigations/${preset.id}/run`}>Run</Link></Button> : canRun ? <Button size="sm" variant="ghost" asChild title={preset.validation_error ?? "Complete every step before running"}><Link to={`/manual-mitigations/${preset.id}`}>Review setup</Link></Button> : null}{canRun && (activeByPreset[preset.id] ?? 0) > 0 ? <Button size="sm" variant="ghost" asChild><Link to={`/mitigations?tab=active&preset_id=${preset.id}`}>Revert</Link></Button> : null}{canEdit && <Button size="sm" variant="ghost" asChild><Link to={`/manual-mitigations/${preset.id}/edit`}>Edit</Link></Button>}{canEdit && <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => { if (window.confirm(`Archive “${preset.name}”? Active runs and history will remain unchanged.`)) void api.mitigationPresets.remove(preset.id, preset.revision).then(() => setPresets((current) => current.filter((item) => item.id !== preset.id))).catch((cause) => toast.error(cause instanceof Error ? cause.message : "Archive failed")); }}>Delete</Button>}<Button size="sm" variant="ghost" asChild><Link to={`/manual-mitigations/${preset.id}`}>Details</Link></Button></div></td></tr>)}</tbody></table>{!loadError && shownPresets.length === 0 && <p className="p-8 text-center text-sm text-muted-foreground">{presets.length ? "No mitigations match this search." : "No saved manual mitigations yet."}</p>}</div>
+    <div className="overflow-x-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50 text-left"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">Readiness</th><th className="px-3 py-2">Routers</th><th className="px-3 py-2">Steps</th><th className="px-3 py-2">Active runs</th><th className="px-3 py-2">Last result</th><th className="px-3 py-2 text-right">Actions</th></tr></thead><tbody>{shownPresets.map((preset) => <tr key={preset.id} className="border-t"><td className="px-3 py-3"><Link className="font-medium hover:underline" to={`/manual-mitigations/${preset.id}`}>{preset.name}</Link><p className="max-w-xl truncate text-xs text-muted-foreground">{preset.description || "No description"}</p></td><td className="px-3 py-3"><Badge variant={readiness(preset) === "ready" ? "outline" : readiness(preset) === "needs_setup" ? "destructive" : "secondary"}>{readiness(preset).replace("_", " ")}</Badge></td><td className="px-3 py-3">{new Set(preset.actions.map((action) => action.device_id)).size}</td><td className="px-3 py-3 tabular-nums">{preset.actions.length}</td><td className="px-3 py-3 tabular-nums">{activeByPreset[preset.id] ?? 0}</td><td className="px-3 py-3">{preset.recent_runs?.[0]?.state ?? "Never run"}</td><td className="px-3 py-3"><div className="flex justify-end gap-1">
+      {canRun && readiness(preset) === "ready" ? <RowActionButton label={`Run ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}/run`}><Play className="size-4" /></Link></RowActionButton> : canRun ? <RowActionButton label={`Review setup for ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}`}><ShieldAlert className="size-4" /></Link></RowActionButton> : null}
+      {canRun && (activeByPreset[preset.id] ?? 0) > 0 && <RowActionButton label={`Revert active runs for ${preset.name}`} asChild><Link to={`/mitigations?tab=active&preset_id=${preset.id}`}><RotateCcw className="size-4" /></Link></RowActionButton>}
+      {canEdit && <RowActionButton label={`Edit ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}/edit`}><Pencil className="size-4" /></Link></RowActionButton>}
+      {canEdit && <RowActionButton label={`Delete ${preset.name}`} tone="destructive" onClick={() => { if (window.confirm(`Archive “${preset.name}”? Active runs and history will remain unchanged.`)) void api.mitigationPresets.remove(preset.id, preset.revision).then(() => setPresets((current) => current.filter((item) => item.id !== preset.id))).catch((cause) => toast.error(cause instanceof Error ? cause.message : "Archive failed")); }}><Trash2 className="size-4" /></RowActionButton>}
+      <RowActionButton label="Details" asChild><Link to={`/manual-mitigations/${preset.id}`}><Eye className="size-4" /></Link></RowActionButton>
+    </div></td></tr>)}</tbody></table>{!loadError && shownPresets.length === 0 && <p className="p-8 text-center text-sm text-muted-foreground">{presets.length ? "No mitigations match this search." : "No saved manual mitigations yet."}</p>}</div>
   </div>;
 
   return (
@@ -400,10 +450,11 @@ export default function ManualReroute() {
             <CardHeader><div className="flex flex-wrap items-start justify-between gap-3"><div>
               <CardTitle>{bundleId !== null ? bundle?.source?.preset_name ?? bundle?.source?.name ?? `Mitigation run #${bundleId}` : selectedPreset ? selectedPreset.name : runMode ? "Run once" : "New manual mitigation"}</CardTitle>
               <CardDescription>{runMode ? "Run a temporary copy. Saved targets and parameters remain unchanged." : "Actions execute from top to bottom as one run."}</CardDescription>
-            </div>{selectedPreset && <div className="flex flex-wrap gap-2">
+            </div>{selectedPreset && <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="tabular-nums">revision {selectedPreset.revision}</Badge>
               {presetInvalid && <Badge variant="destructive">invalid</Badge>}
               {!presetInvalid && presetNeedsPreview && <Badge variant="outline">validation on preview</Badge>}
+              {!runMode && !editorMode && canEdit && <Button size="sm" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit`}>Edit mitigation</Link></Button>}
             </div>}</div></CardHeader>
             <CardContent className="space-y-5">
               {presetInvalid && <div className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">
@@ -418,7 +469,9 @@ export default function ManualReroute() {
               </div>}
 
               {bundleId === null && <OrderedActionSetEditor actions={displayActions} templates={templates} devices={devices} busy={busy}
-                readOnly={runMode || !editorMode || !canEdit} selectedIndex={selectedAction} onSelect={setSelectedAction}
+                readOnly={runMode || !editorMode || !canEdit} selectedIndex={selectedAction}
+                onSelect={(runMode && canRun) || (!runMode && editorMode && canEdit) ? setSelectedAction : undefined}
+                editLabel={runMode ? "Override" : "Edit"} renderEditor={renderActionEditor}
                 onMove={!runMode && editorMode && canEdit ? moveAction : undefined}
                 onRemove={!runMode && editorMode && canEdit ? (index) => { setActions((current) => current.filter((_, i) => i !== index)); setSelectedAction(null); invalidatePreview(); } : undefined}
                 onReset={runMode ? (index) => { const key = actionIdentity(actions[index], index); setOverrides(({ [key]: _removed, ...current }) => current); invalidatePreview(); } : undefined} />}
@@ -434,9 +487,10 @@ export default function ManualReroute() {
               </div>}
 
               {bundleId === null && ((!runMode && editorMode && canEdit) || (runMode && !selectedPreset && canRun)) && <div className="space-y-3 rounded-md border border-dashed border-border p-3">
+                <div><h3 className="text-sm font-semibold">Add actions</h3><p className="text-xs text-muted-foreground">Choose a template and one or more routers to append new steps.</p></div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="space-y-1 text-sm font-medium">Action template<select className={inputClass} value={templateId} onChange={(event) => { setTemplateId(event.target.value); setNewValuesByDevice({}); setBulkPrefixes(""); setIncludeMss(false); }}>
-                    <option value="">Select template…</option>{orderTemplatesForChoice(templates).map((template) => <option key={template.id} value={template.id}>{templateLabel(template)}</option>)}
+                    <option value="">Select template…</option>{orderTemplatesForChoice(templates.filter((template) => template.enabled)).map((template) => <option key={template.id} value={template.id}>{templateLabel(template)}</option>)}
                   </select></label>
                   <fieldset className="space-y-1 text-sm font-medium"><legend>Target routers</legend><div className="max-h-36 space-y-1 overflow-y-auto rounded-md border border-input p-2">
                     {devices.map((device) => <label key={device.id} className="flex items-center gap-2 font-normal"><input type="checkbox" checked={deviceIds.includes(device.id)} onChange={() => setDeviceIds((current) => current.includes(device.id) ? current.filter((id) => id !== device.id) : [...current, device.id])} />{device.name}</label>)}
@@ -453,38 +507,13 @@ export default function ManualReroute() {
                 </div>
               </div>}
 
-              {!runMode && editorMode && canEdit && selectedBaseAction && selectedRunTemplate && <div className="space-y-3 rounded-md border border-border bg-muted/30 p-3">
-                <div><h3 className="text-sm font-medium">Edit action {selectedAction! + 1}</h3>
-                  <p className="text-xs text-muted-foreground">Changes remain local until you save the complete ordered set.</p></div>
-                <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={selectedBaseAction.device_id}
-                  onChange={(event) => { const next = [...actions]; next[selectedAction!] = { ...selectedBaseAction, device_id: Number(event.target.value), params: {} }; setActions(next); invalidatePreview(); }}>
-                  {devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
-                </select></label>
-                <ActionParamsForm schema={selectedRunTemplate.parameter_schema} deviceId={selectedBaseAction.device_id}
-                  values={stringValues(selectedBaseAction.params)} onChange={(values) => {
-                    const next = [...actions]; next[selectedAction!] = { ...selectedBaseAction, params: cleanValues(values) }; setActions(next); invalidatePreview();
-                  }} />
-              </div>}
-
-              {runMode && bundleId === null && selectedRunAction && selectedBaseAction && selectedRunTemplate && <div className="space-y-3 rounded-md border border-border bg-muted/30 p-3">
-                <div><h3 className="text-sm font-medium">Temporary override for action {selectedAction! + 1}</h3>
-                  <p className="text-xs text-muted-foreground">Only the target router and parameters can change. Template, order, and enabled state stay fixed.</p></div>
-                <label className="block space-y-1 text-sm font-medium">Target router<select className={inputClass} value={selectedRunAction.device_id}
-                  onChange={(event) => setOverride(selectedAction!, { device_id: Number(event.target.value), params: {} })}>
-                  {devices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
-                </select></label>
-                <ActionParamsForm schema={selectedRunTemplate.parameter_schema} deviceId={selectedRunAction.device_id}
-                  values={stringValues(selectedRunAction.params)}
-                  onChange={(values) => setOverride(selectedAction!, { device_id: selectedRunAction.device_id, params: cleanValues(values) })} />
-              </div>}
-
               {bundleId === null && <ActionsAndRevert actions={runMode ? effectiveActions : actions} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} />}
               {!runMode ? <div className="flex flex-wrap justify-between gap-2 border-t border-border pt-4"><div>
                 {selectedPreset && editorMode && canEdit && <Button variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setDeleteOpen(true)} disabled={busy}><Archive className="size-4" /> Archive</Button>}
               </div><div className="flex flex-wrap gap-2">
                 {selectedPreset && canRun && <Button variant="outline" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/run`}><Play className="size-4" /> Run</Link></Button>}
                 {selectedPreset && !editorMode && canEdit && <Button asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit`}>Edit</Link></Button>}
-                {editorMode && <Button variant="outline" onClick={() => { if (!dirty || window.confirm("Discard unsaved changes?")) navigate(selectedPreset ? `/manual-mitigations/${selectedPreset.id}` : "/manual-mitigations"); }}>Cancel</Button>}
+                {editorMode && <Button variant="outline" onClick={() => navigate(selectedPreset ? `/manual-mitigations/${selectedPreset.id}` : "/manual-mitigations")}>Cancel</Button>}
                 {editorMode && canEdit && <Button onClick={() => void save()} disabled={busy || !name.trim()}><Save className="size-4" /> {busy ? "Saving…" : "Save"}</Button>}
               </div></div> : <div className="space-y-4 border-t border-border pt-4">
                 {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>

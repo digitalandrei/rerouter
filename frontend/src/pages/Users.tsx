@@ -9,11 +9,13 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { RotateCcw, Trash2 } from "lucide-react";
 import { api, type User, ApiError } from "@/lib/api";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { RowActionButton } from "@/components/row-action-button";
 import {
   Card,
   CardContent,
@@ -344,22 +346,23 @@ export default function Users() {
                       ))}
                     </select>
 
-                    <Button
-                      size="sm"
-                      variant="outline"
+                    <RowActionButton
+                      label={`Reset 2FA for ${user.email}`}
                       disabled={rowBusy[user.id]}
+                      disabledReason="Another action for this user is in progress"
                       onClick={() => setPending({ kind: "reset", user })}
                     >
-                      Reset 2FA
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="destructive"
+                      <RotateCcw className="size-4" />
+                    </RowActionButton>
+                    <RowActionButton
+                      label={`Delete ${user.email}`}
+                      tone="destructive"
                       disabled={rowBusy[user.id]}
+                      disabledReason="Another action for this user is in progress"
                       onClick={() => setPending({ kind: "delete", user })}
                     >
-                      Delete
-                    </Button>
+                      <Trash2 className="size-4" />
+                    </RowActionButton>
                   </div>
                   {rowError[user.id] && (
                     <p className="text-xs text-destructive" role="alert">

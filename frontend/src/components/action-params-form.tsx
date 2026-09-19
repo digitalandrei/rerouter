@@ -72,6 +72,7 @@ export function ActionParamsForm({
   omitParams?: Set<string>;
 }) {
   const [peers, setPeers] = useState<BgpPeer[]>([]);
+  const [peerInventoryState, setPeerInventoryState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [networks, setNetworks] = useState<BgpNetwork[]>([]);
   const [rtbh, setRtbh] = useState<RtbhCommunity[]>([]);
   const [interfaces, setInterfaces] = useState<Interface[]>([]);
@@ -91,6 +92,7 @@ export function ActionParamsForm({
     // picked for device B. The `cancelled` flag drops late responses from a
     // superseded device for the same reason.
     setPeers([]);
+    setPeerInventoryState(deviceId && !isExportPolicy ? "loading" : "idle");
     setNetworks([]);
     setInterfaces([]);
     setRouteMaps([]);
@@ -99,10 +101,10 @@ export function ActionParamsForm({
     api.devices
       .bgpPeers(deviceId)
       .then((v) => {
-        if (!cancelled) setPeers(v);
+        if (!cancelled) { setPeers(v); setPeerInventoryState("ready"); }
       })
       .catch(() => {
-        if (!cancelled) setPeers([]);
+        if (!cancelled) { setPeers([]); setPeerInventoryState("error"); }
       });
     api.devices
       .bgpNetworks(deviceId)
@@ -165,10 +167,10 @@ export function ActionParamsForm({
   // previous device) would be submitted and then refused fail-closed by the
   // validator — which is exactly the "pfx-to-viva" the operator saw.
   useEffect(() => {
-    if (!pfxListParam) return;
+    if (!pfxListParam || peerInventoryState !== "ready") return;
     if ((values[pfxListParam] ?? "") === derivedPfxList) return;
     onChange({ ...values, [pfxListParam]: derivedPfxList });
-  }, [pfxListParam, derivedPfxList, values, onChange]);
+  }, [pfxListParam, derivedPfxList, peerInventoryState, values, onChange]);
 
   function set(name: string, value: string) {
     onChange({ ...values, [name]: value });

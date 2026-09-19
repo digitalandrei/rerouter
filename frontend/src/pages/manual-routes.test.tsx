@@ -1,13 +1,37 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
-import { api, type MitigationPreset } from "@/lib/api";
+import { api, type MitigationPreset, type Template } from "@/lib/api";
 import { AuthProvider } from "@/lib/auth";
 import ManualReroute from "@/pages/ManualReroute";
 
 const saved: MitigationPreset = { id: 4, name: "Edge diversion", description: "Reviewed set", revision: 2, archived_at: null, actions: [], definition_status: "draft", validation_error: null, created_at: "2026-09-19T08:00:00Z", updated_at: "2026-09-19T08:00:00Z", recent_runs: [] };
+const editableTemplate: Template = { id: 5, name: "null_route_prefix", display_name: "Null route", description: null, provider_type: "device_cli", mode: "config", automatic_allowed: false, parameter_schema: { prefix: { type: "cidr", label: "Prefix" } }, plan: null, verification: null, rollback_template_id: null, enabled: true };
+const alternateTemplate: Template = { ...editableTemplate, id: 6, name: "alternate_route", display_name: "Alternate route" };
+const legacyPeerTemplate: Template = { ...editableTemplate, id: 7, name: "legacy_peer", display_name: "Legacy peer", parameter_schema: { neighbor: { type: "ip", source: "bgp_peer" }, prefix_list: { type: "string", source: "peer_out_prefix_list" } } };
+const longSaved: MitigationPreset = {
+  ...saved,
+  definition_status: "needs_setup",
+  validation_error: "Action 16 needs setup",
+  actions: Array.from({ length: 16 }, (_, index) => ({ id: 100 + index, reroute_template_id: 5, template_name: editableTemplate.name, device_id: 10, device_name: "Router A", params: { prefix: `192.0.2.${index}/32` }, enabled: true, auto_target: null, validation_status: index === 15 ? "invalid" : "valid" })),
+};
+
+function mockEditorDependencies(preset: MitigationPreset) {
+  vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "edit_rules", "trigger_manual_reroute"] });
+  vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([preset]);
+  vi.spyOn(api.templates, "list").mockResolvedValue([editableTemplate, alternateTemplate]);
+  vi.spyOn(api.devices, "list").mockResolvedValue([
+    { id: 10, name: "Router A" }, { id: 11, name: "Router B" },
+  ] as never);
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [], page: 1, per_page: 200, total: 0 });
+  vi.spyOn(api.rtbh, "list").mockResolvedValue([]);
+  vi.spyOn(api.devices, "bgpPeers").mockResolvedValue([]);
+  vi.spyOn(api.devices, "bgpNetworks").mockResolvedValue([]);
+  vi.spyOn(api.devices, "interfaces").mockResolvedValue([]);
+  vi.spyOn(api.devices, "routeMaps").mockResolvedValue([]);
+}
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -52,4 +76,94 @@ it("never lets a late detail response overwrite new or run-once routes", async (
   await router.navigate("/manual-mitigations/new?run=once");
   expect(await screen.findByText("Run once")).toBeTruthy();
   expect(screen.queryByDisplayValue("Edge diversion")).toBeNull();
+});
+
+it("edits the last action of a saved needs-setup set inline and persists the same preset", async () => {
+  mockEditorDependencies(longSaved);
+  let persisted = longSaved;
+  vi.spyOn(api.mitigationPresets, "get").mockImplementation(async () => persisted);
+  const update = vi.spyOn(api.mitigationPresets, "update").mockImplementation(async (id, body) => {
+    persisted = { ...longSaved, ...body, id, revision: 3 };
+    return persisted;
+  });
+  const preview = vi.spyOn(api.manualMitigations, "preview");
+  const apply = vi.spyOn(api.manualMitigations, "apply");
+  const remove = vi.spyOn(api.mitigationPresets, "remove");
+  const confirm = vi.spyOn(window, "confirm");
+  const router = createMemoryRouter([
+    { path: "/manual-mitigations/:id", element: <ManualReroute /> },
+    { path: "/manual-mitigations/:id/edit", element: <ManualReroute /> },
+  ], { initialEntries: ["/manual-mitigations/4"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+
+  await user.click(await screen.findByRole("link", { name: "Edit mitigation" }));
+  const editLast = await screen.findByRole("button", { name: "Edit action 16" });
+  await user.click(editLast);
+  const editorHeading = screen.getByRole("heading", { name: "Edit action 16" });
+  const row = editorHeading.closest("li");
+  expect(row).not.toBeNull();
+  expect(within(row!).getByText("Changes remain in this draft until you save the mitigation.")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Add actions" }).compareDocumentPosition(editorHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+
+  const editor = within(row!);
+  await user.selectOptions(editor.getByLabelText("Action template"), "6");
+  await user.selectOptions(editor.getByLabelText("Target router"), "11");
+  await user.type(editor.getByLabelText("Prefix (cidr)"), "203.0.113.16/32");
+  await user.click(editor.getByLabelText("Enabled"));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+  const [id, body] = update.mock.calls[0];
+  expect(id).toBe(4);
+  expect(body.revision).toBe(2);
+  expect(body.actions).toHaveLength(16);
+  expect(body.actions[15]).toMatchObject({ id: 115, reroute_template_id: 6, device_id: 11, params: { prefix: "203.0.113.16/32" }, enabled: false });
+  expect(preview).not.toHaveBeenCalled();
+  expect(apply).not.toHaveBeenCalled();
+  expect(remove).not.toHaveBeenCalled();
+  expect(confirm).not.toHaveBeenCalled();
+  await waitFor(() => expect(router.state.location.pathname).toBe("/manual-mitigations/4"));
+
+  await router.navigate("/manual-mitigations/4/edit");
+  await user.click(await screen.findByRole("button", { name: "Edit action 16" }));
+  expect((within(screen.getByRole("heading", { name: "Edit action 16" }).closest("li")!).getByLabelText("Target router") as HTMLSelectElement).value).toBe("11");
+});
+
+it("keeps a dirty action draft when cancel navigation is declined", async () => {
+  mockEditorDependencies(longSaved);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(longSaved);
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  const router = createMemoryRouter([
+    { path: "/manual-mitigations/:id", element: <ManualReroute /> },
+    { path: "/manual-mitigations/:id/edit", element: <ManualReroute /> },
+  ], { initialEntries: ["/manual-mitigations/4/edit"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Edit action 1" }));
+  await user.click(within(screen.getByRole("heading", { name: "Edit action 1" }).closest("li")!).getByLabelText("Enabled"));
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+  expect(router.state.location.pathname).toBe("/manual-mitigations/4/edit");
+  expect((within(screen.getByRole("heading", { name: "Edit action 1" }).closest("li")!).getByLabelText("Enabled") as HTMLInputElement).checked).toBe(false);
+});
+
+it("does not clear a saved derived peer value when inventory loading fails", async () => {
+  const preset = { ...longSaved, actions: [{ ...longSaved.actions[0], reroute_template_id: 7, params: { neighbor: "198.51.100.1", prefix_list: "PL-LEGACY" } }] };
+  mockEditorDependencies(preset);
+  vi.mocked(api.templates.list).mockResolvedValue([legacyPeerTemplate]);
+  vi.mocked(api.devices.bgpPeers).mockRejectedValue(new Error("inventory unavailable"));
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(preset);
+  const update = vi.spyOn(api.mitigationPresets, "update").mockImplementation(async (_id, body) => ({ ...preset, ...body, revision: 3 }));
+  const router = createMemoryRouter([
+    { path: "/manual-mitigations/:id", element: <ManualReroute /> },
+    { path: "/manual-mitigations/:id/edit", element: <ManualReroute /> },
+  ], { initialEntries: ["/manual-mitigations/4/edit"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Edit action 1" }));
+  await waitFor(() => expect(api.devices.bgpPeers).toHaveBeenCalledWith(10));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(update).toHaveBeenCalled());
+  expect(update.mock.calls[0][1].actions[0].params).toEqual({ neighbor: "198.51.100.1", prefix_list: "PL-LEGACY" });
 });

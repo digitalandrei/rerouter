@@ -1,8 +1,9 @@
-import { ArrowDown, ArrowUp, RotateCcw, Trash2 } from "lucide-react";
+import type { ReactNode } from "react";
+import { ArrowDown, ArrowUp, Pencil, RotateCcw, Trash2, X } from "lucide-react";
 import type { ActionDraft, Device, Template } from "@/lib/api";
 import { templateLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { RowActionButton } from "@/components/row-action-button";
 
 export interface OrderedActionItem extends ActionDraft {
   client_key?: string;
@@ -21,6 +22,8 @@ export function OrderedActionSetEditor({
   onMove,
   onRemove,
   onReset,
+  editLabel = "Edit",
+  renderEditor,
   emptyMessage = "No actions yet.",
 }: {
   actions: OrderedActionItem[];
@@ -29,10 +32,12 @@ export function OrderedActionSetEditor({
   busy?: boolean;
   readOnly?: boolean;
   selectedIndex?: number | null;
-  onSelect?: (index: number) => void;
+  onSelect?: (index: number | null) => void;
   onMove?: (index: number, delta: -1 | 1) => void;
   onRemove?: (index: number) => void;
   onReset?: (index: number) => void;
+  editLabel?: "Edit" | "Override";
+  renderEditor?: (index: number) => ReactNode;
   emptyMessage?: string;
 }) {
   if (actions.length === 0) {
@@ -59,82 +64,83 @@ export function OrderedActionSetEditor({
             }`}
           >
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className="inline-flex size-6 shrink-0 items-center justify-center rounded bg-muted text-xs font-semibold tabular-nums">
-                {index + 1}
-              </span>
-              <button
-                type="button"
-                className="min-w-0 flex-1 text-left outline-none focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={() => onSelect?.(index)}
-                disabled={!onSelect}
-                aria-pressed={onSelect ? selected : undefined}
-              >
-                <span className="block truncate text-sm font-medium">
-                  {template ? templateLabel(template) : `Action template #${action.reroute_template_id}`}
+              <div className="flex min-w-0 basis-full items-center gap-2 sm:basis-0 sm:flex-1">
+                <span className="inline-flex size-6 shrink-0 items-center justify-center rounded bg-muted text-xs font-semibold tabular-nums">
+                  {index + 1}
                 </span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {device?.name ?? `Router #${action.device_id}`}
-                </span>
-              </button>
+                <div className="min-w-0 flex-1 text-left">
+                  <span className="block truncate text-sm font-medium">
+                    {template ? templateLabel(template) : `Action template #${action.reroute_template_id}`}
+                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {device?.name ?? `Router #${action.device_id}`}
+                  </span>
+                </div>
+              </div>
               {action.overridden && (
                 <Badge variant="outline" className="border-amber-500 text-amber-800 dark:text-amber-300">
                   temporary override
                 </Badge>
               )}
               {!action.enabled && <Badge variant="outline">disabled</Badge>}
-              {!readOnly && onMove && (
-                <div className="flex items-center" aria-label={`Reorder action ${index + 1}`}>
-                  <Button
-                    type="button"
-                    size="icon-sm"
-                    variant="ghost"
-                    disabled={busy || index === 0}
-                    onClick={() => onMove(index, -1)}
-                    title="Run earlier"
+              <div className="ml-8 flex flex-wrap items-center gap-1 sm:ml-0">
+                {onSelect && (
+                  <RowActionButton
+                    label={selected ? `Close editor for action ${index + 1}` : `${editLabel} action ${index + 1}`}
+                    aria-expanded={selected}
+                    disabled={busy}
+                    disabledReason="Wait for the current request to finish"
+                    onClick={() => onSelect(selected ? null : index)}
                   >
-                    <ArrowUp className="size-4" />
-                    <span className="sr-only">Move action {index + 1} earlier</span>
-                  </Button>
-                  <Button
+                    {selected ? <X className="size-4" /> : <Pencil className="size-4" />}
+                  </RowActionButton>
+                )}
+                {!readOnly && onMove && (
+                  <div className="flex items-center gap-1" aria-label={`Reorder action ${index + 1}`}>
+                    <RowActionButton
+                      type="button"
+                      label={`Move action ${index + 1} earlier`}
+                      disabled={busy || index === 0}
+                      disabledReason={index === 0 ? "Already the first action" : "Wait for the current request to finish"}
+                      onClick={() => onMove(index, -1)}
+                    >
+                      <ArrowUp className="size-4" />
+                    </RowActionButton>
+                    <RowActionButton
+                      type="button"
+                      label={`Move action ${index + 1} later`}
+                      disabled={busy || index === actions.length - 1}
+                      disabledReason={index === actions.length - 1 ? "Already the last action" : "Wait for the current request to finish"}
+                      onClick={() => onMove(index, 1)}
+                    >
+                      <ArrowDown className="size-4" />
+                    </RowActionButton>
+                  </div>
+                )}
+                {onReset && action.overridden && (
+                  <RowActionButton
                     type="button"
-                    size="icon-sm"
-                    variant="ghost"
-                    disabled={busy || index === actions.length - 1}
-                    onClick={() => onMove(index, 1)}
-                    title="Run later"
+                    label={`Reset override for action ${index + 1}`}
+                    disabled={busy}
+                    disabledReason="Wait for the current request to finish"
+                    onClick={() => onReset(index)}
                   >
-                    <ArrowDown className="size-4" />
-                    <span className="sr-only">Move action {index + 1} later</span>
-                  </Button>
-                </div>
-              )}
-              {onReset && action.overridden && (
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  disabled={busy}
-                  onClick={() => onReset(index)}
-                  title="Reset temporary override"
-                >
-                  <RotateCcw className="size-4" />
-                  <span className="sr-only">Reset override for action {index + 1}</span>
-                </Button>
-              )}
-              {!readOnly && onRemove && (
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  className="text-destructive hover:text-destructive"
-                  disabled={busy}
-                  onClick={() => onRemove(index)}
-                  title="Remove action"
-                >
-                  <Trash2 className="size-4" />
-                  <span className="sr-only">Remove action {index + 1}</span>
-                </Button>
-              )}
+                    <RotateCcw className="size-4" />
+                  </RowActionButton>
+                )}
+                {!readOnly && onRemove && (
+                  <RowActionButton
+                    type="button"
+                    label={`Remove action ${index + 1}`}
+                    tone="destructive"
+                    disabled={busy}
+                    disabledReason="Wait for the current request to finish"
+                    onClick={() => onRemove(index)}
+                  >
+                    <Trash2 className="size-4" />
+                  </RowActionButton>
+                )}
+              </div>
             </div>
             <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 pl-8 text-xs text-muted-foreground">
               {action.auto_target === "flow_dst_host" && (
@@ -155,6 +161,7 @@ export function OrderedActionSetEditor({
                 {action.warning}
               </p>
             )}
+            {selected && renderEditor?.(index)}
           </li>
         );
       })}

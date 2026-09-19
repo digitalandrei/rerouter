@@ -20,6 +20,7 @@ import { Badge } from "@/components/ui/badge";
 import { ToneBadge } from "@/components/status-badge";
 import { sshStatusBadge, automationStatus } from "@/lib/labels";
 import { Button } from "@/components/ui/button";
+import { RowActionButton } from "@/components/row-action-button";
 import {
   Card,
   CardContent,
@@ -533,18 +534,15 @@ export default function Devices() {
                       onClick={(e) => e.stopPropagation()}
                     >
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          title="View device"
+                        <RowActionButton
+                          label={`View ${device.name}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             navigate(`/devices/${device.id}`);
                           }}
                         >
                           <Eye className="size-4" />
-                          <span className="sr-only">View</span>
-                        </Button>
+                        </RowActionButton>
                       </div>
                     </TableCell>
                   </TableRow>
