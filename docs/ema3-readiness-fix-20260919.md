@@ -32,3 +32,22 @@ backs up application data and compares these records before and after restarting
 only the controller. It checks the complete live eMA3 definition using the
 database-only diagnostic before and after restart. No live mitigation preview,
 execution, reversal or router configuration change is part of this correction.
+
+Accepted and deployed source: `1cab3d218baf2ac7f813246b9234ee2717a8c2ed`.
+All 280 backend tests passed on the existing restricted MariaDB test schema,
+with formatting, strict Clippy, optimized build and deployment recovery/parser
+checks passing. The frontend did not change.
+
+After deployment, the same live readiness calculation reports preset 2
+`e-manuel-apply-ema3-test` as `ready` with no validation error. Preset 1 remains
+blocked; its current first reported reason is stale or missing cached policy
+inventory for device 2. Health and readiness endpoints return HTTP 200, and
+the public frontend hash is unchanged. The live database retains 13 rules,
+two presets, 24 saved actions, schema 69, and zero reroutes, bundles and active
+locks. Configuration, environment, credentials and saved definitions compare
+identically before and after deployment.
+
+The application-data backup is
+`/root/rerouter-backups/readiness-1cab3d218baf/database-evidence.sql.gz`
+(40,202,855 bytes, gzip integrity verified). Detailed local evidence is under
+`/tmp/rerouter-workflow-review-20260919/readiness-hotfix/`.
