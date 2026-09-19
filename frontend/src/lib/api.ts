@@ -641,7 +641,7 @@ export interface MitigationPreset {
   actions: PresetAction[];
   created_at: string;
   updated_at: string;
-  recent_runs?: Array<{ bundle_id: number; state: string; created_at: string }>;
+  recent_runs?: Array<Partial<RerouteBundle> & { bundle_id: number; state: string; created_at: string }>;
   validation_status?: "needs_preview" | "valid" | "invalid";
   validation_error?: string | null;
   definition_status?: "draft" | "needs_setup" | "ready";
@@ -759,6 +759,14 @@ export interface RerouteBundle {
   lifecycle_state?: string;
   active?: boolean;
   remaining_mutations?: number;
+  unknown_effects?: number;
+  device_ids?: number[];
+  device_names?: string[];
+  affected_devices?: Array<{ id?: number; name?: string | null; device_id?: number; device_name?: string | null }>;
+  remaining_changes?: number;
+  parent_bundle_id?: number | null;
+  recovery_bundle_id?: number | null;
+  automatic_recovery_block_reason?: string | null;
   recovery_deadline?: string | null;
   automatic_recovery_cancelled_at?: string | null;
   revert?: { available: boolean; block_reasons: string[]; noop?: boolean };
@@ -1246,7 +1254,7 @@ export const api = {
 
   mitigationPresets: {
     list: () => request<MitigationPreset[]>("/api/mitigation-presets"),
-    get: (id: number) => request<MitigationPreset>(`/api/mitigation-presets/${id}`),
+    get: (id: number): Promise<MitigationPreset> => request<MitigationPreset>(`/api/mitigation-presets/${id}`).then((preset) => ({ ...preset, recent_runs: preset.recent_runs?.map((run) => ({ ...run, source_preset_revision: run.source_preset_revision ?? run.source?.preset_revision })) } as MitigationPreset)),
     create: (body: { name: string; description?: string; actions: ActionDraft[] }) =>
       request<MitigationPreset>("/api/mitigation-presets", { method: "POST", body }),
     update: (
@@ -1283,7 +1291,7 @@ export const api = {
 
   /** Progress and lifecycle of an ordered mitigation bundle. */
   bundles: {
-    list: (opts?: { page?: number; per_page?: number; lifecycle?: "active" | "inactive" | "all"; trigger_type?: string; rule_id?: number; preset_id?: number }) => {
+    list: (opts?: { page?: number; per_page?: number; lifecycle?: "active" | "inactive" | "all"; trigger_type?: string; rule_id?: number; preset_id?: number; logical_only?: boolean }) => {
       const query = new URLSearchParams();
       for (const [key, value] of Object.entries(opts ?? {})) if (value !== undefined) query.set(key, String(value));
       return request<RerouteBundlePage | RerouteBundle[]>(`/api/reroute-bundles${query.size ? `?${query}` : ""}`);
@@ -1321,11 +1329,12 @@ export const api = {
   },
 
   alerts: {
-    list: (opts?: { limit?: number; offset?: number; days?: number }) => {
+    list: (opts?: { limit?: number; offset?: number; days?: number; exclude_bundled_action_lifecycle?: boolean }) => {
       const p = new URLSearchParams();
       if (opts?.limit !== undefined) p.set("limit", String(opts.limit));
       if (opts?.offset !== undefined) p.set("offset", String(opts.offset));
       if (opts?.days !== undefined) p.set("days", String(opts.days));
+      if (opts?.exclude_bundled_action_lifecycle) p.set("exclude_bundled_action_lifecycle", "true");
       const qs = p.toString();
       return request<AlertPage>(`/api/alerts${qs ? `?${qs}` : ""}`);
     },

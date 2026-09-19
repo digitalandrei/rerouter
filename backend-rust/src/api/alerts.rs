@@ -21,6 +21,10 @@ pub struct ListQuery {
     offset: Option<i64>,
     /// Only alerts from the last N days (default 2, capped at the 48-hour retention window).
     days: Option<i64>,
+    /// Dashboard feed only: hide per-action lifecycle noise when the action is
+    /// part of a mitigation bundle. Raw alert history remains the default.
+    #[serde(default, alias = "exclude_bundle_action_events")]
+    exclude_bundled_action_lifecycle: bool,
 }
 
 /// A row from the `alerts` table, with the device / interface / rule NAMES
@@ -34,6 +38,7 @@ struct AlertRow {
     device_id: Option<u64>,
     interface_id: Option<u64>,
     rule_id: Option<u64>,
+    bundle_id: Option<u64>,
     device_name: Option<String>,
     interface_name: Option<String>,
     rule_name: Option<String>,
@@ -53,10 +58,13 @@ pub async fn list(
     let days = q.days.unwrap_or(2).clamp(1, 2);
 
     let total: i64 = match sqlx::query_scalar(
-        "SELECT COUNT(*) FROM alerts \
-         WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)",
+        "SELECT COUNT(*) FROM alerts a \
+         LEFT JOIN reroutes correlated ON correlated.id=COALESCE(a.reroute_id,CAST(JSON_UNQUOTE(JSON_EXTRACT(a.payload_json,'$.reroute_id')) AS UNSIGNED)) \
+         WHERE a.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) \
+           AND (?=0 OR correlated.bundle_id IS NULL OR a.event_type NOT IN ('reroute_started','reroute_succeeded','reroute_failed','reroute_uncertain'))",
     )
     .bind(days)
+    .bind(q.exclude_bundled_action_lifecycle)
     .fetch_one(&state.pool)
     .await
     {
@@ -66,6 +74,7 @@ pub async fn list(
 
     let rows = sqlx::query_as::<_, AlertRow>(
         "SELECT a.id, a.event_type, a.severity, a.device_id, a.interface_id, a.rule_id, \
+                COALESCE(correlated.bundle_id,CAST(JSON_UNQUOTE(JSON_EXTRACT(a.payload_json,'$.bundle_id')) AS UNSIGNED)) AS bundle_id, \
                 d.name AS device_name, \
                 COALESCE(di.if_name, di.if_descr) AS interface_name, \
                 r.name AS rule_name, \
@@ -74,10 +83,13 @@ pub async fn list(
          LEFT JOIN devices d ON d.id = a.device_id \
          LEFT JOIN device_interfaces di ON di.id = a.interface_id \
          LEFT JOIN rules r ON r.id = a.rule_id \
+         LEFT JOIN reroutes correlated ON correlated.id=COALESCE(a.reroute_id,CAST(JSON_UNQUOTE(JSON_EXTRACT(a.payload_json,'$.reroute_id')) AS UNSIGNED)) \
          WHERE a.created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) \
+           AND (?=0 OR correlated.bundle_id IS NULL OR a.event_type NOT IN ('reroute_started','reroute_succeeded','reroute_failed','reroute_uncertain')) \
          ORDER BY a.id DESC LIMIT ? OFFSET ?",
     )
     .bind(days)
+    .bind(q.exclude_bundled_action_lifecycle)
     .bind(limit)
     .bind(offset)
     .fetch_all(&state.pool)
@@ -95,6 +107,7 @@ pub async fn list(
                         "device_id": r.device_id,
                         "interface_id": r.interface_id,
                         "rule_id": r.rule_id,
+                        "bundle_id": r.bundle_id,
                         "device_name": r.device_name,
                         "interface_name": r.interface_name,
                         "rule_name": r.rule_name,

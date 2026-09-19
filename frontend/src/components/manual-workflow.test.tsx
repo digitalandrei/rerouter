@@ -17,6 +17,13 @@ describe("manual mitigation workflow", () => {
     view.rerender(<BundleProgressView bundle={{ ...base, state: "compensation_blocked" }} bundleId={9} totalHint={1} pollError={null} />);
     expect(screen.getByText(/recovery is blocked and needs review; routing not verified/i)).toBeTruthy();
   });
+  it("shows the applied-changes alarm only for unhealthy partial outcomes", () => {
+    const healthy = { id: 1, rule_id: null, trigger_type: "manual", state: "succeeded", execution_state: "succeeded", lifecycle_state: "active", failure_policy: "abort_and_compensate", total_actions: 8, completed_actions: 8, remaining_mutations: 8, failure_reason: null, started_at: null, finished_at: null, actions: [], still_applied_reroute_ids: [1,2,3,4,5,6,7,8] } as RerouteBundle;
+    const view = render(<BrowserRouter><BundleProgressView bundle={healthy} bundleId={1} totalHint={8} pollError={null} /></BrowserRouter>);
+    expect(screen.queryByText(/changes? (?:is|are) still applied/i)).toBeNull();
+    view.rerender(<BrowserRouter><BundleProgressView bundle={{ ...healthy, state: "compensation_blocked", execution_state: "compensation_blocked", lifecycle_state: "recovery_blocked" }} bundleId={1} totalHint={8} pollError={null} /></BrowserRouter>);
+    expect(screen.getByText(/changes? (?:is|are) still applied/i)).toBeTruthy();
+  });
   it("only inspects after an explicit click and invalidates evidence after edits", async () => {
     const user = userEvent.setup();
     const inspect = vi.spyOn(api.actionSets, "inspect").mockResolvedValue({

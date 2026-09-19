@@ -20,10 +20,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { SeverityBadge } from "@/components/status-badge";
+import { SeverityBadge, ToneBadge } from "@/components/status-badge";
 import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
 import { useAuth } from "@/lib/auth";
 import { Link } from "react-router-dom";
+import { presentMitigationRun, runSourceName } from "@/lib/mitigation-run-state";
 
 export default function Dashboard() {
   const { hasPermission } = useAuth();
@@ -34,6 +35,7 @@ export default function Dashboard() {
   const [firingRules, setFiringRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [activeRuns, setActiveRuns] = useState<RerouteBundle[]>([]);
+  const [recentRuns, setRecentRuns] = useState<RerouteBundle[]>([]);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
@@ -48,7 +50,7 @@ export default function Dashboard() {
       .finally(() => setLoadingStatus(false));
 
     api.alerts
-      .list({ limit: 10 })
+      .list({ limit: 10, exclude_bundled_action_lifecycle: true })
       .then((page) => setAlerts(page.rows))
       .then(() => setErrors((value) => { const next = { ...value }; delete next.alerts; return next; }))
       .catch(() => setErrors((value) => ({ ...value, alerts: "Recent alerts could not be refreshed." })))
@@ -70,6 +72,9 @@ export default function Dashboard() {
       setActiveRuns(Array.isArray(response) ? response : response.items);
       setErrors((value) => { const next = { ...value }; delete next.runs; return next; });
     }).catch(() => setErrors((value) => ({ ...value, runs: "Active mitigation runs could not be refreshed." })));
+    api.bundles.list({ lifecycle: "all", logical_only: true, page: 1, per_page: 10 }).then((response) => {
+      setRecentRuns(Array.isArray(response) ? response : response.items);
+    }).catch(() => setErrors((value) => ({ ...value, activity: "Recent mitigation activity could not be refreshed." })));
   }, []);
 
   useEffect(() => {
@@ -95,14 +100,15 @@ export default function Dashboard() {
 
       {Object.keys(errors).length > 0 && <div role="alert" className="flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"><span>{Object.values(errors).join(" ")} Existing values may be stale.</span><Button size="sm" variant="outline" onClick={loadData}>Try again</Button></div>}
 
-      {(activeRuns.length > 0 || firingRules.length > 0 || errors.runs || errors.rules) && <Card>
-        <CardHeader><CardTitle className="text-lg text-destructive">Unresolved operational incidents</CardTitle><CardDescription>Active router changes and detection rules requiring operator attention.</CardDescription></CardHeader>
+      {(activeRuns.length > 0 || errors.runs) && <Card>
+        <CardHeader><CardTitle className="text-lg">Active mitigations</CardTitle><CardDescription>Router changes that remain active or need operator review.</CardDescription></CardHeader>
         <CardContent className="space-y-3">
           {errors.runs && <p className="text-sm text-destructive">Active runs are unavailable; this is not confirmation that no changes remain.</p>}
-          {activeRuns.map((run) => <div key={run.id} className="flex flex-wrap items-center gap-2 text-sm"><strong>{run.source?.preset_name ?? run.source?.name ?? `Run #${run.id}`}</strong><Badge variant="outline">{run.remaining_mutations ?? run.still_applied_reroute_ids?.length ?? 0} changes remain</Badge><Button asChild size="sm" variant="outline" className="ml-auto"><Link to={`/manual-mitigations?bundle=${run.id}`}>View run</Link></Button></div>)}
-          {firingRules.map((rule) => <div key={rule.id} className="flex flex-wrap items-center gap-2 text-sm"><SeverityBadge severity={rule.severity} /><strong>{rule.name}</strong><Badge variant="outline">{rule.current_state === "recovered_awaiting_revert" ? "recovered · awaiting revert" : "firing"}</Badge><Button asChild size="sm" variant="outline" className="ml-auto"><Link to={`/rules?rule_id=${rule.id}`}>View rule</Link></Button></div>)}
+          {activeRuns.map((run) => { const state = presentMitigationRun(run); const devices = run.affected_devices?.map((device) => device.name ?? device.device_name ?? `Device ${device.id ?? device.device_id}`).join(", "); return <div key={run.id} className="flex flex-wrap items-center gap-2 text-sm"><strong>{runSourceName(run)}</strong><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="text-xs text-muted-foreground">{state.detail}</span>{devices && <span className="text-xs text-muted-foreground">{devices}</span>}<span className="text-xs text-muted-foreground">{run.triggered_by ?? "system"} · {run.started_at ? new Date(run.started_at).toLocaleString() : "not started"}</span><span className="text-xs text-muted-foreground">{run.recovery_deadline ? `Scheduled until ${new Date(run.recovery_deadline).toLocaleString()}` : "Until manually reverted"}</span><Button asChild size="sm" variant="outline" className="ml-auto"><Link to={`/mitigations?tab=active&run=${run.id}`}>{run.revert?.available ? "Review & revert" : "Review run"}</Link></Button></div>; })}
         </CardContent>
       </Card>}
+
+      <Card><CardHeader><CardTitle className="text-lg">Recent mitigation activity</CardTitle><CardDescription>One row per mitigation run. Recovery work is shown with its original run.</CardDescription></CardHeader><CardContent className="space-y-3">{errors.activity && recentRuns.length === 0 ? <p role="alert" className="text-sm text-destructive">Recent mitigation activity is unavailable. This does not confirm that no runs exist.</p> : recentRuns.length === 0 ? <p className="text-sm text-muted-foreground">No mitigation runs yet.</p> : <>{errors.activity && <p role="alert" className="text-sm text-amber-700 dark:text-amber-300">Refresh failed. Showing the most recently loaded mitigation activity.</p>}{recentRuns.map((run) => { const state = presentMitigationRun(run); const devices = run.affected_devices?.map((device) => device.name ?? device.device_name ?? `Device ${device.id ?? device.device_id}`).join(", "); const active = run.active ?? state.remaining > 0; return <div key={run.id} className="flex flex-wrap items-center gap-2 text-sm"><strong>{runSourceName(run)}</strong><ToneBadge tone={state.tone}>{state.label}</ToneBadge>{devices && <span className="text-xs text-muted-foreground">{devices}</span>}<span className="ml-auto text-xs text-muted-foreground">{run.triggered_by ?? "system"} · {run.started_at ? new Date(run.started_at).toLocaleString() : "not started"}</span><Button asChild size="sm" variant="outline"><Link to={active ? `/mitigations?tab=active&run=${run.id}` : `/manual-mitigations?bundle=${run.id}`}>Review run</Link></Button></div>; })}</>}</CardContent></Card>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <Card>
@@ -165,7 +171,7 @@ export default function Dashboard() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardDescription>Alerts (24 h)</CardDescription>
+            <CardDescription>Alert events (24 h)</CardDescription>
             <CardTitle className="text-2xl">
               {loadingStatus ? (
                 <span className="text-muted-foreground text-base">
@@ -256,14 +262,16 @@ export default function Dashboard() {
         <CardHeader>
           <CardTitle className="text-lg">Recent alerts</CardTitle>
           <CardDescription>
-            Latest 10 alert events across all devices and interfaces.
+            Latest alert events. Bundled action progress appears in mitigation activity.
           </CardDescription>
         </CardHeader>
         <CardContent>
           {loadingAlerts ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : errors.alerts && alerts.length === 0 ? (
+            <p role="alert" className="text-sm text-destructive">Recent alert events are unavailable. This does not confirm that no alerts occurred.</p>
           ) : alerts.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No alerts yet.</p>
+            <p className="text-sm text-muted-foreground">No other alert events in this period.</p>
           ) : (
             <ul className="divide-y">
               {alerts.map((alert) => (
@@ -275,14 +283,15 @@ export default function Dashboard() {
                   <span className="text-xs font-medium">{eventTypeLabel(alert.event_type)}</span>
                   {alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">
-                      <Link to={`/devices/${alert.device_id}`} className="hover:underline">device #{alert.device_id}</Link>
+                      <Link to={`/devices/${alert.device_id}`} className="hover:underline">{alert.device_name ?? `device #${alert.device_id}`}</Link>
                     </span>
                   )}
                   {alert.interface_id !== null && alert.device_id !== null && (
                     <span className="text-xs text-muted-foreground">
-                      <Link to={`/devices/${alert.device_id}/interfaces/${alert.interface_id}`} className="hover:underline">interface #{alert.interface_id}</Link>
+                      <Link to={`/devices/${alert.device_id}/interfaces/${alert.interface_id}`} className="hover:underline">{alert.interface_name ?? `interface #${alert.interface_id}`}</Link>
                     </span>
                   )}
+                  {alert.rule_id !== null && <span className="text-xs text-muted-foreground">{alert.rule_name ?? `rule #${alert.rule_id}`}</span>}
                   <span className="flex-1" />
                   <span className="text-xs text-muted-foreground">
                     {new Date(alert.created_at).toLocaleString()}

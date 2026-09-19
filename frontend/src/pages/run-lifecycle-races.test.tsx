@@ -18,7 +18,7 @@ it("ignores a late revert preview after the audit reason changes and confirms th
   let resolveOld!: (value: ManualMitigationPreview) => void;
   const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve as (value: ManualMitigationPreview) => void; })).mockResolvedValueOnce(preview).mockResolvedValueOnce({ bundle_id: 99, async: true });
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
-  await user.click(await screen.findByRole("button", { name: "View run 7" }));
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
   const reason = await screen.findByLabelText("Audit reason"); await user.type(reason, "Reason A"); await user.click(screen.getByRole("button", { name: "Preview whole-run revert" }));
   await user.clear(reason); await user.type(reason, "Reason B"); resolveOld({ ...preview, preview_token: "token-a" }); await new Promise((resolve) => setTimeout(resolve, 0));
   expect(screen.queryByRole("button", { name: "Confirm reviewed revert" })).toBeNull();
@@ -42,7 +42,7 @@ it("does not reopen a closed run when a polling response arrives late", async ()
   vi.spyOn(api.bundles, "list").mockResolvedValueOnce({ items: [run], page: 1, per_page: 200, total: 1 }).mockImplementationOnce(() => new Promise((resolve) => { resolvePoll = resolve; }));
   vi.spyOn(api.bundles, "get").mockResolvedValue(run);
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
-  await user.click(await screen.findByRole("button", { name: "View run 7" })); const closeButtons = await screen.findAllByRole("button", { name: "Close" }); await user.click(closeButtons.find((button) => button.textContent === "Close")!);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" })); const closeButtons = await screen.findAllByRole("button", { name: "Close" }); await user.click(closeButtons.find((button) => button.textContent === "Close")!);
   polls.forEach((poll) => poll()); await vi.waitFor(() => expect(resolvePoll).toBeTypeOf("function")); resolvePoll({ items: [run], page: 1, per_page: 200, total: 1 }); await Promise.resolve();
   expect(screen.queryByRole("dialog")).toBeNull();
 });

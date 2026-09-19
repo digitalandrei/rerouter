@@ -103,13 +103,7 @@ pub(crate) async fn fetch(
     } else {
         ("needs_setup", None)
     };
-    let recent_runs = sqlx::query_as::<_, (u64, String, DateTime<Utc>)>(
-        "SELECT id, state, created_at FROM reroute_bundles \
-         WHERE JSON_UNQUOTE(JSON_EXTRACT(source_json, '$.preset_id')) = ? ORDER BY id DESC LIMIT 5",
-    )
-    .bind(id.to_string())
-    .fetch_all(pool)
-    .await?;
+    let recent_runs = super::run_summaries::recent_for_preset(pool, id, 5).await?;
     Ok(Some(json!({
         "id": row.id, "name": row.name, "description": row.description,
         "revision": row.revision, "archived_at": row.archived_at,
@@ -123,7 +117,12 @@ pub(crate) async fn fetch(
             "params": a.params_json.0, "enabled": a.enabled, "position": a.position,
             "auto_target": null,
         })).collect::<Vec<_>>(),
-        "recent_runs": recent_runs.into_iter().map(|(id, state, created_at)| json!({"id": id, "bundle_id": id, "state": state, "created_at": created_at})).collect::<Vec<_>>(),
+        // Keep bundle_id for old clients; every other field is the same shared
+        // logical-run summary returned by /api/reroute-bundles.
+        "recent_runs": recent_runs.into_iter().map(|mut run| {
+            run["bundle_id"] = run["id"].clone();
+            run
+        }).collect::<Vec<_>>(),
     })))
 }
 

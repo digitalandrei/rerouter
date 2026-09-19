@@ -37,6 +37,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { RowActionButton } from "@/components/row-action-button";
+import { ToneBadge } from "@/components/status-badge";
+import { presentMitigationRun, recentRunAsBundle } from "@/lib/mitigation-run-state";
 
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -506,6 +508,11 @@ export default function ManualReroute() {
                 </label>
               </div>}
 
+              {!runMode && selectedPreset?.recent_runs?.some((run) => run.active || (run.lifecycle_state && run.lifecycle_state !== "inactive") || (run.remaining_changes ?? run.remaining_mutations ?? 0) > 0 || (run.unknown_effects ?? 0) > 0) && <div className="space-y-2 rounded-md border p-4">
+                <h3 className="text-sm font-semibold">Current state</h3>
+                {selectedPreset.recent_runs.filter((run) => run.active || (run.lifecycle_state && run.lifecycle_state !== "inactive") || (run.remaining_changes ?? run.remaining_mutations ?? 0) > 0 || (run.unknown_effects ?? 0) > 0).map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const devices = run.affected_devices?.map((device) => device.name ?? device.device_name ?? `Device ${device.id ?? device.device_id}`).join(", "); return <div key={run.bundle_id} className="space-y-1 rounded-md bg-muted/40 p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span>Run #{run.bundle_id}</span><Button asChild className="ml-auto" size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{run.revert?.available ? "Review & revert" : "Review run"}</Link></Button></div><p className="text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects{devices ? ` · ${devices}` : ""}</p><p className="text-xs text-muted-foreground">{run.triggered_by ?? "system"} · {run.started_at ? new Date(run.started_at).toLocaleString() : "not started"} · {run.recovery_deadline ? `Scheduled until ${new Date(run.recovery_deadline).toLocaleString()}` : "Until manually reverted"}</p>{bundleRun.verification_mode === "configuration_only" && <p className="text-xs text-muted-foreground">BGP advertisements were not verified.</p>}{run.source_preset_revision && run.source_preset_revision !== selectedPreset.revision && <p className="text-xs text-amber-700 dark:text-amber-300">This run used revision {run.source_preset_revision}; the saved mitigation is now revision {selectedPreset.revision}.</p>}</div>; })}
+              </div>}
+
               {bundleId === null && <OrderedActionSetEditor actions={displayActions} templates={templates} devices={devices} busy={busy}
                 readOnly={runMode || !editorMode || !canEdit} selectedIndex={selectedAction}
                 onSelect={(runMode && canRun) || (!runMode && editorMode && canEdit) ? setSelectedAction : undefined}
@@ -517,10 +524,10 @@ export default function ManualReroute() {
               {!runMode && selectedPreset?.recent_runs && selectedPreset.recent_runs.length > 0 && <div className="space-y-2">
                 <h3 className="text-sm font-medium">Recent runs</h3>
                 <ul className="divide-y divide-border rounded-md border border-border text-sm">
-                  {selectedPreset.recent_runs.slice(0, 5).map((run) => <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
-                    <Link className="font-medium text-primary underline-offset-4 hover:underline" to={`/manual-mitigations?bundle=${run.bundle_id}`}>Run #{run.bundle_id}</Link>
-                    <span className="text-muted-foreground">{run.state} · {new Date(run.created_at).toLocaleString()}</span>
-                  </li>)}
+                  {selectedPreset.recent_runs.slice(0, 5).map((run) => { const active = (run.remaining_mutations ?? 0) > 0; return <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                    <div><strong>Run #{run.bundle_id}</strong><span className="ml-2 text-muted-foreground">{run.execution_state ?? run.state} · {new Date(run.created_at).toLocaleString()}</span>{active && <span className="block text-xs text-muted-foreground">{run.remaining_mutations} router changes remain</span>}</div>
+                    <Button asChild size="sm" variant="outline"><Link to={active ? `/mitigations?tab=active&run=${run.bundle_id}` : `/manual-mitigations?bundle=${run.bundle_id}`}>{active ? "Review & revert" : "Review run"}</Link></Button>
+                  </li>; })}
                 </ul>
               </div>}
 
@@ -573,7 +580,7 @@ export default function ManualReroute() {
                 </div>}
                 {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
                 <div className="flex flex-wrap justify-end gap-2">
-                  <Button variant="outline" disabled={busy} onClick={() => { leaveBundleView(); setRunMode(false); setOverrides({}); setSelectedAction(null); invalidatePreview(); }}>Back to saved mitigation</Button>
+                  <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; if (presetId) navigate(`/manual-mitigations/${presetId}`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
                   {!preview && bundleId === null && <Button onClick={() => void preparePreview()} disabled={busy || effectiveActions.length === 0 || presetInvalid || (verificationMode === "configuration_only" && capabilitiesState !== "ready")}>{busy ? "Preparing…" : "Preview exact plan"}</Button>}
                   {preview && <Button variant="destructive" onClick={() => void applyPreview()} disabled={busy || !preview.plan_id || !preview.preview_token || (verificationMode === "configuration_only" && capabilitiesState !== "ready")}>{busy ? "Starting…" : "Confirm and run reviewed plan"}</Button>}
                 </div>

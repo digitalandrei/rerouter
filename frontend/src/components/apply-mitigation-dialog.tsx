@@ -19,6 +19,7 @@
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { presentMitigationRun } from "@/lib/mitigation-run-state";
 import {
   api,
   asBundleNotAdmitted,
@@ -215,6 +216,8 @@ export function BundleProgressView({
   const stillApplied = bundle?.still_applied_reroute_ids ?? [];
   const bad =
     state === "compensation_blocked" || state === "aborted" || state === "failed";
+  const unhealthyApplied = bad || (bundle?.unknown_effects ?? 0) > 0 || bundle?.lifecycle_state === "recovery_blocked";
+  const presentation = bundle ? presentMitigationRun(bundle) : null;
 
   return (
     <div className="space-y-3">
@@ -222,12 +225,10 @@ export function BundleProgressView({
       <div className="rounded-md border border-border p-3">
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <StateBadge state={state} />
-          <span className="font-medium">
-            {BUNDLE_STATE_LABEL[state] ?? state}
-          </span>
+          <span className="font-medium">{presentation?.label ?? BUNDLE_STATE_LABEL[state] ?? state}</span>
           <span className="flex-1" />
           <span className="text-xs text-muted-foreground">
-            bundle #{bundleId} · {done}/{total} action{total === 1 ? "" : "s"}
+            run #{bundleId} · {done}/{total} step{total === 1 ? "" : "s"}
           </span>
         </div>
         <div
@@ -245,26 +246,25 @@ export function BundleProgressView({
         {bundle?.failure_reason && (
           <p className="mt-2 text-xs text-destructive">{bundle.failure_reason}</p>
         )}
+        {presentation && <p className="mt-2 text-xs text-muted-foreground">{presentation.detail}</p>}
         {!terminal && (
           <p className="mt-2 text-xs text-muted-foreground">
-            Running on the controller — closing this dialog does not stop it.
-            Failure policy: <code>{bundle?.failure_policy ?? "abort_and_compensate"}</code>.
+            This run continues if you close this window.
           </p>
         )}
       </div>
 
       {/* CRITICAL: what is still pushed to the routers right now. */}
-      {terminal && stillApplied.length > 0 && (
+      {terminal && unhealthyApplied && stillApplied.length > 0 && (
         <div className="rounded-md border-2 border-destructive bg-destructive/10 p-3">
           <div className="text-sm font-semibold text-destructive">
-            {stillApplied.length} action{stillApplied.length === 1 ? " is" : "s are"} STILL
-            APPLIED on the routers
+            {stillApplied.length} change{stillApplied.length === 1 ? " is" : "s are"} still applied
           </div>
           <p className="mt-1 text-xs text-destructive">
             {state === "compensation_blocked"
-              ? "Automatic rollback was blocked (a device is locked pending admin acknowledgement of an uncertain reroute). Doctrine forbids acting through that lock."
-              : "This bundle aborted and its failure policy left applied siblings in place."}{" "}
-            Traffic is diverted until each of these is rolled back by hand.
+              ? "Automatic recovery stopped because an action outcome is uncertain."
+              : "The run stopped before every applied change could be restored."}{" "}
+            Review the exact action evidence and reconcile uncertain outcomes before preparing a revert.
           </p>
           <ul className="mt-2 space-y-1">
             {stillApplied.map((rid) => {

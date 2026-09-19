@@ -24,6 +24,7 @@ pub mod reroutes;
 pub mod routing_policies;
 pub mod rtbh;
 pub mod rules;
+pub(crate) mod run_summaries;
 pub mod settings;
 pub mod templates;
 pub mod users;
