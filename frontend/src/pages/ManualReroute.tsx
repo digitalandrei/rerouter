@@ -533,9 +533,9 @@ export default function ManualReroute() {
               {!runMode && selectedPreset?.recent_runs && selectedPreset.recent_runs.length > 0 && <div className="space-y-2">
                 <h3 className="text-sm font-medium">Recent runs</h3>
                 <ul className="divide-y divide-border rounded-md border border-border text-sm">
-                  {selectedPreset.recent_runs.slice(0, 5).map((run) => { const active = (run.remaining_mutations ?? 0) > 0; return <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
-                    <div><strong>Run #{run.bundle_id}</strong><span className="ml-2 text-muted-foreground">{run.execution_state ?? run.state} · {new Date(run.created_at).toLocaleString()}</span>{active && <span className="block text-xs text-muted-foreground">{run.remaining_mutations} router changes remain</span>}</div>
-                    <Button asChild size="sm" variant="outline"><Link to={active ? `/mitigations?tab=active&run=${run.bundle_id}` : `/manual-mitigations?bundle=${run.bundle_id}`}>{active ? "Review & revert" : "Review run"}</Link></Button>
+                  {selectedPreset.recent_runs.slice(0, 5).map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const active = run.active ?? state.remaining > 0; return <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+                    <div className="flex flex-wrap items-center gap-2"><strong>Run #{run.bundle_id}</strong><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="text-muted-foreground">{new Date(run.created_at).toLocaleString()}</span>{active && <span className="block text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects</span>}</div>
+                    <Button asChild size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{active ? "Review & revert" : "Review run"}</Link></Button>
                   </li>; })}
                 </ul>
               </div>}

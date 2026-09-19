@@ -737,6 +737,17 @@ export interface RerouteBundleAction {
   params?: Record<string, unknown> | null;
 }
 
+export interface RecoveryRunSummary {
+  id: number;
+  parent_bundle_id: number | null;
+  state: BundleState;
+  total_actions: number;
+  completed_actions: number;
+  started_at: string | null;
+  finished_at: string | null;
+  failure_reason: string | null;
+}
+
 export interface RerouteBundle {
   id: number;
   rule_id: number | null;
@@ -769,6 +780,8 @@ export interface RerouteBundle {
   remaining_changes?: number;
   parent_bundle_id?: number | null;
   recovery_bundle_id?: number | null;
+  latest_recovery_bundle_id?: number | null;
+  latest_recovery?: RecoveryRunSummary | null;
   automatic_recovery_block_reason?: string | null;
   recovery_deadline?: string | null;
   automatic_recovery_cancelled_at?: string | null;

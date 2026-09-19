@@ -348,3 +348,130 @@ async fn one_original_run_owns_summary_lifecycle_and_dashboard_action_events_are
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn latest_manual_recovery_is_derived_during_claim_and_after_settlement() {
+    let db = common::test_database().await;
+    let pool = db.pool().clone();
+    let key = Key::from(&[84_u8; 64]);
+    let (user, _, cookie) = viewer(&pool, &key).await;
+    let app = api::router(api::AppState {
+        pool: pool.clone(),
+        config: Config::default(),
+        cookie_key: key,
+    });
+    let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,recovery_claim_token,source_json,started_at,finished_at) \
+        VALUES('manual',?,'succeeded','abort_and_compensate',8,8,'recovery_claimed',8,'manual:test',JSON_OBJECT('kind','preset','preset_name','Recovery fixture'),UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+        .bind(user).execute(&pool).await.unwrap().last_insert_id();
+    let older = sqlx::query("INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,source_json,started_at,finished_at,failure_reason) \
+        VALUES(?,'manual',?,'failed','abort_and_compensate',8,3,'inactive',0,JSON_OBJECT('kind','bundle_revert','original_bundle_id',?),UTC_TIMESTAMP(),UTC_TIMESTAMP(),'older recovery failed')")
+        .bind(source).bind(user).bind(source).execute(&pool).await.unwrap().last_insert_id();
+    let newest = sqlx::query("INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,source_json,started_at) \
+        VALUES(?,'manual',?,'running','abort_and_compensate',8,4,'recovery_running',0,JSON_OBJECT('kind','bundle_revert','original_bundle_id',?),UTC_TIMESTAMP())")
+        .bind(source).bind(user).bind(source).execute(&pool).await.unwrap().last_insert_id();
+
+    let (status, claimed) = get(&app, &cookie, &format!("/api/reroute-bundles/{source}")).await;
+    assert_eq!(status, StatusCode::OK, "{claimed}");
+    assert_eq!(
+        claimed["recovery_bundle_id"],
+        Value::Null,
+        "scheduler ownership column remains untouched"
+    );
+    assert_eq!(claimed["latest_recovery_bundle_id"], newest);
+    assert_eq!(claimed["latest_recovery"]["id"], newest);
+    assert_eq!(claimed["latest_recovery"]["parent_bundle_id"], source);
+    assert_eq!(claimed["latest_recovery"]["state"], "running");
+    assert_eq!(claimed["latest_recovery"]["completed_actions"], 4);
+    assert_eq!(claimed["latest_recovery"]["total_actions"], 8);
+    assert_ne!(
+        claimed["latest_recovery_bundle_id"], older,
+        "newest child wins"
+    );
+
+    let (_, child) = get(&app, &cookie, &format!("/api/reroute-bundles/{newest}")).await;
+    assert_eq!(child["parent_bundle_id"], source);
+    assert_eq!(child["latest_recovery_bundle_id"], Value::Null);
+    assert_eq!(child["latest_recovery"], Value::Null);
+
+    let (_, active) = get(
+        &app,
+        &cookie,
+        "/api/reroute-bundles?lifecycle=active&page=1&per_page=200",
+    )
+    .await;
+    let active_source = active["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["id"] == source)
+        .expect("claimed source remains the one active logical run");
+    assert_eq!(active_source["latest_recovery_bundle_id"], newest);
+    assert!(!active["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| run["id"] == newest || run["id"] == older));
+    let (_, raw) = get(&app, &cookie, "/api/reroute-bundles").await;
+    assert!(raw
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| run["id"] == newest));
+    assert!(raw.as_array().unwrap().iter().any(|run| run["id"] == older));
+    let (_, logical) = get(
+        &app,
+        &cookie,
+        "/api/reroute-bundles?logical_only=true&page=1&per_page=200",
+    )
+    .await;
+    assert!(logical["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| run["id"] == source));
+    assert!(!logical["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| run["id"] == newest || run["id"] == older));
+
+    sqlx::query("UPDATE reroute_bundles SET state='succeeded',completed_actions=8,lifecycle_state='inactive',finished_at=UTC_TIMESTAMP() WHERE id=?")
+        .bind(newest).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE reroute_bundles SET lifecycle_state='inactive',remaining_mutations=0,recovery_claim_token=NULL WHERE id=?")
+        .bind(source).execute(&pool).await.unwrap();
+    let (_, settled) = get(&app, &cookie, &format!("/api/reroute-bundles/{source}")).await;
+    assert_eq!(settled["remaining_mutations"], 0);
+    assert_eq!(settled["recovery_bundle_id"], Value::Null);
+    assert_eq!(settled["latest_recovery_bundle_id"], newest);
+    assert_eq!(settled["latest_recovery"]["state"], "succeeded");
+    assert_eq!(settled["latest_recovery"]["completed_actions"], 8);
+    assert!(settled["latest_recovery"]["finished_at"].is_string());
+    let (_, inactive_now) = get(
+        &app,
+        &cookie,
+        "/api/reroute-bundles?lifecycle=active&page=1&per_page=200",
+    )
+    .await;
+    assert!(!inactive_now["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run| run["id"] == source));
+
+    sqlx::query("DELETE FROM reroute_bundles WHERE id IN (?,?)")
+        .bind(newest)
+        .bind(older)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id=?")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

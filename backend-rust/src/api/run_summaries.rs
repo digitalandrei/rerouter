@@ -175,6 +175,18 @@ struct UnknownRow {
     unknown_effects: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct RecoveryRow {
+    parent_bundle_id: u64,
+    id: u64,
+    state: String,
+    total_actions: u32,
+    completed_actions: u32,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    failure_reason: Option<String>,
+}
+
 fn push_ids(query: &mut QueryBuilder<'_, MySql>, ids: &[u64]) {
     let mut separated = query.separated(",");
     for id in ids {
@@ -230,11 +242,51 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
         .map(|row| (row.bundle_id, row.unknown_effects.max(0) as u32))
         .collect::<BTreeMap<_, _>>();
 
+    // Manual recovery children intentionally do not populate the scheduler's
+    // `recovery_bundle_id` column. Derive the newest child independently so the
+    // read model preserves both meanings and remains correct after settlement.
+    let mut recovery_query = QueryBuilder::<MySql>::new(
+        "SELECT child.parent_bundle_id,child.id,child.state,child.total_actions,child.completed_actions,\
+         child.started_at,child.finished_at,child.failure_reason FROM reroute_bundles child \
+         JOIN (SELECT parent_bundle_id,MAX(id) AS id FROM reroute_bundles \
+         WHERE parent_bundle_id IN (",
+    );
+    push_ids(&mut recovery_query, &ids);
+    recovery_query.push(") GROUP BY parent_bundle_id) latest ON latest.id=child.id");
+    let recovery_rows = recovery_query
+        .build_query_as::<RecoveryRow>()
+        .fetch_all(pool)
+        .await?;
+    let latest_recoveries = recovery_rows
+        .into_iter()
+        .map(|recovery| {
+            let parent = recovery.parent_bundle_id;
+            (
+                parent,
+                json!({
+                    "id":recovery.id,"parent_bundle_id":recovery.parent_bundle_id,
+                    "state":recovery.state,"total_actions":recovery.total_actions,
+                    "completed_actions":recovery.completed_actions,"started_at":recovery.started_at,
+                    "finished_at":recovery.finished_at,"failure_reason":recovery.failure_reason,
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
     Ok(rows
         .into_iter()
         .map(|row| {
             let source = row.source_json.map(|value| value.0).unwrap_or(Value::Null);
             let affected_devices = devices.remove(&row.id).unwrap_or_default();
+            let latest_recovery = if row.parent_bundle_id.is_none() {
+                latest_recoveries.get(&row.id).cloned()
+            } else {
+                None
+            };
+            let latest_recovery_bundle_id = latest_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.get("id"))
+                .and_then(Value::as_u64);
             let unknown_effects = unknown.get(&row.id).copied().unwrap_or(0);
             let remaining_changes = row.remaining_mutations.saturating_sub(unknown_effects);
             let mut block_reasons = Vec::new();
@@ -263,6 +315,7 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
             let routing_verified = source.get("routing_verified").cloned();
             json!({
                 "id":row.id,"parent_bundle_id":row.parent_bundle_id,"recovery_bundle_id":row.recovery_bundle_id,
+                "latest_recovery_bundle_id":latest_recovery_bundle_id,"latest_recovery":latest_recovery,
                 "rule_id":row.rule_id,"trigger_type":row.trigger_type,"state":row.state,
                 "execution_state":row.state,"failure_policy":row.failure_policy,"reason":row.reason,
                 "total_actions":row.total_actions,"completed_actions":row.completed_actions,

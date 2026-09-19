@@ -26,6 +26,7 @@ it("shows one honest pending state while preparing and confirming a whole-run re
   resolveOld(preview); await screen.findByRole("button", { name: "Apply reviewed revert" });
   await user.click(screen.getByRole("button", { name: "Apply reviewed revert" }));
   expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Reason A", plan_id: 12, preview_token: "token-b" });
+  expect((await screen.findAllByText(/recovery #99/i)).length).toBeGreaterThan(0);
 });
 
 it("pages through run history beyond the first fifty records", async () => {
@@ -56,12 +57,11 @@ it("refreshes an open run after it leaves the active list", async () => {
   vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; });
   vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
   vi.spyOn(api.bundles, "list").mockResolvedValueOnce({ items: [run], page: 1, per_page: 200, total: 1 }).mockResolvedValue({ items: [], page: 1, per_page: 200, total: 0 });
-  vi.spyOn(api.bundles, "get").mockResolvedValueOnce(run).mockResolvedValueOnce(run).mockResolvedValue({ ...run, state: "succeeded", execution_state: "succeeded", lifecycle_state: "inactive", active: false, remaining_mutations: 0, remaining_changes: 0, recovery_bundle_id: 99 });
+  vi.spyOn(api.bundles, "get").mockResolvedValueOnce(run).mockResolvedValueOnce(run).mockResolvedValueOnce({ ...run, state: "succeeded", execution_state: "succeeded", lifecycle_state: "inactive", active: false, remaining_mutations: 0, remaining_changes: 0, latest_recovery_bundle_id: 99, latest_recovery: { id: 99, parent_bundle_id: 7, state: "succeeded", total_actions: 1, completed_actions: 1, started_at: null, finished_at: null, failure_reason: null } }).mockResolvedValue({ ...run, id: 99, parent_bundle_id: 7, state: "succeeded", execution_state: "succeeded", lifecycle_state: "inactive", active: false, remaining_mutations: 0, remaining_changes: 0 });
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
   await user.click(await screen.findByRole("button", { name: "Review run 7" }));
   polls.forEach((poll) => poll());
   expect((await screen.findAllByText("Reverted")).length).toBeGreaterThan(0);
-  expect(screen.getByText(/No owned router changes remain/i)).toBeTruthy();
 });
 
 it("retains selected evidence and warns when its independent refresh fails", async () => {
@@ -75,4 +75,34 @@ it("retains selected evidence and warns when its independent refresh fails", asy
   polls.forEach((poll) => poll());
   expect(await screen.findByText(/Selected run could not be refreshed/i)).toBeTruthy();
   expect(screen.getByRole("dialog")).toBeTruthy();
+});
+
+it("shows recovery child progress instead of original apply progress through completion", async () => {
+  auth(); const polls: Array<() => void> = [];
+  vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; }); vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+  const source = { ...run, total_actions: 8, completed_actions: 8, lifecycle_state: "recovery_claimed", latest_recovery_bundle_id: 2, actions: [{ reroute_id: 71, position: 0, device_id: 3, device_name: "eMA3", state: "succeeded", failure_reason: null, template_display_name: "Original apply" }] } as RerouteBundle;
+  const childRunning = { ...run, id: 2, parent_bundle_id: 7, trigger_type: "rollback", state: "running", execution_state: "running", lifecycle_state: "recovery_running", total_actions: 8, completed_actions: 3, remaining_mutations: 0, actions: [{ reroute_id: 81, position: 0, device_id: 3, device_name: "eMA3", state: "running", failure_reason: null, template_display_name: "Restore policy" }] } as RerouteBundle;
+  const sourceDone = { ...source, lifecycle_state: "inactive", active: false, remaining_mutations: 0, remaining_changes: 0, latest_recovery: { id: 2, parent_bundle_id: 7, state: "succeeded", total_actions: 8, completed_actions: 8, started_at: null, finished_at: null, failure_reason: null } } as RerouteBundle;
+  const childDone = { ...childRunning, state: "succeeded", execution_state: "succeeded", lifecycle_state: "inactive", completed_actions: 8 } as RerouteBundle;
+  vi.spyOn(api.bundles, "list").mockResolvedValueOnce({ items: [source], page: 1, per_page: 200, total: 1 }).mockResolvedValue({ items: [], page: 1, per_page: 200, total: 0 });
+  let sourceReads = 0; let childReads = 0;
+  vi.spyOn(api.bundles, "get").mockImplementation(async (id) => id === 2 ? (++childReads === 1 ? childRunning : childDone) : (++sourceReads <= 3 ? source : sourceDone));
+  const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  expect(await screen.findByText("Revert progress")).toBeTruthy(); expect(screen.getByText("Restore policy")).toBeTruthy(); expect((await screen.findAllByText("Reverting")).length).toBeGreaterThan(0); const original = screen.getByText("Original apply"); expect(original.closest("details")?.hasAttribute("open")).toBe(false);
+  polls.forEach((poll) => poll()); expect(await screen.findByText(/Revert completed · recovery #2/)).toBeTruthy(); expect((await screen.findAllByText(/Reverted|Revert completed/)).length).toBeGreaterThan(0);
+});
+
+it("clears old child evidence when the parent switches recovery IDs and the new child is unavailable", async () => {
+  auth(); const polls: Array<() => void> = [];
+  vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; }); vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+  const source2 = { ...run, latest_recovery_bundle_id: 2, lifecycle_state: "recovery_running" } as RerouteBundle;
+  const source3 = { ...source2, latest_recovery_bundle_id: 3 } as RerouteBundle;
+  const child2 = { ...run, id: 2, parent_bundle_id: 7, state: "running", execution_state: "running", actions: [{ reroute_id: 82, position: 0, device_id: 3, device_name: "eMA3", state: "running", failure_reason: null, template_display_name: "Old child evidence" }] } as RerouteBundle;
+  let sourceReads = 0;
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [source2], page: 1, per_page: 200, total: 1 });
+  vi.spyOn(api.bundles, "get").mockImplementation(async (id) => { if (id === 2) return child2; if (id === 3) throw new Error("unavailable"); return ++sourceReads <= 2 ? source2 : source3; });
+  const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  polls.forEach((poll) => poll()); expect(await screen.findByText(/unavailable for this recovery run/i)).toBeTruthy(); expect(screen.queryByText("Old child evidence")).toBeNull(); expect((await screen.findAllByText(/recovery #3/i)).length).toBeGreaterThan(0);
 });
