@@ -1,6 +1,9 @@
 # Recovery progress release — 2026-09-19
 
-Status: **prepared and tested; not deployed**.
+Status: **deployed and read-only verified**.
+
+Deployed source and both release markers:
+`59ce8be0baa69c87918550ab35adb627cb0e1f0e`.
 
 ## Problem and root cause
 
@@ -17,7 +20,7 @@ run with zero remaining changes and `recovery_bundle_id = NULL`. The interface
 could not reliably distinguish **Reverted** from an original run that made only
 verified no-op changes.
 
-## Prepared behavior
+## Implemented behavior
 
 The shared run-summary read model now derives the latest recovery child in one
 batch query over `parent_bundle_id`. It returns two additive fields:
@@ -50,7 +53,7 @@ the execution evidence for its revert.
 
 ## Current finished EMDD evidence
 
-The release is prepared against this exact settled application state:
+The deployment preserved this exact settled application state:
 
 - Source bundle **#1**: manual, succeeded, lifecycle inactive, 8/8 actions,
   zero remaining mutations, no recovery claim, and
@@ -105,8 +108,8 @@ All execution tests used fake SSH and dedicated test-database rows.
   recovery states. Evidence is under `/tmp/rerouter-visual-qa`; it recorded no
   page errors, mutation requests, missing endpoints, or horizontal overflow.
   The recovery-progress presentation correction was confirmed.
-- Astra final integration and execution-safety review approved the prepared
-  release.
+- Astra final integration and execution-safety review approved the release
+  before deployment.
 
 The run-summary regression proves:
 
@@ -120,12 +123,12 @@ The run-summary regression proves:
 - a successful latest child provides evidence to distinguish a reverted run
   from an all-no-op original.
 
-## Prepared deployment
+## Deployment execution
 
 The reviewed driver is
 `scripts/deploy-recovery-progress-release.sh`; its mock/recovery check is
-`scripts/test-deploy-recovery-progress-release.sh`. Neither has been run for this
-release.
+`scripts/test-deploy-recovery-progress-release.sh`. The reviewed driver was used
+for this release after its mock preservation and recovery checks passed.
 
 The driver requires and verifies:
 
@@ -164,25 +167,46 @@ reconciliation.
 The script contains no mitigation preview, apply, revert, router discovery,
 router test, notification test, or router execution request.
 
-## Required post-deployment checks
+## Deployment verification
 
-Before marking this release deployed, the operator must verify:
+The deployment completed with this evidence:
 
-- controller service active, loopback `/api/ready` and `/api/health` successful,
-  and the running executable identical to the reviewed controller artifact;
-- deployed controller and frontend hashes match the release;
-- the deployed frontend tree matches the reviewed release tree;
-- config and environment remain byte-for-byte unchanged;
-- schema remains at 69 and the migration count/version are unchanged;
-- preset #2 remains ready and preset #1 remains needs setup through the installed
-  binary's DB-only diagnostics;
-- bundles #1 and #2, all sixteen reroutes, both action ledgers, presets, rules,
-  credentials, and settings match their stopped-window snapshots exactly;
-- zero in-flight reroutes/bundles, recovery claims, device change windows, and
-  active locks;
-- read-only summary responses expose child #2 as bundle #1's latest recovery and
-  present the source as reverted, without treating child #2 as another active
-  mitigation.
+- Controller SHA-256:
+  `a2a76529510918ab5cf2c97c1290383e6853db3d7e997e219cf92c8b11547ed7`.
+- Frontend index and public index SHA-256:
+  `dfef225f9cc057cbdacaeaf5e5808d036b8c6573722e1f041944d1248722587f`.
+- Restorable backup:
+  `/root/rerouter-backups/recovery-progress-59ce8be0baa6`.
+- `rerouter-controller.service` started at **2026-09-19 17:50:48Z**. Loopback
+  readiness and health checks passed. The readiness loop recorded one harmless
+  initial `curl` connection refusal while the service was still starting, then
+  succeeded normally.
+- Public HTTPS readiness and health checks passed, and the public index hash
+  matched the reviewed frontend artifact.
+- The running executable matched the deployed controller artifact. The deployed
+  frontend tree matched the reviewed release tree.
+- Schema remained at 69 with latest migration `20260919000200`; startup applied
+  no new migration.
+- Operating mode remained Observe and automatic actions remained disabled.
+- Source bundle #1 remained succeeded and inactive with 8/8 completed actions
+  and zero remaining mutations. Child bundle #2 remained succeeded and inactive
+  with 8/8 completed actions and zero remaining mutations.
+- All sixteen reroutes remained succeeded with `mutation_effect = changed`:
+  eight originals and their eight successful inverses. Both action ledgers
+  remained complete, for sixteen successful changed entries total.
+- Active locks and device change windows remained zero. No reroute, bundle, or
+  recovery claim was in flight.
+- Preset #2 remained ready and preset #1 remained needs setup through the
+  installed binary's DB-only diagnostics.
+- Config and environment remained byte-for-byte unchanged. Bundles, reroutes,
+  action ledgers, presets, rules, encrypted credential fields, settings, and
+  other protected stopped-window snapshots matched after restart.
+- The installed binary's DB-only preset diagnostic exercised the new
+  latest-recovery query against live MySQL. The exact preserved database state,
+  together with the reviewed and tested presentation logic, establishes the
+  expected source **Reverted** state and child #2 recovery evidence.
+- Router actions executed during deployment: **0**.
 
-Deployment remains incomplete until the post-deployment checks above are
-recorded.
+The desktop/mobile Playwright evidence above was produced before deployment.
+No authenticated live post-deployment visual session was performed or is implied
+by the public health and static-asset verification.
