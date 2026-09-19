@@ -112,7 +112,7 @@ pub async fn validate_drafts(
                 "action {}: prefix is outside the router's announced space",
                 position + 1
             );
-            templates::render(&template, &canonical.params)
+            validate_definition_shape(&template, &canonical.params)
                 .with_context(|| format!("action {}", position + 1))?;
         }
         validated.push((template, canonical));
@@ -259,12 +259,13 @@ async fn inspect_actions_inner_for_mode<R: super::device_plan::PreparationReader
             "action {}: prefix outside announced space",
             action.position + 1
         );
-        let rendered = templates::render(&action.template, &action.params)?;
-        ensure!(
-            rendered.verify.is_some(),
-            "action {}: verification is required",
-            action.position + 1
-        );
+        if let Some(rendered) = validate_definition_shape(&action.template, &action.params)? {
+            ensure!(
+                rendered.verify.is_some(),
+                "action {}: verification is required",
+                action.position + 1
+            );
+        }
     }
     let inputs: Vec<_> = actions
         .iter()
@@ -370,6 +371,24 @@ async fn inspect_actions_inner_for_mode<R: super::device_plan::PreparationReader
         action.prepared = Some(plan);
     }
     Ok(())
+}
+
+fn validate_definition_shape(
+    template: &Template,
+    params: &Value,
+) -> Result<Option<templates::RenderedPlan>> {
+    // `None` means this is the one recognized structured template: typed
+    // preparation will build its commands and exact proof later. It never means
+    // an unverified action or a generic empty static plan.
+    if template.name == "bgp_export_policy_set" {
+        templates::validate_and_expand(&template.parameter_schema, params)?;
+        ensure!(
+            template.verification.get("method").and_then(Value::as_str) == Some("prepared_state"),
+            "structured export-policy template requires prepared_state verification"
+        );
+        return Ok(None);
+    }
+    Ok(Some(templates::render(template, params)?))
 }
 
 /// Build inverses exclusively from durable mutation ownership. Mutable rule or

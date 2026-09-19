@@ -127,6 +127,18 @@ pub(crate) async fn fetch(
     })))
 }
 
+/// Read-only operator diagnostic using the same readiness computation as the API.
+pub async fn readiness(pool: &MySqlPool, id: u64) -> anyhow::Result<Option<Value>> {
+    Ok(fetch(pool, id, true).await?.map(|value| {
+        json!({
+            "id": value["id"],
+            "name": value["name"],
+            "status": value["definition_status"],
+            "validation_error": value["validation_error"],
+        })
+    }))
+}
+
 #[derive(Default, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]

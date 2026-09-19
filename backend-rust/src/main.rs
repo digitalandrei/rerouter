@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long)]
     check_db: bool,
 
+    /// Read and validate one saved mitigation preset, print bounded JSON, and exit.
+    #[arg(long)]
+    check_mitigation_preset: Option<u64>,
+
     /// Apply pending sqlx migrations (backend-rust/migrations/) and exit.
     #[arg(long)]
     migrate: bool,
@@ -174,6 +178,16 @@ async fn main() -> Result<()> {
             "database credential preflight passed"
         );
         println!("database connection OK");
+        return Ok(());
+    }
+    if let Some(id) = cli.check_mitigation_preset {
+        match api::mitigation_presets::readiness(&pool, id).await? {
+            Some(value) => println!("{}", serde_json::to_string(&value)?),
+            None => {
+                eprintln!("mitigation preset {id} not found");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 
