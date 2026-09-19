@@ -24,6 +24,8 @@ import {
   asBundleNotAdmitted,
   isBundleAccepted,
   isBundleTerminal,
+  bundleVerificationMode,
+  configurationOnlyRunStatus,
   type RerouteBundle,
   type Rule,
   type RerouteResult,
@@ -216,6 +218,7 @@ export function BundleProgressView({
 
   return (
     <div className="space-y-3">
+      {bundle && bundleVerificationMode(bundle) === "configuration_only" && <p className="rounded-md border p-3 text-sm font-medium">{configurationOnlyRunStatus(bundle.state)}</p>}
       <div className="rounded-md border border-border p-3">
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <StateBadge state={state} />

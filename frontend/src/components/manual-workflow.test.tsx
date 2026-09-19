@@ -3,13 +3,20 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BrowserRouter } from "react-router-dom";
-import { api, type Rule } from "@/lib/api";
+import { api, type Rule, type RerouteBundle } from "@/lib/api";
 import { ActionsAndRevert } from "@/components/actions-and-revert";
-import { ApplyMitigationDialog } from "@/components/apply-mitigation-dialog";
+import { ApplyMitigationDialog, BundleProgressView } from "@/components/apply-mitigation-dialog";
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("manual mitigation workflow", () => {
+  it("labels compensated and blocked configuration-only outcomes without claiming routing verification", () => {
+    const base: Omit<RerouteBundle, "state"> = { id: 9, rule_id: null, trigger_type: "manual", failure_policy: "abort_and_compensate", total_actions: 1, completed_actions: 1, failure_reason: null, started_at: null, finished_at: null, actions: [], still_applied_reroute_ids: [], source: { kind: "manual", verification_mode: "configuration_only" } };
+    const view = render(<BundleProgressView bundle={{ ...base, state: "compensated" }} bundleId={9} totalHint={1} pollError={null} />);
+    expect(screen.getByText(/changes were reverted; routing not verified/i)).toBeTruthy();
+    view.rerender(<BundleProgressView bundle={{ ...base, state: "compensation_blocked" }} bundleId={9} totalHint={1} pollError={null} />);
+    expect(screen.getByText(/recovery is blocked and needs review; routing not verified/i)).toBeTruthy();
+  });
   it("only inspects after an explicit click and invalidates evidence after edits", async () => {
     const user = userEvent.setup();
     const inspect = vi.spyOn(api.actionSets, "inspect").mockResolvedValue({

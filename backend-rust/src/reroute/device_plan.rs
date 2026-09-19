@@ -43,6 +43,14 @@ pub struct DeviceTransportIdentity {
     pub pinned_host_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMode {
+    #[default]
+    Routing,
+    ConfigurationOnly,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreparedEffect {
@@ -317,6 +325,8 @@ pub enum DeviceStateSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedInverse {
+    #[serde(default)]
+    pub verification_mode: VerificationMode,
     /// The state that must still be current before an inverse may run.  A
     /// mismatch means somebody else changed the router and the inverse refuses.
     pub expected_current: Vec<DeviceStateSnapshot>,
@@ -340,6 +350,8 @@ pub struct PreparedDeviceAction {
     pub template_id: u64,
     pub template_name: String,
     pub canonical_params: Value,
+    #[serde(default)]
+    pub verification_mode: VerificationMode,
     pub commands: Vec<String>,
     pub before: Vec<DeviceStateSnapshot>,
     pub after: Vec<DeviceStateSnapshot>,
@@ -382,6 +394,9 @@ impl PreparedDeviceAction {
             _ => {}
         }
         if let Some(inverse) = &self.inverse {
+            if inverse.verification_mode != self.verification_mode {
+                bail!("prepared inverse verification scope differs from its action");
+            }
             if inverse.commands.is_empty()
                 || inverse.expected_current.is_empty()
                 || inverse.restore.is_empty()
@@ -402,6 +417,7 @@ impl PreparedDeviceAction {
             && self.template_id == runtime.template_id
             && self.template_name == runtime.template_name
             && self.canonical_params == runtime.canonical_params
+            && self.verification_mode == runtime.verification_mode
             && self.commands == runtime.commands
             && self.before == runtime.before
             && self.after == runtime.after
@@ -600,6 +616,7 @@ pub fn prepare_prefix_list_action(
                 template_id: input.template_id,
                 template_name: input.template_name.clone(),
                 canonical_params: input.canonical_params.clone(),
+                verification_mode: VerificationMode::Routing,
                 commands: Vec::new(),
                 before: vec![before_list.clone(), established_neighbor.clone()],
                 after: vec![
@@ -654,6 +671,7 @@ pub fn prepare_prefix_list_action(
                 community: None,
             };
             let inverse = PreparedInverse {
+                verification_mode: VerificationMode::Routing,
                 expected_current: vec![
                     after_list.clone(),
                     advertisement.clone(),
@@ -682,6 +700,7 @@ pub fn prepare_prefix_list_action(
                 template_id: input.template_id,
                 template_name: input.template_name.clone(),
                 canonical_params: params,
+                verification_mode: VerificationMode::Routing,
                 commands: rendered.commands,
                 before: vec![before_list, established_neighbor.clone()],
                 after: vec![
@@ -1372,10 +1391,34 @@ pub async fn prepare_actions_read_only(
     prepare_actions_read_only_with_reader(pool, inputs, &RusshPreparationReader { pool }).await
 }
 
+pub async fn prepare_actions_read_only_for_mode(
+    pool: &MySqlPool,
+    inputs: &[PrepareInput],
+    verification_mode: VerificationMode,
+) -> Result<Vec<PreparedDeviceAction>> {
+    prepare_actions_read_only_with_reader_for_mode(
+        pool,
+        inputs,
+        &RusshPreparationReader { pool },
+        verification_mode,
+    )
+    .await
+}
+
 pub async fn prepare_actions_read_only_with_reader<R: PreparationReader>(
     pool: &MySqlPool,
     inputs: &[PrepareInput],
     reader: &R,
+) -> Result<Vec<PreparedDeviceAction>> {
+    prepare_actions_read_only_with_reader_for_mode(pool, inputs, reader, VerificationMode::Routing)
+        .await
+}
+
+pub async fn prepare_actions_read_only_with_reader_for_mode<R: PreparationReader>(
+    pool: &MySqlPool,
+    inputs: &[PrepareInput],
+    reader: &R,
+    verification_mode: VerificationMode,
 ) -> Result<Vec<PreparedDeviceAction>> {
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut projected_prefix_lists: HashMap<(u64, String), String> = HashMap::new();
@@ -1452,7 +1495,7 @@ pub async fn prepare_actions_read_only_with_reader<R: PreparationReader>(
                     }
                 };
                 let list_output = projected_list.unwrap_or_else(|| reads[read_index].clone());
-                let action = prepare_prefix_list_action(
+                let mut action = prepare_prefix_list_action(
                     input,
                     &template,
                     &reads[0],
@@ -1461,6 +1504,10 @@ pub async fn prepare_actions_read_only_with_reader<R: PreparationReader>(
                     &neighbor_output,
                     &list_output,
                 )?;
+                action.verification_mode = verification_mode;
+                if let Some(inverse) = &mut action.inverse {
+                    inverse.verification_mode = verification_mode;
+                }
                 if let Some(DeviceStateSnapshot::PrefixList { entries, .. }) = action.after.first()
                 {
                     projected_prefix_lists.insert(key, render_prefix_list_snapshot(&list, entries));
@@ -1473,9 +1520,19 @@ pub async fn prepare_actions_read_only_with_reader<R: PreparationReader>(
                 prepared.push(action);
             }
             _ => {
-                let action =
-                    prepare_catalog_action(pool, input, &template, &projected_states, reader)
-                        .await?;
+                let mut action = prepare_catalog_action(
+                    pool,
+                    input,
+                    &template,
+                    &projected_states,
+                    reader,
+                    verification_mode,
+                )
+                .await?;
+                action.verification_mode = verification_mode;
+                if let Some(inverse) = &mut action.inverse {
+                    inverse.verification_mode = verification_mode;
+                }
                 for state in &action.after {
                     if let Some(key) = state_key(input.device_id, state) {
                         projected_states.insert(key, state.clone());
@@ -1494,6 +1551,7 @@ async fn prepare_catalog_action(
     template: &super::templates::Template,
     projected: &HashMap<String, DeviceStateSnapshot>,
     reader: &impl PreparationReader,
+    verification_mode: VerificationMode,
 ) -> Result<PreparedDeviceAction> {
     let subst =
         super::templates::validate_and_expand(&template.parameter_schema, &input.canonical_params)?;
@@ -1510,7 +1568,7 @@ async fn prepare_catalog_action(
             prepare_route_map(pool, input, template, &subst, projected,reader).await
         }
         "bgp_export_policy_set" => {
-            prepare_export_policy(pool, input, template, &subst, projected,reader).await
+            prepare_export_policy(pool, input, template, &subst, projected,reader,verification_mode).await
         }
         "iface_tcp_adjust_mss" | "iface_tcp_adjust_mss_remove" => {
             prepare_interface_mss(pool, input, template, &subst, projected,reader).await
@@ -1531,6 +1589,7 @@ async fn prepare_export_policy(
     subst: &serde_json::Map<String, Value>,
     projected: &HashMap<String, DeviceStateSnapshot>,
     reader: &impl PreparationReader,
+    verification_mode: VerificationMode,
 ) -> Result<PreparedDeviceAction> {
     use crate::reroute::policy::{BindingScope, PolicyKind};
     let neighbor = subst_string(subst, "neighbor_ip")?;
@@ -1677,7 +1736,7 @@ async fn prepare_export_policy(
     };
     let mut desired_verify = vec![after.clone()];
     let mut restore_verify = vec![before.clone()];
-    if kind == PolicyKind::PrefixList {
+    if verification_mode == VerificationMode::Routing && kind == PolicyKind::PrefixList {
         let desired = exact_permitted_prefixes(&desired_name, &prefix_lists)?;
         let prior = current_name
             .as_deref()
@@ -1698,19 +1757,21 @@ async fn prepare_export_policy(
                 community: None,
             });
         }
-    } else if let Some(prefix_list) = current_prefix.as_deref() {
-        // Attribute-only route-map replacement must preserve reachability
-        // selected by the complementary prefix-list. Bind that actual routing
-        // proof into both apply and restore verification.
-        for prefix in exact_permitted_prefixes(prefix_list, &prefix_lists)? {
-            let proof = DeviceStateSnapshot::BgpAdvertisement {
-                neighbor: neighbor.clone(),
-                prefix,
-                present: true,
-                community: None,
-            };
-            desired_verify.push(proof.clone());
-            restore_verify.push(proof);
+    } else if verification_mode == VerificationMode::Routing {
+        if let Some(prefix_list) = current_prefix.as_deref() {
+            // Attribute-only route-map replacement must preserve reachability
+            // selected by the complementary prefix-list. Bind that actual routing
+            // proof into both apply and restore verification.
+            for prefix in exact_permitted_prefixes(prefix_list, &prefix_lists)? {
+                let proof = DeviceStateSnapshot::BgpAdvertisement {
+                    neighbor: neighbor.clone(),
+                    prefix,
+                    present: true,
+                    community: None,
+                };
+                desired_verify.push(proof.clone());
+                restore_verify.push(proof);
+            }
         }
     }
     finish_prepared(
@@ -1721,6 +1782,7 @@ async fn prepare_export_policy(
         desired_verify.clone(),
         desired_verify.clone(),
         Some(PreparedInverse {
+            verification_mode,
             expected_current: desired_verify,
             restore: restore_verify.clone(),
             commands: export_attachment_commands(local_asn, &family, &neighbor, restore),
@@ -2012,6 +2074,7 @@ async fn prepare_static_route(
         after_states.clone(),
         verify,
         inverse_commands.map(|commands| PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: after_states,
             restore: inverse_verify.clone(),
             commands,
@@ -2322,6 +2385,7 @@ async fn prepare_neighbor_shutdown(
         vec![desired.clone(), desired_operational.clone()],
         vec![desired.clone(), desired_operational.clone()],
         Some(PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: vec![desired, desired_operational],
             restore: vec![before.clone(), before_operational.clone()],
             commands: vec![
@@ -2407,6 +2471,7 @@ async fn prepare_route_map(
         vec![desired.clone()],
         vec![desired.clone()],
         Some(PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: vec![desired],
             restore: vec![before.clone()],
             commands: scoped_route_map_commands(local_asn, &family, &neighbor, &direction, restore),
@@ -2570,6 +2635,7 @@ async fn prepare_interface_mss(
         vec![desired.clone()],
         vec![desired.clone()],
         Some(PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: vec![desired],
             restore: vec![before.clone()],
             commands: vec![
@@ -2678,6 +2744,7 @@ async fn prepare_interface_admin(
         vec![desired.clone(), desired_operational.clone()],
         vec![desired.clone(), desired_operational.clone()],
         Some(PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: vec![desired, desired_operational],
             restore: vec![before.clone(), before_operational.clone()],
             commands: vec![
@@ -2700,12 +2767,17 @@ fn finish_prepared(
     verify: Vec<DeviceStateSnapshot>,
     inverse: Option<PreparedInverse>,
 ) -> Result<PreparedDeviceAction> {
+    let verification_mode = inverse
+        .as_ref()
+        .map(|prepared| prepared.verification_mode)
+        .unwrap_or(VerificationMode::Routing);
     let action = PreparedDeviceAction {
         schema_version: PREPARED_DEVICE_ACTION_SCHEMA_VERSION,
         device_id: input.device_id,
         template_id: input.template_id,
         template_name: input.template_name.clone(),
         canonical_params: input.canonical_params.clone(),
+        verification_mode,
         commands: if effect == PreparedEffect::Change {
             commands
         } else {
@@ -2909,6 +2981,7 @@ mod tests {
             template_id: 2,
             template_name: "example".into(),
             canonical_params: serde_json::json!({}),
+            verification_mode: VerificationMode::Routing,
             commands: Vec::new(),
             before: Vec::new(),
             after: Vec::new(),
@@ -2923,12 +2996,40 @@ mod tests {
     fn noop_can_never_claim_an_inverse() {
         let mut plan = base(PreparedEffect::AlreadySatisfied);
         plan.inverse = Some(PreparedInverse {
+            verification_mode: VerificationMode::Routing,
             expected_current: Vec::new(),
             restore: Vec::new(),
             commands: vec!["no shutdown".into()],
             verify: Vec::new(),
         });
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn verification_mode_is_strict_backward_compatible_and_execution_bound() {
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "device_id": 1,
+            "template_id": 2,
+            "template_name": "example",
+            "canonical_params": {},
+            "commands": [],
+            "before": [],
+            "after": [],
+            "verify": [],
+            "effect": "already_satisfied",
+            "prepared_at": Utc::now()
+        });
+        let decoded: PreparedDeviceAction = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.verification_mode, VerificationMode::Routing);
+
+        let mut configuration_only = decoded.clone();
+        configuration_only.verification_mode = VerificationMode::ConfigurationOnly;
+        assert!(!decoded.equivalent_for_execution(&configuration_only));
+
+        let mut unknown = legacy;
+        unknown["verification_mode"] = serde_json::json!("configish");
+        assert!(serde_json::from_value::<PreparedDeviceAction>(unknown).is_err());
     }
 
     #[test]
@@ -3262,6 +3363,7 @@ mod tests {
             template_id: 1,
             template_name: name.into(),
             canonical_params: serde_json::json!({}),
+            verification_mode: VerificationMode::Routing,
             commands: vec![
                 "configure terminal".into(),
                 "interface GigabitEthernet0/0".into(),
@@ -3311,6 +3413,7 @@ mod tests {
             template_id: 1,
             template_name: "bgp_session_enable".into(),
             canonical_params: serde_json::json!({}),
+            verification_mode: VerificationMode::Routing,
             commands: vec![
                 "configure terminal".into(),
                 "router bgp 65000".into(),
@@ -3421,6 +3524,7 @@ mod tests {
             template_id: 1,
             template_name: "bgp_export_policy_set".into(),
             canonical_params: serde_json::json!({"policy_kind":"prefix_list"}),
+            verification_mode: VerificationMode::Routing,
             commands: vec!["x".into()],
             before: vec![state("eMA1")],
             after: vec![state("eMA2")],
@@ -3533,6 +3637,7 @@ mod tests {
             template_id: 1,
             template_name: "bgp_export_policy_set".into(),
             canonical_params: serde_json::json!({"policy_kind":"route_map"}),
+            verification_mode: VerificationMode::Routing,
             commands: vec!["x".into()],
             before: vec![state(None)],
             after: vec![state(Some("PREPEND"))],

@@ -210,12 +210,14 @@ fn prepared(
         template_id: template.id,
         template_name: template.name.clone(),
         canonical_params: json!({}),
+        verification_mode: device_plan::VerificationMode::Routing,
         commands: vec!["configure terminal".into(), "shutdown".into(), "end".into()],
         before: vec![before.clone()],
         after: vec![after.clone()],
         verify: vec![after.clone()],
         effect: device_plan::PreparedEffect::Change,
         inverse: with_inverse.then_some(device_plan::PreparedInverse {
+            verification_mode: device_plan::VerificationMode::Routing,
             expected_current: vec![after],
             restore: vec![before.clone()],
             commands: vec![

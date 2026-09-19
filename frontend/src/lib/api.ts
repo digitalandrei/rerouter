@@ -532,6 +532,8 @@ export interface Reroute {
   source_preset_name?: string | null;
   source_preset_revision?: number | null;
   source?: ActionSource | null;
+  verification_mode?: VerificationMode;
+  routing_verified?: boolean;
 }
 
 export interface RerouteStep {
@@ -656,6 +658,14 @@ export interface ManualMitigationPreview {
   operating_mode: "observe" | "enforce";
   projections?: DeviceProjection[];
   revert_after_seconds?: number | null;
+  verification_mode?: VerificationMode;
+  routing_verified?: boolean;
+}
+
+export type VerificationMode = "routing" | "configuration_only";
+export interface ManualMitigationCapabilities {
+  configuration_test_device_ids: number[];
+  configuration_test_templates: string[];
 }
 
 export interface ManualMitigationAccepted {
@@ -694,6 +704,20 @@ const BUNDLE_TERMINAL_STATES: ReadonlySet<string> = new Set([
 
 export function isBundleTerminal(state: string): boolean {
   return BUNDLE_TERMINAL_STATES.has(state);
+}
+
+export function configurationOnlyRunStatus(state: string): string {
+  switch (state) {
+    case "succeeded": return "Configuration verified; routing not verified.";
+    case "compensated": return "Configuration-only test failed; changes were reverted; routing not verified.";
+    case "compensation_blocked": return "Configuration recovery is blocked and needs review; routing not verified.";
+    case "failed": case "aborted": return "Configuration-only test failed; routing was not verified.";
+    default: return "Configuration-only test in progress; neither configuration nor routing is verified yet.";
+  }
+}
+
+export function bundleVerificationMode(bundle: Pick<RerouteBundle, "verification_mode" | "source">): VerificationMode {
+  return bundle.verification_mode ?? bundle.source?.verification_mode ?? "routing";
 }
 
 export interface RerouteBundleAction {
@@ -738,6 +762,8 @@ export interface RerouteBundle {
   recovery_deadline?: string | null;
   automatic_recovery_cancelled_at?: string | null;
   revert?: { available: boolean; block_reasons: string[]; noop?: boolean };
+  verification_mode?: VerificationMode;
+  routing_verified?: boolean;
 }
 
 export interface RerouteBundlePage {
@@ -781,6 +807,8 @@ export interface ActionSource {
   preset_revision?: number | null;
   rule_id?: number | null;
   name?: string | null;
+  verification_mode?: VerificationMode;
+  routing_verified?: boolean;
 }
 
 /** 202 from a confirmed manual rule apply: the bundle runs in background. */
@@ -1233,12 +1261,14 @@ export const api = {
   },
 
   manualMitigations: {
+    capabilities: () => request<ManualMitigationCapabilities>("/api/manual-mitigations/capabilities"),
     preview: (body: {
       preset_id?: number;
       preset_revision?: number;
       actions: ActionDraft[];
       reason?: string;
       revert_after_seconds?: number;
+      verification_mode?: VerificationMode;
     }) =>
       request<ManualMitigationPreview>("/api/manual-mitigations/preview", {
         method: "POST",

@@ -26,6 +26,42 @@ restricts new automatic activation rather than corrective owned work.
 Disarming pauses new autonomous work and autonomous-origin compensation. An
 already authorized manual-origin compensation may finish its failure policy.
 
+## Configuration-only lab verification
+
+Configuration-only verification is an explicit per-run choice for approved lab
+routers. It never activates automatically. Configure each approved transport
+identity with all four fields; placeholders are shown here deliberately:
+
+```toml
+[[safety.configuration_test_devices]]
+device_id = 3
+host = "lab-router.example.invalid"
+port = 22
+pinned_host_fingerprint = "SHA256:..."
+# Optional; defaults shown.
+action_rate_limit_count = 32
+action_rate_limit_window_seconds = 600
+```
+
+The current database identity must match the device id, host, port, and pinned
+fingerprint at capability lookup, preview, confirmation, and execution. A run
+may target one approved device and may use only `bgp_export_policy_set` and
+`iface_tcp_adjust_mss` actions. Select **Configuration only** for that run,
+review the exact projection and commands, and confirm the short-lived preview
+token normally.
+
+This mode proves the exact configuration before and after each action. An Idle
+BGP peer is allowed because advertised-route and Established-state evidence is
+outside this proof scope; the result must state that routing was not verified.
+The reviewed soft-out refresh command remains part of an export-policy plan,
+and IOS command errors still fail normally. They are never suppressed.
+
+Configuration-only runs have no timer, rule, automatic, or unattended recovery
+path. Use the explicit manual **Revert** workflow; its fresh preview inherits the
+persisted configuration-only scope and restores owned changes in reverse order.
+Immediate compensation after a failed manual run inherits the same scope. Older
+stored snapshots with no `verification_mode` deserialize as `routing`.
+
 ## Recovery
 
 Use the persisted original inverses in reverse order. Drift or uncertain state

@@ -167,3 +167,35 @@ it("does not clear a saved derived peer value when inventory loading fails", asy
   await waitFor(() => expect(update).toHaveBeenCalled());
   expect(update.mock.calls[0][1].actions[0].params).toEqual({ neighbor: "198.51.100.1", prefix_list: "PL-LEGACY" });
 });
+
+it("sends an explicit configuration-only scope without a deadline and rejects a mismatched preview", async () => {
+  const labTemplate = { ...editableTemplate, id: 20, name: "iface_tcp_adjust_mss", display_name: "Set MSS", parameter_schema: { interface: { type: "string", label: "Interface" }, mss: { type: "integer", label: "MSS" } } };
+  const labPreset: MitigationPreset = { ...saved, definition_status: "ready", validation_status: "valid", actions: [{ reroute_template_id: 20, template_name: labTemplate.name, device_id: 3, device_name: "eMA3 lab", params: { interface: "Bundle-Ether3", mss: "1436" }, enabled: true }] };
+  vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "trigger_manual_reroute"] });
+  vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([labPreset]);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(labPreset);
+  vi.spyOn(api.templates, "list").mockResolvedValue([labTemplate]);
+  vi.spyOn(api.devices, "list").mockResolvedValue([{ id: 3, name: "eMA3 lab" }, { id: 4, name: "Production edge" }] as never);
+  vi.spyOn(api.manualMitigations, "capabilities")
+    .mockResolvedValueOnce({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] })
+    .mockRejectedValueOnce(new Error("identity inventory unavailable"))
+    .mockResolvedValue({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] });
+  const preview = vi.spyOn(api.manualMitigations, "preview").mockResolvedValue({ plan_id: 8, preview_token: "token", results: [], operating_mode: "observe", verification_mode: "routing", routing_verified: false });
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
+  const user = userEvent.setup(); render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  await user.click(await screen.findByRole("radio", { name: /configuration-only lab test — ema3 lab/i }));
+  await user.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText(/lab eligibility is unavailable/i)).toBeTruthy();
+  expect((screen.getByRole("radio", { name: /configuration-only lab test — ema3 lab/i }) as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByRole("button", { name: "Preview exact plan" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(preview).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Retry lab eligibility" }));
+  await waitFor(() => expect(screen.queryByText(/lab eligibility is unavailable/i)).toBeNull());
+  await user.click(screen.getByRole("button", { name: "Preview exact plan" }));
+  await waitFor(() => expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only", revert_after_seconds: undefined })));
+  expect(screen.queryByRole("button", { name: "Confirm and run reviewed plan" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Override action 1" }));
+  await user.selectOptions(screen.getByLabelText("Target router"), "4");
+  await waitFor(() => expect((screen.getByRole("radio", { name: /normal routing verification/i }) as HTMLInputElement).checked).toBe(true));
+  expect(screen.queryByText(/router configuration will change; BGP advertisement is not verified/i)).toBeNull();
+});

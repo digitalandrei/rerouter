@@ -12,6 +12,8 @@ import {
   type MitigationPreset,
   type RerouteBundle,
   type Template,
+  type VerificationMode,
+  type ManualMitigationCapabilities,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
@@ -21,6 +23,8 @@ import {
   isCurrentPreview,
   moveOrderedAction,
   expandBulkActions,
+  configurationOnlyEligible as isConfigurationOnlyEligible,
+  previewMatchesVerificationMode,
 } from "@/lib/action-sets";
 import { orderTemplatesForChoice, templateGuidance, templateLabel } from "@/lib/labels";
 import { ActionParamsForm } from "@/components/action-params-form";
@@ -85,6 +89,9 @@ export default function ManualReroute() {
   const [reason, setReason] = useState("");
   const [revertAfter, setRevertAfter] = useState("");
   const [preview, setPreview] = useState<ManualMitigationPreview | null>(null);
+  const [verificationMode, setVerificationMode] = useState<VerificationMode>("routing");
+  const [capabilities, setCapabilities] = useState<ManualMitigationCapabilities>({ configuration_test_device_ids: [], configuration_test_templates: [] });
+  const [capabilitiesState, setCapabilitiesState] = useState<"loading" | "ready" | "error">("loading");
   const [bundleId, setBundleId] = useState<number | null>(initialBundleId);
   const [bundle, setBundle] = useState<RerouteBundle | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -105,6 +112,11 @@ export default function ManualReroute() {
     () => applyActionOverrides(actions, overrides),
     [actions, overrides],
   );
+  const configurationOnlyEligible = useMemo(() => isConfigurationOnlyEligible(effectiveActions, templates, capabilities), [effectiveActions, capabilities, templates]);
+  const configurationTestDeviceName = useMemo(() => {
+    const deviceId = effectiveActions.find((action) => action.enabled !== false)?.device_id;
+    return devices.find((device) => device.id === deviceId)?.name ?? (deviceId ? `device #${deviceId}` : "the eligible lab device");
+  }, [effectiveActions, devices]);
   const dirty = selectedPreset
     ? name !== selectedPreset.name ||
       description !== (selectedPreset.description ?? "") ||
@@ -167,6 +179,7 @@ export default function ManualReroute() {
       // can still be inspected and repaired. New actions only offer enabled ones.
       setTemplates(actionTemplates.filter((template) => template.provider_type === "device_cli"));
       setDevices(routers);
+      void loadCapabilities(generation);
       const initialId = bundleId !== null ? undefined : routeId ?? undefined;
       if (initialId) {
         const current = await api.mitigationPresets.get(initialId);
@@ -183,6 +196,16 @@ export default function ManualReroute() {
   useEffect(() => { void load(); return () => { loadGeneration.current += 1; }; }, [routeId, location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { allowNavigation.current = false; }, [location.pathname]);
+
+  async function loadCapabilities(generation = loadGeneration.current) {
+    setCapabilitiesState("loading");
+    try {
+      const value = await api.manualMitigations.capabilities();
+      if (generation === loadGeneration.current) { setCapabilities(value); setCapabilitiesState("ready"); }
+    } catch {
+      if (generation === loadGeneration.current) setCapabilitiesState("error");
+    }
+  }
 
   useEffect(() => {
     if (!listMode) return;
@@ -214,6 +237,15 @@ export default function ManualReroute() {
   }, [dirty, editorMode]);
 
   useEffect(() => { if (blocker.state === "blocked") { if (window.confirm("Discard unsaved changes?")) blocker.proceed(); else blocker.reset(); } }, [blocker]);
+
+  useEffect(() => {
+    if (capabilitiesState === "ready" && verificationMode === "configuration_only" && !configurationOnlyEligible) {
+      setVerificationMode("routing");
+      setRevertAfter("");
+      invalidatePreview();
+      toast.error("Configuration-only test was cleared because the effective actions are no longer eligible for the EMA3 lab target.");
+    }
+  }, [configurationOnlyEligible, verificationMode, capabilitiesState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const fromUrl = Number(searchParams.get("bundle")) || null;
@@ -327,9 +359,15 @@ export default function ManualReroute() {
         preset_revision: selectedPreset?.revision,
         actions: effectiveActions.map(actionDraftPayload),
         reason: reason.trim() || undefined,
-        revert_after_seconds: revertAfter ? Number(revertAfter) : undefined,
+        revert_after_seconds: verificationMode === "routing" && revertAfter ? Number(revertAfter) : undefined,
+        verification_mode: verificationMode,
       });
-      if (isCurrentPreview(generation, requestGeneration.current)) setPreview(result);
+      if (isCurrentPreview(generation, requestGeneration.current)) {
+        if (!previewMatchesVerificationMode(result, verificationMode)) {
+          toast.error("The preview returned a different verification scope. Prepare a new preview before running.");
+          setPreview(null);
+        } else setPreview(result);
+      }
     } catch (error) {
       if (isCurrentPreview(generation, requestGeneration.current))
         toast.error(error instanceof ApiError ? error.message : "Preview failed");
@@ -516,11 +554,19 @@ export default function ManualReroute() {
                 {editorMode && <Button variant="outline" onClick={() => navigate(selectedPreset ? `/manual-mitigations/${selectedPreset.id}` : "/manual-mitigations")}>Cancel</Button>}
                 {editorMode && canEdit && <Button onClick={() => void save()} disabled={busy || !name.trim()}><Save className="size-4" /> {busy ? "Saving…" : "Save"}</Button>}
               </div></div> : <div className="space-y-4 border-t border-border pt-4">
+                {bundleId === null && <fieldset className="space-y-2"><legend className="text-sm font-medium">Verification scope</legend>
+                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "routing"} onChange={() => { setVerificationMode("routing"); invalidatePreview(); }} /><span><strong>Normal routing verification</strong><span className="block text-xs text-muted-foreground">Apply the reviewed plan and verify its routing outcome.</span></span></label>
+                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "configuration_only"} disabled={capabilitiesState !== "ready" || !configurationOnlyEligible} onChange={() => { setVerificationMode("configuration_only"); setRevertAfter(""); invalidatePreview(); }} /><span><strong>Configuration-only lab test — {configurationTestDeviceName}</strong><span className="block text-xs text-muted-foreground">Available only when every enabled action targets this eligible lab device and uses an approved template.</span></span></label>
+                  {capabilitiesState === "loading" && <p role="status" className="text-xs text-muted-foreground">Checking configuration-only lab eligibility…</p>}
+                  {capabilitiesState === "error" && <div className="flex flex-wrap items-center gap-2 text-xs text-amber-800 dark:text-amber-300" role="alert"><span>Lab eligibility is unavailable. Normal routing runs remain available; a selected lab scope is retained but cannot be previewed or confirmed.</span><Button type="button" size="sm" variant="outline" onClick={() => void loadCapabilities()}>Retry lab eligibility</Button></div>}
+                  {verificationMode === "configuration_only" && <p role="alert" className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Configuration-only test — router configuration will change; BGP advertisement is not verified.</p>}
+                </fieldset>}
                 {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
                   <Input value={reason} maxLength={500} onChange={(event) => { setReason(event.target.value); invalidatePreview(); }} placeholder="Why is this mitigation being run?" />
                 </label>}
-                {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select className={inputClass} value={revertAfter} onChange={(event) => { setRevertAfter(event.target.value); invalidatePreview(); }}><option value="">Until manually reverted</option><option value="900">After 15 minutes</option><option value="3600">After 1 hour</option><option value="14400">After 4 hours</option><option value="86400">After 24 hours</option></select><span className="block text-xs font-normal text-muted-foreground">Timed recovery is paused unless Enforce mode and the automatic master switch are both enabled. Manual revert remains available.</span></label>}
+                {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select className={inputClass} value={revertAfter} disabled={verificationMode === "configuration_only"} onChange={(event) => { setRevertAfter(event.target.value); invalidatePreview(); }}><option value="">Until manually reverted</option><option value="900">After 15 minutes</option><option value="3600">After 1 hour</option><option value="14400">After 4 hours</option><option value="86400">After 24 hours</option></select><span className="block text-xs font-normal text-muted-foreground">{verificationMode === "configuration_only" ? "Configuration-only tests have no automatic recovery. Revert the reviewed run manually." : "Timed recovery is paused unless Enforce mode and the automatic master switch are both enabled. Manual revert remains available."}</span></label>}
                 {preview && <div className="space-y-3" aria-live="polite"><div className="flex items-center gap-2 text-sm font-medium"><ShieldCheck className="size-4" /> Exact server preview</div>
+                  {(preview.verification_mode ?? "routing") === "configuration_only" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Configuration-only test — router configuration will change; BGP advertisement is not verified.</p>}
                   {preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}
                   {preview.expires_at && <p className="text-xs text-muted-foreground">Preview expires {new Date(preview.expires_at).toLocaleString()}.</p>}
                   {preview.operating_mode === "observe" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode disables automatic response. This one-use preview can authorize this explicit manual run after confirmation.</p>}
@@ -528,8 +574,8 @@ export default function ManualReroute() {
                 {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
                 <div className="flex flex-wrap justify-end gap-2">
                   <Button variant="outline" disabled={busy} onClick={() => { leaveBundleView(); setRunMode(false); setOverrides({}); setSelectedAction(null); invalidatePreview(); }}>Back to saved mitigation</Button>
-                  {!preview && bundleId === null && <Button onClick={() => void preparePreview()} disabled={busy || effectiveActions.length === 0 || presetInvalid}>{busy ? "Preparing…" : "Preview exact plan"}</Button>}
-                  {preview && <Button variant="destructive" onClick={() => void applyPreview()} disabled={busy || !preview.plan_id || !preview.preview_token}>{busy ? "Starting…" : "Confirm and run reviewed plan"}</Button>}
+                  {!preview && bundleId === null && <Button onClick={() => void preparePreview()} disabled={busy || effectiveActions.length === 0 || presetInvalid || (verificationMode === "configuration_only" && capabilitiesState !== "ready")}>{busy ? "Preparing…" : "Preview exact plan"}</Button>}
+                  {preview && <Button variant="destructive" onClick={() => void applyPreview()} disabled={busy || !preview.plan_id || !preview.preview_token || (verificationMode === "configuration_only" && capabilitiesState !== "ready")}>{busy ? "Starting…" : "Confirm and run reviewed plan"}</Button>}
                 </div>
               </div>}
             </CardContent>

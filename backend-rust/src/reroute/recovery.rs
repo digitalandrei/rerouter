@@ -117,6 +117,7 @@ pub async fn schedule_if_eligible(pool: &MySqlPool, bundle_id: u64) -> anyhow::R
          WHERE id=? AND state='succeeded' AND trigger_type='manual' \
            AND recovery_deadline IS NULL \
            AND automatic_recovery_cancelled_at IS NULL \
+           AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')),'routing')<>'configuration_only' \
            AND JSON_EXTRACT(source_json,'$.revert_after_seconds') IS NOT NULL",
     ).bind(bundle_id).execute(pool).await?;
     Ok(())
@@ -234,6 +235,7 @@ pub async fn claim_one_due(
     let candidate: Option<u64> = sqlx::query_scalar(
         "SELECT id FROM reroute_bundles WHERE lifecycle_state='recovery_scheduled' \
          AND recovery_deadline<=UTC_TIMESTAMP() AND recovery_claim_token IS NULL \
+         AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')),'routing')<>'configuration_only' \
          AND automatic_recovery_cancelled_at IS NULL ORDER BY recovery_deadline,id LIMIT 1 FOR UPDATE",
     ).fetch_optional(&mut *tx).await?;
     let Some(source_id) = candidate else {

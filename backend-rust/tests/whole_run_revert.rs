@@ -81,6 +81,7 @@ async fn inverse_preview_refuses_third_state_drift() {
         template_id: 1,
         template_name: "prepared_inverse".into(),
         canonical_params: json!({}),
+        verification_mode: rerouter_controller::reroute::device_plan::VerificationMode::Routing,
         commands: vec![
             "configure terminal".into(),
             "no ip tcp adjust-mss".into(),
@@ -154,6 +155,7 @@ async fn whole_run_revert_binds_exact_remaining_set_and_is_idempotent() {
         },
     ];
     let inverse = PreparedInverse {
+        verification_mode: rerouter_controller::reroute::device_plan::VerificationMode::Routing,
         expected_current: after.clone(),
         restore: before.clone(),
         commands: vec![

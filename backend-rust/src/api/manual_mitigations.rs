@@ -13,7 +13,7 @@ use super::{err, AppState};
 use crate::auth::rbac::{markers, RequirePermission};
 use crate::auth::sessions::Session;
 use crate::reroute::bundle::{self, BundleAction, BundleRun, FailurePolicy};
-use crate::reroute::device_plan::{PreparedDeviceAction, PreparedEffect};
+use crate::reroute::device_plan::{PreparedDeviceAction, PreparedEffect, VerificationMode};
 use crate::reroute::executor::ActorContext;
 use crate::reroute::preparation::{self, ActionDraft};
 use crate::reroute::{guard, templates};
@@ -22,6 +22,8 @@ pub(crate) type JsonResp = (StatusCode, Json<Value>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunSnapshot {
+    #[serde(default)]
+    pub verification_mode: VerificationMode,
     pub actions: Vec<BundleAction>,
     pub device_actions: Vec<PreparedDeviceAction>,
     pub source: Value,
@@ -36,6 +38,8 @@ pub(crate) struct RunSnapshot {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewBody {
+    #[serde(default)]
+    pub verification_mode: VerificationMode,
     #[serde(default)]
     pub preset_id: Option<u64>,
     #[serde(default)]
@@ -60,6 +64,86 @@ pub async fn preview(
     Json(body): Json<PreviewBody>,
 ) -> JsonResp {
     preview_manual(&state, &g.session, body, "manual_mitigation").await
+}
+
+pub async fn capabilities(
+    _g: RequirePermission<markers::ViewAsset>,
+    State(state): State<AppState>,
+) -> JsonResp {
+    match eligible_configuration_test_device_ids(&state).await {
+        Ok(ids) => (
+            StatusCode::OK,
+            Json(json!({
+                "configuration_test_device_ids": ids,
+                "configuration_test_templates": ["bgp_export_policy_set", "iface_tcp_adjust_mss"]
+            })),
+        ),
+        Err(e) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("configuration-test capabilities unavailable: {e:#}"),
+        ),
+    }
+}
+
+async fn eligible_configuration_test_device_ids(state: &AppState) -> anyhow::Result<Vec<u64>> {
+    let ids = state
+        .config
+        .safety
+        .configuration_test_devices
+        .iter()
+        .map(|d| d.device_id)
+        .collect::<Vec<_>>();
+    let current = crate::ssh::RusshExecutor::new(state.pool.clone())
+        .transport_identities(&ids)
+        .await?;
+    Ok(state
+        .config
+        .safety
+        .configuration_test_devices
+        .iter()
+        .filter(|expected| {
+            current.get(&expected.device_id).is_some_and(|actual| {
+                actual.host == expected.host
+                    && actual.port == expected.port
+                    && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
+            })
+        })
+        .map(|d| d.device_id)
+        .collect())
+}
+
+async fn validate_configuration_only_scope(
+    state: &AppState,
+    actions: &[BundleAction],
+) -> anyhow::Result<()> {
+    ensure!(
+        !actions.is_empty(),
+        "configuration-only verification needs enabled actions"
+    );
+    let device_id = actions[0].device_id;
+    ensure!(
+        actions.iter().all(|a| a.device_id == device_id),
+        "configuration-only verification requires one designated lab device"
+    );
+    ensure!(
+        actions.iter().all(|a| {
+            matches!(
+                a.template.name.as_str(),
+                "bgp_export_policy_set" | "iface_tcp_adjust_mss"
+            ) || (a.original_reroute_id.is_some()
+                && a.prepared.as_ref().is_some_and(|prepared| {
+                    prepared.verification_mode == VerificationMode::ConfigurationOnly
+                }))
+        }),
+        "configuration-only verification supports only bgp_export_policy_set and iface_tcp_adjust_mss"
+    );
+    ensure!(
+        eligible_configuration_test_device_ids(state)
+            .await?
+            .contains(&device_id),
+        "lab device transport identity is not currently designated"
+    );
+    Ok(())
 }
 
 pub(crate) async fn preview_manual(
@@ -130,7 +214,7 @@ pub(crate) async fn preview_manual(
         Ok(actions) => actions,
         Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e:#}")),
     };
-    let actions = validated
+    let actions: Vec<BundleAction> = validated
         .into_iter()
         .filter(|(_, a)| a.enabled)
         .enumerate()
@@ -146,8 +230,38 @@ pub(crate) async fn preview_manual(
             original_reroute_id: None,
         })
         .collect();
-    let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason,"revert_after_seconds":body.revert_after_seconds});
-    preview_actions(
+    if body.verification_mode == VerificationMode::ConfigurationOnly {
+        if body.revert_after_seconds.is_some() {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "configuration-only verification does not allow timed reverts",
+            );
+        }
+        if let Err(e) = validate_configuration_only_scope(state, &actions).await {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+        }
+        let device_id = actions[0].device_id;
+        let lab_limit = state
+            .config
+            .safety
+            .configuration_test_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .map(|device| device.action_rate_limit_count)
+            .unwrap_or(0);
+        if actions.len() as u32 > lab_limit {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!(
+                    "configuration-only action set has {} actions; lab limit is {}",
+                    actions.len(),
+                    lab_limit
+                ),
+            );
+        }
+    }
+    let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason,"revert_after_seconds":body.revert_after_seconds,"verification_mode":body.verification_mode});
+    preview_actions_mode(
         state,
         actor,
         scope,
@@ -157,6 +271,7 @@ pub(crate) async fn preview_manual(
         reason,
         request,
         body.revert_after_seconds,
+        body.verification_mode,
     )
     .await
 }
@@ -181,6 +296,34 @@ pub(crate) async fn preview_actions(
     request: Value,
     revert_after_seconds: Option<u32>,
 ) -> JsonResp {
+    preview_actions_mode(
+        state,
+        actor,
+        scope,
+        scope_id,
+        actions,
+        source,
+        reason,
+        request,
+        revert_after_seconds,
+        VerificationMode::Routing,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preview_actions_mode(
+    state: &AppState,
+    actor: &Session,
+    scope: &str,
+    scope_id: Option<u64>,
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    revert_after_seconds: Option<u32>,
+    verification_mode: VerificationMode,
+) -> JsonResp {
     preview_actions_core(
         state,
         actor,
@@ -192,6 +335,7 @@ pub(crate) async fn preview_actions(
         request,
         revert_after_seconds,
         false,
+        verification_mode,
     )
     .await
 }
@@ -208,6 +352,7 @@ async fn preview_actions_core(
     request: Value,
     revert_after_seconds: Option<u32>,
     inverse_already_inspected: bool,
+    mut verification_mode: VerificationMode,
 ) -> JsonResp {
     let clear_only =
         actions.is_empty() && source.get("kind").and_then(Value::as_str) == Some("rule_clear");
@@ -217,13 +362,55 @@ async fn preview_actions_core(
             "no enabled actions to prepare",
         );
     }
+    let inherited_configuration_only = actions
+        .iter()
+        .filter_map(|a| a.prepared.as_ref())
+        .any(|p| p.verification_mode == VerificationMode::ConfigurationOnly);
+    if inherited_configuration_only {
+        if actions
+            .iter()
+            .filter_map(|a| a.prepared.as_ref())
+            .any(|p| p.verification_mode != VerificationMode::ConfigurationOnly)
+        {
+            return err(
+                StatusCode::CONFLICT,
+                "mixed verification scopes are not executable",
+            );
+        }
+        verification_mode = VerificationMode::ConfigurationOnly;
+    }
+    if verification_mode == VerificationMode::ConfigurationOnly {
+        if !matches!(
+            scope,
+            "manual_mitigation" | "bundle_revert" | "reroute_rollback"
+        ) || revert_after_seconds.is_some()
+        {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "configuration-only verification is manual and cannot use timed recovery",
+            );
+        }
+        if let Err(e) = validate_configuration_only_scope(state, &actions).await {
+            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+        }
+        source["verification_mode"] = json!(verification_mode);
+        source["routing_verified"] = json!(false);
+        source["verification_label"] =
+            json!("Configuration-only test; routing will not be verified");
+    }
     let enforce = super::settings::operating_mode(&state.pool, &state.config).await == "enforce";
     let _policy = match guard::policy_fence(&state.pool).await {
         Ok(fence) => Some(fence),
         Err(e) => return err(StatusCode::CONFLICT, &format!("preview policy busy: {e}")),
     };
     if actions.iter().any(|a| a.prepared.is_none()) {
-        if let Err(e) = inspect_actions(&state.pool, &mut actions).await {
+        let inspected = if verification_mode == VerificationMode::ConfigurationOnly {
+            preparation::inspect_actions_for_mode(&state.pool, &mut actions, verification_mode)
+                .await
+        } else {
+            inspect_actions(&state.pool, &mut actions).await
+        };
+        if let Err(e) = inspected {
             return err(
                 StatusCode::CONFLICT,
                 &format!("complete mitigation preparation refused; nothing was executed: {e:#}"),
@@ -286,13 +473,24 @@ async fn preview_actions_core(
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
-        let mut plan = match templates::render(&action.template, &action.params) {
-            Ok(plan) => plan,
-            Err(e) => {
-                return err(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    &format!("action {}: {e:#}", action.position + 1),
-                )
+        let mut plan = if let Some(prepared) = &action.prepared {
+            crate::reroute::templates::RenderedPlan {
+                template_id: prepared.template_id,
+                template_name: prepared.template_name.clone(),
+                config_mode: false,
+                commands: prepared.commands.clone(),
+                verify: None,
+                sequence_pending: false,
+            }
+        } else {
+            match templates::render(&action.template, &action.params) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return err(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &format!("action {}: {e:#}", action.position + 1),
+                    )
+                }
             }
         };
         let (inverse, before, after, effect) = if let Some(prepared) = &action.prepared {
@@ -328,6 +526,7 @@ async fn preview_actions_core(
         }));
     }
     let snapshot = RunSnapshot {
+        verification_mode,
         device_actions: actions.iter().filter_map(|a| a.prepared.clone()).collect(),
         actions,
         source: source.clone(),
@@ -356,6 +555,8 @@ async fn preview_actions_core(
             StatusCode::OK,
             Json(
                 json!({"plan_id":row.last_insert_id(),"preview_token":token,"results":results,"projections":projections,"revert_after_seconds":revert_after_seconds,
+            "verification_mode":verification_mode,"routing_verified":if verification_mode == VerificationMode::ConfigurationOnly {Some(false)} else {None},
+            "verification_label":if verification_mode == VerificationMode::ConfigurationOnly {Some("Configuration-only test; routing will not be verified")} else {None},
             "source":source,"expires_at":Utc::now()+chrono::Duration::minutes(5),"operating_mode":if enforce {"enforce"} else {"observe"}}),
             ),
         ),
@@ -372,17 +573,59 @@ pub async fn preview_actions_with_reader<R: crate::reroute::device_plan::Prepara
     actor: &Session,
     scope: &str,
     scope_id: Option<u64>,
-    mut actions: Vec<BundleAction>,
+    actions: Vec<BundleAction>,
     source: Value,
     reason: String,
     request: Value,
     revert_after_seconds: Option<u32>,
     reader: &R,
 ) -> JsonResp {
-    if !actions.iter().any(|a| a.original_reroute_id.is_some()) {
-        if let Err(e) =
+    preview_actions_with_reader_mode(
+        state,
+        actor,
+        scope,
+        scope_id,
+        actions,
+        source,
+        reason,
+        request,
+        revert_after_seconds,
+        reader,
+        VerificationMode::Routing,
+    )
+    .await
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn preview_actions_with_reader_mode<R: crate::reroute::device_plan::PreparationReader>(
+    state: &AppState,
+    actor: &Session,
+    scope: &str,
+    scope_id: Option<u64>,
+    mut actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    revert_after_seconds: Option<u32>,
+    reader: &R,
+    verification_mode: VerificationMode,
+) -> JsonResp {
+    if actions.iter().any(|a| a.prepared.is_none())
+        && !actions.iter().any(|a| a.original_reroute_id.is_some())
+    {
+        if let Err(e) = if verification_mode == VerificationMode::ConfigurationOnly {
+            preparation::inspect_actions_with_reader_for_mode(
+                &state.pool,
+                &mut actions,
+                false,
+                reader,
+                verification_mode,
+            )
+            .await
+        } else {
             preparation::inspect_actions_with_reader(&state.pool, &mut actions, false, reader).await
-        {
+        } {
             return err(
                 StatusCode::CONFLICT,
                 &format!("complete mitigation preparation refused; nothing was executed: {e:#}"),
@@ -420,6 +663,7 @@ pub async fn preview_actions_with_reader<R: crate::reroute::device_plan::Prepara
         request,
         revert_after_seconds,
         true,
+        verification_mode,
     )
     .await
 }
@@ -482,7 +726,7 @@ async fn accept_plan_inner(
     scope_id: Option<u64>,
     force_persist_failure: bool,
 ) -> anyhow::Result<AcceptedPlan> {
-    let _policy_fence = guard::policy_fence(&state.pool).await?;
+    let policy_fence = guard::policy_fence(&state.pool).await?;
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query_as::<_, PlanRow>(
         "SELECT user_id, scope, scope_id, snapshot_json, plan_hash, token_hash, expires_at, consumed_at, bundle_id \
@@ -500,6 +744,20 @@ async fn accept_plan_inner(
         "stored preview integrity check failed"
     );
     let snapshot: RunSnapshot = serde_json::from_value(row.snapshot_json.0)?;
+    if snapshot.verification_mode == VerificationMode::ConfigurationOnly {
+        ensure!(
+            matches!(
+                scope,
+                "manual_mitigation" | "bundle_revert" | "reroute_rollback"
+            ),
+            "configuration-only scope cannot be automatic or rule-driven"
+        );
+        ensure!(
+            snapshot.revert_after_seconds.is_none(),
+            "configuration-only scope cannot schedule a timed revert"
+        );
+        validate_configuration_only_scope(state, &snapshot.actions).await?;
+    }
     let source_kind = snapshot.source.get("kind").and_then(Value::as_str);
     let source_id = match (scope, source_kind) {
         ("manual_mitigation", Some("preset")) => {
@@ -527,12 +785,14 @@ async fn accept_plan_inner(
         let bundle_id = row
             .bundle_id
             .context("consumed preview has no execution; reconcile before retrying")?;
-        return Ok(AcceptedPlan {
+        let accepted = AcceptedPlan {
             bundle_id,
             plan_id,
             snapshot,
             already_accepted: true,
-        });
+        };
+        policy_fence.release().await?;
+        return Ok(accepted);
     }
     ensure!(
         row.expires_at > Utc::now(),
@@ -594,12 +854,27 @@ async fn accept_plan_inner(
             && (!snapshot.actions.is_empty() || snapshot.source["kind"] == "rule_clear"),
         "incomplete execution snapshot"
     );
+    ensure!(
+        snapshot
+            .device_actions
+            .iter()
+            .all(|prepared| prepared.verification_mode == snapshot.verification_mode)
+            && snapshot.actions.iter().all(|action| action
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.verification_mode == snapshot.verification_mode)),
+        "execution snapshot contains a missing or mixed verification scope"
+    );
     for (action, prepared) in snapshot.actions.iter().zip(&snapshot.device_actions) {
         let owned = action
             .prepared
             .as_ref()
             .context("missing concrete device action")?;
         owned.validate()?;
+        ensure!(
+            action.device_id == owned.device_id && action.template.id == owned.template_id,
+            "prepared action identity does not match its bundle action"
+        );
         ensure!(
             owned == prepared,
             "execution snapshot order or prepared action changed"
@@ -684,12 +959,14 @@ async fn accept_plan_inner(
             "bundle #{bundle_id} was not admitted; no router command was sent"
         )));
     }
-    Ok(AcceptedPlan {
+    let accepted = AcceptedPlan {
         bundle_id,
         plan_id,
         snapshot,
         already_accepted: false,
-    })
+    };
+    policy_fence.release().await?;
+    Ok(accepted)
 }
 
 pub(crate) fn spawn_accepted(state: &AppState, actor: &Session, accepted: AcceptedPlan) {

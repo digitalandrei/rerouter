@@ -150,6 +150,14 @@ pub async fn inspect_actions(
     inspect_actions_inner(pool, actions, automatic, None::<&NoReader>).await
 }
 
+pub async fn inspect_actions_for_mode(
+    pool: &MySqlPool,
+    actions: &mut [super::bundle::BundleAction],
+    mode: super::device_plan::VerificationMode,
+) -> Result<()> {
+    inspect_actions_inner_for_mode(pool, actions, false, None::<&NoReader>, mode).await
+}
+
 struct NoReader;
 impl super::device_plan::PreparationReader for NoReader {
     fn read_one<'a>(&'a self, _: u64, _: &'a str) -> crate::ssh::BoxFuture<'a, Result<String>> {
@@ -173,11 +181,38 @@ pub async fn inspect_actions_with_reader<R: super::device_plan::PreparationReade
     inspect_actions_inner(pool, actions, automatic, Some(reader)).await
 }
 
+pub async fn inspect_actions_with_reader_for_mode<R: super::device_plan::PreparationReader>(
+    pool: &MySqlPool,
+    actions: &mut [super::bundle::BundleAction],
+    automatic: bool,
+    reader: &R,
+    mode: super::device_plan::VerificationMode,
+) -> Result<()> {
+    inspect_actions_inner_for_mode(pool, actions, automatic, Some(reader), mode).await
+}
+
 async fn inspect_actions_inner<R: super::device_plan::PreparationReader>(
     pool: &MySqlPool,
     actions: &mut [super::bundle::BundleAction],
     automatic: bool,
     reader: Option<&R>,
+) -> Result<()> {
+    inspect_actions_inner_for_mode(
+        pool,
+        actions,
+        automatic,
+        reader,
+        super::device_plan::VerificationMode::Routing,
+    )
+    .await
+}
+
+async fn inspect_actions_inner_for_mode<R: super::device_plan::PreparationReader>(
+    pool: &MySqlPool,
+    actions: &mut [super::bundle::BundleAction],
+    automatic: bool,
+    reader: Option<&R>,
+    verification_mode: super::device_plan::VerificationMode,
 ) -> Result<()> {
     ensure!(!actions.is_empty(), "no enabled actions to prepare");
     let mut phase = 0;
@@ -240,16 +275,36 @@ async fn inspect_actions_inner<R: super::device_plan::PreparationReader>(
             canonical_params: a.params.clone(),
         })
         .collect();
-    let plans = match reader {
+    let mut plans = match reader {
         Some(reader) => {
-            super::device_plan::prepare_actions_read_only_with_reader(pool, &inputs, reader).await?
+            super::device_plan::prepare_actions_read_only_with_reader_for_mode(
+                pool,
+                &inputs,
+                reader,
+                verification_mode,
+            )
+            .await?
         }
         None => {
-            crate::ssh::RusshExecutor::new(pool.clone())
-                .prepare_actions(&inputs)
+            super::device_plan::prepare_actions_read_only_for_mode(pool, &inputs, verification_mode)
                 .await?
         }
     };
+    for plan in &mut plans {
+        plan.verification_mode = verification_mode;
+        if let Some(inverse) = &mut plan.inverse {
+            inverse.verification_mode = verification_mode;
+        }
+        if verification_mode == super::device_plan::VerificationMode::ConfigurationOnly {
+            ensure!(
+                matches!(
+                    plan.template_name.as_str(),
+                    "bgp_export_policy_set" | "iface_tcp_adjust_mss"
+                ),
+                "configuration-only verification supports only lab export-policy and MSS actions"
+            );
+        }
+    }
     ensure!(
         plans.len() == actions.len(),
         "device preparation did not return the complete action set"
@@ -378,6 +433,7 @@ pub async fn prepare_rollbacks(
             template_id: template.id,
             template_name: template.name.clone(),
             canonical_params: params.clone(),
+            verification_mode: inverse.verification_mode,
             commands: inverse.commands,
             before: inverse.expected_current,
             after: inverse.restore,

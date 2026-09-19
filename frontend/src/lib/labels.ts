@@ -16,7 +16,7 @@ const TEMPLATE_LABELS: Record<string, string> = {
 const TEMPLATE_GUIDANCE: Record<string, string> = {
   bgp_advertise_add: "Edits entries inside the peer’s attached prefix list. For new work, use Change BGP export policy to change the peer attachment.",
   bgp_advertise_remove: "Removes entries inside the peer’s attached prefix list. For new work, use Change BGP export policy to change the peer attachment.",
-  bgp_export_policy_set: "Changes which existing prefix list or route map is attached outbound to the selected peer; it does not edit policy contents.",
+  bgp_export_policy_set: "Changes which policy is attached outbound to the selected peer. Prefix-list changes preserve the outbound route map, which may also filter routes. Shared policy contents are not edited.",
 };
 
 /** snake_case / kebab / space token -> human Title Case, respecting acronyms

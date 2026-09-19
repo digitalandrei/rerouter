@@ -1,4 +1,17 @@
-import type { ActionDraft } from "@/lib/api";
+import type { ActionDraft, ManualMitigationCapabilities, ManualMitigationPreview, Template, VerificationMode } from "@/lib/api";
+
+export function configurationOnlyEligible(actions: ActionDraft[], templates: Template[], capabilities: ManualMitigationCapabilities): boolean {
+  const enabled = actions.filter((action) => action.enabled !== false);
+  return enabled.length > 0
+    && new Set(enabled.map((action) => action.device_id)).size === 1
+    && capabilities.configuration_test_device_ids.includes(enabled[0].device_id)
+    && enabled.every((action) => capabilities.configuration_test_templates.includes(templates.find((template) => template.id === action.reroute_template_id)?.name ?? ""));
+}
+
+export function previewMatchesVerificationMode(preview: ManualMitigationPreview, requested: VerificationMode): boolean {
+  const returned = preview.verification_mode ?? "routing";
+  return returned === requested && (returned !== "configuration_only" || preview.routing_verified === false);
+}
 
 export type ActionOverride = {
   device_id: number;

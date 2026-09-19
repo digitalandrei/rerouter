@@ -2,6 +2,7 @@ mod common;
 
 use rerouter_controller::reroute::device_plan::{
     self, DeviceStateSnapshot, PreparationReader, PrepareInput, PreparedSafetyEffect,
+    VerificationMode,
 };
 use serde_json::json;
 
@@ -51,11 +52,14 @@ async fn sanitized_ema3_snapshot_prepares_exact_additive_replacement() {
         template_name: "bgp_export_policy_set".into(),
         canonical_params: json!({"neighbor_ip":"23.45.23.197","policy_kind":"prefix_list","policy_name":"pfx-to-viva"}),
     };
-    let prepared =
-        device_plan::prepare_actions_read_only_with_reader(pool, &[input], &Ema3Snapshot)
-            .await
-            .unwrap()
-            .remove(0);
+    let prepared = device_plan::prepare_actions_read_only_with_reader(
+        pool,
+        std::slice::from_ref(&input),
+        &Ema3Snapshot,
+    )
+    .await
+    .unwrap()
+    .remove(0);
     let DeviceStateSnapshot::ExportPolicyAttachment {
         prefix_list: before,
         ..
@@ -89,6 +93,36 @@ async fn sanitized_ema3_snapshot_prepares_exact_additive_replacement() {
         .collect::<Vec<_>>();
     assert!(advertised.contains(&"194.105.142.0/24"));
     assert!(advertised.contains(&"194.102.117.0/24"));
+    let configuration_only = device_plan::prepare_actions_read_only_with_reader_for_mode(
+        pool,
+        &[input],
+        &Ema3Snapshot,
+        VerificationMode::ConfigurationOnly,
+    )
+    .await
+    .unwrap()
+    .remove(0);
+    assert_eq!(
+        configuration_only.verification_mode,
+        VerificationMode::ConfigurationOnly
+    );
+    assert!(configuration_only
+        .verify
+        .iter()
+        .all(|state| !matches!(state, DeviceStateSnapshot::BgpAdvertisement { .. })));
+    assert!(configuration_only
+        .verify
+        .iter()
+        .any(|state| matches!(state, DeviceStateSnapshot::ExportPolicyAttachment { .. })));
+    let inverse = configuration_only.inverse.as_ref().expect("proven inverse");
+    assert_eq!(
+        inverse.verification_mode,
+        VerificationMode::ConfigurationOnly
+    );
+    assert!(inverse
+        .verify
+        .iter()
+        .all(|state| !matches!(state, DeviceStateSnapshot::BgpAdvertisement { .. })));
     sqlx::query("DELETE FROM devices WHERE id=?")
         .bind(device)
         .execute(pool)

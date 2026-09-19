@@ -437,6 +437,25 @@ pub(crate) async fn execute_with<S: SshExecutor>(
             )
         }
     };
+    if prepared_action.verification_mode
+        == crate::reroute::device_plan::VerificationMode::ConfigurationOnly
+    {
+        if !configuration_only_authority_allowed(unattended, req.rule_id) {
+            return blocked(
+                &req,
+                device_name,
+                "configuration-only verification cannot run through automatic authority, recovery, or rules".into(),
+            );
+        }
+        let designated = self::configuration_test_identity_matches(pool, cfg, req.device_id).await;
+        if !designated {
+            return blocked(
+                &req,
+                device_name,
+                "configuration-only lab device identity changed before execution".into(),
+            );
+        }
+    }
     let plan = RenderedPlan {
         template_id: prepared_action.template_id,
         template_name: prepared_action.template_name.clone(),
@@ -632,6 +651,49 @@ pub(crate) async fn execute_with<S: SshExecutor>(
         device_id: req.device_id,
         device_name,
     }
+}
+
+fn configuration_only_authority_allowed(unattended: bool, rule_id: Option<u64>) -> bool {
+    !unattended && rule_id.is_none()
+}
+
+#[cfg(test)]
+mod configuration_only_tests {
+    use super::configuration_only_authority_allowed;
+
+    #[test]
+    fn only_direct_manual_authority_can_use_configuration_only_scope() {
+        assert!(configuration_only_authority_allowed(false, None));
+        assert!(!configuration_only_authority_allowed(true, None));
+        assert!(!configuration_only_authority_allowed(false, Some(7)));
+        assert!(!configuration_only_authority_allowed(true, Some(7)));
+    }
+}
+
+async fn configuration_test_identity_matches(
+    pool: &MySqlPool,
+    cfg: &Config,
+    device_id: u64,
+) -> bool {
+    let Some(expected) = cfg
+        .safety
+        .configuration_test_devices
+        .iter()
+        .find(|device| device.device_id == device_id)
+    else {
+        return false;
+    };
+    let actual = RusshExecutor::new(pool.clone())
+        .transport_identities(&[device_id])
+        .await;
+    actual
+        .ok()
+        .and_then(|ids| ids.get(&device_id).cloned())
+        .is_some_and(|actual| {
+            actual.host == expected.host
+                && actual.port == expected.port
+                && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
+        })
 }
 
 async fn validate_execution_authorization(
@@ -927,6 +989,7 @@ async fn load_prepared_action(
             template_id,
             template_name: format!("inverse-of-{original_id}"),
             canonical_params: params.map(|value| value.0).unwrap_or(Value::Null),
+            verification_mode: inverse.verification_mode,
             commands: inverse.commands,
             before: inverse.expected_current,
             after: inverse.restore,

@@ -16,7 +16,7 @@
  *   - otherwise                 -> a plain typed textbox
  * The controlled `values` map is the resolved parameter set the caller submits.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import {
   api,
   type TemplateParamSpec,
@@ -79,6 +79,7 @@ export function ActionParamsForm({
   const [routeMaps, setRouteMaps] = useState<string[]>([]);
   const [policyInventory, setPolicyInventory] = useState<RoutingPolicyInventory | null>(null);
   const [policyError, setPolicyError] = useState<string | null>(null);
+  const policyKindHelpId = useId();
   const isExportPolicy = "neighbor_ip" in schema && "policy_kind" in schema && "policy_name" in schema;
 
   useEffect(() => {
@@ -143,6 +144,10 @@ export function ActionParamsForm({
     return () => { cancelled = true; };
   }, [deviceId, isExportPolicy]);
 
+  useEffect(() => {
+    if (isExportPolicy && values.policy_kind === undefined) onChange({ ...values, policy_kind: "prefix_list" });
+  }, [isExportPolicy, values, onChange]);
+
   const localAsns = Array.from(
     new Set(peers.map((p) => p.local_as).filter((a): a is number => a != null)),
   );
@@ -203,10 +208,11 @@ export function ActionParamsForm({
     const names = kind === "route_map" ? policyInventory?.route_maps.map((item) => item.name) ?? [] : policyInventory?.prefix_lists.map((item) => item.name) ?? [];
     const visibleNames = name && !names.includes(name) ? [name, ...names] : names;
     return <div className="space-y-3 sm:col-span-2">
+      <div className="space-y-1"><p className="text-sm font-medium">{kind === "route_map" ? "Change the outbound route map (advanced)" : "Change the outbound prefix list"}</p><p className="text-xs text-muted-foreground">{kind === "route_map" ? "Choose an existing shared route map for this peer. Its outbound prefix list stays attached." : "Choose an existing shared prefix list for this peer. Its outbound route map stays attached and may also filter routes."}</p></div>
       <div className="grid gap-3 sm:grid-cols-3">
         <label className="space-y-1 text-sm font-medium">Peer<select className={inputClass} value={peer} onChange={(event) => onChange({ ...values, neighbor_ip: event.target.value })}><option value="">Select peer…</option>{peer && !peers.includes(peer) && <option value={peer}>{peer} (missing)</option>}{peers.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-        <label className="space-y-1 text-sm font-medium">Policy type<select className={inputClass} value={kind} onChange={(event) => onChange({ ...values, policy_kind: event.target.value, policy_name: "" })}><option value="prefix_list">Prefix list</option><option value="route_map">Route map</option></select></label>
-        <label className="space-y-1 text-sm font-medium">Outbound policy<select className={inputClass} value={name} onChange={(event) => onChange({ ...values, policy_name: event.target.value })}><option value="">Select policy…</option>{visibleNames.map((item) => <option key={item} value={item}>{item}{!names.includes(item) ? " (missing)" : ""}</option>)}</select></label>
+        <label className="space-y-1 text-sm font-medium">Change attachment<select aria-describedby={policyKindHelpId} className={inputClass} value={kind} onChange={(event) => onChange({ ...values, policy_kind: event.target.value, policy_name: "" })}><option value="prefix_list">Outbound prefix list (recommended)</option><option value="route_map">Outbound route map (advanced)</option></select><span id={policyKindHelpId} className="block text-xs font-normal text-muted-foreground">Changing type clears the selected policy. Saved route-map actions keep their existing type.</span></label>
+        <label className="space-y-1 text-sm font-medium">{kind === "route_map" ? "Outbound route map" : "Outbound prefix list"}<select className={inputClass} value={name} onChange={(event) => onChange({ ...values, policy_name: event.target.value })}><option value="">Select {kind === "route_map" ? "route map" : "prefix list"}…</option>{visibleNames.map((item) => <option key={item} value={item}>{item}{!names.includes(item) ? " (missing)" : ""}</option>)}</select></label>
       </div>
       {policyError && <p role="alert" className="text-sm text-destructive">{policyError}</p>}
       {!policyInventory && !policyError && <p role="status" className="text-sm text-muted-foreground">Loading cached routing policy inventory…</p>}

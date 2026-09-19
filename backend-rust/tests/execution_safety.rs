@@ -360,6 +360,7 @@ async fn destructive_step_is_blocked_when_replacement_flaps_after_its_own_verifi
             template_id,
             template_name: template_name.into(),
             canonical_params: json!({}),
+            verification_mode: device_plan::VerificationMode::Routing,
             commands: vec![
                 "configure terminal".into(),
                 "ip route 192.0.2.1 255.255.255.255 Null0".into(),
@@ -677,6 +678,7 @@ async fn prepared_inverse_uses_persisted_effective_params_not_mutable_catalog_in
         route_map: Some("RM_OLD".into()),
     };
     let inverse = device_plan::PreparedInverse {
+        verification_mode: device_plan::VerificationMode::Routing,
         expected_current: vec![expected_current],
         restore: vec![restore.clone()],
         commands: vec![
@@ -801,6 +803,7 @@ async fn consumed_manual_plan_is_bound_to_its_actor_before_any_ssh_write() {
         template_id,
         template_name: template.name.clone(),
         canonical_params: json!({}),
+        verification_mode: device_plan::VerificationMode::Routing,
         commands: vec![
             "configure terminal".into(),
             "interface Loopback0".into(),

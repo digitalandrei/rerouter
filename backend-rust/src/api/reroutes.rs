@@ -46,6 +46,7 @@ struct RerouteRow {
     bundle_id: Option<u64>,
     mutation_effect: String,
     source_json: Option<sqlx::types::Json<Value>>,
+    planned_steps_json: Option<sqlx::types::Json<Value>>,
     device_id: Option<u64>,
     device_name: Option<String>,
     reroute_template_id: Option<u64>,
@@ -64,7 +65,7 @@ struct RerouteRow {
     created_at: DateTime<Utc>,
 }
 
-const REROUTE_SELECT: &str = "SELECT r.id, r.bundle_id, r.mutation_effect, b.source_json, r.device_id, d.name AS device_name, \
+const REROUTE_SELECT: &str = "SELECT r.id, r.bundle_id, r.mutation_effect, b.source_json, r.planned_steps_json, r.device_id, d.name AS device_name, \
      r.reroute_template_id, t.name AS template_name, t.display_name AS template_display_name, \
      r.trigger_type, r.state, \
      r.reason, r.success, r.verification_status, r.failure_reason, r.rule_id, u.email AS triggered_by, \
@@ -81,6 +82,8 @@ fn reroute_json(r: &RerouteRow) -> Value {
         "bundle_id": r.bundle_id,
         "mutation_effect": r.mutation_effect,
         "source": r.source_json.as_ref().map(|source| &source.0),
+        "verification_mode": r.planned_steps_json.as_ref().and_then(|steps| steps.0.get("verification_mode")).cloned().or_else(||r.source_json.as_ref().and_then(|source| source.0.get("verification_mode")).cloned()).unwrap_or(json!("routing")),
+        "routing_verified": r.source_json.as_ref().and_then(|source| source.0.get("routing_verified")).cloned(),
         "device_id": r.device_id,
         "device_name": r.device_name,
         "reroute_template_id": r.reroute_template_id,
@@ -240,6 +243,7 @@ pub async fn manual(
             &state,
             &g.session,
             manual::PreviewBody {
+                verification_mode: crate::reroute::device_plan::VerificationMode::Routing,
                 preset_id: None,
                 preset_revision: None,
                 actions,
@@ -666,6 +670,8 @@ pub async fn bundle_list(
             "id":r.id,"rule_id":r.rule_id,"trigger_type":r.trigger_type,"state":r.state.clone(),"execution_state":r.state,"reason":r.reason,
             "total_actions":r.total_actions,"completed_actions":r.completed_actions,"failure_reason":r.failure_reason,
             "started_at":r.started_at,"finished_at":r.finished_at,"created_at":r.created_at,
+            "verification_mode":r.source_json.as_ref().and_then(|s|s.0.get("verification_mode")).cloned().unwrap_or(json!("routing")),
+            "routing_verified":r.source_json.as_ref().and_then(|s|s.0.get("routing_verified")).cloned(),
             "source":r.source_json.map(|s|s.0),"triggered_by":r.triggered_by,
             "lifecycle_state":r.lifecycle_state,"remaining_mutations":r.remaining_mutations,
             "active":r.remaining_mutations>0,"recovery_deadline":r.recovery_deadline,
@@ -819,6 +825,8 @@ pub async fn bundle_show(
             json!({"id":id,"rule_id":row.rule_id,"trigger_type":row.trigger_type,"state":row.state,
         "failure_policy":row.failure_policy,"total_actions":row.total_actions,"completed_actions":row.completed_actions,
         "failure_reason":row.failure_reason,"started_at":row.started_at,"finished_at":row.finished_at,"source":source,
+        "verification_mode":source.get("verification_mode").cloned().unwrap_or(json!("routing")),
+        "routing_verified":source.get("routing_verified").cloned(),
         "execution_state":row.state,"lifecycle_state":row.lifecycle_state,"remaining_mutations":row.remaining_mutations,
         "active":row.remaining_mutations>0,"recovery_deadline":row.recovery_deadline,
         "automatic_recovery_cancelled_at":row.automatic_recovery_cancelled_at,

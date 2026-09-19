@@ -89,8 +89,8 @@ pub struct Detection {
     pub deprecated_hysteresis_seconds: Option<u64>,
 }
 
-/// Global operating mode. `Observe` is the safe read-only / alert-only posture:
-/// NO reroute executes — automatic or manual. Detection still runs, and when a
+/// Global operating mode. `Observe` disables autonomous execution. Explicitly
+/// authorized manual runs and reverts still execute. Detection still runs, and when a
 /// rule fires the alert carries the rendered plan of the actions that *would*
 /// have run. The authoritative runtime value lives in
 /// `system_settings.operating_mode` (changed from /settings by an admin,
@@ -107,7 +107,7 @@ pub enum OperatingMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Safety {
-    /// SAFETY: defaults to Observe (read-only / alert-only).
+    /// SAFETY: defaults to Observe (autonomous execution disabled).
     pub operating_mode: OperatingMode,
     pub automatic_actions_enabled: bool,
     /// Global circuit breaker: at most N executed actions per window across all
@@ -120,6 +120,29 @@ pub struct Safety {
     /// Per-device throttle: after any action on a device, that device is in
     /// cooldown for this long (0 = none).
     pub same_device_cooldown_seconds: u64,
+    /// Devices explicitly authorized for manual configuration-only verification.
+    /// Every field must continue to match the current enrolled transport identity.
+    pub configuration_test_devices: Vec<LabDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabDevice {
+    pub device_id: u64,
+    pub host: String,
+    pub port: u16,
+    pub pinned_host_fingerprint: String,
+    #[serde(default = "default_lab_action_rate_limit_count")]
+    pub action_rate_limit_count: u32,
+    #[serde(default = "default_lab_action_rate_limit_window_seconds")]
+    pub action_rate_limit_window_seconds: u64,
+}
+
+fn default_lab_action_rate_limit_count() -> u32 {
+    32
+}
+fn default_lab_action_rate_limit_window_seconds() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -263,13 +286,14 @@ impl Default for Detection {
 impl Default for Safety {
     fn default() -> Self {
         Self {
-            // SAFETY: observe (read-only / alert-only), automatic actions OFF.
+            // SAFETY: Observe and automatic actions OFF by default.
             operating_mode: OperatingMode::Observe,
             automatic_actions_enabled: false,
             global_action_rate_limit_count: 3,
             global_action_rate_limit_window_seconds: 600,
             same_rule_cooldown_seconds: 900,
             same_device_cooldown_seconds: 300,
+            configuration_test_devices: Vec::new(),
         }
     }
 }
@@ -395,6 +419,21 @@ impl Config {
             && self.safety.global_action_rate_limit_window_seconds == 0
         {
             anyhow::bail!("the global action rate-limit window must be non-zero");
+        }
+        let mut configuration_test_device_ids = std::collections::BTreeSet::new();
+        for device in &self.safety.configuration_test_devices {
+            if device.device_id == 0
+                || device.port == 0
+                || device.host.trim().is_empty()
+                || device.pinned_host_fingerprint.trim().is_empty()
+                || !(1..=256).contains(&device.action_rate_limit_count)
+                || device.action_rate_limit_window_seconds == 0
+            {
+                anyhow::bail!("configuration test device identities must be complete");
+            }
+            if !configuration_test_device_ids.insert(device.device_id) {
+                anyhow::bail!("configuration test device ids must be unique");
+            }
         }
         if self.telemetry.stale_after_seconds == 0
             || self.telemetry.reachability_interval_seconds == 0

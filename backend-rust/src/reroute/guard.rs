@@ -21,6 +21,82 @@ use crate::reroute::executor::ActionRequest;
 use crate::reroute::locks;
 use crate::reroute::templates::{RenderedPlan, Template};
 
+#[derive(Debug, Clone)]
+enum RateScope {
+    Routing {
+        limit: u32,
+        window: u64,
+    },
+    ConfigurationOnly {
+        device_id: u64,
+        limit: u32,
+        window: u64,
+    },
+}
+
+async fn bundle_rate_scope(
+    pool: &MySqlPool,
+    cfg: &Config,
+    bundle_id: u64,
+) -> Result<RateScope, BlockReason> {
+    let row: Option<(Option<String>, Option<u64>)> = sqlx::query_as(
+        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.verification_mode')) AS CHAR), MIN(a.device_id) FROM reroute_bundles b LEFT JOIN reroute_bundle_actions a ON a.bundle_id=b.id WHERE b.id=? GROUP BY b.id",
+    ).bind(bundle_id).fetch_optional(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
+    let (mode, device_id) =
+        row.ok_or_else(|| BlockReason::GateReadFailed("bundle missing".into()))?;
+    if mode.as_deref() == Some("configuration_only") {
+        let device_id = device_id
+            .ok_or_else(|| BlockReason::GateReadFailed("lab bundle has no device".into()))?;
+        let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND (device_id<>? OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'configuration_only')")
+            .bind(bundle_id).bind(device_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
+        if invalid != 0 {
+            return Err(BlockReason::GateReadFailed(
+                "lab bundle ledger has mixed scope or targets".into(),
+            ));
+        }
+        let lab = cfg
+            .safety
+            .configuration_test_devices
+            .iter()
+            .find(|d| d.device_id == device_id)
+            .ok_or_else(|| {
+                BlockReason::GateReadFailed("lab device is no longer designated".into())
+            })?;
+        Ok(RateScope::ConfigurationOnly {
+            device_id,
+            limit: lab.action_rate_limit_count,
+            window: lab.action_rate_limit_window_seconds,
+        })
+    } else if mode.as_deref().is_none() || mode.as_deref() == Some("routing") {
+        let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'routing'")
+            .bind(bundle_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
+        if invalid != 0 {
+            return Err(BlockReason::GateReadFailed(
+                "routing bundle ledger has mixed verification scope".into(),
+            ));
+        }
+        Ok(RateScope::Routing {
+            limit: cfg.safety.global_action_rate_limit_count,
+            window: cfg.safety.global_action_rate_limit_window_seconds,
+        })
+    } else {
+        Err(BlockReason::GateReadFailed(
+            "bundle has unknown verification scope".into(),
+        ))
+    }
+}
+
+fn rate_values(scope: &RateScope) -> (u32, u64, String) {
+    match scope {
+        RateScope::Routing { limit, window } => (*limit, *window, "reroute:rate-global".into()),
+        RateScope::ConfigurationOnly {
+            device_id,
+            limit,
+            window,
+        } => (*limit, *window, format!("reroute:rate-lab:{device_id}")),
+    }
+}
+
 /// Cross-component policy fence. The detached connection is never returned to
 /// the pool while it owns the MySQL advisory lock; cancellation/drop closes the
 /// socket and MySQL releases the lock with the session.
@@ -487,17 +563,17 @@ pub async fn admit_bundle(
     bundle_id: u64,
     size: u32,
 ) -> Result<(), BlockReason> {
-    let limit = cfg.safety.global_action_rate_limit_count;
+    let scope = bundle_rate_scope(pool, cfg, bundle_id).await?;
+    let (limit, window, rate_lock_suffix) = rate_values(&scope);
     if limit == 0 {
         return Ok(());
     }
-    let window = cfg.safety.global_action_rate_limit_window_seconds;
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
 
-    let rate_lock = crate::db::scoped_advisory_lock_name(&mut conn, "reroute:rate-global")
+    let rate_lock = crate::db::scoped_advisory_lock_name(&mut conn, &rate_lock_suffix)
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     conn.close_on_drop();
@@ -511,8 +587,13 @@ pub async fn admit_bundle(
         return Err(BlockReason::GuardBusy);
     }
 
-    let already = recent_reroute_count_on(&mut conn, window, Some(bundle_id)).await;
-    let outstanding = outstanding_bundle_actions(&mut conn, window, bundle_id).await;
+    let lab_device = match scope {
+        RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
+        _ => None,
+    };
+    let already = scoped_recent_reroute_count(&mut conn, window, Some(bundle_id), lab_device).await;
+    let outstanding =
+        scoped_outstanding_bundle_actions(&mut conn, window, bundle_id, lab_device).await;
     let projected = already.saturating_add(outstanding);
     if projected.saturating_add(size as i64) > limit as i64 {
         let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
@@ -558,29 +639,39 @@ pub async fn admit_bundle(
     Ok(())
 }
 
-/// Capacity other in-flight bundles have reserved but not yet spent, within the
-/// rate window. Fails closed (large number) on a read error, like the counters.
-async fn outstanding_bundle_actions(
+/// Scoped recent action count. Fails closed on a read error.
+async fn scoped_recent_reroute_count(
+    conn: &mut MySqlConnection,
+    window_secs: u64,
+    exclude_bundle: Option<u64>,
+    lab_device: Option<u64>,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM reroutes r LEFT JOIN reroute_bundles b ON b.id=r.bundle_id \
+         WHERE r.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+           AND (? IS NULL OR r.bundle_id IS NULL OR r.bundle_id<>?) \
+           AND (COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.planned_steps_json,'$.verification_mode')),JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.verification_mode')),'routing')='configuration_only')=? \
+           AND (? IS NULL OR r.device_id=?)",
+    )
+    .bind(window_secs as i64).bind(exclude_bundle).bind(exclude_bundle).bind(lab_device.is_some()).bind(lab_device).bind(lab_device)
+    .fetch_one(&mut *conn).await.unwrap_or(i64::MAX)
+}
+
+async fn scoped_outstanding_bundle_actions(
     conn: &mut MySqlConnection,
     window_secs: u64,
     exclude_bundle: u64,
+    lab_device: Option<u64>,
 ) -> i64 {
-    // SUM() yields DECIMAL, which does not decode into i64 — without the outer
-    // CAST this read ERRORS as soon as one other bundle is in flight, and the
-    // fail-closed fallback then refuses every bundle while looking like a
-    // legitimate rate-limit refusal. COALESCE keeps the no-rows case at 0.
     sqlx::query_scalar::<_, i64>(
-        "SELECT CAST(COALESCE(SUM(CAST(rate_reserved_actions AS SIGNED)), 0) AS SIGNED) \
-           FROM reroute_bundles \
-          WHERE state IN ('planned', 'running', 'compensating') \
-            AND id <> ? \
-            AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
+        "SELECT CAST(COALESCE(SUM(CAST(rate_reserved_actions AS SIGNED)),0) AS SIGNED) FROM reroute_bundles \
+         WHERE state IN ('planned','running','compensating') AND id<>? \
+           AND created_at>DATE_SUB(UTC_TIMESTAMP(),INTERVAL ? SECOND) \
+           AND (COALESCE(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')),'routing')='configuration_only')=? \
+           AND (? IS NULL OR EXISTS(SELECT 1 FROM reroute_bundle_actions a WHERE a.bundle_id=reroute_bundles.id AND a.device_id=?))",
     )
-    .bind(exclude_bundle)
-    .bind(window_secs as i64)
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap_or(i64::MAX)
+    .bind(exclude_bundle).bind(window_secs as i64).bind(lab_device.is_some()).bind(lab_device).bind(lab_device)
+    .fetch_one(&mut *conn).await.unwrap_or(i64::MAX)
 }
 
 async fn outstanding_bundle_actions_pool(
@@ -593,6 +684,7 @@ async fn outstanding_bundle_actions_pool(
            FROM reroute_bundles \
           WHERE state IN ('planned', 'running', 'compensating') \
             AND (? IS NULL OR id <> ?) \
+            AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')),'routing')<>'configuration_only' \
             AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
     )
     .bind(exclude_bundle)
@@ -613,6 +705,7 @@ async fn outstanding_bundle_actions_pool_on(
            FROM reroute_bundles \
           WHERE state IN ('planned', 'running', 'compensating') \
             AND (? IS NULL OR id <> ?) \
+            AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')),'routing')<>'configuration_only' \
             AND created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND)",
     )
     .bind(exclude_bundle)
@@ -639,6 +732,14 @@ pub async fn reserve_and_persist(
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<u64, BlockReason> {
+    let rate_scope = match req.bundle {
+        Some(bundle) => bundle_rate_scope(pool, cfg, bundle.bundle_id).await?,
+        None => RateScope::Routing {
+            limit: cfg.safety.global_action_rate_limit_count,
+            window: cfg.safety.global_action_rate_limit_window_seconds,
+        },
+    };
+    let (rate_limit, rate_window, rate_lock_suffix) = rate_values(&rate_scope);
     let mut conn = pool
         .acquire()
         .await
@@ -646,12 +747,10 @@ pub async fn reserve_and_persist(
 
     // Global rate-limit critical section. Every non-corrective trigger participates
     // so concurrent manual and automatic requests share one authoritative budget.
-    let rate_limit = cfg.safety.global_action_rate_limit_count;
-    let rate_window = cfg.safety.global_action_rate_limit_window_seconds;
     let use_global = req.trigger_type != "rollback" && rate_limit > 0;
     let mut rate_lock = None;
     if use_global {
-        let name = crate::db::scoped_advisory_lock_name(&mut conn, "reroute:rate-global")
+        let name = crate::db::scoped_advisory_lock_name(&mut conn, &rate_lock_suffix)
             .await
             .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
         conn.close_on_drop();
@@ -665,14 +764,33 @@ pub async fn reserve_and_persist(
             return Err(BlockReason::GuardBusy);
         }
         rate_lock = Some(name);
-        let recent =
-            recent_reroute_count_on(&mut conn, rate_window, req.bundle.map(|b| b.bundle_id)).await;
-        let reserved_elsewhere = outstanding_bundle_actions_pool_on(
+        let lab_device = match rate_scope {
+            RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
+            _ => None,
+        };
+        let recent = scoped_recent_reroute_count(
             &mut conn,
             rate_window,
             req.bundle.map(|b| b.bundle_id),
+            lab_device,
         )
         .await;
+        let reserved_elsewhere = if lab_device.is_some() {
+            scoped_outstanding_bundle_actions(
+                &mut conn,
+                rate_window,
+                req.bundle.map(|b| b.bundle_id).unwrap_or(0),
+                lab_device,
+            )
+            .await
+        } else {
+            outstanding_bundle_actions_pool_on(
+                &mut conn,
+                rate_window,
+                req.bundle.map(|b| b.bundle_id),
+            )
+            .await
+        };
         let projected = recent.saturating_add(reserved_elsewhere);
         let own_reserved = if let Some(bundle) = req.bundle {
             sqlx::query_scalar::<_, u32>(
@@ -889,34 +1007,15 @@ async fn recent_reroute_count(
     exclude_bundle: Option<u64>,
 ) -> i64 {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM reroutes \
-          WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
-            AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
+        "SELECT COUNT(*) FROM reroutes r LEFT JOIN reroute_bundles b ON b.id=r.bundle_id \
+          WHERE r.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
+            AND (? IS NULL OR r.bundle_id IS NULL OR r.bundle_id <> ?) \
+            AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.planned_steps_json,'$.verification_mode')),JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.verification_mode')),'routing')<>'configuration_only'",
     )
     .bind(window_secs as i64)
     .bind(exclude_bundle)
     .bind(exclude_bundle)
     .fetch_one(pool)
-    .await
-    .unwrap_or(i64::MAX)
-}
-
-/// Same fail-closed count, executed on the connection that owns the advisory
-/// lock so the critical section cannot outlive its lock connection.
-async fn recent_reroute_count_on(
-    conn: &mut MySqlConnection,
-    window_secs: u64,
-    exclude_bundle: Option<u64>,
-) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM reroutes \
-          WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? SECOND) \
-            AND (? IS NULL OR bundle_id IS NULL OR bundle_id <> ?)",
-    )
-    .bind(window_secs as i64)
-    .bind(exclude_bundle)
-    .bind(exclude_bundle)
-    .fetch_one(&mut *conn)
     .await
     .unwrap_or(i64::MAX)
 }
@@ -927,7 +1026,7 @@ async fn insert_reroute(
     plan: &RenderedPlan,
     consume_bundle_reservation: bool,
 ) -> anyhow::Result<u64> {
-    let steps = json!({ "commands": plan.commands, "verify": plan.verify });
+    let mut steps = json!({ "commands": plan.commands, "verify": plan.verify });
     let mut tx = conn.begin().await?;
     let auth = req
         .authorization
@@ -976,6 +1075,7 @@ async fn insert_reroute(
                 template_id: req.template.id,
                 template_name: req.template.name.clone(),
                 canonical_params: original.1.map(|value| value.0).unwrap_or(Value::Null),
+                verification_mode: inverse.verification_mode,
                 commands: inverse.commands,
                 before: inverse.expected_current,
                 after: inverse.restore,
@@ -993,6 +1093,7 @@ async fn insert_reroute(
             anyhow::bail!("reroute has no durable prepared sibling");
         };
     prepared.validate()?;
+    steps["verification_mode"] = serde_json::to_value(prepared.verification_mode)?;
     let prior_state = serde_json::to_value(&prepared.before)?;
     let after_state = serde_json::to_value(&prepared.after)?;
     let rollback_snapshot = match prepared.inverse.as_ref() {

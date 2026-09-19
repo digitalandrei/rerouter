@@ -4,6 +4,73 @@ use chrono::{DateTime, Utc};
 use rerouter_controller::{config::Config, reroute::recovery};
 
 #[tokio::test]
+async fn configuration_only_run_never_schedules_or_claims_automatic_recovery() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    sqlx::query("UPDATE system_settings SET `value`='enforce' WHERE `key`='operating_mode'")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE system_settings SET `value`='true' WHERE `key`='automatic_actions_enabled'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'192.0.2.211')")
+        .bind(format!(
+            "configuration-only-lifecycle-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let bundle = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,completed_actions,finished_at,remaining_mutations,source_json) VALUES('manual','succeeded','abort_and_compensate',1,1,UTC_TIMESTAMP(),1,JSON_OBJECT('verification_mode','configuration_only','revert_after_seconds',60))")
+        .execute(pool).await.unwrap().last_insert_id();
+    let reroute = sqlx::query("INSERT INTO reroutes(bundle_id,bundle_position,device_id,trigger_type,state,mutation_effect) VALUES(?,0,?,'manual','succeeded','changed')")
+        .bind(bundle).bind(device).execute(pool).await.unwrap().last_insert_id();
+    recovery::schedule_if_eligible(pool, bundle).await.unwrap();
+    let deadline: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT recovery_deadline FROM reroute_bundles WHERE id=?")
+            .bind(bundle)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(deadline.is_none());
+    sqlx::query("UPDATE reroute_bundles SET lifecycle_state='recovery_scheduled',recovery_deadline=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND) WHERE id=?").bind(bundle).execute(pool).await.unwrap();
+    assert!(recovery::claim_one_due(pool, &Config::default())
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::query("DELETE FROM reroutes WHERE id=?")
+        .bind(reroute)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+        .bind(bundle)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM devices WHERE id=?")
+        .bind(device)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE system_settings SET `value`='observe' WHERE `key`='operating_mode'")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE system_settings SET `value`='false' WHERE `key`='automatic_actions_enabled'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn timer_is_anchored_once_and_disabled_automation_leaves_it_pending() {
     let db = common::test_database().await;
     let pool = db.pool();

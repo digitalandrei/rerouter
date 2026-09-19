@@ -1,6 +1,6 @@
 mod common;
 use rerouter_controller::reroute::{
-    device_plan::{self, DeviceStateSnapshot, PreparationReader, PrepareInput},
+    device_plan::{self, DeviceStateSnapshot, PreparationReader, PrepareInput, VerificationMode},
     templates,
 };
 use serde_json::json;
@@ -51,14 +51,15 @@ async fn snmp_short_alias_canonicalizes_to_proven_cli_interface_identity() {
     .await
     .unwrap();
     assert_eq!(canonical["interface"], "Port-channel1");
+    let input = PrepareInput {
+        device_id: device,
+        template_id: tid,
+        template_name: template.name.clone(),
+        canonical_params: canonical,
+    };
     let prepared = device_plan::prepare_actions_read_only_with_reader(
         pool,
-        &[PrepareInput {
-            device_id: device,
-            template_id: tid,
-            template_name: template.name.clone(),
-            canonical_params: canonical,
-        }],
+        std::slice::from_ref(&input),
         &InterfaceRead,
     )
     .await
@@ -76,6 +77,27 @@ async fn snmp_short_alias_canonicalizes_to_proven_cli_interface_identity() {
         .unwrap()
         .commands
         .contains(&"no ip tcp adjust-mss".into()));
+    let configuration_only = device_plan::prepare_actions_read_only_with_reader_for_mode(
+        pool,
+        &[input],
+        &InterfaceRead,
+        VerificationMode::ConfigurationOnly,
+    )
+    .await
+    .unwrap()
+    .remove(0);
+    assert_eq!(
+        configuration_only.verification_mode,
+        VerificationMode::ConfigurationOnly
+    );
+    assert_eq!(
+        configuration_only
+            .inverse
+            .as_ref()
+            .unwrap()
+            .verification_mode,
+        VerificationMode::ConfigurationOnly
+    );
     let invalid = templates::canonicalize_inventory_params(
         pool,
         device,

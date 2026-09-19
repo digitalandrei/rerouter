@@ -148,7 +148,7 @@ export function OrderedActionSetEditor({
                   target resolved from rule flows
                 </span>
               )}
-              {isPolicyChange && <span><span className="font-medium text-foreground">Peer {String(action.params.neighbor_ip ?? "not selected")}</span> · {action.params.policy_kind === "route_map" ? "route map" : "prefix list"} {String(action.params.policy_name ?? "not selected")}</span>}
+              {isPolicyChange && <span><span className="font-medium text-foreground">Peer {String(action.params.neighbor_ip ?? "not selected")}</span> · {action.params.policy_kind === "route_map" ? "Outbound route map" : "Outbound prefix list"}: {String(action.params.policy_name ?? "not selected")}{action.params.policy_kind !== "route_map" ? " · route map preserved" : " · prefix list preserved"}</span>}
               {!isPolicyChange && params.map(([name, value]) => (
                 <span key={name} className="break-all">
                   <span className="font-medium text-foreground">{template?.parameter_schema[name]?.label ?? name.replaceAll("_", " ")}</span>: {typeof value === "boolean" ? (value ? "Yes" : "No") : String(value)}

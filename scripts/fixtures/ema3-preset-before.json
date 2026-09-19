@@ -1,0 +1,822 @@
+[
+  {
+    "kind": "preset",
+    "value": {
+      "id": 1,
+      "name": "e-manuel-apply",
+      "revision": 4,
+      "archived_at": null,
+      "description": "advertise prefix 194.105.142.0/24 to Akamai, remove prefix 194.105.142.0/24 from on-prem ISP and mss clamp to 1436."
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 31,
+      "params": {
+        "neighbor_ip": "23.45.23.197",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 0,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 32,
+      "params": {
+        "neighbor_ip": "23.45.23.209",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 1,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 33,
+      "params": {
+        "neighbor_ip": "23.45.23.199",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 2,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 34,
+      "params": {
+        "neighbor_ip": "23.45.23.211",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 3,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 35,
+      "params": {
+        "neighbor_ip": "23.45.23.201",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 4,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 36,
+      "params": {
+        "neighbor_ip": "23.45.23.213",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 5,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 37,
+      "params": {
+        "neighbor_ip": "23.45.23.203",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 6,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 38,
+      "params": {
+        "neighbor_ip": "23.45.23.215",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 7,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 39,
+      "params": {
+        "neighbor_ip": "23.45.23.205",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 8,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 40,
+      "params": {
+        "neighbor_ip": "23.45.23.217",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 9,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 41,
+      "params": {
+        "neighbor_ip": "23.45.23.219",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-194105142-only"
+      },
+      "enabled": 1,
+      "position": 10,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 42,
+      "params": {
+        "neighbor_ip": "23.45.23.207",
+        "policy_kind": "prefix_list",
+        "policy_name": "pfx-to-viva"
+      },
+      "enabled": 1,
+      "position": 11,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 43,
+      "params": {
+        "mss": "1436",
+        "interface": "Po1"
+      },
+      "enabled": 1,
+      "position": 12,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "iface_tcp_adjust_mss",
+      "reroute_template_id": 12
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 44,
+      "params": {
+        "mss": "1436",
+        "interface": "Po1"
+      },
+      "enabled": 1,
+      "position": 13,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "iface_tcp_adjust_mss",
+      "reroute_template_id": 12
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 45,
+      "params": {
+        "neighbor_ip": "213.249.122.145",
+        "policy_kind": "prefix_list",
+        "policy_name": "no-export"
+      },
+      "enabled": 1,
+      "position": 14,
+      "device_id": 2,
+      "preset_id": 1,
+      "device_name": "eMA1",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "action",
+    "value": {
+      "id": 46,
+      "params": {
+        "neighbor_ip": "213.249.122.169",
+        "policy_kind": "prefix_list",
+        "policy_name": "rr-colt-without-194105142"
+      },
+      "enabled": 1,
+      "position": 15,
+      "device_id": 1,
+      "preset_id": 1,
+      "device_name": "eMA2",
+      "template_name": "bgp_export_policy_set",
+      "reroute_template_id": 22
+    }
+  },
+  {
+    "kind": "device",
+    "value": {
+      "id": 1,
+      "name": "eMA2"
+    }
+  },
+  {
+    "kind": "device",
+    "value": {
+      "id": 2,
+      "name": "eMA1"
+    }
+  },
+  {
+    "kind": "device",
+    "value": {
+      "id": 3,
+      "name": "eMA3"
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 4,
+      "name": "null_route_prefix",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 5,
+      "name": "null_route_withdraw",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 6,
+      "name": "bgp_session_enable",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 7,
+      "name": "bgp_session_disable",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 8,
+      "name": "blackhole_prefix",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 9,
+      "name": "blackhole_withdraw",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 10,
+      "name": "bgp_advertise_add",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 11,
+      "name": "bgp_advertise_remove",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 12,
+      "name": "iface_tcp_adjust_mss",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 13,
+      "name": "iface_tcp_adjust_mss_remove",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 14,
+      "name": "iface_shutdown",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 15,
+      "name": "iface_no_shutdown",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 16,
+      "name": "null_route_prefix_v6",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 17,
+      "name": "null_route_withdraw_v6",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 18,
+      "name": "blackhole_prefix_v6",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 19,
+      "name": "blackhole_withdraw_v6",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 20,
+      "name": "bgp_route_map_set",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 21,
+      "name": "bgp_route_map_unset",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "template",
+    "value": {
+      "id": 22,
+      "name": "bgp_export_policy_set",
+      "enabled": 1
+    }
+  },
+  {
+    "kind": "inventory",
+    "value": {
+      "read_at": "2026-09-19 09:03:11.000000",
+      "device_id": 3,
+      "inventory": {
+        "read_at": "2026-09-19T09:03:10.907428528Z",
+        "blockers": [],
+        "device_id": 3,
+        "route_maps": [
+          {
+            "name": "prepend-1",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "as-path_prepend",
+                    "value": "as-path prepend 34501"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 100
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "prepend-2",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "as-path_prepend",
+                    "value": "as-path prepend 34501 34501"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 100
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "prepend-3",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "as-path_prepend",
+                    "value": "as-path prepend 34501 34501 34501"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 100
+              }
+            ],
+            "references": [
+              "neighbor:89.33.22.81:ipv4:out"
+            ]
+          },
+          {
+            "name": "prepend-4",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "as-path_prepend",
+                    "value": "as-path prepend 34501 34501 34501 34501"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 100
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "prepend-5",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "as-path_prepend",
+                    "value": "as-path prepend 34501 34501 34501 34501 34501"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 100
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "set-metric",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "metric_80",
+                    "value": "metric 80"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 10
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "set-pref-150",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "local-preference_150",
+                    "value": "local-preference 150"
+                  }
+                ],
+                "action": "permit",
+                "matches": [],
+                "sequence": 10
+              }
+            ],
+            "references": []
+          },
+          {
+            "name": "teste-iulian",
+            "clauses": [
+              {
+                "sets": [
+                  {
+                    "kind": "local-preference_201",
+                    "value": "local-preference 201"
+                  }
+                ],
+                "action": "permit",
+                "matches": [
+                  {
+                    "kind": "ip_address_10",
+                    "value": "ip address 10"
+                  }
+                ],
+                "sequence": 10
+              },
+              {
+                "sets": [
+                  {
+                    "kind": "local-preference_199",
+                    "value": "local-preference 199"
+                  }
+                ],
+                "action": "permit",
+                "matches": [
+                  {
+                    "kind": "ip_address_10",
+                    "value": "ip address 10"
+                  }
+                ],
+                "sequence": 11
+              }
+            ],
+            "references": []
+          }
+        ],
+        "completeness": "complete",
+        "prefix_lists": [
+          {
+            "name": "no-default",
+            "entries": [
+              {
+                "action": "deny",
+                "prefix": "0.0.0.0/0",
+                "sequence": 10
+              },
+              {
+                "ge": 1,
+                "le": 24,
+                "action": "permit",
+                "prefix": "0.0.0.0/0",
+                "sequence": 20
+              }
+            ],
+            "referenced_by": []
+          },
+          {
+            "name": "no-export",
+            "entries": [
+              {
+                "le": 32,
+                "action": "deny",
+                "prefix": "0.0.0.0/0",
+                "sequence": 10
+              }
+            ],
+            "referenced_by": [
+              "neighbor:23.45.23.197:ipv4:out",
+              "neighbor:23.45.23.199:ipv4:out",
+              "neighbor:23.45.23.201:ipv4:out",
+              "neighbor:23.45.23.203:ipv4:out",
+              "neighbor:23.45.23.205:ipv4:out",
+              "neighbor:23.45.23.207:ipv4:out"
+            ]
+          },
+          {
+            "name": "pfx-to-viva",
+            "entries": [
+              {
+                "action": "permit",
+                "prefix": "194.105.142.0/24",
+                "sequence": 5
+              },
+              {
+                "le": 32,
+                "action": "deny",
+                "prefix": "0.0.0.0/0",
+                "sequence": 10
+              }
+            ],
+            "referenced_by": [
+              "neighbor:89.33.22.81:ipv4:out",
+              "neighbor:213.249.122.145:ipv4:out"
+            ]
+          },
+          {
+            "name": "send-default",
+            "entries": [
+              {
+                "action": "permit",
+                "prefix": "0.0.0.0/0",
+                "sequence": 10
+              },
+              {
+                "action": "permit",
+                "prefix": "194.105.142.0/24",
+                "sequence": 20
+              },
+              {
+                "ge": 1,
+                "le": 24,
+                "action": "deny",
+                "prefix": "0.0.0.0/0",
+                "sequence": 30
+              }
+            ],
+            "referenced_by": []
+          }
+        ],
+        "peer_bindings": [
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.197",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.199",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.201",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.203",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.205",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "23.45.23.207",
+            "policy_kind": "prefix_list",
+            "policy_name": "no-export",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "89.33.22.81",
+            "policy_kind": "prefix_list",
+            "policy_name": "pfx-to-viva",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "89.33.22.81",
+            "policy_kind": "route_map",
+            "policy_name": "prepend-3",
+            "address_family": "ipv4"
+          },
+          {
+            "scope": "direct",
+            "direction": "out",
+            "local_asn": 34501,
+            "neighbor_ip": "213.249.122.145",
+            "policy_kind": "prefix_list",
+            "policy_name": "pfx-to-viva",
+            "address_family": "ipv4"
+          }
+        ]
+      },
+      "completeness": "complete"
+    }
+  },
+  {
+    "kind": "state",
+    "value": {
+      "mode": "observe",
+      "runs": 0,
+      "locks": 0,
+      "rules": 13,
+      "bundles": 0,
+      "automatic": "false"
+    }
+  }
+]
