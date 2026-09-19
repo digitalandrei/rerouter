@@ -137,3 +137,17 @@ explicit fields. No schema migration is required.
 
 Deployment remains the final step at this commit. Use the reviewed deploy script,
 config manifest and staged hashes. Do not execute or revert any live mitigation.
+
+## Deployment completed
+
+Release `4129744de24ee346dfc9ae34e7238d1bd1ee356c` is deployed and read-only
+verified: schema 69, 13 rules, 19 templates, only lab device 3. The original and
+new definitions are unchanged by deployment; runs, bundles and active locks
+remain zero. The environment is unchanged. All 46 public frontend files match.
+Backup: `/root/rerouter-backups/ema3-lab-4129744de24e`.
+See `docs/ema3-lab-release-20260919.md` for acceptance evidence.
+
+The owned MySQL test schema/account and tunnel were removed, and the private
+test URL was deleted. The temporary deployment SSH connection was closed using
+its own control socket after process identity verification. Database services
+were never stopped. No live mitigation, revert or router write was performed.
