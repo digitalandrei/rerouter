@@ -73,3 +73,23 @@ keeping full action evidence available below the run summary.
 
 Detailed browser and release evidence is under
 `/tmp/rerouter-workflow-review-20260919/mitigation-clarity/`.
+
+## Deployment result
+
+Deployed source `3276418925c6dde0e6cf9fae809b5ffc4b3846cd` to EMDD.
+The controller and public frontend hashes match the reviewed release, schema 69
+remains current, and health/readiness return OK. The configuration and session
+environment are unchanged.
+
+The deployment preserved the application data byte-for-byte across its guarded
+snapshots: 13 rules, two saved definitions, 24 saved definition actions, one
+original run, eight action records, and zero active locks. Run 1 remains
+`succeeded`, lifecycle `active`, with 8/8 actions complete and eight owned
+changes. It has no recovery child or recovery claim. The eMA3 saved definition
+reports Ready; the original eMA1/eMA2 definition remains Needs setup.
+
+No preview, apply, revert, notification test, router command, or router
+connection was issued during deployment. The restorable backup is
+`/root/rerouter-backups/mitigation-clarity-3276418925c6`; its compressed database
+evidence is 40,457,282 bytes with SHA-256
+`b13c9291903a0aa39097270e730bf34e11af0704650b33fb363455a6aa646088`.
