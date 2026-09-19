@@ -141,6 +141,27 @@ pub(crate) async fn recent_for_preset(
     .await
 }
 
+/// Every currently active original run for a saved definition. This is kept
+/// separate from the bounded recent-history slice: an applied run can remain
+/// active while many newer no-op, failed, or already-reverted runs accumulate.
+pub(crate) async fn active_for_preset(
+    pool: &MySqlPool,
+    preset_id: u64,
+) -> anyhow::Result<Vec<Value>> {
+    list(
+        pool,
+        &RunSummaryFilter {
+            lifecycle: Some("active"),
+            preset_id: Some(preset_id),
+            original_only: true,
+            ..Default::default()
+        },
+        256,
+        0,
+    )
+    .await
+}
+
 #[derive(sqlx::FromRow)]
 struct DeviceRow {
     bundle_id: u64,

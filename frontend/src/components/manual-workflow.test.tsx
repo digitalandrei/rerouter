@@ -22,7 +22,7 @@ describe("manual mitigation workflow", () => {
     const view = render(<BrowserRouter><BundleProgressView bundle={healthy} bundleId={1} totalHint={8} pollError={null} /></BrowserRouter>);
     expect(screen.queryByText(/changes? (?:is|are) still applied/i)).toBeNull();
     view.rerender(<BrowserRouter><BundleProgressView bundle={{ ...healthy, state: "compensation_blocked", execution_state: "compensation_blocked", lifecycle_state: "recovery_blocked" }} bundleId={1} totalHint={8} pollError={null} /></BrowserRouter>);
-    expect(screen.getByText(/changes? (?:is|are) still applied/i)).toBeTruthy();
+    expect(screen.getByText(/known changes remain/i)).toBeTruthy();
   });
   it("only inspects after an explicit click and invalidates evidence after edits", async () => {
     const user = userEvent.setup();

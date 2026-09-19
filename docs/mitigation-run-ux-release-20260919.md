@@ -62,7 +62,7 @@ keeping full action evidence available below the run summary.
 - Complete backend suite passed on the dedicated MariaDB test schema.
 - Complete backend suite passed on an isolated MySQL 8 schema; the temporary
   schema, restricted account, and owned SSH tunnel were removed afterward.
-- 54 frontend tests, typecheck, production build, Rust formatting and strict
+- 59 frontend tests, typecheck, production build, Rust formatting and strict
   Clippy passed.
 - Desktop and mobile mocked browser checks covered Dashboard, saved mitigation
   details, and the Active-run dialog. No horizontal overflow, page errors,

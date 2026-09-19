@@ -258,13 +258,13 @@ export function BundleProgressView({
       {terminal && unhealthyApplied && stillApplied.length > 0 && (
         <div className="rounded-md border-2 border-destructive bg-destructive/10 p-3">
           <div className="text-sm font-semibold text-destructive">
-            {stillApplied.length} change{stillApplied.length === 1 ? " is" : "s are"} still applied
+            {presentation?.known ?? 0} known change{(presentation?.known ?? 0) === 1 ? "" : "s"} remain; {presentation?.unknown ?? 0} outcome{(presentation?.unknown ?? 0) === 1 ? " is" : "s are"} unknown
           </div>
           <p className="mt-1 text-xs text-destructive">
             {state === "compensation_blocked"
               ? "Automatic recovery stopped because an action outcome is uncertain."
               : "The run stopped before every applied change could be restored."}{" "}
-            Review the exact action evidence and reconcile uncertain outcomes before preparing a revert.
+            These {stillApplied.length} action record{stillApplied.length === 1 ? "" : "s"} may remain applied. Review the exact evidence and reconcile uncertain outcomes before preparing a revert.
           </p>
           <ul className="mt-2 space-y-1">
             {stillApplied.map((rid) => {

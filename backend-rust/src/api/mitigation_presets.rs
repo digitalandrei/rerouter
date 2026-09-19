@@ -104,6 +104,7 @@ pub(crate) async fn fetch(
         ("needs_setup", None)
     };
     let recent_runs = super::run_summaries::recent_for_preset(pool, id, 5).await?;
+    let active_runs = super::run_summaries::active_for_preset(pool, id).await?;
     Ok(Some(json!({
         "id": row.id, "name": row.name, "description": row.description,
         "revision": row.revision, "archived_at": row.archived_at,
@@ -120,6 +121,10 @@ pub(crate) async fn fetch(
         // Keep bundle_id for old clients; every other field is the same shared
         // logical-run summary returned by /api/reroute-bundles.
         "recent_runs": recent_runs.into_iter().map(|mut run| {
+            run["bundle_id"] = run["id"].clone();
+            run
+        }).collect::<Vec<_>>(),
+        "active_runs": active_runs.into_iter().map(|mut run| {
             run["bundle_id"] = run["id"].clone();
             run
         }).collect::<Vec<_>>(),

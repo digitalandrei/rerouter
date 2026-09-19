@@ -120,6 +120,14 @@ async fn one_original_run_owns_summary_lifecycle_and_dashboard_action_events_are
         .execute(&pool)
         .await
         .unwrap();
+    // The active source run is older than the five-row recent-history window.
+    // Current state must come from active_runs, not from recent_runs.
+    let mut newer_inactive = Vec::new();
+    for _ in 0..6 {
+        newer_inactive.push(sqlx::query("INSERT INTO reroute_bundles(trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,source_json,started_at,finished_at) \
+            VALUES('manual',?,'succeeded','abort_and_compensate',0,0,'inactive',0,?,UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+            .bind(user).bind(sqlx::types::Json(&source)).execute(&pool).await.unwrap().last_insert_id());
+    }
     let changed = sqlx::query("INSERT INTO reroutes(bundle_id,bundle_position,device_id,trigger_type,state,mutation_effect,started_at,finished_at) \
         VALUES(?,0,?,'manual','succeeded','changed',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
         .bind(root).bind(device).execute(&pool).await.unwrap().last_insert_id();
@@ -208,11 +216,32 @@ async fn one_original_run_owns_summary_lifecycle_and_dashboard_action_events_are
     let (_, preset_value) = get(&app, &cookie, &format!("/api/mitigation-presets/{preset}")).await;
     assert_eq!(
         preset_value["recent_runs"].as_array().unwrap().len(),
+        5,
+        "{preset_value}"
+    );
+    assert!(
+        !preset_value["recent_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["bundle_id"] == root),
+        "older active run is deliberately outside recent history"
+    );
+    assert_eq!(
+        preset_value["active_runs"].as_array().unwrap().len(),
         1,
         "{preset_value}"
     );
-    assert_eq!(preset_value["recent_runs"][0]["bundle_id"], root);
-    assert_eq!(preset_value["recent_runs"][0]["remaining_mutations"], 2);
+    assert_eq!(preset_value["active_runs"][0]["bundle_id"], root);
+    assert_eq!(preset_value["active_runs"][0]["remaining_mutations"], 2);
+    assert!(
+        !preset_value["active_runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["bundle_id"] == child),
+        "recovery child must stay nested under its source run"
+    );
 
     let (_, raw) = get(&app, &cookie, "/api/alerts?limit=200").await;
     let raw_marker = raw["rows"]
@@ -291,6 +320,13 @@ async fn one_original_run_owns_summary_lifecycle_and_dashboard_action_events_are
         .execute(&pool)
         .await
         .unwrap();
+    for id in newer_inactive {
+        sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
         .bind(root)
         .execute(&pool)

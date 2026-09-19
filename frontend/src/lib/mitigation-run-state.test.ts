@@ -32,10 +32,14 @@ describe("presentMitigationRun", () => {
   });
 
   it("keeps unknown effects separate from known remaining changes", () => {
-    const state = presentMitigationRun({ ...liveFixture, remaining_mutations: 3, unknown_effects: 2, lifecycle_state: "recovery_blocked" });
+    const state = presentMitigationRun({ ...liveFixture, remaining_changes: 1, remaining_mutations: 2, unknown_effects: 1, lifecycle_state: "recovery_blocked" });
     expect(state.label).toBe("Needs attention");
-    expect(state.remaining).toBe(3);
-    expect(state.unknown).toBe(2);
-    expect(state.detail).toContain("2 effects are unknown");
+    expect(state.known).toBe(1);
+    expect(state.unknown).toBe(1);
+    expect(state.detail).toContain("1 known change remains; 1 outcome is unknown");
+  });
+
+  it("keeps scheduled recovery in the applied state until recovery actually starts", () => {
+    expect(presentMitigationRun({ ...liveFixture, lifecycle_state: "recovery_scheduled" }).label).toBe("Applied manually");
   });
 });

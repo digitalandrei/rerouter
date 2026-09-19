@@ -632,6 +632,8 @@ export interface PresetAction extends ActionDraft {
   checked_at?: string | null;
 }
 
+export type PresetRunSummary = Partial<RerouteBundle> & { bundle_id: number; state: string; created_at: string };
+
 export interface MitigationPreset {
   id: number;
   name: string;
@@ -641,7 +643,8 @@ export interface MitigationPreset {
   actions: PresetAction[];
   created_at: string;
   updated_at: string;
-  recent_runs?: Array<Partial<RerouteBundle> & { bundle_id: number; state: string; created_at: string }>;
+  recent_runs?: PresetRunSummary[];
+  active_runs?: PresetRunSummary[];
   validation_status?: "needs_preview" | "valid" | "invalid";
   validation_error?: string | null;
   definition_status?: "draft" | "needs_setup" | "ready";
@@ -1254,7 +1257,7 @@ export const api = {
 
   mitigationPresets: {
     list: () => request<MitigationPreset[]>("/api/mitigation-presets"),
-    get: (id: number): Promise<MitigationPreset> => request<MitigationPreset>(`/api/mitigation-presets/${id}`).then((preset) => ({ ...preset, recent_runs: preset.recent_runs?.map((run) => ({ ...run, source_preset_revision: run.source_preset_revision ?? run.source?.preset_revision })) } as MitigationPreset)),
+    get: (id: number): Promise<MitigationPreset> => request<MitigationPreset>(`/api/mitigation-presets/${id}`).then((preset) => ({ ...preset, recent_runs: preset.recent_runs?.map((run) => ({ ...run, source_preset_revision: run.source_preset_revision ?? run.source?.preset_revision })), active_runs: preset.active_runs?.map((run) => ({ ...run, source_preset_revision: run.source_preset_revision ?? run.source?.preset_revision })) } as MitigationPreset)),
     create: (body: { name: string; description?: string; actions: ActionDraft[] }) =>
       request<MitigationPreset>("/api/mitigation-presets", { method: "POST", body }),
     update: (

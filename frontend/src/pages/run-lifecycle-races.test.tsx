@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -38,11 +38,39 @@ it("does not reopen a closed run when a polling response arrives late", async ()
   auth(); const polls: Array<() => void> = [];
   vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; });
   vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
-  let resolvePoll!: (value: { items: RerouteBundle[]; page: number; per_page: number; total: number }) => void;
-  vi.spyOn(api.bundles, "list").mockResolvedValueOnce({ items: [run], page: 1, per_page: 200, total: 1 }).mockImplementationOnce(() => new Promise((resolve) => { resolvePoll = resolve; }));
-  vi.spyOn(api.bundles, "get").mockResolvedValue(run);
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 });
+  let resolveSelected!: (value: RerouteBundle) => void;
+  vi.spyOn(api.bundles, "get").mockResolvedValueOnce(run).mockResolvedValueOnce(run).mockImplementationOnce(() => new Promise((resolve) => { resolveSelected = resolve; })).mockResolvedValue(run);
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
-  await user.click(await screen.findByRole("button", { name: "Review run 7" })); const closeButtons = await screen.findAllByRole("button", { name: "Close" }); await user.click(closeButtons.find((button) => button.textContent === "Close")!);
-  polls.forEach((poll) => poll()); await vi.waitFor(() => expect(resolvePoll).toBeTypeOf("function")); resolvePoll({ items: [run], page: 1, per_page: 200, total: 1 }); await Promise.resolve();
-  expect(screen.queryByRole("dialog")).toBeNull();
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  polls.forEach((poll) => poll()); await vi.waitFor(() => expect(resolveSelected).toBeTypeOf("function"));
+  const closeButtons = await screen.findAllByRole("button", { name: "Close" }); await user.click(closeButtons.find((button) => button.textContent === "Close")!);
+  resolveSelected(run); await new Promise((resolve) => setTimeout(resolve, 0)); polls.forEach((poll) => poll()); await new Promise((resolve) => setTimeout(resolve, 0));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+it("refreshes an open run after it leaves the active list", async () => {
+  auth(); const polls: Array<() => void> = [];
+  vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; });
+  vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+  vi.spyOn(api.bundles, "list").mockResolvedValueOnce({ items: [run], page: 1, per_page: 200, total: 1 }).mockResolvedValue({ items: [], page: 1, per_page: 200, total: 0 });
+  vi.spyOn(api.bundles, "get").mockResolvedValueOnce(run).mockResolvedValueOnce(run).mockResolvedValue({ ...run, state: "succeeded", execution_state: "succeeded", lifecycle_state: "inactive", active: false, remaining_mutations: 0, remaining_changes: 0, recovery_bundle_id: 99 });
+  const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  polls.forEach((poll) => poll());
+  expect((await screen.findAllByText("Reverted")).length).toBeGreaterThan(0);
+  expect(screen.getByText(/No owned router changes remain/i)).toBeTruthy();
+});
+
+it("retains selected evidence and warns when its independent refresh fails", async () => {
+  auth(); const polls: Array<() => void> = [];
+  vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; });
+  vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 });
+  vi.spyOn(api.bundles, "get").mockResolvedValueOnce(run).mockResolvedValueOnce(run).mockRejectedValue(new Error("offline"));
+  const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  polls.forEach((poll) => poll());
+  expect(await screen.findByText(/Selected run could not be refreshed/i)).toBeTruthy();
+  expect(screen.getByRole("dialog")).toBeTruthy();
 });

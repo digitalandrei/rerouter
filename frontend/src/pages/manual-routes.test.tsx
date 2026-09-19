@@ -35,6 +35,31 @@ function mockEditorDependencies(preset: MitigationPreset) {
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+it("renders every active run for a saved mitigation with an exact selection link", async () => {
+  const activePreset: MitigationPreset = { ...saved, definition_status: "ready", active_runs: [1, 2].map((id) => ({ bundle_id: id, id, state: "succeeded", execution_state: "succeeded", lifecycle_state: "active", active: true, created_at: `2026-09-19T08:0${id}:00Z`, remaining_changes: id, unknown_effects: 0, trigger_type: "manual", total_actions: 8, completed_actions: 8, revert: { available: true, block_reasons: [] } })) };
+  mockEditorDependencies(activePreset);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(activePreset);
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4"] });
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  expect(await screen.findByRole("heading", { name: "Current state" })).toBeTruthy();
+  const links = await screen.findAllByRole("link", { name: "Review & revert" });
+  expect(links.map((link) => link.getAttribute("href"))).toEqual(["/mitigations?tab=active&run=1", "/mitigations?tab=active&run=2"]);
+});
+
+it("returns from a direct run link to its saved mitigation details", async () => {
+  const preset = { ...saved, definition_status: "ready", active_runs: [{ bundle_id: 1, id: 1, state: "succeeded", execution_state: "succeeded", lifecycle_state: "active", active: true, created_at: "2026-09-19T08:01:00Z", remaining_changes: 1, trigger_type: "manual", total_actions: 1, completed_actions: 1 }] } as MitigationPreset;
+  mockEditorDependencies(preset);
+  const getPreset = vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(preset);
+  vi.spyOn(api.bundles, "get").mockResolvedValue({ id: 1, rule_id: null, trigger_type: "manual", state: "succeeded", execution_state: "succeeded", lifecycle_state: "active", active: true, remaining_changes: 1, failure_policy: "abort_and_compensate", total_actions: 1, completed_actions: 1, failure_reason: null, started_at: null, finished_at: null, actions: [], still_applied_reroute_ids: [], source: { kind: "preset", preset_id: 4, preset_name: "Edge diversion" } } as never);
+  const router = createMemoryRouter([{ path: "/manual-mitigations", element: <ManualReroute /> }, { path: "/manual-mitigations/:id", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations?bundle=1"] });
+  const user = userEvent.setup(); render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Return to mitigation details" }));
+  await waitFor(() => expect(router.state.location.pathname).toBe("/manual-mitigations/4"));
+  expect(getPreset).toHaveBeenCalledWith(4);
+  expect(await screen.findByRole("heading", { name: "Current state" })).toBeTruthy();
+  expect((await screen.findAllByText("Edge diversion")).length).toBeGreaterThan(0);
+});
+
 it("navigates list to URL-owned detail/edit and saves one deliberate draft", async () => {
   vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "edit_rules", "trigger_manual_reroute"] });
   vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([saved]);
