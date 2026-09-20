@@ -761,6 +761,7 @@ export interface RecoveryRunSummary {
   started_at: string | null;
   finished_at: string | null;
   failure_reason: string | null;
+  dismiss?: { available: boolean; confirmation_phrase?: string | null };
 }
 
 export interface RunSummary {
@@ -1346,6 +1347,7 @@ export const api = {
     revert: (id: number, body: { dry_run: boolean; reason?: string; plan_id?: number; preview_token?: string; direct_run?: boolean; request_id?: string }) =>
       request<ManualMitigationPreview | ManualMitigationAccepted>(`/api/reroute-bundles/${id}/revert`, { method: "POST", body }),
     takeControl: (id: number) => request<{ ok: true; bundle_id: number; automatic_recovery_cancelled: true }>(`/api/reroute-bundles/${id}/take-control`, { method: "POST" }),
+    dismissRecovery: (id: number, confirmation: string) => request<{ ok: true; bundle_id: number; dismissed?: true; already_dismissed?: true }>(`/api/reroute-bundles/${id}/dismiss-recovery`, { method: "POST", body: { confirmation } }),
   },
 
   actionSets: {

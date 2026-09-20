@@ -1000,6 +1000,139 @@ pub async fn bundle_take_control(
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DismissRecoveryBody {
+    confirmation: String,
+}
+
+/// Dismiss a terminal recovery attempt that is durably proven to have made no
+/// router write. Immutable actions, associations and history remain intact.
+pub async fn dismiss_recovery(
+    g: RequirePermission<markers::TriggerManualReroute>,
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<DismissRecoveryBody>,
+) -> JsonResp {
+    let expected = format!("DISMISS RECOVERY #{id}");
+    if body.confirmation.trim() != expected {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confirmation phrase does not match",
+        );
+    }
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let child: Option<(String, Option<u64>, Option<sqlx::types::Json<Value>>)> =
+        match sqlx::query_as(
+            "SELECT state,parent_bundle_id,source_json FROM reroute_bundles WHERE id=? FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+        };
+    let Some((child_state, parent_id, source)) = child else {
+        return err(StatusCode::NOT_FOUND, "recovery run not found");
+    };
+    if parent_id.is_none() {
+        return err(
+            StatusCode::CONFLICT,
+            "only a recovery child can be dismissed",
+        );
+    }
+    if source
+        .as_ref()
+        .and_then(|value| value.0.get("dismissed_at"))
+        .is_some()
+    {
+        return (
+            StatusCode::OK,
+            Json(json!({"ok":true,"bundle_id":id,"already_dismissed":true})),
+        );
+    }
+    if !matches!(
+        child_state.as_str(),
+        "failed" | "aborted" | "compensation_blocked"
+    ) {
+        return err(
+            StatusCode::CONFLICT,
+            "recovery is not a dismissible terminal failure",
+        );
+    }
+    let settlements: (i64, i64) = match sqlx::query_as(
+        "SELECT COUNT(CASE WHEN settlement='known_no_write' THEN 1 END), \
+                COUNT(CASE WHEN settlement IN ('active','blocked') THEN 1 END) \
+         FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let unsafe_actions: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reroutes WHERE bundle_id=? AND (state IN ('pending','running','verifying','uncertain') \
+         OR mutation_effect IN ('changed','unknown'))",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    let claimed_sources: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources ras JOIN reroute_bundles source ON source.id=ras.source_bundle_id \
+         WHERE ras.recovery_bundle_id=? AND source.recovery_claim_token IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+    };
+    if settlements.0 <= 0 || settlements.1 > 0 || unsafe_actions > 0 || claimed_sources > 0 {
+        return err(
+            StatusCode::CONFLICT,
+            "recovery cannot be dismissed because no-write settlement is not proven",
+        );
+    }
+    if sqlx::query(
+        "UPDATE reroute_bundles SET source_json=JSON_SET(COALESCE(source_json,JSON_OBJECT()), \
+         '$.dismissed_at',DATE_FORMAT(UTC_TIMESTAMP(),'%Y-%m-%dT%H:%i:%sZ'),'$.dismissed_by',?) WHERE id=?",
+    )
+    .bind(g.session.user_id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .is_err()
+        || super::audit_mutation_on(
+            &mut tx,
+            &g.session,
+            "recovery_attempt_dismissed",
+            "reroute_bundle",
+            id,
+            "dismissed proven no-write recovery attempt; immutable evidence preserved",
+        )
+        .await
+        .is_err()
+        || tx.commit().await.is_err()
+    {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "dismiss_recovery_failed");
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok":true,"bundle_id":id,"dismissed":true})),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

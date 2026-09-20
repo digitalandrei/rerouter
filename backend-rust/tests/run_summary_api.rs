@@ -51,6 +51,42 @@ async fn viewer(pool: &MySqlPool, key: &Key) -> (u64, String, String) {
     (id, email, cookie)
 }
 
+async fn operator(pool: &MySqlPool, key: &Key) -> (u64, String) {
+    let email = format!("run-dismiss-{}@example.test", uuid::Uuid::new_v4());
+    let id = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('Run dismiss fixture',?,'unused')",
+    )
+    .bind(email)
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    sqlx::query(
+        "INSERT INTO role_user(role_id,user_id) SELECT id,? FROM roles WHERE name='operator'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let (session, _) = sessions::create(pool, id, "127.0.0.1", "run-dismiss-test", 1)
+        .await
+        .unwrap();
+    let token = sessions::mark_totp_verified_and_rotate(pool, session)
+        .await
+        .unwrap();
+    let response = SignedCookieJar::new(key.clone())
+        .add(sessions::build_cookie(token, time::Duration::hours(1)))
+        .into_response();
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    (id, cookie)
+}
+
 async fn get(app: &Router, cookie: &str, path: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -75,6 +111,90 @@ async fn get(app: &Router, cookie: &str, path: &str) -> (StatusCode, Value) {
         serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)})),
     )
+}
+
+async fn post(app: &Router, cookie: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .extension(ConnectInfo(
+                    "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)})),
+    )
+}
+
+#[tokio::test]
+async fn proven_no_write_recovery_can_be_dismissed_without_deleting_history() {
+    let db = common::test_database().await;
+    let pool = db.pool().clone();
+    let key = Key::from(&[82_u8; 64]);
+    let (user, cookie) = operator(&pool, &key).await;
+    let app = api::router(api::AppState {
+        pool: pool.clone(),
+        config: Config::default(),
+        cookie_key: key,
+    });
+    let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,triggered_by_user_id,state,lifecycle_state,total_actions,completed_actions,remaining_mutations,source_json) VALUES('manual',?,'succeeded','active',1,1,1,JSON_OBJECT('kind','manual'))")
+        .bind(user).execute(&pool).await.unwrap().last_insert_id();
+    let child = sqlx::query("INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,state,lifecycle_state,total_actions,completed_actions,source_json,failure_reason) VALUES(?,'manual',?,'failed','inactive',1,1,JSON_OBJECT('kind','recovery'),'failed before router write')")
+        .bind(source).bind(user).execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO recovery_attempt_sources(recovery_bundle_id,source_bundle_id,claim_token,settlement,settled_at) VALUES(?,?,?,'known_no_write',UTC_TIMESTAMP())")
+        .bind(child).bind(source).bind(format!("dismiss-{child}")).execute(&pool).await.unwrap();
+
+    let (_, before) = get(&app, &cookie, &format!("/api/reroute-bundles/{source}")).await;
+    assert_eq!(before["latest_recovery_bundle_id"], child);
+    assert_eq!(before["latest_recovery"]["dismiss"]["available"], true);
+    let phrase = format!("DISMISS RECOVERY #{child}");
+    assert_eq!(
+        before["latest_recovery"]["dismiss"]["confirmation_phrase"],
+        phrase
+    );
+    assert_eq!(
+        post(
+            &app,
+            &cookie,
+            &format!("/api/reroute-bundles/{child}/dismiss-recovery"),
+            json!({"confirmation":"CONFIRM"}),
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    );
+    let (status, dismissed) = post(
+        &app,
+        &cookie,
+        &format!("/api/reroute-bundles/{child}/dismiss-recovery"),
+        json!({"confirmation":phrase}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dismissed}");
+    let (_, after) = get(&app, &cookie, &format!("/api/reroute-bundles/{source}")).await;
+    assert_eq!(after["latest_recovery"], Value::Null);
+    let (_, retained) = get(&app, &cookie, &format!("/api/reroute-bundles/{child}")).await;
+    assert!(retained["source"]["dismissed_at"].is_string());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs WHERE event_type='recovery_attempt_dismissed' AND entity_id=?")
+            .bind(child).fetch_one(&pool).await.unwrap(),
+        1,
+    );
 }
 
 #[tokio::test]

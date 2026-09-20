@@ -477,6 +477,103 @@ async fn startup_repairs_a_published_direct_recovery_as_proven_no_write() {
 }
 
 #[tokio::test]
+async fn direct_recovery_inherits_configuration_only_scope_before_rate_admission() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let (source, _) = source_fixture(pool).await;
+    sqlx::query("UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.verification_mode','configuration_only','$.routing_verified',false) WHERE id=?")
+        .bind(source).execute(pool).await.unwrap();
+    sqlx::query("UPDATE reroutes SET rollback_snapshot_json=JSON_SET(rollback_snapshot_json,'$.verification_mode','configuration_only') WHERE bundle_id=?")
+        .bind(source).execute(pool).await.unwrap();
+    let user = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('direct scope fixture',?,'unused')",
+    )
+    .bind(format!(
+        "direct-scope-{}@example.test",
+        uuid::Uuid::new_v4()
+    ))
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let actor = Session {
+        id: 1,
+        user_id: user,
+        totp_verified: true,
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-scope-test".into(),
+    };
+    let mut cfg = Config::default();
+    cfg.safety.global_action_rate_limit_count = 0;
+    let admission = rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        manual_mitigations::admit_direct_recovery(
+            pool,
+            &actor,
+            source,
+            "configuration-only direct recovery",
+            "configuration-only-request",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let child_mode: String = sqlx::query_scalar(
+        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')) AS CHAR) FROM reroute_bundles WHERE id=?",
+    )
+    .bind(admission.bundle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(child_mode, "configuration_only");
+    let originals: Vec<u64> = sqlx::query_scalar(
+        "SELECT original_reroute_id FROM reroute_bundle_actions WHERE bundle_id=? ORDER BY position",
+    )
+    .bind(admission.bundle_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(
+        originals.is_empty(),
+        "admission must still precede preparation"
+    );
+    let originals = reroute::recovery::owned_original_ids(pool, source)
+        .await
+        .unwrap();
+    let actions = reroute::preparation::prepare_rollbacks(pool, &originals, "scope proof", false)
+        .await
+        .unwrap();
+    assert!(actions
+        .iter()
+        .all(|action| action.prepared.as_ref().unwrap().verification_mode
+            == reroute::device_plan::VerificationMode::ConfigurationOnly));
+    reroute::bundle::persist_actions(pool, admission.bundle_id, &actions)
+        .await
+        .unwrap();
+    rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        async {
+            reroute::guard::admit_bundle(pool, &cfg, admission.bundle_id, actions.len() as u32)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    reroute::recovery::finalize_recovery_child(
+        pool,
+        admission.bundle_id,
+        "failed",
+        Some("scope regression cleanup"),
+        &format!("recovery:bundle:{}", admission.bundle_id),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn delayed_timer_publishes_before_read_and_disarm_settles_without_write() {
     let db = common::test_database().await;
     let pool = db.pool();

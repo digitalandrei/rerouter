@@ -427,6 +427,10 @@ struct RecoveryRow {
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     failure_reason: Option<String>,
+    known_no_write_sources: i64,
+    unsettled_sources: i64,
+    unsafe_actions: i64,
+    claimed_sources: i64,
 }
 
 fn push_ids(query: &mut QueryBuilder<'_, MySql>, ids: &[u64]) {
@@ -490,21 +494,29 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
     // wins as a group, even when a newer legacy-looking child exists.
     let mut recovery_query = QueryBuilder::<MySql>::new(
         "SELECT latest.source_bundle_id AS parent_bundle_id,child.id,child.state,child.total_actions,child.completed_actions,\
-         child.started_at,child.finished_at,child.failure_reason FROM reroute_bundles child \
+         child.started_at,child.finished_at,child.failure_reason, \
+         (SELECT COUNT(CASE WHEN ras2.settlement='known_no_write' THEN 1 END) FROM recovery_attempt_sources ras2 WHERE ras2.recovery_bundle_id=child.id) AS known_no_write_sources, \
+         (SELECT COUNT(CASE WHEN ras2.settlement IN ('active','blocked') THEN 1 END) FROM recovery_attempt_sources ras2 WHERE ras2.recovery_bundle_id=child.id) AS unsettled_sources, \
+         (SELECT COUNT(*) FROM reroutes inverse2 WHERE inverse2.bundle_id=child.id AND (inverse2.state IN ('pending','running','verifying','uncertain') OR inverse2.mutation_effect IN ('changed','unknown'))) AS unsafe_actions, \
+         (SELECT COUNT(*) FROM recovery_attempt_sources ras2 JOIN reroute_bundles source2 ON source2.id=ras2.source_bundle_id WHERE ras2.recovery_bundle_id=child.id AND source2.recovery_claim_token IS NOT NULL) AS claimed_sources \
+         FROM reroute_bundles child \
          JOIN (SELECT candidates.source_bundle_id,\
          COALESCE(MAX(CASE WHEN candidates.explicit_assoc=1 THEN candidates.child_id END),\
                   MAX(CASE WHEN candidates.explicit_assoc=0 THEN candidates.child_id END)) AS id \
-         FROM (SELECT source_bundle_id,recovery_bundle_id AS child_id,1 AS explicit_assoc \
-         FROM recovery_attempt_sources WHERE source_bundle_id IN (",
+         FROM (SELECT ras.source_bundle_id,ras.recovery_bundle_id AS child_id,1 AS explicit_assoc \
+         FROM recovery_attempt_sources ras JOIN reroute_bundles mapped_child ON mapped_child.id=ras.recovery_bundle_id \
+         WHERE ras.source_bundle_id IN (",
     );
     push_ids(&mut recovery_query, &ids);
     recovery_query.push(
-        ") UNION ALL SELECT legacy_child.parent_bundle_id AS source_bundle_id,legacy_child.id AS child_id,0 AS explicit_assoc \
+        ") AND JSON_EXTRACT(mapped_child.source_json,'$.dismissed_at') IS NULL \
+         UNION ALL SELECT legacy_child.parent_bundle_id AS source_bundle_id,legacy_child.id AS child_id,0 AS explicit_assoc \
          FROM reroute_bundles legacy_child WHERE legacy_child.parent_bundle_id IN (",
     );
     push_ids(&mut recovery_query, &ids);
     recovery_query.push(
-        ") AND NOT EXISTS(SELECT 1 FROM recovery_attempt_sources explicit_child \
+        ") AND JSON_EXTRACT(legacy_child.source_json,'$.dismissed_at') IS NULL \
+         AND NOT EXISTS(SELECT 1 FROM recovery_attempt_sources explicit_child \
          WHERE explicit_child.recovery_bundle_id=legacy_child.id) \
          UNION ALL SELECT original.bundle_id AS source_bundle_id,inverse.bundle_id AS child_id,0 AS explicit_assoc \
          FROM reroutes inverse JOIN reroutes original ON original.id=inverse.rollback_of_reroute_id \
@@ -514,7 +526,9 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
     recovery_query.push(
         ") AND inverse.bundle_id IS NOT NULL AND inverse.bundle_id<>original.bundle_id \
          AND NOT EXISTS(SELECT 1 FROM recovery_attempt_sources explicit_child \
-         WHERE explicit_child.recovery_bundle_id=inverse.bundle_id)) candidates \
+         WHERE explicit_child.recovery_bundle_id=inverse.bundle_id) \
+         AND NOT EXISTS(SELECT 1 FROM reroute_bundles dismissed_child WHERE dismissed_child.id=inverse.bundle_id \
+           AND JSON_EXTRACT(dismissed_child.source_json,'$.dismissed_at') IS NOT NULL)) candidates \
          GROUP BY candidates.source_bundle_id) latest ON latest.id=child.id",
     );
     let recovery_rows = recovery_query
@@ -525,6 +539,11 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
         .into_iter()
         .map(|recovery| {
             let parent = recovery.parent_bundle_id;
+            let dismiss_available = matches!(recovery.state.as_str(), "failed" | "aborted" | "compensation_blocked")
+                && recovery.known_no_write_sources > 0
+                && recovery.unsettled_sources == 0
+                && recovery.unsafe_actions == 0
+                && recovery.claimed_sources == 0;
             (
                 parent,
                 json!({
@@ -532,6 +551,7 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
                     "state":recovery.state,"total_actions":recovery.total_actions,
                     "completed_actions":recovery.completed_actions,"started_at":recovery.started_at,
                     "finished_at":recovery.finished_at,"failure_reason":recovery.failure_reason,
+                    "dismiss":{"available":dismiss_available,"confirmation_phrase":if dismiss_available {Some(format!("DISMISS RECOVERY #{}",recovery.id))} else {None}},
                 }),
             )
         })

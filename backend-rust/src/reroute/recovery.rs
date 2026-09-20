@@ -662,6 +662,8 @@ pub async fn finalize_recovery_child(
         "compensation_blocked"
     } else if restored == mappings.len() {
         "succeeded"
+    } else if retryable > 0 {
+        "failed"
     } else {
         terminal_state
     };

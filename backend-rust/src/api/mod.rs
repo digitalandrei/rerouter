@@ -395,6 +395,10 @@ pub fn router(state: AppState) -> Router {
             "/api/reroute-bundles/{id}/take-control",
             post(reroutes::bundle_take_control),
         )
+        .route(
+            "/api/reroute-bundles/{id}/dismiss-recovery",
+            post(reroutes::dismiss_recovery),
+        )
         .route("/api/reroute-bundles", get(reroutes::bundle_list))
         // alerts + audit
         .route("/api/alerts", get(alerts::list))

@@ -24,7 +24,7 @@ operator policy fence.
   coalescing, obsolete response cancellation, and retained error evidence.
 - Final optimized controller built with `cargo build --locked --release --features embed-ui`.
 - Fresh-schema tests and upgrades from 56 and 69 migrations passed on the existing
-  MariaDB 11.4 and MySQL 8.4 services. The manifest contains 75 migrations.
+  MariaDB 11.4 and MySQL 8.4 services. The manifest contains 76 migrations.
 - MySQL 8.4: the same 352 Rust tests passed; no failures.
 
 All database work used restricted accounts and only task-created

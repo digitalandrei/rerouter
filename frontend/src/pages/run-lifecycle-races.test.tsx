@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { createMemoryRouter, MemoryRouter, RouterProvider } from "react-router-dom";
@@ -116,6 +116,30 @@ it("reconstructs a preparing revert from server state after a page reload", asyn
   expect((screen.getByRole("button", { name: "Revert now" }) as HTMLButtonElement).disabled).toBe(true);
   expect((screen.getByRole("button", { name: "Preview revert" }) as HTMLButtonElement).disabled).toBe(true);
   expect((await screen.findAllByText(/recovery #100/i)).length).toBeGreaterThan(0);
+});
+
+it("requires the server phrase to dismiss a proven no-write failed revert", async () => {
+  auth();
+  const failed = {
+    ...run,
+    latest_recovery_bundle_id: 100,
+    latest_recovery: { id: 100, parent_bundle_id: 7, state: "failed", total_actions: 1, completed_actions: 1, started_at: null, finished_at: "2026-09-20T08:02:00Z", failure_reason: "no write", dismiss: { available: true, confirmation_phrase: "DISMISS RECOVERY #100" } },
+    revert: { available: true, block_reasons: [] },
+  } as RerouteBundle;
+  const child = { ...run, id: 100, parent_bundle_id: 7, state: "failed", execution_state: "failed", lifecycle_state: "inactive", remaining_mutations: 0, remaining_changes: 0, failure_reason: "no write" } as RerouteBundle;
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [failed], page: 1, per_page: 25, total: 1 });
+  vi.spyOn(api.bundles, "get").mockImplementation(async (id) => id === 100 ? child : failed);
+  const dismiss = vi.spyOn(api.bundles, "dismissRecovery").mockResolvedValue({ ok: true, bundle_id: 100, dismissed: true });
+  const user = userEvent.setup();
+  render(<AuthProvider><MemoryRouter initialEntries={["/mitigations?tab=active&run=7"]}><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+
+  await user.click(await screen.findByRole("button", { name: "Dismiss failed revert" }));
+  const confirmation = await screen.findByRole("dialog", { name: "Dismiss failed revert #100?" });
+  const submit = within(confirmation).getByRole("button", { name: "Dismiss failed revert" }) as HTMLButtonElement;
+  expect(submit.disabled).toBe(true);
+  await user.type(within(confirmation).getByRole("textbox"), "DISMISS RECOVERY #100");
+  await user.click(submit);
+  await waitFor(() => expect(dismiss).toHaveBeenCalledWith(100, "DISMISS RECOVERY #100"));
 });
 
 it("shows cancellation only when automatic recovery actually exists", async () => {

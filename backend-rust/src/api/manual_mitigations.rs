@@ -75,7 +75,26 @@ pub async fn admit_direct_recovery(
         );
         let originals = ownership.original_reroute_ids;
         let claim_token = format!("mdir:{}", crate::auth::sessions::generate_token());
-        let source = json!({
+        let owner_source: Option<sqlx::types::Json<Value>> = sqlx::query_scalar(
+            "SELECT source_json FROM reroute_bundles WHERE id=? FOR UPDATE",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let inherited_mode = owner_source
+            .as_ref()
+            .and_then(|value| value.0.get("verification_mode"))
+            .cloned()
+            .unwrap_or_else(|| json!("routing"));
+        let inherited_routing_verified = owner_source
+            .as_ref()
+            .and_then(|value| value.0.get("routing_verified"))
+            .cloned();
+        let inherited_label = owner_source
+            .as_ref()
+            .and_then(|value| value.0.get("verification_label"))
+            .cloned();
+        let mut source = json!({
             "kind":"recovery",
             "admission_kind":"direct",
             "operator_request_id":request_id,
@@ -83,8 +102,15 @@ pub async fn admit_direct_recovery(
             "source_bundle_ids":[source_id],
             "original_reroute_ids":originals,
             "reason":reason,
-            "preparation_phase":"published"
+            "preparation_phase":"published",
+            "verification_mode":inherited_mode
         });
+        if let Some(value) = inherited_routing_verified {
+            source["routing_verified"] = value;
+        }
+        if let Some(value) = inherited_label {
+            source["verification_label"] = value;
+        }
         let bundle_id = sqlx::query(
             "INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,reason,state,failure_policy,total_actions,source_json) \
              VALUES(?,'manual',?,?,'planned','abort_and_compensate',?,?)",
@@ -191,6 +217,29 @@ pub fn spawn_direct_recovery(state: &AppState, actor: &Session, admission: Direc
                 ensure!(
                     actions.len() == originals.len(),
                     "direct recovery preparation omitted an owned action"
+                );
+                let prepared_mode = actions
+                    .first()
+                    .and_then(|action| action.prepared.as_ref())
+                    .map(|prepared| prepared.verification_mode)
+                    .context("direct recovery has no prepared verification scope")?;
+                ensure!(
+                    actions.iter().all(|action| action
+                        .prepared
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.verification_mode == prepared_mode)),
+                    "direct recovery prepared mixed verification scopes"
+                );
+                let persisted_mode: VerificationMode = serde_json::from_value(
+                    source
+                        .0
+                        .get("verification_mode")
+                        .cloned()
+                        .unwrap_or_else(|| json!("routing")),
+                )?;
+                ensure!(
+                    persisted_mode == prepared_mode,
+                    "direct recovery source scope differs from its prepared actions"
                 );
                 let fence = guard::policy_fence(&worker_pool).await?;
                 let claim_count: i64 = sqlx::query_scalar(
