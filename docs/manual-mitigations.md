@@ -5,6 +5,16 @@ Action Templates. It does not add a free-form command facility. Rules and manual
 runs use the same preparation, authorization, device ownership, verification,
 and recovery engine.
 
+The UI presents both definition types consistently. Manual Mitigations are
+operator-triggered definitions. Rules add a detection condition and automatic
+execution preferences around an ordered mitigation definition; when Manual
+apply is enabled, that same action set can also be run from the Rule detail page
+without waiting for a firing state.
+
+Both normal detail pages default to **Overview & run** and use **Configuration**
+for the definition; explicit edit/new routes open Configuration. Tab selection is a URL fragment (`#overview` or `#configuration`),
+so path and filters remain intact and browser navigation remains meaningful.
+
 ## Build and reuse
 
 - Use **Manual Mitigations** to create, edit, duplicate, archive, or run a named

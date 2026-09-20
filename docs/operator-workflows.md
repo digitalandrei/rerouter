@@ -15,6 +15,12 @@ statements that describe Observe as blocking all manual execution.
 5. Follow the bundle until every action is verified. Execution success and
    remaining owned changes are separate facts.
 
+A Rule with an ordered action set is also a mitigation definition. Its detection
+condition controls automatic triggering; it does not change the action set. When
+**Manual apply** is enabled, an operator may run that defined mitigation from the
+Rule detail page regardless of the current detection state, using the same exact
+preview, confirmation, and execution gates.
+
 ## Automatic work
 
 Autonomous starts require Enforce, the automatic master switch, the relevant

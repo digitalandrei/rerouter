@@ -1,5 +1,5 @@
 /**
- * ApplyMitigationDialog — modal to manually apply a firing rule's configured
+ * ApplyMitigationDialog — modal to manually apply a rule's configured
  * mitigation actions.
  *
  * Contract (docs/reroute-engine.md, docs/doctrine.md §8, plans/015):

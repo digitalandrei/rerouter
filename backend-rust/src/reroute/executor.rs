@@ -768,12 +768,10 @@ async fn validate_execution_authorization(
                         "SELECT COUNT(*) \
                            FROM reroute_bundles b \
                            JOIN rules r ON r.id = b.rule_id \
-                           JOIN rule_states rs ON rs.rule_id = r.id \
                           WHERE b.id = ? AND b.rule_id = ? \
                             AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.kind')) = 'rule' \
                             AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json, '$.actions_revision')) AS UNSIGNED) = r.actions_revision \
-                            AND r.enabled = 1 AND r.manual_apply_enabled = 1 \
-                            AND rs.current_state = 'firing'",
+                            AND r.manual_apply_enabled = 1",
                     )
                     .bind(auth.bundle_id)
                     .bind(rule_id)
@@ -781,7 +779,7 @@ async fn validate_execution_authorization(
                     .await?;
                     anyhow::ensure!(
                         current == 1,
-                        "rule changed, was disabled, or stopped firing after authorization"
+                        "rule actions changed or manual apply was disabled after authorization"
                     );
                 }
             }

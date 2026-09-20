@@ -561,17 +561,16 @@ Manual reroutes are first-class:
 Manual reroutes support **dry-run**: render the exact plan without changing any
 routing (in observe mode every trigger behaves this way regardless).
 
-### Apply a firing rule's mitigation (supervised path)
+### Run a rule's defined mitigation manually (supervised path)
 
 Between alert-only and unattended automatic execution there is a supervised
-middle ground: an operator manually applies a *firing* rule's own configured
-actions from its alert (Alerts page) or from the dashboard's active-matches list.
+middle ground: an operator manually runs a rule's own configured actions from
+its detail page. Active alerts and the dashboard provide shortcuts while firing.
 `POST /api/rules/{id}/apply` is opt-in per rule (`rules.manual_apply_enabled`,
-default off, set in the rule editor) and **only permitted while the rule's state
-is `firing`** (you mitigate a live breach, not a cleared one). It runs each
+default off, set in the rule editor) and requires at least one defined action. It runs each
 enabled `rule_action` through the *same* gated executor as a `manual` trigger
-attributed to the operator, so it inherits every protection: blocked in observe
-mode (returns the would-run plan per action), requires `trigger_manual_reroute`,
+attributed to the operator, so it inherits every protection: exact preview and
+confirmation in both operating modes, `trigger_manual_reroute`,
 and honours device locks, the global maintenance lock, per-device and per-rule
 cooldowns, the rate limit, and the protected-interface guard. Because the trigger
 is `manual`, the global **automatic** master switch does not gate it — this is a

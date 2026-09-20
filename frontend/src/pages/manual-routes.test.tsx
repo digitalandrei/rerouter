@@ -60,6 +60,25 @@ it("returns from a direct run link to its saved mitigation details", async () =>
   expect((await screen.findAllByText("Edge diversion")).length).toBeGreaterThan(0);
 });
 
+it("defaults a run to Overview and preserves path and query while tabs update the hash", async () => {
+  const preset: MitigationPreset = { ...saved, definition_status: "ready", validation_status: "valid", actions: [{ reroute_template_id: 5, template_name: editableTemplate.name, device_id: 10, device_name: "Router A", params: { prefix: "192.0.2.1/32" }, enabled: true }] };
+  mockEditorDependencies(preset);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(preset);
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run?keep=1"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  const overview = await screen.findByRole("tab", { name: "Overview & run" });
+  expect(overview.getAttribute("aria-selected")).toBe("true");
+  expect(router.state.location.hash).toBe("");
+  await user.click(screen.getByRole("tab", { name: "Configuration" }));
+  expect(router.state.location.pathname).toBe("/manual-mitigations/4/run");
+  expect(router.state.location.search).toBe("?keep=1");
+  expect(router.state.location.hash).toBe("#configuration");
+  expect(await screen.findByRole("button", { name: "Override action 1" })).toBeTruthy();
+  await user.click(screen.getByRole("tab", { name: "Overview & run" }));
+  expect(router.state.location.hash).toBe("#overview");
+});
+
 it("navigates list to URL-owned detail/edit and saves one deliberate draft", async () => {
   vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "edit_rules", "trigger_manual_reroute"] });
   vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([saved]);
@@ -74,7 +93,7 @@ it("navigates list to URL-owned detail/edit and saves one deliberate draft", asy
   await user.click(await screen.findByRole("link", { name: "Details" }));
   await waitFor(() => expect(router.state.location.pathname).toBe("/manual-mitigations/4"));
   expect((await screen.findAllByText("Edge diversion")).length).toBeGreaterThan(0);
-  await user.click(screen.getByRole("link", { name: "Edit" }));
+  await user.click(screen.getByRole("link", { name: "Edit mitigation" }));
   const name = await screen.findByLabelText("Name");
   await user.clear(name); await user.type(name, "Edge diversion revised");
   await user.click(screen.getByRole("button", { name: "Save" }));
@@ -167,6 +186,10 @@ it("keeps a dirty action draft when cancel navigation is declined", async () => 
   render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
   await user.click(await screen.findByRole("button", { name: "Edit action 1" }));
   await user.click(within(screen.getByRole("heading", { name: "Edit action 1" }).closest("li")!).getByLabelText("Enabled"));
+  await user.click(screen.getByRole("tab", { name: "Overview & run" }));
+  expect(confirm).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("tab", { name: "Configuration" }));
+  expect((within(screen.getByRole("heading", { name: "Edit action 1" }).closest("li")!).getByLabelText("Enabled") as HTMLInputElement).checked).toBe(false);
   await user.click(screen.getByRole("button", { name: "Cancel" }));
   await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
   expect(router.state.location.pathname).toBe("/manual-mitigations/4/edit");
@@ -227,8 +250,10 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   await user.click(screen.getByRole("button", { name: "Preview changes" }));
   await waitFor(() => expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only", revert_after_seconds: undefined })));
   expect(screen.queryByRole("button", { name: "Apply reviewed changes" })).toBeNull();
+  await user.click(screen.getByRole("tab", { name: "Configuration" }));
   await user.click(screen.getByRole("button", { name: "Override action 1" }));
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
+  await user.click(screen.getByRole("tab", { name: "Overview & run" }));
   expect((screen.getByRole("radio", { name: /^configuration only/i }) as HTMLInputElement).checked).toBe(true);
   expect(await screen.findByText(/supported actions on one enabled router/i)).toBeTruthy();
   expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);

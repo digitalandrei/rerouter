@@ -1407,7 +1407,6 @@ pub async fn apply(
     struct Context {
         name: String,
         manual_apply_enabled: bool,
-        current_state: Option<String>,
         actions_revision: u64,
         interface_id: Option<u64>,
         flow_direction: Option<String>,
@@ -1416,9 +1415,9 @@ pub async fn apply(
         flow_port_kind: Option<String>,
     }
     let context = match sqlx::query_as::<_, Context>(
-        "SELECT r.name, r.manual_apply_enabled, rs.current_state, r.actions_revision, \
+        "SELECT r.name, r.manual_apply_enabled, r.actions_revision, \
         r.interface_id, r.flow_direction, r.flow_protocol, r.flow_port, r.flow_port_kind \
-        FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ?",
+        FROM rules r WHERE r.id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -1428,10 +1427,10 @@ pub async fn apply(
         Ok(None) => return err(StatusCode::NOT_FOUND, "rule not found"),
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
     };
-    if !context.manual_apply_enabled || context.current_state.as_deref() != Some("firing") {
+    if !context.manual_apply_enabled {
         return err(
             StatusCode::CONFLICT,
-            "manual apply requires a firing rule with manual apply enabled",
+            "manual apply is disabled for this rule",
         );
     }
     let reason = body

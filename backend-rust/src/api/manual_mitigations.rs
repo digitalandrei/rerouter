@@ -926,15 +926,15 @@ async fn accept_plan_inner(
     }
     let rule_id = snapshot.source.get("rule_id").and_then(Value::as_u64);
     if snapshot.source.get("kind").and_then(Value::as_str) == Some("rule") {
-        let rule: Option<(bool, u64, Option<String>)> = sqlx::query_as(
-            "SELECT r.manual_apply_enabled, r.actions_revision, rs.current_state \
-            FROM rules r LEFT JOIN rule_states rs ON rs.rule_id = r.id WHERE r.id = ? FOR UPDATE",
+        let rule: Option<(bool, u64)> = sqlx::query_as(
+            "SELECT r.manual_apply_enabled, r.actions_revision \
+            FROM rules r WHERE r.id = ? FOR UPDATE",
         )
         .bind(rule_id)
         .fetch_optional(&mut *tx)
         .await?;
         ensure!(
-            matches!(rule, Some((true, revision, Some(ref current))) if current=="firing" && Some(revision)==snapshot.source.get("actions_revision").and_then(Value::as_u64)),
+            matches!(rule, Some((true, revision)) if Some(revision)==snapshot.source.get("actions_revision").and_then(Value::as_u64)),
             "rule_changed; prepare a fresh preview"
         );
     }

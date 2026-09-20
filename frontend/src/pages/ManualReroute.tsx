@@ -36,6 +36,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { RowActionButton } from "@/components/row-action-button";
 import { AsyncRetryButton } from "@/components/async-retry-button";
 import { ToneBadge } from "@/components/status-badge";
@@ -125,7 +126,25 @@ export default function ManualReroute() {
       JSON.stringify(actions.map(actionDraftPayload)) !==
         JSON.stringify(selectedPreset.actions.map(actionDraftPayload))
     : name.length > 0 || description.length > 0 || actions.length > 0;
-  const blocker = useBlocker(() => editorMode && dirty && !allowNavigation.current);
+  const blocker = useBlocker(({ currentLocation, nextLocation }) =>
+    editorMode
+      && dirty
+      && !allowNavigation.current
+      && (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search));
+  const manualTab = location.hash === "#configuration"
+    ? "configuration"
+    : location.hash === "#overview"
+      ? "overview"
+      : editorMode
+        ? "configuration"
+        : "overview";
+
+  function setManualTab(next: string) {
+    navigate(
+      { pathname: location.pathname, search: location.search, hash: next === "configuration" ? "#configuration" : "#overview" },
+      { replace: false },
+    );
+  }
 
   function invalidatePreview() {
     requestGeneration.current += 1;
@@ -447,13 +466,13 @@ export default function ManualReroute() {
   const shownPresets = presets.filter((preset) => `${preset.name} ${preset.description ?? ""}`.toLowerCase().includes(search.trim().toLowerCase()));
 
   if (listMode) return <div className="space-y-6">
-    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1><p className="mt-1 text-sm text-muted-foreground">Saved ordered action sets. Archiving a definition never reverts an active run.</p></div><div className="flex gap-2">{canRun && <Button variant="outline" asChild><Link to="/manual-mitigations/new?run=once"><Play className="size-4" /> Run once</Link></Button>}{canEdit && <Button asChild><Link to="/manual-mitigations/new"><Plus className="size-4" /> Add</Link></Button>}</div></div>
+    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1><p className="mt-1 text-sm text-muted-foreground">Saved ordered action sets. Archiving a definition never reverts an active run.</p></div><div className="flex gap-2">{canRun && <Button variant="outline" asChild><Link to="/manual-mitigations/new?run=once#configuration"><Play className="size-4" /> Run once</Link></Button>}{canEdit && <Button asChild><Link to="/manual-mitigations/new#configuration"><Plus className="size-4" /> Add</Link></Button>}</div></div>
     <Input aria-label="Search manual mitigations" placeholder="Search by name or description…" value={search} onChange={(event) => setSearch(event.target.value)} />
     {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{loadError} <AsyncRetryButton onRetry={load} /></div>}
     <div className="overflow-x-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50 text-left"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">Readiness</th><th className="px-3 py-2">Routers</th><th className="px-3 py-2">Steps</th><th className="px-3 py-2">Active runs</th><th className="px-3 py-2">Last result</th><th className="px-3 py-2 text-right">Actions</th></tr></thead><tbody>{shownPresets.map((preset) => <tr key={preset.id} className="border-t"><td className="px-3 py-3"><Link className="font-medium hover:underline" to={`/manual-mitigations/${preset.id}`}>{preset.name}</Link><p className="max-w-xl truncate text-xs text-muted-foreground">{preset.description || "No description"}</p></td><td className="px-3 py-3"><Badge variant={readiness(preset) === "ready" ? "outline" : readiness(preset) === "needs_setup" ? "destructive" : "secondary"}>{readiness(preset).replace("_", " ")}</Badge></td><td className="px-3 py-3">{new Set(preset.actions.map((action) => action.device_id)).size}</td><td className="px-3 py-3 tabular-nums">{preset.actions.length}</td><td className="px-3 py-3 tabular-nums">{activeByPreset[preset.id] ?? 0}</td><td className="px-3 py-3">{preset.recent_runs?.[0]?.state ?? "Never run"}</td><td className="px-3 py-3"><div className="flex justify-end gap-1">
       {canRun && readiness(preset) === "ready" ? <RowActionButton label={`Run ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}/run`}><Play className="size-4" /></Link></RowActionButton> : canRun ? <RowActionButton label={`Review setup for ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}`}><ShieldAlert className="size-4" /></Link></RowActionButton> : null}
       {canRun && (activeByPreset[preset.id] ?? 0) > 0 && <RowActionButton label={`Review revert eligibility for active runs of ${preset.name}`} asChild><Link to={`/mitigations?tab=active&preset_id=${preset.id}`}><RotateCcw className="size-4" /></Link></RowActionButton>}
-      {canEdit && <RowActionButton label={`Edit ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}/edit`}><Pencil className="size-4" /></Link></RowActionButton>}
+      {canEdit && <RowActionButton label={`Edit ${preset.name}`} asChild><Link to={`/manual-mitigations/${preset.id}/edit#configuration`}><Pencil className="size-4" /></Link></RowActionButton>}
       {canEdit && <RowActionButton label={deletingPresetId === preset.id ? `Archiving ${preset.name}…` : `Delete ${preset.name}`} tone="destructive" disabled={deletingPresetId !== null} loading={deletingPresetId === preset.id} loadingLabel={`Archiving ${preset.name}…`} onClick={() => void archivePreset(preset)}><Trash2 className="size-4" /></RowActionButton>}
       <RowActionButton label="Details" asChild><Link to={`/manual-mitigations/${preset.id}`}><Eye className="size-4" /></Link></RowActionButton>
     </div></td></tr>)}</tbody></table>{!loadError && shownPresets.length === 0 && <p className="p-8 text-center text-sm text-muted-foreground">{presets.length ? "No mitigations match this search." : "No saved manual mitigations yet."}</p>}</div>
@@ -470,8 +489,8 @@ export default function ManualReroute() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => { if (!dirty || window.confirm("Discard unsaved changes and reload?")) void refreshPage(); }} disabled={busy} loading={refreshing} loadingLabel="Refreshing…"><RefreshCw className="size-4" /> Refresh</Button>
-          {canRun && <Button variant="outline" size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new?run=once" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Play className="size-4" /> Run once</Link></Button>}
-          {canEdit && <Button size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Plus className="size-4" /> New mitigation</Link></Button>}
+          {canRun && <Button variant="outline" size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new?run=once#configuration" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Play className="size-4" /> Run once</Link></Button>}
+          {canEdit && <Button size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new#configuration" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Plus className="size-4" /> New mitigation</Link></Button>}
         </div>
       </div>
 
@@ -490,100 +509,89 @@ export default function ManualReroute() {
               <Badge variant="outline" className="tabular-nums">revision {selectedPreset.revision}</Badge>
               {presetInvalid && <Badge variant="destructive">invalid</Badge>}
               {!presetInvalid && presetNeedsPreview && <Badge variant="outline">validation on preview</Badge>}
-              {!runMode && !editorMode && canEdit && <Button size="sm" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit`}>Edit mitigation</Link></Button>}
+              {!runMode && !editorMode && canEdit && <Button size="sm" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit#configuration`}>Edit mitigation</Link></Button>}
             </div>}</div></CardHeader>
-            <CardContent className="space-y-5"><fieldset className="contents" disabled={busy}>
-              {presetInvalid && <div className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">
+            <CardContent><fieldset className="contents" disabled={busy}>
+              {presetInvalid && <div className="mb-5 rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">
                 <p className="font-medium">{selectedPreset?.definition_status === "draft" ? "Draft — add and configure every step before running." : "Needs setup — the complete action set is blocked."}</p>
                 <p className="mt-1 break-words">{selectedPreset?.validation_error ?? "One or more steps are incomplete. All saved steps remain visible; none will be silently omitted."}</p>
               </div>}
-              {!runMode && editorMode && canEdit && <div className="grid gap-3 sm:grid-cols-2">
-                <label className="space-y-1 text-sm font-medium">Name<Input value={name} maxLength={191} onChange={(event) => setName(event.target.value)} /></label>
-                <label className="space-y-1 text-sm font-medium sm:col-span-2">Description <span className="font-normal text-muted-foreground">(optional)</span>
-                  <textarea className={`${inputClass} min-h-20 resize-y`} maxLength={4000} value={description} onChange={(event) => setDescription(event.target.value)} />
-                </label>
-              </div>}
+              <Tabs value={manualTab} onValueChange={setManualTab}>
+                <TabsList variant="line" aria-label="Manual mitigation sections">
+                  <TabsTrigger value="overview">Overview &amp; run</TabsTrigger>
+                  <TabsTrigger value="configuration">Configuration</TabsTrigger>
+                </TabsList>
 
-              {!runMode && activePresetRuns.length > 0 && <div className="space-y-2 rounded-md border p-4">
-                <h3 className="text-sm font-semibold">Current state</h3>
-                {activePresetRuns.map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const devices = run.affected_devices?.map((device) => device.name ?? device.device_name ?? `Device ${device.id ?? device.device_id}`).join(", "); return <div key={run.bundle_id} className="space-y-1 rounded-md bg-muted/40 p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span>Run #{run.bundle_id}</span><Button asChild className="ml-auto" size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{run.revert?.available ? "Review & revert" : "Review run"}</Link></Button></div><p className="text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects{devices ? ` · ${devices}` : ""}</p><p className="text-xs text-muted-foreground">{run.triggered_by ?? "system"} · {run.started_at ? new Date(run.started_at).toLocaleString() : "not started"} · {run.recovery_deadline ? `Revert scheduled for ${new Date(run.recovery_deadline).toLocaleString()} · pending until automatic recovery is allowed` : "Until manually reverted"}</p>{bundleRun.verification_mode === "configuration_only" && <p className="text-xs text-muted-foreground">BGP advertisements were not verified.</p>}{run.source_preset_revision && run.source_preset_revision !== selectedPreset!.revision && <p className="text-xs text-amber-700 dark:text-amber-300">This run used revision {run.source_preset_revision}; the saved mitigation is now revision {selectedPreset!.revision}.</p>}</div>; })}
-              </div>}
+                <TabsContent value="overview" className="mt-4 space-y-5">
+                  {runMode && <div className="space-y-4 rounded-md border border-border p-4">
+                    {bundleId === null && <section className="space-y-3" aria-labelledby="verification-heading"><div><h3 id="verification-heading" className="text-sm font-medium">Verification</h3><p className="mt-1 max-w-3xl text-xs text-muted-foreground">The preview reads current configuration and shows the exact configuration commands and inverse. Execution reads the resulting configuration back.</p></div>
+                      <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked readOnly /><span><strong>Configuration only</strong><span className="block max-w-3xl text-xs text-muted-foreground">Verify the reviewed configuration without checking routing outcomes.</span></span></label>
+                      <label className="flex items-start gap-2 text-sm opacity-60"><input className="mt-1" type="radio" name="verification-mode" disabled /><span><strong>Additional checks</strong><span className="block max-w-3xl text-xs text-muted-foreground">Action-specific routing, BGP, and operational checks will be available in a future version.</span></span></label>
+                      <p className="rounded-md border border-border bg-muted/40 p-3 text-sm">BGP advertisements are not verified.</p>
+                      {capabilitiesState === "loading" && <p role="status" className="text-xs text-muted-foreground">Checking Configuration-only eligibility…</p>}
+                      {capabilitiesState === "ready" && !configurationOnlyEligible && <p role="alert" className="text-xs text-destructive">Configuration only requires supported actions on one enabled router with a pinned SSH identity.</p>}
+                      {(capabilitiesState === "error" || retryingCapabilities) && <div className="flex flex-wrap items-center gap-2 text-xs text-amber-800 dark:text-amber-300" role="alert"><span>{retryingCapabilities ? "Checking eligibility…" : "Configuration-only eligibility is unavailable, so preview and execution remain blocked."}</span><Button type="button" size="sm" variant="outline" onClick={() => void retryCapabilities()} loading={retryingCapabilities} loadingLabel="Checking eligibility…">Retry eligibility</Button></div>}
+                    </section>}
+                    {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
+                      <Input value={reason} maxLength={500} disabled={busy} onChange={(event) => { setReason(event.target.value); invalidatePreview(); }} placeholder="Why is this mitigation being run?" />
+                    </label>}
+                    {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select aria-describedby="revert-schedule-help" className={inputClass} value="" disabled><option value="">Until manually reverted</option></select><span id="revert-schedule-help" className="block text-xs font-normal text-muted-foreground">Automatic recovery is unavailable. Revert the reviewed run manually.</span></label>}
+                    {preview && <div className="space-y-3" aria-live="polite"><div className="flex items-center gap-2 text-sm font-medium"><ShieldCheck className="size-4" /> Exact server preview</div>
+                      {preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}
+                      {preview.expires_at && <p className="text-xs text-muted-foreground">Preview expires {new Date(preview.expires_at).toLocaleString()}.</p>}
+                      {preview.operating_mode === "observe" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode disables automatic response. This one-use preview can authorize this explicit manual run after confirmation.</p>}
+                    </div>}
+                    {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
+                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+                      <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Step 2 · Review and explicitly confirm the exact changes." : bundleId === null ? "Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
+                      <div className="grid gap-2 sm:grid-cols-[auto_22rem]">
+                        <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}#overview`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
+                        {!preview && bundleId === null && <Button className="w-full sm:w-[22rem]" onClick={() => void preparePreview()} disabled={effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Preparing exact preview…">Preview changes</Button>}
+                        {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
+                      </div>
+                    </div>
+                  </div>}
 
-              {bundleId === null && <OrderedActionSetEditor actions={displayActions} templates={templates} devices={devices} busy={busy}
-                readOnly={runMode || !editorMode || !canEdit} selectedIndex={selectedAction}
-                onSelect={(runMode && canRun) || (!runMode && editorMode && canEdit) ? setSelectedAction : undefined}
-                editLabel={runMode ? "Override" : "Edit"} renderEditor={renderActionEditor}
-                onMove={!runMode && editorMode && canEdit ? moveAction : undefined}
-                onRemove={!runMode && editorMode && canEdit ? (index) => { setActions((current) => current.filter((_, i) => i !== index)); setSelectedAction(null); invalidatePreview(); } : undefined}
-                onReset={runMode ? (index) => { const key = actionIdentity(actions[index], index); setOverrides(({ [key]: _removed, ...current }) => current); invalidatePreview(); } : undefined} />}
+                  {!runMode && selectedPreset && canRun && !presetInvalid && <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border p-4"><div><h3 className="text-sm font-semibold">Run this mitigation</h3><p className="text-xs text-muted-foreground">Create a fresh exact preview from the saved configuration.</p></div><Button asChild><Link to={`/manual-mitigations/${selectedPreset.id}/run#overview`}><Play className="size-4" /> Run mitigation</Link></Button></div>}
+                  {!runMode && activePresetRuns.length > 0 && <div className="space-y-2 rounded-md border p-4">
+                    <h3 className="text-sm font-semibold">Current state</h3>
+                    {activePresetRuns.map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const devices = run.affected_devices?.map((device) => device.name ?? device.device_name ?? `Device ${device.id ?? device.device_id}`).join(", "); return <div key={run.bundle_id} className="space-y-1 rounded-md bg-muted/40 p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span>Run #{run.bundle_id}</span><Button asChild className="ml-auto" size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{run.revert?.available ? "Review & revert" : "Review run"}</Link></Button></div><p className="text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects{devices ? ` · ${devices}` : ""}</p><p className="text-xs text-muted-foreground">{run.triggered_by ?? "system"} · {run.started_at ? new Date(run.started_at).toLocaleString() : "not started"} · {run.recovery_deadline ? `Revert scheduled for ${new Date(run.recovery_deadline).toLocaleString()} · pending until automatic recovery is allowed` : "Until manually reverted"}</p>{bundleRun.verification_mode === "configuration_only" && <p className="text-xs text-muted-foreground">BGP advertisements were not verified.</p>}{run.source_preset_revision && run.source_preset_revision !== selectedPreset!.revision && <p className="text-xs text-amber-700 dark:text-amber-300">This run used revision {run.source_preset_revision}; the saved mitigation is now revision {selectedPreset!.revision}.</p>}</div>; })}
+                  </div>}
+                  {bundleId === null && <ActionsAndRevert actions={runMode ? effectiveActions : actions} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} disabled={busy} />}
+                  {!runMode && selectedPreset?.recent_runs && selectedPreset.recent_runs.length > 0 && <div className="space-y-2">
+                    <h3 className="text-sm font-medium">Recent runs</h3>
+                    <ul className="divide-y divide-border rounded-md border border-border text-sm">
+                      {selectedPreset.recent_runs.slice(0, 5).map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const active = run.active ?? state.remaining > 0; return <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"><div className="flex flex-wrap items-center gap-2"><strong>Run #{run.bundle_id}</strong><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="text-muted-foreground">{new Date(run.created_at).toLocaleString()}</span>{active && <span className="block text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects</span>}</div><Button asChild size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{active ? "Review & revert" : "Review run"}</Link></Button></li>; })}
+                    </ul>
+                  </div>}
+                  {!runMode && !selectedPreset && <div className="rounded-md border border-dashed border-border p-5 text-sm text-muted-foreground">Build the action set in the Configuration tab before running it.</div>}
+                </TabsContent>
 
-              {!runMode && selectedPreset?.recent_runs && selectedPreset.recent_runs.length > 0 && <div className="space-y-2">
-                <h3 className="text-sm font-medium">Recent runs</h3>
-                <ul className="divide-y divide-border rounded-md border border-border text-sm">
-                  {selectedPreset.recent_runs.slice(0, 5).map((run) => { const bundleRun = recentRunAsBundle(run); const state = presentMitigationRun(bundleRun); const active = run.active ?? state.remaining > 0; return <li key={run.bundle_id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
-                    <div className="flex flex-wrap items-center gap-2"><strong>Run #{run.bundle_id}</strong><ToneBadge tone={state.tone}>{state.label}</ToneBadge><span className="text-muted-foreground">{new Date(run.created_at).toLocaleString()}</span>{active && <span className="block text-xs text-muted-foreground">{state.known} known changes · {state.unknown} unknown effects</span>}</div>
-                    <Button asChild size="sm" variant="outline"><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>{active ? "Review & revert" : "Review run"}</Link></Button>
-                  </li>; })}
-                </ul>
-              </div>}
-
-              {bundleId === null && ((!runMode && editorMode && canEdit) || (runMode && !selectedPreset && canRun)) && <div className="space-y-3 rounded-md border border-dashed border-border p-3">
-                <div><h3 className="text-sm font-semibold">Add actions</h3><p className="text-xs text-muted-foreground">Choose a template and one or more routers to append new steps.</p></div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="space-y-1 text-sm font-medium">Action template<select className={inputClass} value={templateId} onChange={(event) => { setTemplateId(event.target.value); setNewValuesByDevice({}); setBulkPrefixes(""); setIncludeMss(false); }}>
-                    <option value="">Select template…</option>{orderTemplatesForChoice(templates.filter((template) => template.enabled)).map((template) => <option key={template.id} value={template.id}>{templateLabel(template)}</option>)}
-                  </select></label>
-                  <fieldset className="space-y-1 text-sm font-medium"><legend>Target routers</legend><div className="max-h-36 space-y-1 overflow-y-auto rounded-md border border-input p-2">
-                    {devices.map((device) => <label key={device.id} className="flex items-center gap-2 font-normal"><input type="checkbox" checked={deviceIds.includes(device.id)} onChange={() => setDeviceIds((current) => current.includes(device.id) ? current.filter((id) => id !== device.id) : [...current, device.id])} />{device.name}</label>)}
-                  </div></fieldset>
-                </div>
-                {selectedTemplate && templateGuidance(selectedTemplate.name) && <p className="text-xs text-muted-foreground">{templateGuidance(selectedTemplate.name)}</p>}
-                {selectedTemplate && prefixParam && <label className="block space-y-1 text-sm font-medium">Prefixes <span className="font-normal text-muted-foreground">(comma or line separated)</span><textarea className={`${inputClass} min-h-16`} value={bulkPrefixes} onChange={(event) => setBulkPrefixes(event.target.value)} /></label>}
-                {selectedTemplate && deviceIds.map((target) => <div key={target} className="space-y-2 rounded-md border border-border p-3"><div className="text-sm font-medium">{devices.find((device) => device.id === target)?.name}</div><ActionParamsForm schema={selectedTemplate.parameter_schema} deviceId={target} values={newValuesByDevice[target] ?? {}} onChange={(values) => setNewValuesByDevice((current) => ({ ...current, [target]: values }))} omitParams={prefixParam ? new Set([prefixParam]) : undefined} />
-                  {includeMss && <label className="block space-y-1 text-sm font-medium">MSS interface<Input value={mssInterfaceByDevice[target] ?? ""} onChange={(event) => setMssInterfaceByDevice((current) => ({ ...current, [target]: event.target.value }))} /></label>}</div>)}
-                {selectedTemplate && ["bgp_advertise_add", "bgp_advertise_remove"].includes(selectedTemplate.name) && <div className="flex flex-wrap items-center gap-3 rounded-md border border-border p-3"><label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={includeMss} onChange={(event) => setIncludeMss(event.target.checked)} />Also {selectedTemplate.name === "bgp_advertise_add" ? "add" : "remove"} MSS clamp per router</label>{includeMss && selectedTemplate.name === "bgp_advertise_add" && <Input className="max-w-32" value={mssValue} onChange={(event) => setMssValue(event.target.value)} aria-label="MSS value" />}</div>}
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs tabular-nums text-muted-foreground">{actions.length}/256 actions</span>
-                  <Button type="button" size="sm" variant="outline" onClick={addAction} disabled={!selectedTemplate || deviceIds.length === 0 || actions.length >= 256}><CopyPlus className="size-4" /> Add to ordered set</Button>
-                </div>
-              </div>}
-
-              {bundleId === null && <ActionsAndRevert actions={runMode ? effectiveActions : actions} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} disabled={busy} />}
-              {!runMode ? <div className="flex flex-wrap justify-between gap-2 border-t border-border pt-4"><div>
-                {selectedPreset && editorMode && canEdit && <Button variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setDeleteOpen(true)} disabled={busy}><Archive className="size-4" /> Archive</Button>}
-              </div><div className="flex flex-wrap gap-2">
-                {selectedPreset && canRun && <Button variant="outline" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/run`}><Play className="size-4" /> Run</Link></Button>}
-                {selectedPreset && !editorMode && canEdit && <Button asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit`}>Edit</Link></Button>}
-                {editorMode && <Button variant="outline" onClick={() => navigate(selectedPreset ? `/manual-mitigations/${selectedPreset.id}` : "/manual-mitigations")}>Cancel</Button>}
-                {editorMode && canEdit && <Button onClick={() => void save()} disabled={!name.trim()} loading={busy} loadingLabel="Saving…"><Save className="size-4" /> Save</Button>}
-              </div></div> : <div className="space-y-4 border-t border-border pt-4">
-                {bundleId === null && <section className="space-y-3" aria-labelledby="verification-heading"><div><h3 id="verification-heading" className="text-sm font-medium">Verification</h3><p className="mt-1 max-w-3xl text-xs text-muted-foreground">The preview reads current configuration and shows the exact configuration commands and inverse. Execution reads the resulting configuration back.</p></div>
-                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked readOnly /><span><strong>Configuration only</strong><span className="block max-w-3xl text-xs text-muted-foreground">Verify the reviewed configuration without checking routing outcomes.</span></span></label>
-                  <label className="flex items-start gap-2 text-sm opacity-60"><input className="mt-1" type="radio" name="verification-mode" disabled /><span><strong>Additional checks</strong><span className="block max-w-3xl text-xs text-muted-foreground">Action-specific routing, BGP, and operational checks will be available in a future version.</span></span></label>
-                  <p className="rounded-md border border-border bg-muted/40 p-3 text-sm">BGP advertisements are not verified.</p>
-                  {capabilitiesState === "loading" && <p role="status" className="text-xs text-muted-foreground">Checking Configuration-only eligibility…</p>}
-                  {capabilitiesState === "ready" && !configurationOnlyEligible && <p role="alert" className="text-xs text-destructive">Configuration only requires supported actions on one enabled router with a pinned SSH identity.</p>}
-                  {(capabilitiesState === "error" || retryingCapabilities) && <div className="flex flex-wrap items-center gap-2 text-xs text-amber-800 dark:text-amber-300" role="alert"><span>{retryingCapabilities ? "Checking eligibility…" : "Configuration-only eligibility is unavailable, so preview and execution remain blocked."}</span><Button type="button" size="sm" variant="outline" onClick={() => void retryCapabilities()} loading={retryingCapabilities} loadingLabel="Checking eligibility…">Retry eligibility</Button></div>}
-                </section>}
-                {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
-                  <Input value={reason} maxLength={500} disabled={busy} onChange={(event) => { setReason(event.target.value); invalidatePreview(); }} placeholder="Why is this mitigation being run?" />
-                </label>}
-                {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select aria-describedby="revert-schedule-help" className={inputClass} value="" disabled><option value="">Until manually reverted</option></select><span id="revert-schedule-help" className="block text-xs font-normal text-muted-foreground">Automatic recovery is unavailable. Revert the reviewed run manually.</span></label>}
-                {preview && <div className="space-y-3" aria-live="polite"><div className="flex items-center gap-2 text-sm font-medium"><ShieldCheck className="size-4" /> Exact server preview</div>
-                  {preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}
-                  {preview.expires_at && <p className="text-xs text-muted-foreground">Preview expires {new Date(preview.expires_at).toLocaleString()}.</p>}
-                  {preview.operating_mode === "observe" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode disables automatic response. This one-use preview can authorize this explicit manual run after confirmation.</p>}
-                </div>}
-                {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
-                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-                  <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Step 2 · Review and explicitly confirm the exact changes." : bundleId === null ? "Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
-                  <div className="grid gap-2 sm:grid-cols-[auto_22rem]">
-                    <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
-                    {!preview && bundleId === null && <Button className="w-full sm:w-[22rem]" onClick={() => void preparePreview()} disabled={effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Preparing exact preview…">Preview changes</Button>}
-                    {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
-                  </div>
-                </div>
-              </div>}
+                <TabsContent value="configuration" className="mt-4 space-y-5">
+                  {!runMode && editorMode && canEdit && <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="space-y-1 text-sm font-medium">Name<Input value={name} maxLength={191} onChange={(event) => setName(event.target.value)} /></label>
+                    <label className="space-y-1 text-sm font-medium sm:col-span-2">Description <span className="font-normal text-muted-foreground">(optional)</span><textarea className={`${inputClass} min-h-20 resize-y`} maxLength={4000} value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+                  </div>}
+                  {runMode && bundleId === null && <p className="rounded-md border border-border bg-muted/40 p-3 text-sm text-muted-foreground">Review the saved actions here. Temporary overrides affect only this run and invalidate any existing preview.</p>}
+                  {bundleId === null && <OrderedActionSetEditor actions={displayActions} templates={templates} devices={devices} busy={busy}
+                    readOnly={runMode || !editorMode || !canEdit} selectedIndex={selectedAction}
+                    onSelect={(runMode && canRun) || (!runMode && editorMode && canEdit) ? setSelectedAction : undefined}
+                    editLabel={runMode ? "Override" : "Edit"} renderEditor={renderActionEditor}
+                    onMove={!runMode && editorMode && canEdit ? moveAction : undefined}
+                    onRemove={!runMode && editorMode && canEdit ? (index) => { setActions((current) => current.filter((_, i) => i !== index)); setSelectedAction(null); invalidatePreview(); } : undefined}
+                    onReset={runMode ? (index) => { const key = actionIdentity(actions[index], index); setOverrides(({ [key]: _removed, ...current }) => current); invalidatePreview(); } : undefined} />}
+                  {bundleId === null && ((!runMode && editorMode && canEdit) || (runMode && !selectedPreset && canRun)) && <div className="space-y-3 rounded-md border border-dashed border-border p-3">
+                    <div><h3 className="text-sm font-semibold">Add actions</h3><p className="text-xs text-muted-foreground">Choose a template and one or more routers to append new steps.</p></div>
+                    <div className="grid gap-3 sm:grid-cols-2"><label className="space-y-1 text-sm font-medium">Action template<select className={inputClass} value={templateId} onChange={(event) => { setTemplateId(event.target.value); setNewValuesByDevice({}); setBulkPrefixes(""); setIncludeMss(false); }}><option value="">Select template…</option>{orderTemplatesForChoice(templates.filter((template) => template.enabled)).map((template) => <option key={template.id} value={template.id}>{templateLabel(template)}</option>)}</select></label><fieldset className="space-y-1 text-sm font-medium"><legend>Target routers</legend><div className="max-h-36 space-y-1 overflow-y-auto rounded-md border border-input p-2">{devices.map((device) => <label key={device.id} className="flex items-center gap-2 font-normal"><input type="checkbox" checked={deviceIds.includes(device.id)} onChange={() => setDeviceIds((current) => current.includes(device.id) ? current.filter((id) => id !== device.id) : [...current, device.id])} />{device.name}</label>)}</div></fieldset></div>
+                    {selectedTemplate && templateGuidance(selectedTemplate.name) && <p className="text-xs text-muted-foreground">{templateGuidance(selectedTemplate.name)}</p>}
+                    {selectedTemplate && prefixParam && <label className="block space-y-1 text-sm font-medium">Prefixes <span className="font-normal text-muted-foreground">(comma or line separated)</span><textarea className={`${inputClass} min-h-16`} value={bulkPrefixes} onChange={(event) => setBulkPrefixes(event.target.value)} /></label>}
+                    {selectedTemplate && deviceIds.map((target) => <div key={target} className="space-y-2 rounded-md border border-border p-3"><div className="text-sm font-medium">{devices.find((device) => device.id === target)?.name}</div><ActionParamsForm schema={selectedTemplate.parameter_schema} deviceId={target} values={newValuesByDevice[target] ?? {}} onChange={(values) => setNewValuesByDevice((current) => ({ ...current, [target]: values }))} omitParams={prefixParam ? new Set([prefixParam]) : undefined} />{includeMss && <label className="block space-y-1 text-sm font-medium">MSS interface<Input value={mssInterfaceByDevice[target] ?? ""} onChange={(event) => setMssInterfaceByDevice((current) => ({ ...current, [target]: event.target.value }))} /></label>}</div>)}
+                    {selectedTemplate && ["bgp_advertise_add", "bgp_advertise_remove"].includes(selectedTemplate.name) && <div className="flex flex-wrap items-center gap-3 rounded-md border border-border p-3"><label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={includeMss} onChange={(event) => setIncludeMss(event.target.checked)} />Also {selectedTemplate.name === "bgp_advertise_add" ? "add" : "remove"} MSS clamp per router</label>{includeMss && selectedTemplate.name === "bgp_advertise_add" && <Input className="max-w-32" value={mssValue} onChange={(event) => setMssValue(event.target.value)} aria-label="MSS value" />}</div>}
+                    <div className="flex flex-wrap items-center justify-between gap-2"><span className="text-xs tabular-nums text-muted-foreground">{actions.length}/256 actions</span><Button type="button" size="sm" variant="outline" onClick={addAction} disabled={!selectedTemplate || deviceIds.length === 0 || actions.length >= 256}><CopyPlus className="size-4" /> Add to ordered set</Button></div>
+                  </div>}
+                  {!runMode && <div className="flex flex-wrap justify-between gap-2 border-t border-border pt-4"><div>{selectedPreset && editorMode && canEdit && <Button variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setDeleteOpen(true)} disabled={busy}><Archive className="size-4" /> Archive</Button>}</div><div className="flex flex-wrap gap-2">{selectedPreset && !editorMode && canEdit && <Button asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit#configuration`}>Edit</Link></Button>}{editorMode && <Button variant="outline" onClick={() => navigate(selectedPreset ? `/manual-mitigations/${selectedPreset.id}#overview` : "/manual-mitigations")}>Cancel</Button>}{editorMode && canEdit && <Button onClick={() => void save()} disabled={!name.trim()} loading={busy} loadingLabel="Saving…"><Save className="size-4" /> Save</Button>}</div></div>}
+                </TabsContent>
+              </Tabs>
             </fieldset></CardContent>
           </Card>}
         </div>

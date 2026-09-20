@@ -222,7 +222,7 @@ export default function Dashboard() {
             </CardTitle>
             <CardDescription>
               Rules currently firing or recovered while router changes still await revert.
-              Manual apply is available only for firing rules where enabled.
+              Any rule with defined actions and manual apply enabled can also be run from its Rule detail page.
             </CardDescription>
           </CardHeader>
           <CardContent>

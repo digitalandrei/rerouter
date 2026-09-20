@@ -21,9 +21,11 @@ import {
   Info,
   AlertTriangle,
   ShieldAlert,
+  Eye,
+  ArrowLeft,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   api,
   type Rule,
@@ -66,6 +68,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
   TableBody,
@@ -561,8 +564,8 @@ export function RuleActionsDialog({
           <div className="text-sm">
             <div className="font-medium">Allow manual apply</div>
             <div className="text-xs text-muted-foreground">
-              Operators can manually apply this rule's actions from a firing alert.
-              Independent of automatic execution and available in Observe after
+              Operators can manually run this rule's defined actions from its detail page or a firing alert.
+              Independent of detection state and automatic execution, and available in Observe after
               an exact preview; still gated by permission, locks and cooldowns.
             </div>
           </div>
@@ -574,7 +577,7 @@ export function RuleActionsDialog({
             title={
               actions.length === 0
                 ? "Attach an action first"
-                : "Allow operators to manually apply this rule's actions from a firing alert"
+                : "Allow operators to manually run this rule's defined actions"
             }
           />
         </div>
@@ -1097,6 +1100,12 @@ type SortDir = "asc" | "desc";
 
 export default function Rules() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { id: ruleIdRaw } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const ruleId = Number(ruleIdRaw) || null;
+  const detailMode = ruleId !== null;
+  const ruleTab = location.hash === "#configuration" ? "configuration" : "overview";
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("edit_rules");
   const canApply = hasPermission("trigger_manual_reroute");
@@ -1110,7 +1119,7 @@ export default function Rules() {
   const [manageRule, setManageRule] = useState<Rule | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Rule | null>(null);
   const [editRule, setEditRule] = useState<Rule | null>(null);
-  // Firing rule the operator chose to mitigate from this page (same guarded
+  // Rule mitigation the operator chose to run manually (same guarded
   // preview -> token -> execute dialog as Dashboard and Mitigations).
   const [applyRule, setApplyRule] = useState<Rule | null>(null);
   const [clearRuleTarget, setClearRuleTarget] = useState<Rule | null>(null);
@@ -1140,6 +1149,19 @@ export default function Rules() {
       .then(setSettings)
       .catch(() => setSettings(null));
   }, []);
+
+  const detailRule = ruleId === null ? null : rules.find((rule) => rule.id === ruleId) ?? null;
+  const editRoute = detailMode && location.pathname.endsWith("/edit");
+  useEffect(() => {
+    if (editRoute && detailRule && editRule?.id !== detailRule.id) setEditRule(detailRule);
+  }, [editRoute, detailRule, editRule?.id]);
+
+  function setRuleTab(next: string) {
+    navigate(
+      { pathname: location.pathname, search: location.search, hash: next === "configuration" ? "#configuration" : "#overview" },
+      { replace: false },
+    );
+  }
 
   // Quietly refresh the live above/below status every 20s (no loading flicker).
   useEffect(() => {
@@ -1192,9 +1214,52 @@ export default function Rules() {
         return nameSortDir === "asc" ? cmp : -cmp;
       })
     : filtered;
+  const detailDisarmed = detailRule ? autoDisarm(detailRule) : null;
+  const detailDrifted = detailRule ? driftedActions(detailRule) : [];
 
   return (
     <div className="space-y-6">
+      {detailMode ? (
+        <>
+          <div className="space-y-3">
+            <Link to="/rules" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline"><ArrowLeft className="size-4" /> Rules</Link>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div><h1 className="text-2xl font-bold tracking-tight">{detailRule?.name ?? (loading ? "Loading rule…" : `Rule #${ruleId}`)}</h1>{detailRule && <p className="mt-1 text-sm text-muted-foreground">{detailRule.metric_aggregation === "sum" ? `Sum of ${detailRule.member_interface_ids?.length ?? 0} interfaces` : `${detailRule.device_name ?? "Device"} · ${detailRule.interface_name ?? `interface #${detailRule.interface_id}`}`}</p>}</div>
+              {detailRule && <div className="flex flex-wrap items-center gap-2"><SeverityBadge severity={detailRule.severity} /><Badge variant={detailRule.enabled ? "outline" : "secondary"}>{detailRule.enabled ? "enabled" : "disabled"}</Badge>{canEdit && <Button variant="outline" size="sm" asChild><Link to={`/rules/${detailRule.id}/edit#configuration`}><Pencil className="size-4" /> Edit</Link></Button>}{canEdit && <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={() => setDeleteTarget(detailRule)}><Trash2 className="size-4" /> Delete</Button>}</div>}
+            </div>
+          </div>
+
+          {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">Could not refresh this rule. {detailRule ? "Showing retained data." : "No rule data is available."} {loadError}</div>}
+          {!detailRule && !loading && !loadError && <Card><CardContent className="py-8 text-center text-sm text-muted-foreground">Rule not found.</CardContent></Card>}
+          {detailRule && <Tabs value={ruleTab} onValueChange={setRuleTab}>
+            <TabsList variant="line" aria-label="Rule sections"><TabsTrigger value="overview">Overview &amp; run</TabsTrigger><TabsTrigger value="configuration">Configuration</TabsTrigger></TabsList>
+            <TabsContent value="overview" className="mt-4 space-y-4">
+              <Card><CardHeader><CardTitle className="text-lg">Current state</CardTitle></CardHeader><CardContent className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <div><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Condition</p><p className="mt-1 text-sm font-medium">{conditionLabel(detailRule)}</p><div className="mt-1"><RuleStatus rule={detailRule} /></div></div>
+                <div><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Persistence</p><p className="mt-1 text-sm font-medium">{persistenceLabel(detailRule)}</p><div className="mt-1"><RuleProgress rule={detailRule} /></div></div>
+                <div><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Recovery</p><p className="mt-1 text-sm font-medium">{(detailRule.recovery_mode ?? "auto").replaceAll("_", " ")}</p><p className="text-xs text-muted-foreground">Automatic revert {detailRule.automatic_revert_enabled ? "enabled" : "disabled"}</p></div>
+                <div><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Mitigation</p><p className="mt-1 text-sm font-medium">{detailRule.action_count ?? 0} action{detailRule.action_count === 1 ? "" : "s"}</p><p className="text-xs text-muted-foreground">{detailRule.automatic_reroute_enabled ? "automatic execution armed" : "manual execution"}{detailRule.manual_apply_enabled ? " · manual run allowed" : ""}</p></div>
+              </CardContent></Card>
+              {detailDisarmed && <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200"><strong>Automatic execution disarmed</strong><p className="mt-1">{detailDisarmed.reason ?? "An attached action no longer matches discovered inventory."} · {timeAgo(detailDisarmed.at)}</p><p className="mt-1 text-xs">{DISARM_CONSEQUENCE}</p></div>}
+              {detailDrifted.length > 0 && <div className="rounded-md border p-3 text-sm"><strong>{detailDrifted.length} drifted action{detailDrifted.length === 1 ? "" : "s"}</strong><ul className="mt-1 list-disc pl-5 text-muted-foreground">{detailDrifted.map((action) => <li key={action.id}>{action.inventory_drift_reason ?? "Saved parameters no longer match router inventory."}</li>)}</ul></div>}
+              <Card><CardHeader><CardTitle className="text-lg">Operations</CardTitle></CardHeader><CardContent className="space-y-2"><div className="flex flex-wrap gap-2">
+                {canApply && (detailRule.action_count ?? 0) > 0 && <Button variant="destructive" disabled={!detailRule.manual_apply_enabled} title={detailRule.manual_apply_enabled ? "Preview and run this rule's defined mitigation manually" : "Enable manual apply in Configuration first"} onClick={() => setApplyRule(detailRule)}>Run manually</Button>}
+                {canEdit && detailRule.current_state === "firing" && <Button variant="outline" onClick={() => setClearRuleTarget(detailRule)}>Review &amp; clear</Button>}
+                {detailRule.current_state === "recovered_awaiting_revert" && <Button variant="outline" asChild><Link to={`/mitigations?tab=active&rule_id=${detailRule.id}`}>View active run / revert</Link></Button>}
+                <Button variant="outline" onClick={() => setManageRule(detailRule)}><Workflow className="size-4" /> {canEdit ? "Manage mitigation actions" : "Inspect mitigation actions"}</Button>
+              </div>{(detailRule.action_count ?? 0) > 0 && !detailRule.manual_apply_enabled && <p className="text-xs text-muted-foreground">The mitigation is defined, but manual apply is disabled. Enable it in Configuration before running manually.</p>}{detailRule.manual_apply_enabled && (detailRule.action_count ?? 0) > 0 && <p className="text-xs text-muted-foreground">Manual execution uses the same prepared actions and action-specific verification as automatic execution, with an exact preview and explicit confirmation.</p>}</CardContent></Card>
+            </TabsContent>
+            <TabsContent value="configuration" className="mt-4 space-y-4">
+              <Card><CardHeader><div className="flex flex-wrap items-start justify-between gap-3"><div><CardTitle className="text-lg">Detection configuration</CardTitle><p className="mt-1 text-sm text-muted-foreground">Condition, persistence, severity, recovery, and target.</p></div>{canEdit && <Button size="sm" onClick={() => setEditRule(detailRule)}><Pencil className="size-4" /> Edit detection</Button>}</div></CardHeader><CardContent className="grid gap-3 text-sm sm:grid-cols-2"><p>Condition: <strong>{conditionLabel(detailRule)}</strong></p><p>Persistence: <strong>{persistenceLabel(detailRule)}</strong></p><p>Severity: <strong>{detailRule.severity}</strong></p><p>Recovery: <strong>{(detailRule.recovery_mode ?? "auto").replaceAll("_", " ")}</strong></p><p>Target: <strong>{detailRule.metric_aggregation === "sum" ? `${detailRule.member_interface_ids?.length ?? 0} summed interfaces` : `${detailRule.device_name ?? "device"} / ${detailRule.interface_name ?? `interface #${detailRule.interface_id}`}`}</strong></p><p>Metric: <strong>{metricLabel(detailRule.metric)}</strong></p></CardContent></Card>
+              <Card><CardHeader><div className="flex flex-wrap items-start justify-between gap-3"><div><CardTitle className="text-lg">Mitigation configuration</CardTitle><p className="mt-1 text-sm text-muted-foreground">Ordered actions and manual/automatic execution preferences.</p></div><Button size="sm" variant="outline" onClick={() => setManageRule(detailRule)}><Workflow className="size-4" /> {canEdit ? "Edit actions" : "Inspect actions"}</Button></div></CardHeader><CardContent className="space-y-3">
+                <div className="flex flex-wrap gap-2"><Badge variant={detailRule.automatic_reroute_enabled ? "destructive" : "outline"}>{detailRule.automatic_reroute_enabled ? "automatic armed" : "manual"}</Badge>{detailRule.manual_apply_enabled && <Badge variant="outline">manual apply allowed</Badge>}<Badge variant="secondary">revision {detailRule.actions_revision}</Badge></div>
+                {detailRule.actions?.length ? <ol className="space-y-2">{detailRule.actions.map((action, index) => <li key={action.id} className="rounded-md border border-border p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><span className="inline-flex size-6 items-center justify-center rounded bg-muted text-xs font-semibold">{index + 1}</span><strong>{templateLabelFrom(action.template_display_name, action.template_name)}</strong><span className="text-muted-foreground">· {action.device_name ?? `router #${action.device_id}`}</span>{action.inventory_state === "drifted" && <Badge variant="outline" className="border-amber-400 text-amber-700">drifted</Badge>}</div></li>)}</ol> : <p className="text-sm text-muted-foreground">No mitigation actions attached.</p>}
+              </CardContent></Card>
+            </TabsContent>
+          </Tabs>}
+        </>
+      ) : (
+        <>
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Threshold rules</h1>
         <Button variant="outline" size="sm" onClick={() => setAddOpen(true)} disabled={!canEdit}>
@@ -1255,7 +1320,7 @@ export default function Rules() {
                       <TableCell className="pl-6">
                         <div className="flex items-center gap-2">
                           <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
-                          <span className="font-medium">{rule.name}</span>
+                          <Link className="font-medium hover:underline" to={`/rules/${rule.id}#overview`}>{rule.name}</Link>
                           {rule.current_state === "recovered_awaiting_revert" && <Badge variant="outline" className="border-amber-400 text-amber-800 dark:text-amber-300">recovered · awaiting revert</Badge>}
                         </div>
                       </TableCell>
@@ -1319,13 +1384,10 @@ export default function Rules() {
                             size="sm"
                             variant="outline"
                             className="h-7 gap-1.5"
-                            onClick={() => setManageRule(rule)}
+                            asChild
                             title={canEdit ? "Manage mitigation actions" : "Inspect mitigation actions"}
                           >
-                            <Workflow className="size-3.5 text-muted-foreground" />
-                            {rule.action_count
-                              ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}`
-                              : "none"}
+                            <Link to={`/rules/${rule.id}#configuration`}><Workflow className="size-3.5 text-muted-foreground" />{rule.action_count ? `${rule.action_count} action${rule.action_count > 1 ? "s" : ""}` : "none"}</Link>
                           </Button>
                           {rule.action_count ? (
                             <>
@@ -1375,7 +1437,7 @@ export default function Rules() {
                                 <Badge
                                   variant="outline"
                                   className="text-[10px] text-sky-700 dark:text-sky-400"
-                                  title="Operators can manually apply this rule's actions from a firing alert"
+                                  title="Operators can manually run this rule's defined actions"
                                 >
                                   apply
                                 </Badge>
@@ -1412,39 +1474,14 @@ export default function Rules() {
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="flex items-center justify-end gap-1">
-                          {canApply &&
-                            rule.current_state === "firing" &&
-                            rule.manual_apply_enabled &&
-                            (rule.action_count ?? 0) > 0 && (
-                              <Button
-                                size="sm"
-                                variant="destructive"
-                                className="h-7"
-                                title="Apply this rule's configured actions after an exact preview and confirmation"
-                                onClick={() => setApplyRule(rule)}
-                              >
-                                Mitigate
-                              </Button>
-                            )}
-                          {rule.current_state === "recovered_awaiting_revert" && <Button size="sm" variant="outline" className="h-7" asChild><Link to={`/mitigations?tab=active&rule_id=${rule.id}`}>View active run / revert</Link></Button>}
-                          {canEdit && rule.current_state === "firing" && (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7"
-                              title="Review the rollback plan, then clear this firing rule"
-                              onClick={() => setClearRuleTarget(rule)}
-                            >
-                              Clear
-                            </Button>
-                          )}
+                          <RowActionButton label={`View ${rule.name}`} asChild><Link to={`/rules/${rule.id}#overview`}><Eye className="size-4" /></Link></RowActionButton>
                           {canEdit && (
                             <>
                               <RowActionButton
                                 label={`Edit ${rule.name}`}
-                                onClick={() => setEditRule(rule)}
+                                asChild
                               >
-                                <Pencil className="size-4" />
+                                <Link to={`/rules/${rule.id}/edit#configuration`}><Pencil className="size-4" /></Link>
                               </RowActionButton>
                               <RowActionButton
                                 label={`Delete ${rule.name}`}
@@ -1465,6 +1502,8 @@ export default function Rules() {
           )}
         </CardContent>
       </Card>
+        </>
+      )}
 
       {applyRule && (
         <ApplyMitigationDialog
@@ -1498,10 +1537,8 @@ export default function Rules() {
         <RuleDialog
           rule={editRule}
           devices={devices}
-          onClose={() => setEditRule(null)}
-          onSaved={(updated) =>
-            setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r)))
-          }
+          onClose={() => { setEditRule(null); if (editRoute) navigate(`/rules/${editRule.id}#configuration`, { replace: true }); }}
+          onSaved={(updated) => { setRules((rs) => rs.map((r) => (r.id === updated.id ? updated : r))); if (editRoute) navigate(`/rules/${updated.id}#configuration`, { replace: true }); }}
         />
       )}
 
@@ -1523,6 +1560,7 @@ export default function Rules() {
           const rule = deleteTarget;
           setDeleteTarget(null);
           await deleteRule(rule);
+          if (ruleId === rule.id) navigate("/rules");
         }}
       />
       {clearRuleTarget && (

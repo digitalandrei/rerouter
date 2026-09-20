@@ -514,6 +514,46 @@ async fn plans_bind_actor_scope_expiry_source_and_exact_prepared_set() {
         "idempotent confirmation created duplicate attempts"
     );
 
+    // A rule is also an ordered mitigation definition. Manual apply authority
+    // is independent of whether the detection is currently firing; the exact
+    // actor-bound preview remains mandatory.
+    let rule = sqlx::query("INSERT INTO rules(name,metric,operator,threshold_value,duration_seconds,severity,manual_apply_enabled) VALUES(?,'rx_bps','>',1,0,'warning',1)")
+        .bind(format!("manual-rule-{}", uuid::Uuid::new_v4()))
+        .execute(&*pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let revision: u64 = sqlx::query_scalar("SELECT actions_revision FROM rules WHERE id=?")
+        .bind(rule)
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
+    let rule_token = unique_token("non-firing-rule-token");
+    let rule_source =
+        json!({"kind":"rule","rule_id":rule,"name":"manual rule","actions_revision":revision});
+    insert_plan(
+        &pool,
+        operator_a,
+        "rule_apply",
+        Some(rule),
+        &snapshot(&action, &prepared, rule_source),
+        &rule_token,
+        Duration::minutes(5),
+    )
+    .await;
+    let (rule_status, rule_result) = request(
+        &app,
+        &cookie_a,
+        &format!("/api/rules/{rule}/apply"),
+        json!({"preview_token":rule_token,"reason":"authorization test"}),
+    )
+    .await;
+    assert_eq!(
+        rule_status,
+        StatusCode::ACCEPTED,
+        "a defined rule mitigation may be run manually without a firing detection: {rule_result}"
+    );
+
     // Keep otherwise-unused actor visible in this test's ownership set.
     assert_ne!(operator_a, operator_b);
     let _ = sqlx::query("UPDATE system_settings SET `value`=? WHERE `key`='operating_mode'")

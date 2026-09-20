@@ -459,8 +459,8 @@ export interface Rule {
   /** Whether a recovered rule may autonomously revert the run it owns. Clear
    *  detection criteria remain configured independently in recovery_mode. */
   automatic_revert_enabled: boolean;
-  /** Opt-in: operators may manually apply this rule's actions from a firing alert
-   *  (off by default). Still gated like any manual reroute at apply time. */
+  /** Opt-in: operators may manually run this rule's defined actions (off by
+   *  default). Still gated like any manual reroute at apply time. */
   manual_apply_enabled: boolean;
   reroute_template_id: number | null;
   action_count?: number;
@@ -1223,7 +1223,7 @@ export const api = {
         method: "POST",
         body: body ?? {},
       }),
-    /** Manually apply a firing rule's configured actions. Both operating modes
+    /** Manually run a rule's configured actions. Both operating modes
      *  require the actor-bound one-use preview token; Observe only disables
      *  autonomous execution. */
     apply: (

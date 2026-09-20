@@ -503,7 +503,7 @@ export default function Documentation() {
                   device, and parameters, reviews the server-rendered commands, then executes.
                 </li>
                 <li>
-                  <strong>Supervised rule apply:</strong> an operator applies a firing rule's
+                  <strong>Supervised rule apply:</strong> an operator runs a rule's
                   already-configured action set. The rule must explicitly allow manual apply.
                 </li>
                 <li>
@@ -938,7 +938,7 @@ export default function Documentation() {
               <H3>Actions and toggles</H3>
               <Bullets>
                 <li><strong>Enabled:</strong> allows detection evaluation.</li>
-                <li><strong>Manual apply:</strong> lets an operator apply attached actions while the rule is currently firing.</li>
+                <li><strong>Manual apply:</strong> lets an operator run attached actions from the rule detail page, independently of detection state.</li>
                 <li><strong>Auto:</strong> opts the rule into hands-off action, still requiring every global and template gate.</li>
                 <li><strong>Action enabled:</strong> includes that individual ordered action in apply/automatic execution.</li>
               </Bullets>
@@ -1011,10 +1011,10 @@ export default function Documentation() {
                 <li>Execute. Enforce mode consumes the one-use token and follows bundle progress until every action is terminal.</li>
                 <li>Open History to inspect state, outputs, and verification.</li>
               </Steps>
-              <H3>Supervised apply from a firing rule</H3>
+              <H3>Supervised manual run of a rule mitigation</H3>
               <p>
-                On the Detections or Alerts tab, an operator can apply a rule's configured action set
-                only while it is firing and only when Manual apply was enabled on the rule. This uses
+                From the Rule detail page, an operator can run a rule's configured action set whenever
+                Manual apply is enabled and actions are defined. Active-detection views also provide a shortcut while firing. This uses
                 the manual permission and exact-preview workflow. The automatic master switch does not
                 block a deliberate operator apply, but mode, locks, cooldowns, rate limits, reachability,
                 and all other execution gates still apply.

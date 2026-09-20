@@ -79,7 +79,7 @@ const router = createBrowserRouter([
   { element: <RequireAuth />, children: [
     { path: "/dashboard", element: <Dashboard /> }, { path: "/devices", element: <Devices /> },
     { path: "/devices/:id", element: <DeviceDetail /> }, { path: "/devices/:deviceId/interfaces/:ifaceId", element: <InterfaceDetail /> },
-    { path: "/rules", element: <Rules /> }, { path: "/templates", element: <Templates /> }, { path: "/mitigations", element: <Mitigations /> },
+    { path: "/rules", element: <Rules /> }, { path: "/rules/:id", element: <Rules /> }, { path: "/rules/:id/edit", element: <Rules /> }, { path: "/templates", element: <Templates /> }, { path: "/mitigations", element: <Mitigations /> },
     { path: "/manual-mitigations", element: <ManualReroute /> }, { path: "/manual-mitigations/new", element: <ManualReroute /> },
     { path: "/manual-mitigations/:id", element: <ManualReroute /> }, { path: "/manual-mitigations/:id/edit", element: <ManualReroute /> },
     { path: "/manual-mitigations/:id/run", element: <ManualReroute /> }, { path: "/mitigations/manual", element: <Navigate to="/manual-mitigations" replace /> },
