@@ -15,6 +15,12 @@ Both normal detail pages default to **Overview & run** and use **Configuration**
 for the definition; explicit edit/new routes open Configuration. Tab selection is a URL fragment (`#overview` or `#configuration`),
 so path and filters remain intact and browser navigation remains meaningful.
 
+When a saved Manual Mitigation has an applying, active, recovering, or blocked
+run, the UI treats the definition as read-only: Run, Edit, Archive, temporary
+overrides, and preview are disabled. Read-only inspection and links to the active
+run remain available. Recovery actions continue to come from the run summary's
+server-computed eligibility.
+
 ## Build and reuse
 
 - Use **Manual Mitigations** to create, edit, duplicate, archive, or run a named

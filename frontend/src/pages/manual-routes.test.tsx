@@ -44,6 +44,30 @@ it("renders every active run for a saved mitigation with an exact selection link
   expect(await screen.findByRole("heading", { name: "Current state" })).toBeTruthy();
   const links = await screen.findAllByRole("link", { name: "Review & revert" });
   expect(links.map((link) => link.getAttribute("href"))).toEqual(["/mitigations?tab=active&run=1", "/mitigations?tab=active&run=2"]);
+  expect((screen.getByRole("button", { name: "Edit mitigation" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("link", { name: "Run mitigation" })).toBeNull();
+});
+
+it("locks a saved mitigation after navigation while its run remains active", async () => {
+  const labTemplate = { ...editableTemplate, id: 20, name: "iface_tcp_adjust_mss", display_name: "Set MSS", parameter_schema: { interface: { type: "string", label: "Interface" }, mss: { type: "integer", label: "MSS" } } };
+  const activeRun = { bundle_id: 33, id: 33, state: "running", execution_state: "running", lifecycle_state: "active", active: true, created_at: "2026-09-20T08:00:00Z", remaining_changes: 0, unknown_effects: 0, trigger_type: "manual", total_actions: 1, completed_actions: 0, revert: { available: false, block_reasons: ["run is still applying"] } };
+  const preset: MitigationPreset = { ...saved, definition_status: "ready", validation_status: "valid", actions: [{ reroute_template_id: 20, template_name: labTemplate.name, device_id: 3, device_name: "Router A", params: { interface: "Po1", mss: "1436" }, enabled: true }], active_runs: [activeRun as never] };
+  vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "edit_rules", "trigger_manual_reroute"] });
+  vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([preset]);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(preset);
+  vi.spyOn(api.templates, "list").mockResolvedValue([labTemplate]);
+  vi.spyOn(api.devices, "list").mockResolvedValue([{ id: 3, name: "Router A" }] as never);
+  vi.spyOn(api.manualMitigations, "capabilities").mockResolvedValue({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] });
+  const preview = vi.spyOn(api.manualMitigations, "preview");
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  expect(await screen.findByText(/already has an active run/i)).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Review run #33" }).getAttribute("href")).toBe("/mitigations?tab=active&run=33");
+  expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
+  await user.click(screen.getByRole("tab", { name: "Configuration" }));
+  expect((screen.getByRole("button", { name: "Override action 1" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(preview).not.toHaveBeenCalled();
 });
 
 it("returns from a direct run link to its saved mitigation details", async () => {
