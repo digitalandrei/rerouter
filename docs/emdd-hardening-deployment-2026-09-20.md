@@ -51,3 +51,26 @@ selects `rr-194105142-only`. eMA1 and eMA3 withdraw the attacked prefix from COL
 with `no-export`; eMA2 uses `rr-colt-without-194105142` so
 `194.102.117.0/24` remains eligible there. Every Po1 action sets MSS 1436. These
 definition updates created no execution plan or router run.
+
+## Recovery ownership and page-workflow follow-up
+
+Release `recovery-ownership-ui-20260920-ebf70485eb2e` advanced EMDD from
+schema 76 to 77. The controller PID changed from 1090698 to 1092920; controller
+SHA-256 is `97cd3874014af24beee86f35d2cdee0fd9d928a098f35c97ad13af9d0fed6ec3`.
+The installed and public frontend entrypoint both have SHA-256
+`2c68eb23896dc882f524c406e5df04245492c5b7d42a87f42e2f8ce19f0aff76`.
+
+The migration adds recovery-attempt membership provenance. Proven no-write
+recovery now releases only memberships created by that attempt, removes an empty
+child quarantine window, and cannot remove later ownership when startup repair
+is repeated. Active Run/revert is now a URL-owned page instead of a modal.
+Redundant Rules and operational Mitigations shortcuts were removed, as was the
+unsaved Run once entry point.
+
+The stopped-window preflight and final verification both recorded Observe mode,
+automatic actions off, zero in-flight or active bundles, zero device windows,
+zero source memberships, and zero open locks. Both saved mitigations remained
+Ready at revisions 6 and 3. The release performed no router command, mitigation,
+notification send, or rule arming. It controlled only
+`rerouter-controller.service`; no database or web service was restarted or
+reconfigured. No transient or previous application copy remains on EMDD.
