@@ -35,6 +35,14 @@ function mockEditorDependencies(preset: MitigationPreset) {
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+it("shows the exact setup blocker in the mitigation list", async () => {
+  mockEditorDependencies(longSaved);
+  const router = createMemoryRouter([{ path: "/manual-mitigations", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations"] });
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+  expect(await screen.findByText("Action 16 needs setup")).toBeTruthy();
+  expect(screen.getByText("needs setup")).toBeTruthy();
+});
+
 it("renders every active run for a saved mitigation with an exact selection link", async () => {
   const activePreset: MitigationPreset = { ...saved, definition_status: "ready", active_runs: [1, 2].map((id) => ({ bundle_id: id, id, state: "succeeded", execution_state: "succeeded", lifecycle_state: "active", active: true, created_at: `2026-09-19T08:0${id}:00Z`, remaining_changes: id, unknown_effects: 0, trigger_type: "manual", total_actions: 8, completed_actions: 8, revert: { available: true, block_reasons: [] } })) };
   mockEditorDependencies(activePreset);
