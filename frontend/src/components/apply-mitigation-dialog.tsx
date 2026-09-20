@@ -4,13 +4,13 @@
  *
  * Contract (docs/reroute-engine.md, docs/doctrine.md §8, plans/015):
  * - Observe disables automatic response. An authorized operator may still
- *   execute this exact manual preview after explicit confirmation.
+ *   execute an exact prepared manual plan.
  * - In enforce mode the server runs each action through the full safety gate
  *   (locks, cooldowns, etc). A gate block gives executed:false + blocked_reason.
  * - The UI never hides dangerous reroute details: always show the would-run plan.
  * - Execution consumes the server-issued one-use token for the exact preview.
- *   The three steps (reason -> exact preview -> execute) are a doctrine gate and
- *   are never collapsed.
+ *   Operators can review that plan before confirmation or explicitly choose a
+ *   direct run that prepares and submits the same exact plan in one flow.
  * - A confirmed manual apply answers 202 with a bundle id and runs in the
  *   background (a real mitigation is a dozen-plus SSH sessions). The dialog then
  *   polls GET /api/reroute-bundles/{id} and shows per-action progress until a
@@ -29,6 +29,7 @@ import {
   configurationOnlyRunStatus,
   type RerouteBundle,
   type Rule,
+  type RuleApplyResponse,
   type RerouteResult,
   ApiError,
 } from "@/lib/api";
@@ -47,6 +48,37 @@ import {
 const inputClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+export type ExecutionStartStage = "calculating" | "starting";
+
+/** Shows the server-side preparation that always precedes a direct run. */
+export function ExecutionStartStatus({
+  kind,
+  stage,
+}: {
+  kind: "apply" | "revert";
+  stage: ExecutionStartStage;
+}) {
+  const labels = kind === "apply"
+    ? ["Calculate exact changes", "Start the run", "Apply configuration"]
+    : ["Calculate exact revert", "Start the revert", "Restore configuration"];
+  const active = stage === "calculating" ? 0 : 1;
+  return (
+    <div className="rounded-md border border-border bg-muted/30 p-3" role="status" aria-live="polite">
+      <p className="text-sm font-medium">{labels[active]}…</p>
+      <ol className="mt-2 grid gap-2 text-xs sm:grid-cols-3">
+        {labels.map((label, index) => (
+          <li key={label} className={index <= active ? "font-medium text-foreground" : "text-muted-foreground"} aria-current={index === active ? "step" : undefined}>
+            <span className={`mr-1.5 inline-flex size-5 items-center justify-center rounded-full border ${index < active ? "border-emerald-600 bg-emerald-600 text-white" : index === active ? "border-primary text-primary" : "border-muted-foreground/40"}`}>
+              {index < active ? "✓" : index + 1}
+            </span>
+            {label}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
 
 /** Renders the resolved auto-target info from a RerouteResult (if present). */
 function AutoTargetInfo({ result: r }: { result: RerouteResult }) {
@@ -356,8 +388,8 @@ interface ApplyMitigationDialogProps {
 }
 
 /**
- * Phases: reason -> exact dry-run preview -> execution. The execution phase is
- * either synchronous preview results or live bundle progress after confirmation.
+ * Both entry paths create the same exact server plan. Preview pauses for review;
+ * Run now immediately submits the one-use plan and opens live progress.
  */
 export function ApplyMitigationDialog({
   rule,
@@ -378,6 +410,7 @@ export function ApplyMitigationDialog({
   const [bundleTotal, setBundleTotal] = useState(0);
   const [bundle, setBundle] = useState<RerouteBundle | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
+  const [directStage, setDirectStage] = useState<ExecutionStartStage | null>(null);
 
   const isObserve = operatingMode === "observe";
   const isUnknown = operatingMode === "unknown";
@@ -414,6 +447,44 @@ export function ApplyMitigationDialog({
     };
   }, [bundleId]);
 
+  function handleApplyResponse(res: RuleApplyResponse, dryRun: boolean) {
+    if (isBundleAccepted(res)) {
+      setPreviewToken(null);
+      setResults(res.results ?? []);
+      setBundleTotal(res.total_actions);
+      setBundle(null);
+      setBundleId(res.bundle_id);
+      setPhase("progress");
+      return;
+    }
+    setResults(res.results);
+    if (dryRun && res.preview_token) {
+      setPreviewToken(res.preview_token);
+      setPhase("preview");
+    } else {
+      setPreviewToken(null);
+      setPhase("results");
+      if (!dryRun) onApplied?.();
+    }
+  }
+
+  function handleApplyError(e: unknown) {
+    const refused = e instanceof ApiError ? asBundleNotAdmitted(e.body) : null;
+    if (refused) {
+      setPreviewToken(null);
+      setResults(null);
+      setPhase("confirm");
+      setError(
+        `Bundle #${refused.bundle_id} was refused as a whole: ${refused.detail} ` +
+          `None of its ${refused.total_actions} actions executed — the global ` +
+          `action rate budget cannot fit this bundle. Nothing changed on any router. ` +
+          `Prepare a new exact plan to retry (the previous one-use token is spent).`,
+      );
+    } else {
+      setError(e instanceof ApiError ? e.message : "Request failed");
+    }
+  }
+
   async function apply(dryRun: boolean) {
     setBusy(true);
     setError(null);
@@ -423,46 +494,44 @@ export function ApplyMitigationDialog({
         dry_run: dryRun,
         preview_token: dryRun ? undefined : previewToken ?? undefined,
       });
-      // Confirmed manual apply: 202 + bundle handle, work continues
-      // server-side. `results` here carries only the actions that could not be
-      // resolved to run at all.
-      if (isBundleAccepted(res)) {
-        setPreviewToken(null);
-        setResults(res.results ?? []);
-        setBundleTotal(res.total_actions);
-        setBundle(null);
-        setBundleId(res.bundle_id);
-        setPhase("progress");
+      handleApplyResponse(res, dryRun);
+    } catch (e) {
+      handleApplyError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runNow() {
+    setBusy(true);
+    setError(null);
+    setDirectStage("calculating");
+    try {
+      const prepared = await api.rules.apply(rule.id, {
+        reason: reason.trim() || undefined,
+        dry_run: true,
+      });
+      if (isBundleAccepted(prepared)) {
+        handleApplyResponse(prepared, false);
         return;
       }
-      setResults(res.results);
-      if (dryRun && res.preview_token) {
-        setPreviewToken(res.preview_token);
-        setPhase("preview");
-      } else {
+      setResults(prepared.results);
+      if (!prepared.preview_token) {
         setPreviewToken(null);
         setPhase("results");
-        if (!dryRun) onApplied?.();
+        return;
       }
+      setDirectStage("starting");
+      const accepted = await api.rules.apply(rule.id, {
+        reason: reason.trim() || undefined,
+        dry_run: false,
+        preview_token: prepared.preview_token,
+      });
+      handleApplyResponse(accepted, false);
     } catch (e) {
-      // All-or-nothing admission: the bundle did not fit the remaining global
-      // rate budget, so NOTHING ran. The one-use preview token was already
-      // consumed, so the operator has to take a fresh preview.
-      const refused = e instanceof ApiError ? asBundleNotAdmitted(e.body) : null;
-      if (refused) {
-        setPreviewToken(null);
-        setResults(null);
-        setPhase("confirm");
-        setError(
-          `Bundle #${refused.bundle_id} was refused as a whole: ${refused.detail} ` +
-            `None of its ${refused.total_actions} actions executed — the global ` +
-            `action rate budget cannot fit this bundle. Nothing changed on any router. ` +
-            `Preview again to retry (the previous one-use preview token is spent).`,
-        );
-      } else {
-        setError(e instanceof ApiError ? e.message : "Request failed");
-      }
+      handleApplyError(e);
     } finally {
+      setDirectStage(null);
       setBusy(false);
     }
   }
@@ -483,7 +552,7 @@ export function ApplyMitigationDialog({
               {isObserve ? (
                 <p className="font-medium text-amber-700 dark:text-amber-400">
                   The controller is in <strong>observe mode</strong>: automatic response
-                  is disabled. This manual run still requires an exact preview and confirmation.
+                  is disabled. This manual run still requires an exact server plan and all execution gates.
                 </p>
               ) : isUnknown ? (
                 <p className="font-medium text-amber-800 dark:text-amber-300">
@@ -501,7 +570,7 @@ export function ApplyMitigationDialog({
         </DialogHeader>
 
         <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions.</p>
+          <p className="text-xs text-muted-foreground">The controller always reads current router configuration and calculates the exact commands first. Choose Preview changes to review them before confirmation, or Run now to prepare and start the same exact plan in one flow.</p>
           <label className="block space-y-1 text-sm font-medium">
             Reason{" "}
             <span className="font-normal text-muted-foreground">
@@ -526,19 +595,30 @@ export function ApplyMitigationDialog({
               {error}
             </div>
           )}
+          {directStage && <ExecutionStartStatus kind="apply" stage={directStage} />}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="flex-wrap">
           <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
           <Button
             variant="outline"
             onClick={() => void apply(true)}
-            loading={busy}
+            disabled={busy}
+            loading={busy && directStage === null}
             loadingLabel="Preparing exact preview…"
           >
             Preview changes
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={() => void runNow()}
+            disabled={busy}
+            loading={directStage !== null}
+            loadingLabel={directStage === "starting" ? "Starting run…" : "Calculating exact changes…"}
+          >
+            Run now
           </Button>
         </DialogFooter>
       </>

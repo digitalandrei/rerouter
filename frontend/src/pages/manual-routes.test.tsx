@@ -303,12 +303,12 @@ it("locks every run control while an exact preview is pending and keeps the acti
   await waitFor(() => expect(configurationOnly.checked).toBe(true));
   const additionalChecks = screen.getByRole("radio", { name: /^additional checks/i }) as HTMLInputElement;
   const previewButton = screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement;
-  expect(previewButton.className).toContain("sm:w-[22rem]");
+  expect(previewButton.className).toContain("sm:w-44");
   await user.click(previewButton);
 
   const preparing = await screen.findByRole("button", { name: "Preparing exact preview…" }) as HTMLButtonElement;
   expect(preparing).toBe(previewButton);
-  expect(preparing.className).toContain("sm:w-[22rem]");
+  expect(preparing.className).toContain("sm:w-44");
   for (const button of screen.getAllByRole("button")) expect((button as HTMLButtonElement).disabled).toBe(true);
   expect(configurationOnly.matches(":disabled")).toBe(true);
   expect(additionalChecks.matches(":disabled")).toBe(true);
@@ -321,4 +321,31 @@ it("locks every run control while an exact preview is pending and keeps the acti
 
   resolvePreview({ plan_id: 8, preview_token: "token", results: [], operating_mode: "observe", verification_mode: "configuration_only", routing_verified: false });
   expect(await screen.findByRole("button", { name: "Apply reviewed changes" })).toBeTruthy();
+});
+
+it("calculates the exact plan before a direct manual run", async () => {
+  const labTemplate = { ...editableTemplate, id: 20, name: "iface_tcp_adjust_mss", display_name: "Set MSS", parameter_schema: { interface: { type: "string", label: "Interface" }, mss: { type: "integer", label: "MSS" } } };
+  const labPreset: MitigationPreset = { ...saved, definition_status: "ready", validation_status: "valid", actions: [{ reroute_template_id: 20, template_name: labTemplate.name, device_id: 3, device_name: "Lab router", params: { interface: "Bundle-Ether3", mss: "1436" }, enabled: true }] };
+  vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "trigger_manual_reroute"] });
+  vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([labPreset]);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(labPreset);
+  vi.spyOn(api.templates, "list").mockResolvedValue([labTemplate]);
+  vi.spyOn(api.devices, "list").mockResolvedValue([{ id: 3, name: "Lab router" }] as never);
+  vi.spyOn(api.manualMitigations, "capabilities").mockResolvedValue({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] });
+  let resolveExact!: (value: Awaited<ReturnType<typeof api.manualMitigations.preview>>) => void;
+  const preview = vi.spyOn(api.manualMitigations, "preview").mockImplementation(() => new Promise((resolve) => { resolveExact = resolve; }));
+  const apply = vi.spyOn(api.manualMitigations, "apply").mockResolvedValue({ bundle_id: 44, async: true });
+  vi.spyOn(api.bundles, "get").mockResolvedValue({ id: 44, state: "planned", lifecycle_state: "active", total_actions: 1, completed_actions: 0, actions: [], still_applied_reroute_ids: [] } as never);
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+
+  await user.click(await screen.findByRole("button", { name: "Run now" }));
+  const status = await screen.findByRole("status");
+  expect(status.textContent).toContain("Calculate exact changes");
+  expect(apply).not.toHaveBeenCalled();
+  resolveExact({ plan_id: 18, preview_token: "direct-token", results: [], operating_mode: "observe", verification_mode: "configuration_only", routing_verified: false });
+  await waitFor(() => expect(apply).toHaveBeenCalledWith({ plan_id: 18, preview_token: "direct-token" }));
+  expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only" }));
+  expect((await screen.findAllByText(/run #44/i)).length).toBeGreaterThan(0);
 });

@@ -9,9 +9,10 @@ statements that describe Observe as blocking all manual execution.
 2. Open a saved mitigation or rule action set and inspect its current inventory,
    before/after projection, inverse, commands, and verification evidence.
 3. Resolve every blocker. A preview never grants standing execution authority.
-4. Request the exact server preview, record a reason, then explicitly confirm its
-   short-lived one-use token. Authorized manual runs and reverts work in Observe
-   and Enforce and re-check every gate at admission.
+4. Record a reason and choose either **Preview changes** to inspect and confirm
+   the exact commands or **Run now** to prepare and immediately submit them.
+   Both paths use the same short-lived one-use plan. Manual runs and reverts work
+   in Observe and Enforce and re-check every gate at admission.
 5. Follow the bundle until every action is verified. Execution success and
    remaining owned changes are separate facts.
 
@@ -19,7 +20,7 @@ A Rule with an ordered action set is also a mitigation definition. Its detection
 condition controls automatic triggering; it does not change the action set. When
 **Manual apply** is enabled, an operator may run that defined mitigation from the
 Rule detail page regardless of the current detection state, using the same exact
-preview, confirmation, and execution gates.
+preparation and execution gates.
 
 ## Automatic work
 
@@ -55,8 +56,8 @@ host, port, and pinned fingerprint at capability lookup, preview, confirmation,
 and execution. A run may target one enabled device and may use only `bgp_export_policy_set` and
 `iface_tcp_adjust_mss` actions. The manual-run page selects **Configuration
 only**. Ineligible sets remain blocked. **Additional checks** is visible but
-disabled for a future version. Review the exact projection and commands, and
-confirm the short-lived preview token normally.
+disabled for a future version. Preview and direct-run paths both calculate the
+exact projection, commands, inverse, and short-lived plan before execution.
 
 This mode proves the exact configuration before and after each action. An Idle
 BGP peer is allowed because advertised-route and Established-state evidence is
@@ -78,9 +79,10 @@ substituted for Configuration only.
 ## Recovery
 
 Use the persisted original inverses in reverse order. Drift or uncertain state
-freezes recovery; inspect and reconcile rather than inventing an inverse. Taking
-manual control cancels a future automatic deadline. A manual revert always gets
-a fresh exact preview and explicit confirmation.
+freezes recovery; inspect and reconcile rather than inventing an inverse.
+Cancelling automatic recovery cancels a future automatic deadline. A manual
+revert always gets a fresh exact prepared plan; Preview revert pauses for review,
+while Revert now submits that plan immediately.
 
 The **Active Runs** view is server-paginated at 25 logical runs per page. Search
 matches run id, saved/source name, trigger, lifecycle, or operator. Device accepts
@@ -94,7 +96,7 @@ Manual-revert blockers and automatic-recovery errors are displayed separately.
 **Cancel automatic recovery** appears only when a timer-based or rule-driven
 automatic recovery is still eligible and unclaimed. It cancels that future
 automatic revert without sending router commands; the current changes remain
-until an operator previews and confirms a manual revert. Runs configured for
+until an operator starts a manual revert. Runs configured for
 manual recovery do not show this action. **Reconcile device state** is available for an
 uncertain action and for a failed inverse that has persisted changed evidence;
 it remains a read-only comparison and does not acknowledge arbitrary failures.

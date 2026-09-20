@@ -47,9 +47,9 @@ parameters, per-action progress, remaining mutations, and reconciliation.
 
 ## Prepare, confirm, execute
 
-Observe mode renders a would-run plan and cannot mutate router configuration.
-Enforce previews perform complete read-only preparation of every required
-action. The resulting snapshot contains concrete commands, current/desired
+Observe mode disables autonomous response; an authorized manual action can
+still submit an exact prepared plan. Preparation is read-only in both Observe
+and Enforce. The resulting snapshot contains concrete commands, current/desired
 state, typed verification requirements, device host/port/pinned identity, and
 the exact inverse. A failed sibling refuses the whole set; there is no silent
 skip or best-effort execution policy.
@@ -62,10 +62,17 @@ workflow. Starting an exact preview locks the page controls until the request
 settles, so its action set, reason, and recovery behavior cannot change beneath
 the in-flight request.
 
+Every manual apply and revert performs that exact preparation. **Preview
+changes** and **Preview revert** pause afterward so the operator can inspect the
+commands and explicitly submit the prepared plan. **Run now** and **Revert now**
+show preparation as the first status step, then immediately submit the same
+one-use plan. A preparation error or missing execution authority stops either
+flow before router writes.
+
 A five-minute, one-use preview credential binds the operator, reason, source
-revision, ordered actions, and exact prepared snapshot. Confirmation creates a
-durable execution identity before handing work to the background runner.
-Repeating the same confirmation returns the same bundle; it cannot run twice.
+revision, ordered actions, and exact prepared snapshot. Submitting that prepared
+plan creates a durable execution identity before handing work to the background
+runner. Repeating the same submission returns the same bundle; it cannot run twice.
 Edits or archival invalidate unconsumed previews. Admitted runs keep their own
 immutable definition.
 

@@ -28,7 +28,7 @@ import {
 } from "@/lib/action-sets";
 import { orderTemplatesForChoice, templateGuidance, templateLabel } from "@/lib/labels";
 import { ActionParamsForm } from "@/components/action-params-form";
-import { ApplyResultRow, BundleProgressView } from "@/components/apply-mitigation-dialog";
+import { ApplyResultRow, BundleProgressView, ExecutionStartStatus, type ExecutionStartStage } from "@/components/apply-mitigation-dialog";
 import { OrderedActionSetEditor, type OrderedActionItem } from "@/components/ordered-action-set-editor";
 import { ActionsAndRevert } from "@/components/actions-and-revert";
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -95,6 +95,7 @@ export default function ManualReroute() {
   const [overrides, setOverrides] = useState<Record<string, { device_id: number; params: Record<string, unknown> }>>({});
   const [reason, setReason] = useState("");
   const [preview, setPreview] = useState<ManualMitigationPreview | null>(null);
+  const [directStage, setDirectStage] = useState<ExecutionStartStage | null>(null);
   const verificationMode: VerificationMode = "configuration_only";
   const [capabilities, setCapabilities] = useState<ManualMitigationCapabilities>({ configuration_test_device_ids: [], configuration_test_templates: [] });
   const [capabilitiesState, setCapabilitiesState] = useState<"loading" | "ready" | "error">("loading");
@@ -164,6 +165,8 @@ export default function ManualReroute() {
 
   function selectPreset(preset: MitigationPreset) {
     leaveBundleView();
+    setBusy(false);
+    setDirectStage(null);
     setSelectedId(preset.id);
     setName(preset.name);
     setDescription(preset.description ?? "");
@@ -177,6 +180,8 @@ export default function ManualReroute() {
 
   function startNew() {
     leaveBundleView();
+    setBusy(false);
+    setDirectStage(null);
     setSelectedId(null);
     setName("");
     setDescription("");
@@ -372,24 +377,47 @@ export default function ManualReroute() {
     invalidatePreview();
   }
 
+  function canPrepareRun() {
+    if (effectiveActions.length === 0) return false;
+    if (selectedPreset && presetInvalid) {
+      toast.error("Every step must be ready before the complete mitigation can run.");
+      return false;
+    }
+    if (capabilitiesState !== "ready" || !configurationOnlyEligible) {
+      toast.error("Configuration only is unavailable for the current actions or targets.");
+      return false;
+    }
+    return true;
+  }
+
+  async function requestExactPreview() {
+    return api.manualMitigations.preview({
+      preset_id: selectedPreset?.id,
+      preset_revision: selectedPreset?.revision,
+      actions: effectiveActions.map(actionDraftPayload),
+      reason: reason.trim() || undefined,
+      revert_after_seconds: undefined,
+      verification_mode: verificationMode,
+    });
+  }
+
+  function openAcceptedBundle(accepted: { bundle_id: number }) {
+    setPreview(null);
+    setBundleId(accepted.bundle_id);
+    setSearchParams({ bundle: String(accepted.bundle_id) }, { replace: true });
+    setBundle(null);
+    setPollError(null);
+  }
+
   async function preparePreview() {
-    if (effectiveActions.length === 0) return;
-    if (selectedPreset && presetInvalid) return toast.error("Every step must be ready before the complete mitigation can run.");
-    if (capabilitiesState !== "ready" || !configurationOnlyEligible) return toast.error("Configuration only is unavailable for the current actions or targets.");
+    if (!canPrepareRun()) return;
     const generation = ++requestGeneration.current;
     setBusy(true);
     setPreview(null);
     setBundleId(null);
     setBundle(null);
     try {
-      const result = await api.manualMitigations.preview({
-        preset_id: selectedPreset?.id,
-        preset_revision: selectedPreset?.revision,
-        actions: effectiveActions.map(actionDraftPayload),
-        reason: reason.trim() || undefined,
-        revert_after_seconds: undefined,
-        verification_mode: verificationMode,
-      });
+      const result = await requestExactPreview();
       if (isCurrentPreview(generation, requestGeneration.current)) {
         if (!previewMatchesVerificationMode(result, verificationMode)) {
           toast.error("The preview returned a different verification scope. Prepare a new preview before running.");
@@ -399,28 +427,68 @@ export default function ManualReroute() {
     } catch (error) {
       if (isCurrentPreview(generation, requestGeneration.current))
         toast.error(error instanceof ApiError ? error.message : "Preview failed");
-    } finally {
-      setBusy(false);
-    }
+    } finally { if (isCurrentPreview(generation, requestGeneration.current)) setBusy(false); }
   }
 
   async function applyPreview() {
     if (!preview?.plan_id || !preview.preview_token) return;
+    const generation = ++requestGeneration.current;
     setBusy(true);
     try {
       const accepted = await api.manualMitigations.apply({
         plan_id: preview.plan_id,
         preview_token: preview.preview_token,
       });
-      setPreview(null);
-      setBundleId(accepted.bundle_id);
-      setSearchParams({ bundle: String(accepted.bundle_id) }, { replace: true });
-      setBundle(null);
-      setPollError(null);
+      if (isCurrentPreview(generation, requestGeneration.current)) openAcceptedBundle(accepted);
     } catch (error) {
-      setPreview(null);
-      toast.error(`${error instanceof ApiError ? error.message : "Execution failed"}. Prepare a fresh preview before retrying.`);
-    } finally { setBusy(false); }
+      if (isCurrentPreview(generation, requestGeneration.current)) {
+        setPreview(null);
+        toast.error(`${error instanceof ApiError ? error.message : "Execution failed"}. Prepare a fresh exact plan before retrying.`);
+      }
+    } finally { if (isCurrentPreview(generation, requestGeneration.current)) setBusy(false); }
+  }
+
+  async function runNow() {
+    if (!canPrepareRun()) return;
+    const generation = ++requestGeneration.current;
+    setBusy(true);
+    setDirectStage("calculating");
+    setPreview(null);
+    setBundleId(null);
+    setBundle(null);
+    let prepared = false;
+    try {
+      const exact = await requestExactPreview();
+      if (!isCurrentPreview(generation, requestGeneration.current)) return;
+      if (!previewMatchesVerificationMode(exact, verificationMode)) {
+        toast.error("The prepared plan returned a different verification scope. Nothing was started.");
+        return;
+      }
+      if (!exact.plan_id || !exact.preview_token) {
+        setPreview(exact);
+        toast.error("The controller did not authorize this prepared plan. Review the result; nothing was started.");
+        return;
+      }
+      prepared = true;
+      setDirectStage("starting");
+      const accepted = await api.manualMitigations.apply({
+        plan_id: exact.plan_id,
+        preview_token: exact.preview_token,
+      });
+      if (isCurrentPreview(generation, requestGeneration.current)) openAcceptedBundle(accepted);
+    } catch (error) {
+      if (isCurrentPreview(generation, requestGeneration.current)) {
+        setPreview(null);
+        toast.error(prepared
+          ? `${error instanceof ApiError ? error.message : "Execution failed"}. Prepare a fresh exact plan before retrying.`
+          : error instanceof ApiError ? error.message : "The exact plan could not be calculated.");
+      }
+    } finally {
+      if (isCurrentPreview(generation, requestGeneration.current)) {
+        setDirectStage(null);
+        setBusy(false);
+      }
+    }
   }
 
   const displayActions: OrderedActionItem[] = (runMode ? effectiveActions : actions).map((action, index) => ({
@@ -555,10 +623,14 @@ export default function ManualReroute() {
                     </div>}
                     {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
                     <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-                      <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Step 2 · Review and explicitly confirm the exact changes." : bundleId === null ? "Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
-                      <div className="grid gap-2 sm:grid-cols-[auto_22rem]">
+                      <div className="space-y-3">
+                        {directStage && <ExecutionStartStatus kind="apply" stage={directStage} />}
+                        <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Review the exact commands, then apply the reviewed plan." : bundleId === null ? "The controller always reads current router configuration and calculates the exact commands first. Preview changes pauses for review; Run now prepares and starts the same exact plan." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
+                      </div>
+                      <div className={`grid gap-2 ${preview ? "sm:grid-cols-[auto_22rem]" : "sm:grid-cols-[auto_11rem_11rem]"}`}>
                         <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}#overview`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
-                        {!preview && bundleId === null && <Button className="w-full sm:w-[22rem]" onClick={() => void preparePreview()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Preparing exact preview…">Preview changes</Button>}
+                        {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="outline" onClick={() => void preparePreview()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={busy && directStage === null} loadingLabel="Preparing exact preview…">Preview changes</Button>}
+                        {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="destructive" onClick={() => void runNow()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={directStage !== null} loadingLabel={directStage === "starting" ? "Starting run…" : "Calculating changes…"}>Run now</Button>}
                         {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
                       </div>
                     </div>

@@ -22,8 +22,7 @@ describe("RuleActionsDialog", () => {
   it("lets a read-only viewer inspect actions without editing controls", async () => {
     mocks(["view_asset"]);
     render(<AuthProvider><RuleActionsDialog rule={rule} onClose={() => undefined} onChanged={() => undefined} /></AuthProvider>);
-    expect(await screen.findByText("Actions and revert")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Inspect" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Inspect" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Save complete set" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Edit action 1" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Remove action 1" })).toBeNull();
@@ -34,8 +33,7 @@ describe("RuleActionsDialog", () => {
     const save = vi.spyOn(api.rules, "saveActions").mockResolvedValue({ ...rule, actions: [], action_count: 0, actions_revision: 4 });
     const user = userEvent.setup();
     render(<AuthProvider><RuleActionsDialog rule={rule} onClose={() => undefined} onChanged={() => undefined} /></AuthProvider>);
-    await screen.findByText("Actions and revert");
-    await user.click(screen.getByRole("button", { name: "Remove action 1" }));
+    await user.click(await screen.findByRole("button", { name: "Remove action 1" }));
     expect(save).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Save complete set" }));
     await waitFor(() => expect(save).toHaveBeenCalledWith(9, { revision: 3, actions: [] }));
@@ -47,8 +45,7 @@ describe("RuleActionsDialog", () => {
     const save = vi.spyOn(api.rules, "saveActions").mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     const user = userEvent.setup();
     render(<AuthProvider><RuleActionsDialog rule={rule} onClose={() => undefined} onChanged={() => undefined} /></AuthProvider>);
-    await screen.findByText("Actions and revert");
-    await user.click(screen.getByRole("button", { name: "Remove action 1" }));
+    await user.click(await screen.findByRole("button", { name: "Remove action 1" }));
     await user.click(screen.getByRole("button", { name: "Save complete set" }));
     const pending = await screen.findByRole("button", { name: "Saving…" });
     expect(pending.getAttribute("aria-busy")).toBe("true");

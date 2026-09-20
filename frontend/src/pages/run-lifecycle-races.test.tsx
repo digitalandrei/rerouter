@@ -70,6 +70,23 @@ it("shows one honest pending state while preparing and confirming a whole-run re
   expect((await screen.findAllByText(/recovery #99/i)).length).toBeGreaterThan(0);
 });
 
+it("calculates the exact inverse before starting a direct whole-run revert", async () => {
+  auth(); vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 }); vi.spyOn(api.bundles, "get").mockResolvedValue(run);
+  let resolveExact!: (value: ManualMitigationPreview) => void;
+  const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveExact = resolve as (value: ManualMitigationPreview) => void; })).mockResolvedValueOnce({ bundle_id: 100, async: true });
+  const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  await user.type(await screen.findByLabelText("Audit reason"), "Immediate recovery");
+  await user.click(screen.getByRole("button", { name: "Revert now" }));
+  const status = await screen.findByRole("status");
+  expect(status.textContent).toContain("Calculate exact revert");
+  expect(revert).toHaveBeenCalledTimes(1);
+  resolveExact(preview);
+  await waitFor(() => expect(revert).toHaveBeenCalledTimes(2));
+  expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Immediate recovery", plan_id: 12, preview_token: "token-b" });
+  expect((await screen.findAllByText(/recovery #100/i)).length).toBeGreaterThan(0);
+});
+
 it("shows cancellation only when automatic recovery actually exists", async () => {
   auth();
   const manualOnly = { ...run, take_control: { available: false, block_reasons: ["run has no automatic recovery to cancel"] } } as RerouteBundle;

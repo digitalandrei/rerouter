@@ -45,7 +45,7 @@ export function ObserveBanner({ connectionIssue, onRetryConnection }: { connecti
       <strong>{mode ? `${mode.toUpperCase()} mode` : 'MODE UNKNOWN'}</strong>
       <span>Automation: {automation === undefined ? 'unknown' : automation ? 'enabled' : 'disabled'}</span>
       <span>Maintenance lock: {maintenance === undefined ? 'unknown' : maintenance ? 'active' : 'clear'}</span>
-      <span className="min-w-0 text-xs opacity-80">{mode === 'observe' ? 'Automatic response is disabled. Manual runs remain available after explicit preview and confirmation.' : mode === 'enforce' ? 'Automatic response can run only when the master switch and every safety gate allow it. Manual runs still require preview and confirmation.' : 'Verify controller state before making an operational decision.'}</span>
+      <span className="min-w-0 text-xs opacity-80">{mode === 'observe' ? 'Automatic response is disabled. Manual runs remain available through an exact prepared plan.' : mode === 'enforce' ? 'Automatic response can run only when the master switch and every safety gate allow it. Manual runs still require an exact prepared plan.' : 'Verify controller state before making an operational decision.'}</span>
       <span className="ml-auto text-xs opacity-80">{unavailable ? 'Connection interrupted; showing last known state.' : updatedAt ? `Updated ${updatedAt.toLocaleTimeString()}` : 'Connecting…'}</span>
       {unavailable && onRetryConnection && <Button type="button" size="sm" variant="outline" className="h-7" onClick={onRetryConnection}><RefreshCw className="mr-1 h-3.5 w-3.5" /> Retry</Button>}
     </div>

@@ -64,7 +64,7 @@ export interface TotpResponse {
 /**
  * Operating mode (docs/reroute-engine.md "Operating mode"):
  * - "observe" (default): autonomous response is disabled. Authorized manual
- *   runs and reverts still require an exact preview and explicit confirmation.
+ *   runs and reverts still require an exact server-prepared one-use plan.
  * - "enforce": execution allowed, still gated by every other safety rule.
  */
 export type OperatingMode = "observe" | "enforce";

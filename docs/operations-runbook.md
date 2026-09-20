@@ -89,7 +89,9 @@ accepted.
 - **Operating mode:** `operating_mode = observe` in
   `system_settings` (UI: `/settings`, admin-only, audited) is the shipped
   default. Observe disables autonomous work; authorized manual runs and reverts
-  still require an exact server preview and explicit confirmation. Flip to
+  still require an exact server-prepared, one-use plan. Operators may review it
+  before confirmation or choose the direct action that prepares and submits it
+  in one flow. Flip to
   `enforce` only when you are ready to arm autonomous behavior.
 - **Disable all automatic reroutes:** set `automatic_actions_enabled = false` in
   `system_settings` (UI: `/settings`) — takes effect on next evaluation

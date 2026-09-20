@@ -72,6 +72,41 @@ describe("manual mitigation workflow", () => {
     expect(apply).toHaveBeenNthCalledWith(2, 7, expect.objectContaining({ dry_run: false, preview_token: "one-use" }));
   });
 
+  it("prepares an exact token before starting a rule action set directly", async () => {
+    const user = userEvent.setup();
+    let resolveExact!: (value: Awaited<ReturnType<typeof api.rules.apply>>) => void;
+    const apply = vi.spyOn(api.rules, "apply")
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveExact = resolve; }))
+      .mockResolvedValueOnce({ bundle_id: 43, async: true, state: "planned", total_actions: 1, failure_policy: "abort_and_compensate", results: [] });
+    vi.spyOn(api.bundles, "get").mockResolvedValue({ id: 43, state: "planned", lifecycle_state: "active", total_actions: 1, completed_actions: 0, actions: [], still_applied_reroute_ids: [] } as never);
+    const rule = { id: 7, name: "Flood response" } as Rule;
+    render(<BrowserRouter><ApplyMitigationDialog rule={rule} operatingMode="observe" onClose={() => undefined} /></BrowserRouter>);
+
+    await user.click(screen.getByRole("button", { name: "Run now" }));
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toContain("Calculate exact changes");
+    expect(apply).toHaveBeenCalledTimes(1);
+    resolveExact({ results: [{ executed: false, message: "prepared", device_id: 1, would_run: { template_id: 1, template_name: "test", config_mode: true, commands: ["router bgp 64500"], verify: null } }], preview_token: "direct-token" });
+    await waitFor(() => expect(apply).toHaveBeenCalledTimes(2));
+    expect(apply).toHaveBeenNthCalledWith(2, 7, expect.objectContaining({ dry_run: false, preview_token: "direct-token" }));
+    expect(await screen.findByText(/run #43/i)).toBeTruthy();
+  });
+
+  it("does not start a direct rule run when preparation grants no token", async () => {
+    const user = userEvent.setup();
+    const apply = vi.spyOn(api.rules, "apply").mockResolvedValue({
+      results: [{ executed: false, message: "blocked", blocked_reason: "device lock is active", device_id: 1 }],
+      preview_token: null,
+    });
+    const rule = { id: 7, name: "Flood response" } as Rule;
+    render(<BrowserRouter><ApplyMitigationDialog rule={rule} operatingMode="observe" onClose={() => undefined} /></BrowserRouter>);
+
+    await user.click(screen.getByRole("button", { name: "Run now" }));
+    expect(await screen.findByText("device lock is active")).toBeTruthy();
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply).toHaveBeenCalledWith(7, { reason: undefined, dry_run: true });
+  });
+
   it("reports reordered configuration values as changes", async () => {
     const user = userEvent.setup();
     vi.spyOn(api.actionSets, "inspect").mockResolvedValue({ blockers: [], prepared_actions: [], devices: [{ device_id: 1, before_config: "interface A\n ip tcp adjust-mss 1400\ninterface B\n ip tcp adjust-mss 1436", after_config: "interface A\n ip tcp adjust-mss 1436\ninterface B\n ip tcp adjust-mss 1400", revert_config: "interface A\n ip tcp adjust-mss 1400\ninterface B\n ip tcp adjust-mss 1436", changes: [{ action_index: 0, template_name: "iface_tcp_adjust_mss", effect: "change" }], completeness: "complete", blockers: [], read_at: "2026-09-19T08:00:00Z" }] });
