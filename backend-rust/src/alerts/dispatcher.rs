@@ -14,7 +14,6 @@ use crate::ssh::BoxFuture;
 pub const DEDUP_WINDOW_SECS: u64 = 600;
 pub const RATE_LIMIT_PER_HOUR: u32 = 20;
 const POLL_INTERVAL_SECS: u64 = 5;
-const BATCH: i64 = 50;
 const CRITICAL_SLOTS: i64 = 40;
 const NORMAL_SLOTS: i64 = 10;
 const MAX_DELIVERY_ATTEMPTS: u32 = 5;
@@ -179,12 +178,19 @@ async fn drain_once<S: DeliverySender>(pool: &MySqlPool, sender: &S) -> Result<(
 /// Snapshot the complete current audience transactionally before any send.
 async fn materialize_batch(pool: &MySqlPool) -> Result<()> {
     let alerts = sqlx::query_as::<_, PendingAlert>(
-        "SELECT a.id,a.event_type,a.severity \
-         FROM alerts a \
-         WHERE NOT EXISTS (SELECT 1 FROM alert_delivery_intents i WHERE i.alert_id=a.id) \
-         ORDER BY a.id LIMIT ?",
+        "WITH ranked AS ( \
+           SELECT a.id,a.event_type,a.severity, \
+                  ROW_NUMBER() OVER (PARTITION BY (a.severity='critical') ORDER BY a.id) AS class_rank \
+           FROM alerts a \
+           WHERE NOT EXISTS (SELECT 1 FROM alert_delivery_intents i WHERE i.alert_id=a.id) \
+         ) \
+         SELECT id,event_type,severity FROM ranked \
+         WHERE (severity='critical' AND class_rank <= ?) \
+            OR (severity<>'critical' AND class_rank <= ?) \
+         ORDER BY (severity='critical') DESC,id",
     )
-    .bind(BATCH)
+    .bind(CRITICAL_SLOTS)
+    .bind(NORMAL_SLOTS)
     .fetch_all(pool)
     .await?;
     for alert in alerts {
@@ -312,7 +318,7 @@ async fn process_intent<S: DeliverySender>(
             settle_intent(pool, intent.id, claim, "sent", "sent").await?;
         }
         Err(error) => {
-            let detail = truncate(&format!("{error:#}"), 1000);
+            let detail = truncate(&super::safe_diagnostic(&error), 1000);
             record_attempt(pool, intent, "failed", Some(&detail)).await?;
             if intent.attempt_count + 1 >= MAX_DELIVERY_ATTEMPTS {
                 settle_permanent_failure(pool, intent, claim, &detail).await?;
@@ -423,7 +429,13 @@ async fn release_claim_after_internal_error(
         pool,
         id,
         claim,
-        &truncate(&format!("internal dispatcher error: {error:#}"), 1000),
+        &truncate(
+            &format!(
+                "internal dispatcher error: {}",
+                super::safe_diagnostic(error)
+            ),
+            1000,
+        ),
     )
     .await
 }
@@ -871,7 +883,7 @@ mod tests {
         .unwrap()
         .last_insert_id();
 
-        let passes = ((backlog + 56 + BATCH - 1) / BATCH) + 1;
+        let passes = ((backlog + 56 + NORMAL_SLOTS - 1) / NORMAL_SLOTS) + 1;
         for _ in 0..passes {
             materialize_batch(pool).await.unwrap();
         }
@@ -905,6 +917,450 @@ mod tests {
             .ok();
         sqlx::query("DELETE FROM alert_recipients WHERE id=?")
             .bind(recipient_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_repair_preserves_outcomes_and_retry_state() {
+        let database = crate::db::connect_test_database().await;
+        let pool = database.pool();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let recipient_id = sqlx::query(
+            "INSERT INTO alert_recipients (email,verified_at) VALUES (?,UTC_TIMESTAMP())",
+        )
+        .bind(format!("repair-{nonce}@example.test"))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+
+        let mut alerts = Vec::new();
+        for label in [
+            "sent",
+            "suppressed",
+            "retry",
+            "bounced",
+            "existing",
+            "combined_budget",
+            "legacy_rate_limit",
+            "settled_immutable",
+            "sent_then_failed",
+            "teams_rate_url",
+            "settled_failure_with_sent",
+        ] {
+            let id = sqlx::query(
+                "INSERT INTO alerts (event_type,severity,payload_json,dedup_key) \
+                 VALUES (?,'warning','{}',?)",
+            )
+            .bind(format!("repair_{label}"))
+            .bind(format!("repair-{nonce}-{label}"))
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+            alerts.push(id);
+        }
+        let attempts = [
+            (alerts[0], "sent", None),
+            (
+                alerts[1],
+                "queued",
+                Some("suppressed: deduplicated within window"),
+            ),
+            (alerts[2], "failed", Some("connection refused")),
+            (alerts[2], "queued", Some("rate limited: retry later")),
+            (alerts[3], "bounced", Some("mailbox unavailable")),
+            (alerts[4], "sent", None),
+        ];
+        for (alert_id, status, error) in attempts {
+            sqlx::query(
+                "INSERT INTO alert_deliveries \
+                    (alert_id,recipient_id,channel,status,error,sent_at) \
+                 VALUES (?,?,'email',?,?,IF(?='sent',UTC_TIMESTAMP(),NULL))",
+            )
+            .bind(alert_id)
+            .bind(recipient_id)
+            .bind(status)
+            .bind(error)
+            .bind(status)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO alert_deliveries (alert_id,recipient_id,channel,status,error) \
+             VALUES (?,?,'email','failed','fifth disjoint failure'), \
+                    (?,?,'email','queued','rate limited')",
+        )
+        .bind(alerts[5])
+        .bind(recipient_id)
+        .bind(alerts[6])
+        .bind(recipient_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO alert_deliveries \
+                (alert_id,recipient_id,channel,status,error,sent_at,created_at) \
+             VALUES (?,?,'email','sent',NULL,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 9 MINUTE), \
+                     DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE)), \
+                    (?,?,'email','failed','later failure',NULL,UTC_TIMESTAMP())",
+        )
+        .bind(alerts[8])
+        .bind(recipient_id)
+        .bind(alerts[8])
+        .bind(recipient_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO alert_delivery_intents \
+                (alert_id,channel,target_key,recipient_id,target_address,state) \
+             VALUES (?,'email',?,?,?,'pending')",
+        )
+        .bind(alerts[4])
+        .bind(format!("recipient:{recipient_id}"))
+        .bind(recipient_id)
+        .bind(format!("repair-{nonce}@example.test"))
+        .execute(pool)
+        .await
+        .unwrap();
+        for (alert_id, state, outcome, attempts) in [
+            (alerts[5], "pending", None::<&str>, 4u32),
+            (alerts[6], "pending", None::<&str>, 0u32),
+        ] {
+            sqlx::query(
+                "INSERT INTO alert_delivery_intents \
+                    (alert_id,channel,target_key,recipient_id,target_address,state,outcome,attempt_count) \
+                 VALUES (?,'email',?,?,?, ?, ?, ?)",
+            )
+            .bind(alert_id)
+            .bind(format!("recipient:{recipient_id}"))
+            .bind(recipient_id)
+            .bind(format!("repair-{nonce}@example.test"))
+            .bind(state)
+            .bind(outcome)
+            .bind(attempts)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO alert_delivery_intents \
+                (alert_id,channel,target_key,recipient_id,target_address,state,outcome,attempt_count,settled_at,updated_at) \
+             VALUES (?,'email',?,?,?,'settled','suppressed',2,NULL,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 DAY))",
+        )
+        .bind(alerts[7])
+        .bind(format!("recipient:{recipient_id}"))
+        .bind(recipient_id)
+        .bind(format!("repair-{nonce}@example.test"))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO alert_deliveries (alert_id,recipient_id,channel,status,error) \
+             VALUES (?,?,'email','queued','suppressed: already delivered')",
+        )
+        .bind(alerts[7])
+        .bind(recipient_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let immutable_before: (String, Option<String>, u32, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT state,outcome,attempt_count,settled_at,updated_at FROM alert_delivery_intents WHERE alert_id=?")
+                .bind(alerts[7]).fetch_one(pool).await.unwrap();
+        let endpoint_id =
+            sqlx::query("INSERT INTO webhook_endpoints(name,url_encrypted,enabled) VALUES(?,?,1)")
+                .bind(format!("repair-{nonce}"))
+                .bind(vec![1u8, 2, 3])
+                .execute(pool)
+                .await
+                .unwrap()
+                .last_insert_id();
+        let teams_delivery_id = sqlx::query(
+            "INSERT INTO alert_deliveries(alert_id,endpoint_id,channel,status,error,created_at) \
+             VALUES (?,?,'teams','queued',?,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 7 MINUTE))",
+        )
+        .bind(alerts[9])
+        .bind(endpoint_id)
+        .bind("rate limited: retry https://example.invalid/webhook?sig=SYNTHETIC_SECRET")
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+        let teams_created_before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT created_at FROM alert_deliveries WHERE id=?")
+                .bind(teams_delivery_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO alert_delivery_intents \
+                (alert_id,channel,target_key,recipient_id,target_address,state,outcome,attempt_count,settled_at,updated_at) \
+             VALUES (?,'email',?,?,?,'settled','permanent_failure',3,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 DAY),DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 DAY))",
+        )
+        .bind(alerts[10])
+        .bind(format!("recipient:{recipient_id}"))
+        .bind(recipient_id)
+        .bind(format!("repair-{nonce}@example.test"))
+        .execute(pool)
+        .await
+        .unwrap();
+        let winning_delivery = sqlx::query(
+            "INSERT INTO alert_deliveries \
+                (alert_id,recipient_id,channel,status,sent_at,created_at) \
+             VALUES (?,?,'email','sent',DATE_SUB(UTC_TIMESTAMP(),INTERVAL 9 MINUTE),DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE))",
+        )
+        .bind(alerts[10])
+        .bind(recipient_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+        let settled_failure_before: (String, u32, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT state,attempt_count,updated_at FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[10])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260921000300_alert_delivery_repair.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let summaries: Vec<(String, Option<String>, u32)> = sqlx::query_as(
+            "SELECT state,outcome,attempt_count FROM alert_delivery_intents \
+             WHERE alert_id=? AND recipient_id=?",
+        )
+        .bind(alerts[0])
+        .bind(recipient_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(summaries, vec![("settled".into(), Some("sent".into()), 0)]);
+
+        let states: Vec<(u64, String, Option<String>, u32)> = sqlx::query_as(
+            "SELECT alert_id,state,outcome,attempt_count FROM alert_delivery_intents \
+             WHERE alert_id IN (?,?,?,?,?) ORDER BY alert_id",
+        )
+        .bind(alerts[0])
+        .bind(alerts[1])
+        .bind(alerts[2])
+        .bind(alerts[3])
+        .bind(alerts[4])
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(states[1].1, "settled");
+        assert_eq!(states[1].2.as_deref(), Some("suppressed"));
+        assert_eq!(states[2].1, "retry");
+        assert_eq!(states[2].2, None);
+        assert_eq!(states[2].3, 1);
+        assert_eq!(states[3].2.as_deref(), Some("permanent_failure"));
+        assert_eq!(
+            states[4].2.as_deref(),
+            Some("sent"),
+            "historical success settles an existing pending intent"
+        );
+        let settled_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT settled_at FROM alert_delivery_intents WHERE alert_id=? AND recipient_id=?",
+        )
+        .bind(alerts[4])
+        .bind(recipient_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(settled_at.is_some(), "settled success has a timestamp");
+
+        let combined: (String, Option<String>, u32) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[5])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            combined,
+            ("settled".into(), Some("permanent_failure".into()), 5)
+        );
+        let legacy_rate: (String, Option<String>, u32) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[6])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_rate, ("retry".into(), None, 0));
+        let teams_repaired: (String, Option<String>, u32, Option<String>, u64) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count,last_error,endpoint_id \
+             FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[9])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(teams_repaired.0, "retry");
+        assert_eq!(teams_repaired.1, None);
+        assert_eq!(teams_repaired.2, 0);
+        assert_eq!(teams_repaired.4, endpoint_id);
+        let safe_error = teams_repaired.3.expect("retry diagnostic retained");
+        assert!(safe_error.starts_with("rate limited:"));
+        assert!(!safe_error.contains("http"));
+        assert!(!safe_error.contains("SYNTHETIC_SECRET"));
+        let (delivery_error, teams_created_after, repaired_endpoint): (
+            String,
+            chrono::DateTime<chrono::Utc>,
+            u64,
+        ) = sqlx::query_as("SELECT error,created_at,endpoint_id FROM alert_deliveries WHERE id=?")
+            .bind(teams_delivery_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(teams_created_after, teams_created_before);
+        assert_eq!(repaired_endpoint, endpoint_id);
+        assert!(delivery_error.starts_with("rate limited:"));
+        assert!(!delivery_error.contains("http"));
+        assert!(!delivery_error.contains("SYNTHETIC_SECRET"));
+        let immutable_after: (String, Option<String>, u32, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT state,outcome,attempt_count,settled_at,updated_at FROM alert_delivery_intents WHERE alert_id=?")
+                .bind(alerts[7]).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            immutable_after, immutable_before,
+            "settled intent is byte-for-byte immutable across repaired fields"
+        );
+        let (repaired_sent_at, historical_sent_at): (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT i.settled_at, d.sent_at FROM alert_delivery_intents i \
+             JOIN alert_deliveries d ON d.alert_id=i.alert_id AND d.status='sent' \
+             WHERE i.alert_id=?",
+        )
+        .bind(alerts[8])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repaired_sent_at, historical_sent_at,
+            "sent winner settles at the sent attempt, not a later failure"
+        );
+        let settled_failure_after: (
+            String,
+            Option<String>,
+            u32,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count,settled_at,updated_at \
+             FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[10])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let winning_sent_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT sent_at FROM alert_deliveries WHERE id=?")
+                .bind(winning_delivery)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(settled_failure_after.0, settled_failure_before.0);
+        assert_eq!(settled_failure_after.1.as_deref(), Some("sent"));
+        assert_eq!(settled_failure_after.2, settled_failure_before.1);
+        assert_eq!(settled_failure_after.3, winning_sent_at);
+        assert_eq!(settled_failure_after.4, settled_failure_before.2);
+
+        let unlinked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM alert_deliveries d JOIN alerts a ON a.id=d.alert_id \
+             WHERE a.dedup_key LIKE ? AND d.delivery_intent_id IS NULL",
+        )
+        .bind(format!("repair-{nonce}-%"))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unlinked, 0,
+            "every legacy attempt is linked deterministically"
+        );
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260921000300_alert_delivery_repair.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let replayed: Vec<(u64, String, Option<String>, u32)> = sqlx::query_as(
+            "SELECT alert_id,state,outcome,attempt_count FROM alert_delivery_intents \
+             WHERE alert_id IN (?,?,?,?,?) ORDER BY alert_id",
+        )
+        .bind(alerts[0])
+        .bind(alerts[1])
+        .bind(alerts[2])
+        .bind(alerts[3])
+        .bind(alerts[4])
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(replayed, states, "repair is idempotent");
+        let replayed_budget: (String, Option<String>, u32) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[5])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            replayed_budget, combined,
+            "linked legacy failures are not charged twice on replay"
+        );
+        let teams_replayed: (String, Option<String>, u32, Option<String>) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count,last_error FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[9])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            teams_replayed,
+            ("retry".into(), None, 0, Some(safe_error)),
+            "URL scrub and rate-limit classification are idempotent"
+        );
+        let settled_failure_replayed: (
+            String,
+            Option<String>,
+            u32,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT state,outcome,attempt_count,settled_at,updated_at \
+             FROM alert_delivery_intents WHERE alert_id=?",
+        )
+        .bind(alerts[10])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(settled_failure_replayed, settled_failure_after);
+
+        for alert_id in alerts {
+            sqlx::query("DELETE FROM alerts WHERE id=?")
+                .bind(alert_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM alert_recipients WHERE id=?")
+            .bind(recipient_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM webhook_endpoints WHERE id=?")
+            .bind(endpoint_id)
             .execute(pool)
             .await
             .ok();

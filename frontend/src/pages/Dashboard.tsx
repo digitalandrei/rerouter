@@ -9,7 +9,7 @@
  * button for rules that have manual_apply_enabled.
  */
 import { useEffect, useState, useCallback } from "react";
-import { api, type SystemStatus, type Alert, type Rule, type SystemSettings, type RerouteBundle } from "@/lib/api";
+import { api, type SystemStatus, type Alert, type Rule, type SystemSettings, type RunSummary } from "@/lib/api";
 import { eventTypeLabel } from "@/lib/labels";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,8 +34,8 @@ export default function Dashboard() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [firingRules, setFiringRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
-  const [activeRuns, setActiveRuns] = useState<RerouteBundle[]>([]);
-  const [recentRuns, setRecentRuns] = useState<RerouteBundle[]>([]);
+  const [activeRuns, setActiveRuns] = useState<RunSummary[]>([]);
+  const [recentRuns, setRecentRuns] = useState<RunSummary[]>([]);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [refreshing, setRefreshing] = useState(false);

@@ -217,38 +217,23 @@ async fn execute_resolved_rollback_with<S: SshExecutor>(
     // A real rollback is serialized by original action. The same original may be
     // retried after a failed rollback, but never while another rollback is active
     // or after one has already succeeded.
-    let mut lock_conn = None;
-    let mut lock_name = None;
+    let mut rollback_guard = None;
     if !req.dry_run {
         if let Some(original_id) = req.original_reroute_id {
-            let mut conn = pool.acquire().await?;
-            let name = crate::db::scoped_advisory_lock_name(
-                &mut conn,
-                &format!("reroute:rollback:{original_id}"),
-            )
-            .await?;
-            conn.close_on_drop();
-            let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
-                .bind(&name)
-                .fetch_one(&mut *conn)
-                .await?;
-            anyhow::ensure!(got == Some(1), "another rollback is being prepared");
+            let guard =
+                crate::db::advisory::acquire(&format!("05:reroute:rollback:{original_id}")).await?;
             let existing: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM reroutes WHERE rollback_of_reroute_id = ? \
                  AND state IN ('planned','pending','running','verifying','succeeded')",
             )
             .bind(original_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(pool)
             .await?;
             if existing > 0 {
-                let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-                    .bind(&name)
-                    .execute(&mut *conn)
-                    .await;
+                guard.release().await?;
                 anyhow::bail!("this action already has an active or successful rollback");
             }
-            lock_name = Some(name);
-            lock_conn = Some(conn);
+            rollback_guard = Some(guard);
         }
     }
 
@@ -268,12 +253,8 @@ async fn execute_resolved_rollback_with<S: SshExecutor>(
         authorization: req.authorization,
     };
     let outcome = executor::execute_with(pool, cfg, ssh, action, req.dry_run).await;
-    if let (Some(mut conn), Some(name)) = (lock_conn, lock_name) {
-        if let Err(e) = sqlx::query("SELECT RELEASE_LOCK(?)")
-            .bind(name)
-            .execute(&mut *conn)
-            .await
-        {
+    if let Some(guard) = rollback_guard {
+        if let Err(e) = guard.release().await {
             tracing::error!(event_type = "rollback_guard_release_failed", error = %e, "failed to release rollback advisory lock");
         }
     }

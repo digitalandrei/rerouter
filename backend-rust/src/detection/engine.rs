@@ -21,6 +21,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::MySqlPool;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 // TIMESTAMP columns decode as DateTime<Utc> (sqlx-mysql maps NaiveDateTime only
 // to DATETIME); the pool pins the session tz to UTC.
@@ -238,6 +241,140 @@ pub async fn evaluate_aggregate_rules(pool: &MySqlPool, cfg: &Config) -> Result<
     Ok(fired)
 }
 
+/// Evaluate flow rules whose enrolled interface was present in a completed
+/// flush. E3 coalesces interface ids; every rule still uses the same cursor and
+/// publication path as ordinary evaluation.
+pub async fn evaluate_flow_interfaces(
+    pool: &MySqlPool,
+    cfg: &Config,
+    interface_ids: &[u64],
+) -> Result<usize> {
+    if interface_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut ids = interface_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut query=sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT id,actions_revision,name,interface_id,device_id,metric,metric_aggregation,flow_direction,flow_protocol,flow_port,flow_port_kind,operator,threshold_value,duration_seconds,consecutive_samples,recovery_mode,recovery_threshold_value,recovery_window_seconds,recovery_consecutive_samples,severity,automatic_reroute_enabled,automatic_revert_enabled FROM rules WHERE enabled=1 AND metric IN ('flow_pps','flow_bps') AND interface_id IN ("
+    );
+    let mut separated = query.separated(",");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    query.push(") ORDER BY id");
+    evaluate_rules(
+        pool,
+        cfg,
+        query
+            .build_query_as::<InterfaceRule>()
+            .fetch_all(pool)
+            .await?,
+    )
+    .await
+}
+
+pub async fn evaluate_all_flow_rules(pool: &MySqlPool, cfg: &Config) -> Result<usize> {
+    let rules=sqlx::query_as::<_,InterfaceRule>(
+        "SELECT id,actions_revision,name,interface_id,device_id,metric,metric_aggregation,flow_direction,flow_protocol,flow_port,flow_port_kind,operator,threshold_value,duration_seconds,consecutive_samples,recovery_mode,recovery_threshold_value,recovery_window_seconds,recovery_consecutive_samples,severity,automatic_reroute_enabled,automatic_revert_enabled FROM rules WHERE enabled=1 AND metric IN ('flow_pps','flow_bps') ORDER BY id"
+    ).fetch_all(pool).await?;
+    evaluate_rules(pool, cfg, rules).await
+}
+
+#[doc(hidden)]
+pub async fn automatic_flow_evidence_qualified(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule_id: u64,
+) -> Result<bool> {
+    let rule=sqlx::query_as::<_,InterfaceRule>(
+        "SELECT id,actions_revision,name,interface_id,device_id,metric,metric_aggregation,flow_direction,flow_protocol,flow_port,flow_port_kind,operator,threshold_value,duration_seconds,consecutive_samples,recovery_mode,recovery_threshold_value,recovery_window_seconds,recovery_consecutive_samples,severity,automatic_reroute_enabled,automatic_revert_enabled FROM rules WHERE id=? AND enabled=1"
+    ).bind(rule_id).fetch_optional(pool).await?;
+    let Some(rule) = rule else { return Ok(false) };
+    if !is_flow_metric(&rule.metric) {
+        return Ok(true);
+    }
+    Ok(flow_observation(pool, cfg, &rule)
+        .await?
+        .is_some_and(|obs| !obs.low_confidence && obs.source_corroborated))
+}
+
+/// Revalidate a rule-owned automatic recovery against current evidence. A
+/// queued recovery may wait long enough for the incident to relapse; in that
+/// case the published recovery decision is stale and no inverse may be written.
+#[doc(hidden)]
+pub async fn automatic_condition_recovery_qualified(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule_id: u64,
+) -> Result<bool> {
+    let rule=sqlx::query_as::<_,InterfaceRule>(
+        "SELECT id,actions_revision,name,interface_id,device_id,metric,metric_aggregation,flow_direction,flow_protocol,flow_port,flow_port_kind,operator,threshold_value,duration_seconds,consecutive_samples,recovery_mode,recovery_threshold_value,recovery_window_seconds,recovery_consecutive_samples,severity,automatic_reroute_enabled,automatic_revert_enabled FROM rules WHERE id=? AND enabled=1 AND automatic_revert_enabled=1"
+    ).bind(rule_id).fetch_optional(pool).await?;
+    let Some(rule) = rule else { return Ok(false) };
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT current_state FROM rule_states WHERE rule_id=?")
+            .bind(rule_id)
+            .fetch_optional(pool)
+            .await?;
+    if state.as_deref() != Some("recovered_awaiting_revert") {
+        return Ok(false);
+    }
+    let observation = if rule.metric_aggregation == "sum" {
+        aggregate_observation(pool, cfg, &rule).await?
+    } else if is_flow_metric(&rule.metric) {
+        flow_observation(pool, cfg, &rule).await?
+    } else {
+        interface_observation(pool, cfg, &rule).await?
+    };
+    let Some(observation) = observation else {
+        return Ok(false);
+    };
+    if is_flow_metric(&rule.metric)
+        && (observation.low_confidence || !observation.source_corroborated)
+    {
+        return Ok(false);
+    }
+    let Some(operator) = Op::parse(&rule.operator) else {
+        return Ok(false);
+    };
+    if operator.compare(observation.value, rule.threshold_value) {
+        return Ok(false);
+    }
+    Ok(rule.recovery_mode != "threshold"
+        || operator.recovered(
+            observation.value,
+            rule.recovery_threshold_value
+                .unwrap_or(rule.threshold_value),
+        ))
+}
+
+async fn evaluate_rules(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rules: Vec<InterfaceRule>,
+) -> Result<usize> {
+    let mut fired = 0;
+    let mut failures = Vec::new();
+    for rule in rules {
+        match evaluate_rule(pool, cfg, &rule).await {
+            Ok(true) => fired += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(event_type="flow_rule_eval_failed",rule_id=rule.id,error=%error);
+                failures.push(format!("rule {}: {error:#}", rule.id));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "one or more flow rules remain retryable: {}",
+            failures.join("; ")
+        )
+    }
+    Ok(fired)
+}
+
 /// All required members must have advanced. A scheduler tick or a fast member
 /// cannot count the same slow member twice.
 fn evidence_advanced(
@@ -266,22 +403,18 @@ async fn reset_unproven_streak(pool: &MySqlPool, rule_id: u64) -> Result<()> {
 /// Evaluate a single rule and advance its state. Returns Ok(true) iff the rule
 /// transitioned INTO `firing` on this evaluation (the alert edge).
 async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> Result<bool> {
-    // Poll callbacks and the aggregate scheduler must never consume one row
-    // concurrently. Close-on-drop releases this session lock even on cancellation.
-    let mut lease = pool.acquire().await?;
-    lease.close_on_drop();
-    let lock_name = crate::db::scoped_advisory_lock_name(
-        &mut lease,
-        &format!("detection:observation:{}", rule.id),
-    )
-    .await?;
-    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 0)")
-        .bind(lock_name)
-        .fetch_one(&mut *lease)
-        .await?;
-    if got != Some(1) {
-        return Ok(false);
-    }
+    let runtime = cfg.advisory_runtime(pool).await?;
+    crate::db::advisory::background_scope(runtime, async {
+        let guard =
+            crate::db::advisory::acquire(&format!("00:detection:observation:{}", rule.id)).await?;
+        let result = evaluate_rule_inner(pool, cfg, rule).await;
+        guard.release().await?;
+        result
+    })
+    .await?
+}
+
+async fn evaluate_rule_inner(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> Result<bool> {
     let Some(op) = Op::parse(&rule.operator) else {
         return Ok(false); // unknown operator: never matches.
     };
@@ -342,14 +475,10 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             prev.current_state = Some("clear".into());
         }
     }
-    sqlx::query("INSERT INTO rule_states(rule_id,last_observation_json,last_observation_at) VALUES(?,?,?) \
-        ON DUPLICATE KEY UPDATE last_observation_json=VALUES(last_observation_json),last_observation_at=VALUES(last_observation_at)")
-        .bind(rule.id).bind(sqlx::types::Json(&obs.evidence)).bind(now).execute(pool).await?;
     let mut prev_state = prev.current_state.clone().unwrap_or_else(|| "clear".into());
     if prev_state == "recovered_awaiting_revert"
         && rule_owned_changes(pool, rule.id, false).await? == 0
     {
-        clear_state(pool, rule.id, value).await?;
         prev_state = "clear".into();
         prev.first_matched_at = None;
         prev.consecutive_match_count = 0;
@@ -361,17 +490,19 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         let first_matched = prev.first_matched_at.unwrap_or(now);
         let held_secs = (now - first_matched).num_seconds();
         if prev_state == "recovered_awaiting_revert" {
-            upsert_state(
+            publish_simple_observation(
                 pool,
-                rule.id,
+                rule,
                 "firing",
                 Some(first_matched),
-                sampled_at,
                 consecutive,
                 value,
+                &obs,
+                None,
+                0,
+                None,
             )
             .await?;
-            set_recovery_progress(pool, rule.id, None, 0).await?;
             return Ok(false);
         }
 
@@ -388,18 +519,7 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
 
         if should_fire && prev_state != "firing" {
             // Rising edge: fire. Reset any prior recovery progress.
-            upsert_state(
-                pool,
-                rule.id,
-                "firing",
-                Some(first_matched),
-                sampled_at,
-                consecutive,
-                value,
-            )
-            .await?;
-            set_recovery_progress(pool, rule.id, None, 0).await?;
-            if let Err(e) = on_fire(
+            on_fire(
                 pool,
                 cfg,
                 rule,
@@ -407,55 +527,42 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
                 sampled_at,
                 obs.low_confidence,
                 obs.source_corroborated,
+                &obs.evidence,
+                first_matched,
+                consecutive,
             )
-            .await
-            {
-                // No action is attempted until the durable fired event exists. Put
-                // the rule back into matching so the next evaluation retries the
-                // firing edge instead of silently losing it forever.
-                upsert_state(
-                    pool,
-                    rule.id,
-                    "matching",
-                    Some(first_matched),
-                    sampled_at,
-                    consecutive,
-                    value,
-                )
-                .await?;
-                return Err(e);
-            }
+            .await?;
             return Ok(true);
         } else if prev_state == "firing" {
             // Already firing and the firing condition still holds: keep firing,
             // refresh activity (no new alert), and cancel any recovery progress.
-            upsert_state(
+            publish_simple_observation(
                 pool,
-                rule.id,
+                rule,
                 "firing",
                 Some(first_matched),
-                sampled_at,
                 consecutive,
                 value,
+                &obs,
+                None,
+                0,
+                None,
             )
             .await?;
-            set_recovery_progress(pool, rule.id, None, 0).await?;
             return Ok(false);
         } else {
             // Matching but persistence not yet met.
-            if prev_state == "clear" {
-                if let Err(e) = record_event(pool, rule, "matched", value, sampled_at).await {
-                    tracing::warn!(event_type = "rule_match_event_write_failed", rule_id = rule.id, error = %e, "could not persist the start of a matching streak");
-                }
-            }
-            upsert_state(
+            publish_simple_observation(
                 pool,
-                rule.id,
+                rule,
                 "matching",
                 Some(first_matched),
-                sampled_at,
                 consecutive,
                 value,
+                &obs,
+                None,
+                0,
+                (prev_state == "clear").then_some("matched"),
             )
             .await?;
             return Ok(false);
@@ -473,6 +580,19 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
     //               persistence override (else the firing persistence).
     if prev_state == "firing" {
         if rule.recovery_mode == "manual" {
+            publish_simple_observation(
+                pool,
+                rule,
+                "firing",
+                prev.first_matched_at,
+                prev.consecutive_match_count,
+                value,
+                &obs,
+                None,
+                0,
+                None,
+            )
+            .await?;
             return Ok(false);
         }
 
@@ -491,7 +611,19 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
         if !recovered_now {
             // Threshold band: below fire threshold but not yet recovered. Hold
             // firing and reset recovery progress.
-            set_recovery_progress(pool, rule.id, None, 0).await?;
+            publish_simple_observation(
+                pool,
+                rule,
+                "firing",
+                prev.first_matched_at,
+                prev.consecutive_match_count,
+                value,
+                &obs,
+                None,
+                0,
+                None,
+            )
+            .await?;
             return Ok(false);
         }
 
@@ -507,10 +639,31 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             .unwrap_or(rule.duration_seconds as i64);
             let rec_first = prev.recovery_first_at.unwrap_or(now);
             if target_secs == 0 || (now - rec_first).num_seconds() >= target_secs {
-                recover_and_clear(pool, cfg, rule, value, sampled_at).await?;
+                recover_and_clear(
+                    pool,
+                    cfg,
+                    rule,
+                    value,
+                    sampled_at,
+                    obs.low_confidence,
+                    obs.source_corroborated,
+                    &obs.evidence,
+                )
+                .await?;
             } else {
-                set_recovery_progress(pool, rule.id, Some(rec_first), prev.recovery_consecutive)
-                    .await?;
+                publish_simple_observation(
+                    pool,
+                    rule,
+                    "firing",
+                    prev.first_matched_at,
+                    prev.consecutive_match_count,
+                    value,
+                    &obs,
+                    Some(rec_first),
+                    prev.recovery_consecutive,
+                    None,
+                )
+                .await?;
             }
             return Ok(false);
         } else {
@@ -524,9 +677,31 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
             .max(1);
             let rec_consec = prev.recovery_consecutive.saturating_add(1);
             if rec_consec >= target_samples {
-                recover_and_clear(pool, cfg, rule, value, sampled_at).await?;
+                recover_and_clear(
+                    pool,
+                    cfg,
+                    rule,
+                    value,
+                    sampled_at,
+                    obs.low_confidence,
+                    obs.source_corroborated,
+                    &obs.evidence,
+                )
+                .await?;
             } else {
-                set_recovery_progress(pool, rule.id, None, rec_consec).await?;
+                publish_simple_observation(
+                    pool,
+                    rule,
+                    "firing",
+                    prev.first_matched_at,
+                    prev.consecutive_match_count,
+                    value,
+                    &obs,
+                    None,
+                    rec_consec,
+                    None,
+                )
+                .await?;
             }
             return Ok(false);
         }
@@ -535,25 +710,34 @@ async fn evaluate_rule(pool: &MySqlPool, cfg: &Config, rule: &InterfaceRule) -> 
     if prev_state == "recovered_awaiting_revert" {
         // Router ownership outlives the recovered condition. Quiet samples must
         // never clear that ownership marker; only a verified inverse may do so.
-        upsert_state(
+        publish_simple_observation(
             pool,
-            rule.id,
+            rule,
             "recovered_awaiting_revert",
             None,
-            sampled_at,
             0,
             value,
+            &obs,
+            None,
+            0,
+            None,
         )
         .await?;
+        if let Some(bundle_id)=sqlx::query_scalar::<_,u64>("SELECT id FROM reroute_bundles WHERE rule_id=? AND state='planned' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.kind'))='recovery' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase'))='published' ORDER BY id LIMIT 1")
+            .bind(rule.id).fetch_optional(pool).await? {
+            submit_recovery_worker(pool,cfg,rule.clone(),bundle_id).await?;
+        }
         return Ok(false);
     }
 
     // Was matching but the condition dropped before firing, or already clear.
     if prev_state == "matching" {
-        clear_state(pool, rule.id, value).await?;
+        publish_simple_observation(pool, rule, "clear", None, 0, value, &obs, None, 0, None)
+            .await?;
     } else {
         // Keep last_evaluated_at fresh.
-        upsert_state(pool, rule.id, "clear", None, sampled_at, 0, value).await?;
+        publish_simple_observation(pool, rule, "clear", None, 0, value, &obs, None, 0, None)
+            .await?;
     }
     Ok(false)
 }
@@ -731,6 +915,28 @@ async fn flow_observation(
     if !(0..=flow_stale).contains(&(Utc::now() - bucket_ts).num_seconds()) {
         return Ok(None);
     }
+    let quality_dimension = if rule.flow_port.is_some() {
+        crate::telemetry::flow::quality::QualityDimension::Port
+    } else {
+        crate::telemetry::flow::quality::QualityDimension::Interface
+    };
+    let quality_direction = if direction == "egress" {
+        crate::telemetry::flow::Direction::Egress
+    } else {
+        crate::telemetry::flow::Direction::Ingress
+    };
+    let quality = crate::telemetry::flow::quality::bucket_evidence(
+        pool,
+        dev_id,
+        if_index,
+        quality_direction,
+        bucket_ts,
+        quality_dimension,
+    )
+    .await?;
+    if quality.availability == crate::telemetry::flow::quality::EvidenceAvailability::Unavailable {
+        return Ok(None);
+    }
 
     // (est_pkts, est_bytes, low-confidence flag). Aggregates return NULL when a
     // selector has no row in this bucket; its current value is then zero and its
@@ -791,25 +997,13 @@ async fn flow_observation(
         .await?
     };
 
-    let (est_pkts, est_bytes, low_conf, pkts_available, bytes_available) = row;
-    // A missing selector is a measured zero only if the underlying interface
-    // bucket proves that the corresponding counter was available.
-    let base: (Option<u64>, Option<u64>) = sqlx::query_as(
-        "SELECT CAST(MIN(pkts_available) AS UNSIGNED),CAST(MIN(bytes_available) AS UNSIGNED) \
-        FROM flow_iface_buckets WHERE device_id=? AND if_index=? AND direction=? AND bucket_ts=?",
-    )
-    .bind(dev_id)
-    .bind(if_index)
-    .bind(direction)
-    .bind(bucket_ts)
-    .fetch_one(pool)
-    .await?;
+    let (est_pkts, est_bytes, _low_conf, _pkts_available, _bytes_available) = row;
     let available = match rule.metric.as_str() {
-        "flow_pps" => pkts_available.or(base.0),
-        "flow_bps" => bytes_available.or(base.1),
-        _ => None,
+        "flow_pps" => quality.pkts_available,
+        "flow_bps" => quality.bytes_available,
+        _ => false,
     };
-    if available != Some(1) {
+    if !available {
         return Ok(None);
     }
 
@@ -827,7 +1021,7 @@ async fn flow_observation(
         evidence: [(rule.interface_id.unwrap_or(0), bucket_ts)]
             .into_iter()
             .collect(),
-        low_confidence: low_conf.unwrap_or(1) != 0 || !source_corroborated,
+        low_confidence: !quality.sampling_high_confidence || !source_corroborated,
         source_corroborated,
     }))
 }
@@ -855,8 +1049,8 @@ async fn flow_matches_snmp(
     let Some(sampled_at) = sampled_at else {
         return Ok(false);
     };
-    if !valid || (Utc::now() - sampled_at).num_seconds() > cfg.telemetry.stale_after_seconds as i64
-    {
+    let sample_age = (Utc::now() - sampled_at).num_seconds();
+    if !valid || !(0..=cfg.telemetry.stale_after_seconds as i64).contains(&sample_age) {
         return Ok(false);
     }
     let max_skew =
@@ -872,8 +1066,11 @@ async fn flow_matches_snmp(
         ("flow_bps", false) => tx_bps,
         _ => return Ok(false),
     };
-    if !flow_value.is_finite() || !snmp_value.is_finite() || flow_value < 0.0 || snmp_value <= 0.0 {
+    if !flow_value.is_finite() || !snmp_value.is_finite() || flow_value < 0.0 || snmp_value < 0.0 {
         return Ok(false);
+    }
+    if snmp_value == 0.0 {
+        return Ok(flow_value == 0.0);
     }
     let ratio = flow_value / snmp_value;
     let under_ceiling = ratio <= cfg.flow.snmp_corroboration_max_ratio;
@@ -909,6 +1106,7 @@ fn persistence_satisfied(
 /// On the firing edge: record the rule_event and enqueue the alert. In observe
 /// mode (and always, since execution is gated elsewhere) the alert carries the
 /// would-run plan instead of any reroute.
+#[allow(clippy::too_many_arguments)]
 async fn on_fire(
     pool: &MySqlPool,
     cfg: &Config,
@@ -917,6 +1115,9 @@ async fn on_fire(
     sampled_at: Option<Ts>,
     low_confidence: bool,
     source_corroborated: bool,
+    evidence: &std::collections::BTreeMap<u64, Ts>,
+    first_matched: Ts,
+    consecutive: u32,
 ) -> Result<()> {
     let mode = crate::api::settings::operating_mode(pool, cfg).await;
 
@@ -1000,16 +1201,28 @@ async fn on_fire(
     if auto {
         payload["automatic_execution_planned"] = json!(true);
     }
+    let automatic_inputs: Vec<Value> = if auto {
+        sqlx::query_as::<_,(u64,u64,Option<sqlx::types::Json<Value>>,Option<String>,u32)>(
+            "SELECT reroute_template_id,device_id,params_json,auto_target,position FROM rule_actions WHERE rule_id=? AND enabled=1 ORDER BY position,id"
+        ).bind(rule.id).fetch_all(pool).await?.into_iter().map(|(template_id,device_id,params,auto_target,position)|json!({
+            "template_id":template_id,"device_id":device_id,"params":params.map(|v|v.0).unwrap_or(Value::Null),"auto_target":auto_target,"position":position
+        })).collect()
+    } else {
+        Vec::new()
+    };
 
     let dedup_key = match rule.interface_id {
         Some(id) => format!("rule_fired:rule:{}:iface:{}", rule.id, id),
         None => format!("rule_fired:rule:{}:agg", rule.id),
     };
     // Persist the firing edge and its alert atomically BEFORE any SSH side
-    // effect. If this transaction fails, evaluate_rule returns to `matching` and
-    // retries later. Once it commits, a crash can at worst omit the automatic
+    // effect. If this transaction fails, the previous state and cursor remain
+    // unchanged so the same observation can retry later. Once it commits, a crash can at worst omit the automatic
     // action; it can never leave an unalerted action that is retried blindly.
+    let persist_started = std::time::Instant::now();
     let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO rule_states(rule_id,current_state,first_matched_at,recovery_first_at,recovery_consecutive,consecutive_match_count,last_metric_value,last_observation_json,last_observation_at,last_matched_at,last_evaluated_at) VALUES(?,'firing',?,NULL,0,?,?,?,?,?,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE current_state='firing',first_matched_at=VALUES(first_matched_at),recovery_first_at=NULL,recovery_consecutive=0,consecutive_match_count=VALUES(consecutive_match_count),last_metric_value=VALUES(last_metric_value),last_observation_json=VALUES(last_observation_json),last_observation_at=VALUES(last_observation_at),last_matched_at=VALUES(last_observation_at),last_evaluated_at=UTC_TIMESTAMP()")
+        .bind(rule.id).bind(first_matched).bind(consecutive).bind(value).bind(sqlx::types::Json(evidence)).bind(sampled_at).bind(sampled_at).execute(&mut *tx).await?;
     let event = sqlx::query(
         "INSERT INTO rule_events (rule_id, event, metric_value, sampled_at) \
          VALUES (?, 'fired', ?, ?)",
@@ -1033,50 +1246,27 @@ async fn on_fire(
     .execute(&mut *tx)
     .await?;
     let alert_id = alert.last_insert_id();
+    let planned_bundle_id = if auto && !automatic_inputs.is_empty() {
+        let row=sqlx::query("INSERT INTO reroute_bundles(rule_id,rule_event_id,trigger_type,reason,state,failure_policy,total_actions,source_json) VALUES(?,?,'automatic',?,'planned','abort_and_compensate',?,?)")
+            .bind(rule.id).bind(rule_event_id).bind(format!("automatic: rule '{}' fired",rule.name)).bind(automatic_inputs.len() as u32)
+            .bind(sqlx::types::Json(json!({"kind":"rule","rule_id":rule.id,"name":rule.name,"actions_revision":rule.actions_revision,"input_actions":automatic_inputs,"admission_state":"published"})))
+            .execute(&mut *tx).await?;
+        Some(row.last_insert_id())
+    } else {
+        None
+    };
+    if cfg.fail_automatic_decision_before_commit {
+        anyhow::bail!("injected decision publication failure")
+    }
     tx.commit().await?;
+    tracing::info!(event_type="hardening_timing",stage="decision_persist",subject_id=rule.id,elapsed_us=persist_started.elapsed().as_micros() as u64,outcome="committed",observation_at=?sampled_at);
 
-    if auto {
-        match auto_execute_actions(pool, cfg, rule, rule_event_id).await {
-            Ok(executed) => {
-                if !executed.is_empty() {
-                    payload["executed_actions"] = json!(executed);
-                }
-                payload["automatic_execution_completed"] = json!(true);
-            }
-            Err(e) => {
-                payload["automatic_execution_completed"] = json!(false);
-                payload["automatic_execution_error"] = json!(e.to_string());
-                tracing::error!(event_type = "automatic_action_failed", rule_id = rule.id, rule_event_id, error = %e, "automatic action preparation failed after the firing alert was committed; no untracked retry will be attempted");
-                let failure_payload = json!({
-                    "rule_id": rule.id,
-                    "rule_event_id": rule_event_id,
-                    "rule_name": rule.name,
-                    "reason": e.to_string(),
-                    "side_effect_attempted": false,
-                });
-                if let Err(alert_err) = sqlx::query(
-                    "INSERT INTO alerts (event_type, severity, rule_id, payload_json, dedup_key) \
-                     VALUES ('automatic_action_failed', 'critical', ?, ?, ?)",
-                )
-                .bind(rule.id)
-                .bind(sqlx::types::Json(&failure_payload))
-                .bind(format!(
-                    "automatic_action_failed:rule_event:{rule_event_id}"
-                ))
-                .execute(pool)
+    if let Some(bundle_id) = planned_bundle_id {
+        if let Err(error) =
+            submit_automatic_worker(pool, cfg, rule.clone(), rule_event_id, alert_id, bundle_id)
                 .await
-                {
-                    tracing::error!(event_type = "automatic_action_failure_alert_write_failed", rule_id = rule.id, rule_event_id, error = %alert_err, "could not enqueue the automatic-action failure alert");
-                }
-            }
-        }
-        if let Err(e) = sqlx::query("UPDATE alerts SET payload_json = ? WHERE id = ?")
-            .bind(sqlx::types::Json(&payload))
-            .bind(alert_id)
-            .execute(pool)
-            .await
         {
-            tracing::error!(event_type = "rule_alert_outcome_update_failed", rule_id = rule.id, rule_event_id, alert_id, error = %e, "automatic action finished but the firing alert could not be enriched; reroute lifecycle alerts remain durable");
+            tracing::error!(event_type="automatic_worker_submit_failed",rule_id=rule.id,bundle_id,error=%error,"durable firing decision remains committed for startup repair");
         }
     }
 
@@ -1196,6 +1386,537 @@ async fn render_would_run_actions(pool: &MySqlPool, rule: &InterfaceRule) -> Res
     Ok(out)
 }
 
+type JobFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+#[derive(Clone, Copy)]
+enum JobKind {
+    Activation,
+    Recovery,
+}
+struct SupervisedJob {
+    future: JobFuture,
+    pool: Option<MySqlPool>,
+    bundle_id: u64,
+    kind: JobKind,
+}
+
+#[derive(Default)]
+pub struct AutomaticWorkQueue {
+    sender: OnceLock<tokio::sync::mpsc::Sender<SupervisedJob>>,
+}
+
+/// External router I/O used by the durable automatic-work pipeline. Database
+/// publication/admission is intentionally outside this seam.
+#[doc(hidden)]
+pub trait AutomaticWorkPort: Send + Sync + std::fmt::Debug {
+    fn prepare_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+    ) -> crate::ssh::BoxFuture<'a, Result<()>>;
+    fn prepare_recovery<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        originals: &'a [u64],
+        reason: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<crate::reroute::bundle::BundleAction>>>;
+    fn transport_identities<'a>(
+        &'a self,
+        device_ids: &'a [u64],
+    ) -> crate::ssh::BoxFuture<
+        'a,
+        Result<
+            std::collections::BTreeMap<u64, crate::reroute::device_plan::DeviceTransportIdentity>,
+        >,
+    >;
+    fn run_bundle<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        cfg: &'a Config,
+        run: crate::reroute::bundle::BundleRun,
+        actions: Vec<crate::reroute::bundle::BundleAction>,
+    ) -> crate::ssh::BoxFuture<'a, crate::reroute::bundle::BundleOutcome>;
+}
+
+struct ProductionAutomaticWorkPort {
+    ssh: crate::ssh::RusshExecutor,
+}
+impl std::fmt::Debug for ProductionAutomaticWorkPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProductionAutomaticWorkPort")
+            .finish_non_exhaustive()
+    }
+}
+impl ProductionAutomaticWorkPort {
+    fn new(pool: &MySqlPool) -> Self {
+        Self {
+            ssh: crate::ssh::RusshExecutor::new(pool.clone()),
+        }
+    }
+}
+impl AutomaticWorkPort for ProductionAutomaticWorkPort {
+    fn prepare_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+    ) -> crate::ssh::BoxFuture<'a, Result<()>> {
+        Box::pin(
+            async move { crate::reroute::preparation::inspect_actions(pool, actions, true).await },
+        )
+    }
+    fn prepare_recovery<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        originals: &'a [u64],
+        reason: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<crate::reroute::bundle::BundleAction>>> {
+        Box::pin(async move {
+            crate::reroute::preparation::prepare_rollbacks(pool, originals, reason, true).await
+        })
+    }
+    fn transport_identities<'a>(
+        &'a self,
+        device_ids: &'a [u64],
+    ) -> crate::ssh::BoxFuture<
+        'a,
+        Result<
+            std::collections::BTreeMap<u64, crate::reroute::device_plan::DeviceTransportIdentity>,
+        >,
+    > {
+        Box::pin(self.ssh.transport_identities(device_ids))
+    }
+    fn run_bundle<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        cfg: &'a Config,
+        run: crate::reroute::bundle::BundleRun,
+        actions: Vec<crate::reroute::bundle::BundleAction>,
+    ) -> crate::ssh::BoxFuture<'a, crate::reroute::bundle::BundleOutcome> {
+        Box::pin(async move {
+            crate::reroute::bundle::run_with_ssh(pool, cfg, run, actions, &self.ssh).await
+        })
+    }
+}
+
+#[doc(hidden)]
+pub struct InjectedAutomaticWorkPort<R, S> {
+    reader: Arc<R>,
+    ssh: Arc<S>,
+}
+impl<R, S> std::fmt::Debug for InjectedAutomaticWorkPort<R, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedAutomaticWorkPort")
+            .finish_non_exhaustive()
+    }
+}
+impl<R, S> InjectedAutomaticWorkPort<R, S> {
+    pub fn new(reader: Arc<R>, ssh: Arc<S>) -> Self {
+        Self { reader, ssh }
+    }
+}
+impl<R, S> AutomaticWorkPort for InjectedAutomaticWorkPort<R, S>
+where
+    R: crate::reroute::device_plan::PreparationReader + 'static,
+    S: crate::ssh::SshExecutor + 'static,
+{
+    fn prepare_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+    ) -> crate::ssh::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::reroute::preparation::inspect_actions_with_reader(
+                pool,
+                actions,
+                true,
+                &*self.reader,
+            )
+            .await
+        })
+    }
+    fn prepare_recovery<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        originals: &'a [u64],
+        reason: &'a str,
+    ) -> crate::ssh::BoxFuture<'a, Result<Vec<crate::reroute::bundle::BundleAction>>> {
+        Box::pin(async move {
+            let mut actions =
+                crate::reroute::preparation::prepare_rollbacks(pool, originals, reason, false)
+                    .await?;
+            let mut plans = actions
+                .iter()
+                .filter_map(|action| action.prepared.clone())
+                .collect::<Vec<_>>();
+            crate::reroute::device_plan::prepare_inverse_sequence_read_only_with_reader(
+                &*self.reader,
+                &mut plans,
+            )
+            .await?;
+            for (action, plan) in actions.iter_mut().zip(plans) {
+                action.prepared = Some(plan)
+            }
+            Ok(actions)
+        })
+    }
+    fn transport_identities<'a>(
+        &'a self,
+        device_ids: &'a [u64],
+    ) -> crate::ssh::BoxFuture<
+        'a,
+        Result<
+            std::collections::BTreeMap<u64, crate::reroute::device_plan::DeviceTransportIdentity>,
+        >,
+    > {
+        Box::pin(async move {
+            let locks = self.ssh.lock_devices(device_ids).await?;
+            let mut identities = std::collections::BTreeMap::new();
+            for device_id in locks.device_ids() {
+                identities.insert(device_id, locks.transport_identity(device_id)?);
+            }
+            locks.unlock_all().await?;
+            Ok(identities)
+        })
+    }
+    fn run_bundle<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        cfg: &'a Config,
+        run: crate::reroute::bundle::BundleRun,
+        actions: Vec<crate::reroute::bundle::BundleAction>,
+    ) -> crate::ssh::BoxFuture<'a, crate::reroute::bundle::BundleOutcome> {
+        Box::pin(async move {
+            crate::reroute::bundle::run_with_ssh(pool, cfg, run, actions, &*self.ssh).await
+        })
+    }
+}
+impl std::fmt::Debug for AutomaticWorkQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutomaticWorkQueue").finish_non_exhaustive()
+    }
+}
+impl AutomaticWorkQueue {
+    fn sender(&self) -> tokio::sync::mpsc::Sender<SupervisedJob> {
+        self.sender
+            .get_or_init(|| {
+                let (tx, rx) = tokio::sync::mpsc::channel::<SupervisedJob>(4096);
+                let rx = Arc::new(tokio::sync::Mutex::new(rx));
+                for _ in 0..2 {
+                    let rx = rx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let job = { rx.lock().await.recv().await };
+                            let Some(job) = job else { return };
+                            let metadata=(job.pool.clone(),job.bundle_id,job.kind);
+                            if tokio::spawn(job.future).await.is_err(){
+                                tracing::error!(event_type="automatic_worker_panicked","supervised automatic worker job panicked; consumer remains available");
+                                if let Some(pool)=metadata.0.as_ref(){settle_worker_failure(pool,metadata.1,metadata.2,"automatic worker panicked").await;}
+                            }
+                        }
+                    });
+                }
+                tx
+            })
+            .clone()
+    }
+    async fn submit(&self, job: SupervisedJob) -> Result<()> {
+        self.sender()
+            .try_send(job)
+            .map_err(|error| anyhow::anyhow!("automatic worker queue unavailable: {error}"))
+    }
+}
+
+async fn settle_worker_failure(pool: &MySqlPool, bundle_id: u64, kind: JobKind, reason: &str) {
+    let unstarted = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM reroute_bundles WHERE id=? AND state='planned' AND NOT EXISTS(SELECT 1 FROM reroutes WHERE bundle_id=?)",
+    ).bind(bundle_id).bind(bundle_id).fetch_one(pool).await.is_ok_and(|count| count == 1);
+    if unstarted {
+        let owner_token = match kind {
+            JobKind::Activation => format!("bundle:{bundle_id}"),
+            JobKind::Recovery => format!("recovery:bundle:{bundle_id}"),
+        };
+        if let Err(error) = crate::reroute::bundle::finish_and_release(
+            pool,
+            bundle_id,
+            "failed",
+            Some(reason),
+            &owner_token,
+        )
+        .await
+        {
+            tracing::error!(event_type="automatic_worker_settlement_failed",bundle_id,error=%error);
+        }
+        return;
+    }
+    let _ = quarantine_interrupted_worker_bundle(pool, bundle_id, reason).await;
+    match kind {
+        JobKind::Activation => {}
+        JobKind::Recovery => {
+            let _ = crate::reroute::recovery::finalize_recovery_child(
+                pool,
+                bundle_id,
+                "failed",
+                Some(reason),
+                &format!("recovery:bundle:{bundle_id}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn quarantine_interrupted_worker_bundle(
+    pool: &MySqlPool,
+    bundle_id: u64,
+    reason: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let rows:Vec<(u64,u64)>=sqlx::query_as("SELECT id,device_id FROM reroutes WHERE bundle_id=? AND state IN ('planned','pending','running','verifying') FOR UPDATE")
+        .bind(bundle_id).fetch_all(&mut *tx).await?;
+    for (reroute_id, device_id) in rows {
+        sqlx::query("UPDATE reroutes SET state='uncertain',success=NULL,mutation_effect='unknown',verification_status='uncertain',finished_at=UTC_TIMESTAMP(),failure_reason=? WHERE id=? AND state IN ('planned','pending','running','verifying')")
+            .bind(reason).bind(reroute_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO locks(scope,scope_ref,reroute_id,reason,kind) SELECT 'device',?,?,?,'auto_uncertain' WHERE NOT EXISTS(SELECT 1 FROM locks WHERE reroute_id=? AND cleared_at IS NULL)")
+            .bind(device_id.to_string()).bind(reroute_id).bind(reason).bind(reroute_id).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE reroute_bundles SET state='compensation_blocked',lifecycle_state='recovery_blocked',finished_at=UTC_TIMESTAMP(),interrupted_at=UTC_TIMESTAMP(),failure_reason=?,rate_reserved_actions=0 WHERE id=? AND state IN ('planned','running','compensating')")
+        .bind(reason).bind(bundle_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO audit_logs(actor_type,event_type,entity_type,entity_id,message) SELECT 'system','automatic_worker_interrupted','reroute_bundle',?,? WHERE NOT EXISTS(SELECT 1 FROM audit_logs WHERE event_type='automatic_worker_interrupted' AND entity_type='reroute_bundle' AND entity_id=?)")
+        .bind(bundle_id).bind(reason).bind(bundle_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Submit a timer-owned recovery child that was durably published by the short
+/// background claim transaction. Router reads and writes run only in the shared
+/// bounded foreground worker queue.
+pub async fn submit_scheduled_recovery_worker(
+    pool: &MySqlPool,
+    cfg: &Config,
+    bundle_id: u64,
+) -> Result<()> {
+    let claimed=sqlx::query("UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','preparing') WHERE id=? AND state='planned' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase'))='published'")
+        .bind(bundle_id).execute(pool).await?;
+    if claimed.rows_affected() != 1 {
+        return Ok(());
+    }
+    let pool = pool.clone();
+    let cfg = cfg.clone();
+    let port = cfg
+        .automatic_work_port
+        .clone()
+        .unwrap_or_else(|| Arc::new(ProductionAutomaticWorkPort::new(&pool)));
+    let queue = cfg.automatic_work_queue.clone();
+    let job_pool = pool.clone();
+    let settle_pool = pool.clone();
+    let future = Box::pin(async move {
+        let runtime = match cfg.advisory_runtime(&pool).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(event_type="scheduled_recovery_scope_failed",bundle_id,error=%error);
+                settle_worker_failure(
+                    &pool,
+                    bundle_id,
+                    JobKind::Recovery,
+                    &format!("lock runtime unavailable: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let work = async {
+            anyhow::ensure!(
+                crate::api::settings::operating_mode(&pool, &cfg).await == "enforce"
+                    && crate::api::settings::bool_setting(
+                        &pool,
+                        "automatic_actions_enabled",
+                        cfg.safety.automatic_actions_enabled
+                    )
+                    .await,
+                "scheduled recovery authority is off"
+            );
+            let source: sqlx::types::Json<Value> = sqlx::query_scalar(
+                "SELECT source_json FROM reroute_bundles WHERE id=? AND state='planned'",
+            )
+            .bind(bundle_id)
+            .fetch_one(&pool)
+            .await?;
+            let originals = source.0["original_reroute_ids"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let reason = source
+                .0
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("scheduled recovery")
+                .to_string();
+            let actions = port.prepare_recovery(&pool, &originals, &reason).await?;
+            let fence = crate::reroute::guard::policy_fence(&pool).await?;
+            anyhow::ensure!(
+                crate::api::settings::operating_mode(&pool, &cfg).await == "enforce"
+                    && crate::api::settings::bool_setting(
+                        &pool,
+                        "automatic_actions_enabled",
+                        cfg.safety.automatic_actions_enabled
+                    )
+                    .await,
+                "scheduled recovery authority changed during preparation"
+            );
+            let devices = actions
+                .iter()
+                .map(|action| action.device_id)
+                .collect::<Vec<_>>();
+            let identities = port.transport_identities(&devices).await?;
+            fence.release().await?;
+            let mut next = source.0;
+            next["transport_identities"] = json!(identities);
+            next["preparation_phase"] = json!("prepared");
+            sqlx::query("UPDATE reroute_bundles SET source_json=? WHERE id=? AND state='planned'")
+                .bind(sqlx::types::Json(next))
+                .bind(bundle_id)
+                .execute(&pool)
+                .await?;
+            crate::reroute::bundle::persist_actions(&pool, bundle_id, &actions).await?;
+            let outcome = port
+                .run_bundle(
+                    &pool,
+                    &cfg,
+                    crate::reroute::bundle::BundleRun::scheduled_recovery(
+                        bundle_id,
+                        crate::reroute::bundle::FailurePolicy::AbortAndCompensate,
+                    ),
+                    actions,
+                )
+                .await;
+            anyhow::ensure!(
+                outcome.state == "succeeded",
+                "scheduled recovery ended {}: {}",
+                outcome.state,
+                outcome.failure_reason.as_deref().unwrap_or("no diagnostic")
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = crate::db::advisory::foreground_scope(runtime, work).await;
+        if let Err(error) = result.and_then(|value| value) {
+            let _ = crate::reroute::recovery::finalize_recovery_child(
+                &pool,
+                bundle_id,
+                "failed",
+                Some(&format!("{error:#}")),
+                &format!("recovery:bundle:{bundle_id}"),
+            )
+            .await;
+        }
+    });
+    let job = SupervisedJob {
+        future,
+        pool: Some(job_pool),
+        bundle_id,
+        kind: JobKind::Recovery,
+    };
+    if let Err(error) = queue.submit(job).await {
+        settle_worker_failure(
+            &settle_pool,
+            bundle_id,
+            JobKind::Recovery,
+            &format!("worker submission failed: {error:#}"),
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn submit_automatic_worker(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: InterfaceRule,
+    rule_event_id: u64,
+    alert_id: u64,
+    bundle_id: u64,
+) -> Result<()> {
+    let port = cfg
+        .automatic_work_port
+        .clone()
+        .unwrap_or_else(|| Arc::new(ProductionAutomaticWorkPort::new(pool)));
+    submit_automatic_worker_with_port(pool, cfg, rule, rule_event_id, alert_id, bundle_id, port)
+        .await
+}
+
+async fn submit_automatic_worker_with_port(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: InterfaceRule,
+    rule_event_id: u64,
+    alert_id: u64,
+    bundle_id: u64,
+    port: Arc<dyn AutomaticWorkPort>,
+) -> Result<()> {
+    let pool = pool.clone();
+    let cfg = cfg.clone();
+    let queue = cfg.automatic_work_queue.clone();
+    let job_pool = pool.clone();
+    let settle_pool = pool.clone();
+    let future = Box::pin(async move {
+        let runtime = match cfg.advisory_runtime(&pool).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(event_type="automatic_worker_scope_failed",bundle_id,error=%error);
+                settle_worker_failure(
+                    &pool,
+                    bundle_id,
+                    JobKind::Activation,
+                    &format!("lock runtime unavailable: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let work = async {
+            let result =
+                auto_execute_actions(&pool, &cfg, &rule, rule_event_id, bundle_id, &*port).await;
+            match result {
+                Ok(executed) => {
+                    let _=sqlx::query("UPDATE alerts SET payload_json=JSON_SET(payload_json,'$.automatic_execution_completed',true,'$.executed_actions',?) WHERE id=?")
+                        .bind(sqlx::types::Json(executed)).bind(alert_id).execute(&pool).await;
+                }
+                Err(error) => {
+                    let reason = format!("automatic preparation/execution failed: {error:#}");
+                    let _=sqlx::query("UPDATE reroute_bundles SET state='failed',finished_at=UTC_TIMESTAMP(),failure_reason=? WHERE id=? AND state='planned'")
+                        .bind(&reason).bind(bundle_id).execute(&pool).await;
+                    tracing::error!(event_type="automatic_action_failed",rule_id=rule.id,bundle_id,error=%error);
+                }
+            }
+        };
+        if let Err(error) = crate::db::advisory::foreground_scope(runtime, work).await {
+            tracing::error!(event_type="automatic_worker_scope_failed",bundle_id,error=%error);
+            settle_worker_failure(
+                &pool,
+                bundle_id,
+                JobKind::Activation,
+                &format!("foreground scope failed: {error:#}"),
+            )
+            .await;
+        }
+    });
+    let job = SupervisedJob {
+        future,
+        pool: Some(job_pool),
+        bundle_id,
+        kind: JobKind::Activation,
+    };
+    if let Err(error) = queue.submit(job).await {
+        settle_worker_failure(
+            &settle_pool,
+            bundle_id,
+            JobKind::Activation,
+            &format!("worker submission failed: {error:#}"),
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Execute every attached action of a rule via the reroute executor. Called only
 /// on the firing edge, only in enforce mode, only when the rule's auto switch is
 /// on. The executor re-checks Gate 0 + device locks/cooldowns/uncertain, so a
@@ -1208,41 +1929,72 @@ async fn auto_execute_actions(
     cfg: &Config,
     rule: &InterfaceRule,
     rule_event_id: u64,
+    bundle_id: u64,
+    port: &dyn AutomaticWorkPort,
 ) -> Result<Vec<Value>> {
-    let specs = sqlx::query_as::<
-        _,
-        (
-            u64,
-            u64,
-            Option<sqlx::types::Json<Value>>,
-            Option<String>,
-            u32,
-        ),
-    >(
-        "SELECT reroute_template_id, device_id, params_json, auto_target, position \
-           FROM rule_actions \
-          WHERE rule_id = ? AND enabled = 1 ORDER BY position, id",
+    let current: Option<(u64, bool)> = sqlx::query_as(
+        "SELECT actions_revision,automatic_reroute_enabled FROM rules WHERE id=? AND enabled=1",
     )
     .bind(rule.id)
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await?;
+    anyhow::ensure!(
+        current == Some((rule.actions_revision, true)),
+        "rule authority or action revision changed before automatic preparation"
+    );
+    anyhow::ensure!(
+        crate::api::settings::operating_mode(pool, cfg).await == "enforce",
+        "automatic execution is no longer enforced"
+    );
+    anyhow::ensure!(
+        crate::api::settings::bool_setting(
+            pool,
+            "automatic_actions_enabled",
+            cfg.safety.automatic_actions_enabled
+        )
+        .await,
+        "automatic master switch is off"
+    );
+    if is_flow_metric(&rule.metric) {
+        let current = flow_observation(pool, cfg, rule).await?;
+        anyhow::ensure!(
+            current.is_some_and(|obs| !obs.low_confidence && obs.source_corroborated),
+            "flow evidence is no longer qualified for automatic execution"
+        );
+    }
+    let mut source: sqlx::types::Json<Value> = sqlx::query_scalar(
+        "SELECT source_json FROM reroute_bundles WHERE id=? AND state='planned'",
+    )
+    .bind(bundle_id)
+    .fetch_one(pool)
+    .await?;
+    let specs = source
+        .0
+        .get("input_actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     let sel = flow_selector(rule);
     let mut out = Vec::with_capacity(specs.len());
     // Resolve every action first, then run the resolved set as ONE ordered bundle.
     // Resolving up front is what lets the bundle be admitted (or refused) whole.
     let mut ready: Vec<crate::reroute::bundle::BundleAction> = Vec::new();
-    for (template_id, device_id, params_json, auto_target, position) in specs {
-        let params = params_json.map(|j| j.0).unwrap_or(Value::Null);
-        match flow_target::prepare_action(
-            pool,
-            &sel,
-            template_id,
-            device_id,
-            params,
-            auto_target.as_deref(),
-        )
-        .await
+    for spec in specs {
+        let template_id = spec["template_id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("planned action lacks template"))?;
+        let device_id = spec["device_id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("planned action lacks device"))?;
+        let params = spec.get("params").cloned().unwrap_or(Value::Null);
+        let auto_target = spec.get("auto_target").and_then(Value::as_str);
+        let position = spec["position"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("planned action lacks position"))?;
+        match flow_target::prepare_action(pool, &sel, template_id, device_id, params, auto_target)
+            .await
         {
             PreparedAction::Ready {
                 template,
@@ -1295,47 +2047,56 @@ async fn auto_execute_actions(
     }
 
     if ready.is_empty() || !out.is_empty() {
+        sqlx::query("UPDATE reroute_bundles SET state='failed',finished_at=UTC_TIMESTAMP(),failure_reason='automatic inputs could not all be resolved' WHERE id=? AND state='planned'")
+            .bind(bundle_id).execute(pool).await?;
         out.push(json!({"executed":false,"blocked_reason":"entire mitigation refused: every enabled action must be resolved with sufficient confidence"}));
         return Ok(out);
     }
-    let policy_fence = crate::reroute::guard::policy_fence(pool).await?;
-    if let Err(e) = crate::reroute::preparation::inspect_actions(pool, &mut ready, true).await {
+    if let Err(e) = port.prepare_activation(pool, &mut ready).await {
+        sqlx::query("UPDATE reroute_bundles SET state='failed',finished_at=UTC_TIMESTAMP(),failure_reason=? WHERE id=? AND state='planned'")
+            .bind(format!("automatic preparation refused: {e:#}")).bind(bundle_id).execute(pool).await?;
         return Ok(vec![
             json!({"executed":false,"blocked_reason":format!("entire mitigation preparation refused: {e:#}")}),
         ]);
     }
 
     let device_ids: Vec<_> = ready.iter().map(|a| a.device_id).collect();
-    let identities = crate::ssh::RusshExecutor::new(pool.clone())
-        .transport_identities(&device_ids)
-        .await?;
+    let identities = port.transport_identities(&device_ids).await?;
+    let policy_fence = crate::reroute::guard::policy_fence(pool).await?;
+    let current: Option<(u64, bool)> = sqlx::query_as(
+        "SELECT actions_revision,automatic_reroute_enabled FROM rules WHERE id=? AND enabled=1",
+    )
+    .bind(rule.id)
+    .fetch_optional(pool)
+    .await?;
+    anyhow::ensure!(
+        current == Some((rule.actions_revision, true))
+            && crate::api::settings::operating_mode(pool, cfg).await == "enforce"
+            && crate::api::settings::bool_setting(
+                pool,
+                "automatic_actions_enabled",
+                cfg.safety.automatic_actions_enabled
+            )
+            .await,
+        "automatic authority changed during preparation"
+    );
+    if is_flow_metric(&rule.metric) {
+        anyhow::ensure!(
+            automatic_flow_evidence_qualified(pool, cfg, rule.id).await?,
+            "flow evidence changed during preparation"
+        );
+    }
     policy_fence.release().await?;
 
-    // An automatic activation is one authorized decision too, so it gets a bundle:
-    // the guard can then exclude the activation's own earlier siblings from
-    // cooldown history instead of letting action #1 block the rest, and a
-    // mid-activation failure unwinds what it already applied rather than leaving a
-    // half-diverted network unattended.
-    //
-    // `trigger_type: "automatic"` is load-bearing: it is what keeps the
-    // `automatic_actions_enabled` master switch and verify-or-refuse in force.
     let total = ready.len() as u32;
     let policy = crate::reroute::bundle::FailurePolicy::AbortAndCompensate;
-    let bundle_id = crate::reroute::bundle::create(
-        pool,
-        Some(rule.id),
-        Some(rule_event_id),
-        "automatic",
-        None,
-        &format!("automatic: rule '{}' fired", rule.name),
-        policy,
-        total,
-    )
-    .await?;
-
-    sqlx::query("UPDATE reroute_bundles SET source_json = ? WHERE id = ?")
-        .bind(sqlx::types::Json(json!({"kind":"rule","rule_id":rule.id,"name":rule.name,"actions_revision":rule.actions_revision,"transport_identities":identities})))
-        .bind(bundle_id).execute(pool).await?;
+    source.0["transport_identities"] = json!(identities);
+    source.0["admission_state"] = json!("prepared");
+    sqlx::query("UPDATE reroute_bundles SET source_json = ? WHERE id = ? AND state='planned'")
+        .bind(&source)
+        .bind(bundle_id)
+        .execute(pool)
+        .await?;
     if let Err(e) = crate::reroute::bundle::persist_actions(pool, bundle_id, &ready).await {
         sqlx::query("UPDATE reroute_bundles SET state = 'failed', finished_at = UTC_TIMESTAMP(), failure_reason = ? WHERE id = ?")
             .bind(format!("complete action snapshot could not be persisted: {e:#}")).bind(bundle_id).execute(pool).await?;
@@ -1370,13 +2131,14 @@ async fn auto_execute_actions(
         return Ok(out);
     }
 
-    let outcome = crate::reroute::bundle::run(
-        pool,
-        cfg,
-        crate::reroute::bundle::BundleRun::automatic(bundle_id, policy, rule.id, rule_event_id),
-        ready,
-    )
-    .await;
+    let outcome = port
+        .run_bundle(
+            pool,
+            cfg,
+            crate::reroute::bundle::BundleRun::automatic(bundle_id, policy, rule.id, rule_event_id),
+            ready,
+        )
+        .await;
 
     out.extend(outcome.results);
     if outcome.state != "succeeded" {
@@ -1434,61 +2196,7 @@ async fn aggregate_label(pool: &MySqlPool, rule_id: u64) -> String {
     }
 }
 
-/// Insert a rule_events row for the rule's timeline (matched / fired / cleared).
-async fn record_event(
-    pool: &MySqlPool,
-    rule: &InterfaceRule,
-    event: &str,
-    value: f64,
-    sampled_at: Option<Ts>,
-) -> Result<u64> {
-    let res = sqlx::query(
-        "INSERT INTO rule_events (rule_id, event, metric_value, sampled_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(rule.id)
-    .bind(event)
-    .bind(value)
-    .bind(sampled_at)
-    .execute(pool)
-    .await?;
-    Ok(res.last_insert_id())
-}
-
-/// Upsert rule_states to a given state, advancing the streak counters.
-async fn upsert_state(
-    pool: &MySqlPool,
-    rule_id: u64,
-    state: &str,
-    first_matched_at: Option<Ts>,
-    sampled_at: Option<Ts>,
-    consecutive: u32,
-    value: f64,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO rule_states \
-            (rule_id, current_state, first_matched_at, last_matched_at, consecutive_match_count, \
-             last_metric_value, last_evaluated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()) \
-         ON DUPLICATE KEY UPDATE \
-            current_state = VALUES(current_state), \
-            first_matched_at = VALUES(first_matched_at), \
-            last_matched_at = VALUES(last_matched_at), \
-            consecutive_match_count = VALUES(consecutive_match_count), \
-            last_metric_value = VALUES(last_metric_value), \
-            last_evaluated_at = VALUES(last_evaluated_at)",
-    )
-    .bind(rule_id)
-    .bind(state)
-    .bind(first_matched_at)
-    .bind(sampled_at)
-    .bind(consecutive)
-    .bind(value)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Reset a rule's state to clear, stamping last_cleared_at and zeroing the streak.
+/// Explicit operator reset, independent of observation-driven publication.
 async fn clear_state(pool: &MySqlPool, rule_id: u64, value: f64) -> Result<()> {
     sqlx::query(
         "INSERT INTO rule_states \
@@ -1508,54 +2216,130 @@ async fn clear_state(pool: &MySqlPool, rule_id: u64, value: f64) -> Result<()> {
     Ok(())
 }
 
-/// Update recovery progress: the hold start (flow window) and the recovered-side
-/// streak (SNMP samples). Assumes a rule_states row exists (true once firing).
-async fn set_recovery_progress(
+#[allow(clippy::too_many_arguments)]
+async fn publish_simple_observation(
     pool: &MySqlPool,
-    rule_id: u64,
-    first_at: Option<Ts>,
+    rule: &InterfaceRule,
+    state: &str,
+    first_matched: Option<Ts>,
     consecutive: u32,
+    value: f64,
+    obs: &Observation,
+    recovery_first: Option<Ts>,
+    recovery_consecutive: u32,
+    event: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE rule_states SET recovery_first_at = ?, recovery_consecutive = ?, \
-                last_evaluated_at = UTC_TIMESTAMP() WHERE rule_id = ?",
-    )
-    .bind(first_at)
-    .bind(consecutive)
-    .bind(rule_id)
-    .execute(pool)
-    .await?;
+    let persist_started = std::time::Instant::now();
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO rule_states(rule_id,current_state,first_matched_at,last_matched_at,consecutive_match_count,recovery_first_at,recovery_consecutive,last_metric_value,last_observation_json,last_observation_at,last_evaluated_at) VALUES(?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE current_state=VALUES(current_state),first_matched_at=VALUES(first_matched_at),last_matched_at=VALUES(last_matched_at),consecutive_match_count=VALUES(consecutive_match_count),recovery_first_at=VALUES(recovery_first_at),recovery_consecutive=VALUES(recovery_consecutive),last_metric_value=VALUES(last_metric_value),last_observation_json=VALUES(last_observation_json),last_observation_at=VALUES(last_observation_at),last_evaluated_at=UTC_TIMESTAMP()")
+        .bind(rule.id).bind(state).bind(first_matched).bind(obs.sampled_at).bind(consecutive).bind(recovery_first).bind(recovery_consecutive).bind(value).bind(sqlx::types::Json(&obs.evidence)).bind(obs.sampled_at).execute(&mut *tx).await?;
+    if let Some(event) = event {
+        sqlx::query(
+            "INSERT INTO rule_events(rule_id,event,metric_value,sampled_at) VALUES(?,?,?,?)",
+        )
+        .bind(rule.id)
+        .bind(event)
+        .bind(value)
+        .bind(obs.sampled_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(event_type="hardening_timing",stage="decision_persist",subject_id=rule.id,elapsed_us=persist_started.elapsed().as_micros() as u64,outcome="committed",observation_at=?obs.sampled_at);
     Ok(())
 }
 
 /// Recovery edge. A rule stays firing until every automatic reroute created by
 /// this exact firing edge has either no rollback or a verified successful one.
+#[allow(clippy::too_many_arguments)]
 async fn recover_and_clear(
     pool: &MySqlPool,
     cfg: &Config,
     rule: &InterfaceRule,
     value: f64,
     sampled_at: Option<Ts>,
+    low_confidence: bool,
+    source_corroborated: bool,
+    evidence: &std::collections::BTreeMap<u64, Ts>,
 ) -> Result<()> {
+    let observation = Observation {
+        value,
+        sampled_at,
+        evidence: evidence.clone(),
+        low_confidence,
+        source_corroborated,
+    };
     let all_owned = rule_owned_changes(pool, rule.id, false).await?;
     if !rule.automatic_revert_enabled {
         if all_owned == 0 {
-            clear_state(pool, rule.id, value).await?;
-            record_event(pool, rule, "cleared", value, sampled_at).await?;
+            publish_simple_observation(
+                pool,
+                rule,
+                "clear",
+                None,
+                0,
+                value,
+                &observation,
+                None,
+                0,
+                Some("cleared"),
+            )
+            .await?;
             return Ok(());
         }
-        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert', \
-                recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?")
-            .bind(value).bind(rule.id).execute(pool).await?;
-        record_event(pool, rule, "recovered_awaiting_revert", value, sampled_at).await?;
+        publish_simple_observation(
+            pool,
+            rule,
+            "recovered_awaiting_revert",
+            None,
+            0,
+            value,
+            &observation,
+            None,
+            0,
+            Some("recovered_awaiting_revert"),
+        )
+        .await?;
+        return Ok(());
+    }
+    if is_flow_metric(&rule.metric)
+        && (!cfg.flow.automatic_actions_enabled
+            || !cfg.flow.allowlist_enrolled_only
+            || low_confidence
+            || !source_corroborated)
+    {
+        publish_simple_observation(
+            pool,
+            rule,
+            "recovered_awaiting_revert",
+            None,
+            0,
+            value,
+            &observation,
+            None,
+            0,
+            None,
+        )
+        .await?;
         return Ok(());
     }
     if all_owned > 0 && rule_owned_changes(pool, rule.id, true).await? == 0 {
-        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert',recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?")
-            .bind(value).bind(rule.id).execute(pool).await?;
+        publish_simple_observation(
+            pool,
+            rule,
+            "recovered_awaiting_revert",
+            None,
+            0,
+            value,
+            &observation,
+            None,
+            0,
+            None,
+        )
+        .await?;
         return Ok(());
     }
-    if !run_recovery_rollback(pool, cfg, rule.id, &rule.name, None, None).await? {
+    if !publish_recovery_attempt(pool, cfg, rule, value, sampled_at, evidence).await? {
         tracing::warn!(
             event_type = "rule_recovery_pending",
             rule_id = rule.id,
@@ -1564,11 +2348,21 @@ async fn recover_and_clear(
         return Ok(());
     }
     if rule_owned_changes(pool, rule.id, false).await? > 0 {
-        sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert',recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?").bind(value).bind(rule.id).execute(pool).await?;
         return Ok(());
     }
-    clear_state(pool, rule.id, value).await?;
-    record_event(pool, rule, "cleared", value, sampled_at).await?;
+    publish_simple_observation(
+        pool,
+        rule,
+        "clear",
+        None,
+        0,
+        value,
+        &observation,
+        None,
+        0,
+        Some("cleared"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1577,10 +2371,289 @@ async fn rule_owned_changes(pool: &MySqlPool, rule_id: u64, eligible_only: bool)
         .bind(rule_id).bind(eligible_only).fetch_one(pool).await?)
 }
 
+async fn publish_recovery_attempt(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: &InterfaceRule,
+    value: f64,
+    sampled_at: Option<Ts>,
+    evidence: &std::collections::BTreeMap<u64, Ts>,
+) -> Result<bool> {
+    let current: Option<(bool, bool)> =
+        sqlx::query_as("SELECT enabled,automatic_revert_enabled FROM rules WHERE id=?")
+            .bind(rule.id)
+            .fetch_optional(pool)
+            .await?;
+    if current != Some((true, true))
+        || crate::api::settings::operating_mode(pool, cfg).await != "enforce"
+        || !crate::api::settings::bool_setting(
+            pool,
+            "automatic_actions_enabled",
+            cfg.safety.automatic_actions_enabled,
+        )
+        .await
+    {
+        return Ok(false);
+    }
+    let originals:Vec<u64>=sqlx::query_scalar("SELECT r.id FROM reroutes r JOIN reroute_bundles owner ON owner.id=r.bundle_id WHERE r.rule_id=? AND r.trigger_type='automatic' AND r.rollback_of_reroute_id IS NULL AND r.state IN ('succeeded','failed') AND r.mutation_effect='changed' AND owner.automatic_recovery_cancelled_at IS NULL AND owner.automatic_recovery_block_reason IS NULL AND NOT EXISTS(SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=r.id AND inverse.state='succeeded' AND inverse.mutation_effect IN ('changed','noop')) ORDER BY r.id DESC")
+        .bind(rule.id).fetch_all(pool).await?;
+    if originals.is_empty() {
+        return Ok(true);
+    }
+    let mut sources = Vec::new();
+    for original in &originals {
+        if let Some(source) =
+            sqlx::query_scalar::<_, Option<u64>>("SELECT bundle_id FROM reroutes WHERE id=?")
+                .bind(original)
+                .fetch_one(pool)
+                .await?
+        {
+            sources.push(source);
+        }
+    }
+    sources.sort_unstable();
+    sources.dedup();
+    let existing:i64=sqlx::query_scalar("SELECT COUNT(*) FROM recovery_attempt_sources ras JOIN reroute_bundles child ON child.id=ras.recovery_bundle_id WHERE ras.source_bundle_id IN (SELECT bundle_id FROM reroutes WHERE rule_id=? AND bundle_id IS NOT NULL) AND ras.settlement='active' AND child.state IN ('planned','running','compensating')")
+        .bind(rule.id).fetch_one(pool).await?;
+    if existing > 0 {
+        return Ok(true);
+    }
+    let claim_token = format!("rule-recovery:{}", crate::auth::sessions::generate_token());
+    let reason = format!("automatic recovery of rule '{}'", rule.name);
+    let persist_started = std::time::Instant::now();
+    let mut tx = pool.begin().await?;
+    let child=sqlx::query("INSERT INTO reroute_bundles(rule_id,trigger_type,reason,state,failure_policy,total_actions,source_json) VALUES(?,'automatic',?,'planned','abort_and_compensate',?,?)")
+        .bind(rule.id).bind(&reason).bind(originals.len() as u32)
+        .bind(sqlx::types::Json(json!({"kind":"recovery","rule_id":rule.id,"original_reroute_ids":originals,"source_bundle_ids":sources,"preparation_phase":"published","flow_evidence_qualified":!is_flow_metric(&rule.metric) || (cfg.flow.automatic_actions_enabled && cfg.flow.allowlist_enrolled_only)})))
+        .execute(&mut *tx).await?.last_insert_id();
+    crate::reroute::recovery::claim_sources_for_child_on(
+        &mut tx,
+        child,
+        &sources,
+        &originals,
+        &claim_token,
+        false,
+    )
+    .await?;
+    sqlx::query("UPDATE rule_states SET current_state='recovered_awaiting_revert',recovery_first_at=NULL,recovery_consecutive=0,last_metric_value=?,last_observation_json=?,last_observation_at=?,last_evaluated_at=UTC_TIMESTAMP() WHERE rule_id=?")
+        .bind(value).bind(sqlx::types::Json(evidence)).bind(sampled_at).bind(rule.id).execute(&mut *tx).await?;
+    let event=sqlx::query("INSERT INTO rule_events(rule_id,event,metric_value,sampled_at) VALUES(?,'recovered_awaiting_revert',?,?)")
+        .bind(rule.id).bind(value).bind(sampled_at).execute(&mut *tx).await?.last_insert_id();
+    sqlx::query("INSERT INTO alerts(event_type,severity,rule_id,payload_json,dedup_key) VALUES('automatic_recovery_planned','info',?,?,?)")
+        .bind(rule.id).bind(sqlx::types::Json(json!({"rule_id":rule.id,"rule_event_id":event,"bundle_id":child,"original_reroute_ids":originals})))
+        .bind(format!("automatic_recovery_planned:bundle:{child}")).execute(&mut *tx).await?;
+    if cfg.fail_automatic_decision_before_commit {
+        anyhow::bail!("injected recovery publication failure")
+    }
+    tx.commit().await?;
+    tracing::info!(event_type="hardening_timing",stage="decision_persist",subject_id=rule.id,elapsed_us=persist_started.elapsed().as_micros() as u64,outcome="committed",observation_at=?sampled_at);
+    if let Err(error) = submit_recovery_worker(pool, cfg, rule.clone(), child).await {
+        tracing::error!(event_type="recovery_worker_submit_failed",rule_id=rule.id,bundle_id=child,error=%error,"durable recovery decision remains committed for startup repair");
+    }
+    Ok(true)
+}
+
+async fn submit_recovery_worker(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: InterfaceRule,
+    bundle_id: u64,
+) -> Result<()> {
+    let port = cfg
+        .automatic_work_port
+        .clone()
+        .unwrap_or_else(|| Arc::new(ProductionAutomaticWorkPort::new(pool)));
+    submit_recovery_worker_with_port(pool, cfg, rule, bundle_id, port).await
+}
+
+async fn submit_recovery_worker_with_port(
+    pool: &MySqlPool,
+    cfg: &Config,
+    rule: InterfaceRule,
+    bundle_id: u64,
+    port: Arc<dyn AutomaticWorkPort>,
+) -> Result<()> {
+    let claimed=sqlx::query("UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','preparing') WHERE id=? AND state='planned' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase'))='published'")
+        .bind(bundle_id).execute(pool).await?;
+    if claimed.rows_affected() != 1 {
+        return Ok(());
+    }
+    let pool = pool.clone();
+    let cfg = cfg.clone();
+    let queue = cfg.automatic_work_queue.clone();
+    let job_pool = pool.clone();
+    let settle_pool = pool.clone();
+    let future = Box::pin(async move {
+        let runtime = match cfg.advisory_runtime(&pool).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(event_type="recovery_worker_scope_failed",bundle_id,error=%error);
+                settle_worker_failure(
+                    &pool,
+                    bundle_id,
+                    JobKind::Recovery,
+                    &format!("lock runtime unavailable: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let work = async {
+            let source: sqlx::types::Json<Value> = sqlx::query_scalar(
+                "SELECT source_json FROM reroute_bundles WHERE id=? AND state='planned'",
+            )
+            .bind(bundle_id)
+            .fetch_one(&pool)
+            .await?;
+            let current: Option<bool> = sqlx::query_scalar(
+                "SELECT automatic_revert_enabled FROM rules WHERE id=? AND enabled=1",
+            )
+            .bind(rule.id)
+            .fetch_optional(&pool)
+            .await?;
+            anyhow::ensure!(
+                current == Some(true),
+                "automatic recovery preference changed"
+            );
+            anyhow::ensure!(
+                crate::api::settings::operating_mode(&pool, &cfg).await == "enforce",
+                "automatic recovery is no longer enforced"
+            );
+            anyhow::ensure!(
+                crate::api::settings::bool_setting(
+                    &pool,
+                    "automatic_actions_enabled",
+                    cfg.safety.automatic_actions_enabled
+                )
+                .await,
+                "automatic master switch is off"
+            );
+            anyhow::ensure!(
+                source
+                    .0
+                    .get("flow_evidence_qualified")
+                    .and_then(Value::as_bool)
+                    != Some(false),
+                "flow recovery evidence is no longer qualified"
+            );
+            if is_flow_metric(&rule.metric) {
+                let current = flow_observation(&pool, &cfg, &rule).await?;
+                anyhow::ensure!(
+                    current.is_some_and(|obs| !obs.low_confidence && obs.source_corroborated),
+                    "flow recovery evidence became stale or uncorroborated"
+                );
+            }
+            anyhow::ensure!(
+                automatic_condition_recovery_qualified(&pool, &cfg, rule.id).await?,
+                "condition recovery evidence is no longer current"
+            );
+            let blocked:i64=sqlx::query_scalar("SELECT COUNT(*) FROM recovery_attempt_sources ras JOIN reroute_bundles owner ON owner.id=ras.source_bundle_id WHERE ras.recovery_bundle_id=? AND (owner.automatic_recovery_cancelled_at IS NOT NULL OR owner.automatic_recovery_block_reason IS NOT NULL OR owner.recovery_claim_token<>ras.claim_token)")
+                .bind(bundle_id).fetch_one(&pool).await?;
+            anyhow::ensure!(blocked == 0, "automatic recovery source authority changed");
+            let originals = source.0["original_reroute_ids"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let reason = format!("automatic recovery of rule '{}'", rule.name);
+            let actions = port.prepare_recovery(&pool, &originals, &reason).await?;
+            let device_ids = actions
+                .iter()
+                .map(|action| action.device_id)
+                .collect::<Vec<_>>();
+            let identities = port.transport_identities(&device_ids).await?;
+            let fence = crate::reroute::guard::policy_fence(&pool).await?;
+            let current: Option<bool> = sqlx::query_scalar(
+                "SELECT automatic_revert_enabled FROM rules WHERE id=? AND enabled=1",
+            )
+            .bind(rule.id)
+            .fetch_optional(&pool)
+            .await?;
+            anyhow::ensure!(
+                current == Some(true)
+                    && crate::api::settings::operating_mode(&pool, &cfg).await == "enforce"
+                    && crate::api::settings::bool_setting(
+                        &pool,
+                        "automatic_actions_enabled",
+                        cfg.safety.automatic_actions_enabled
+                    )
+                    .await,
+                "automatic recovery authority changed during preparation"
+            );
+            anyhow::ensure!(
+                automatic_condition_recovery_qualified(&pool, &cfg, rule.id).await?,
+                "condition recovery evidence changed during preparation"
+            );
+            let blocked:i64=sqlx::query_scalar("SELECT COUNT(*) FROM recovery_attempt_sources ras JOIN reroute_bundles owner ON owner.id=ras.source_bundle_id WHERE ras.recovery_bundle_id=? AND (owner.automatic_recovery_cancelled_at IS NOT NULL OR owner.automatic_recovery_block_reason IS NOT NULL OR owner.recovery_claim_token<>ras.claim_token)")
+                .bind(bundle_id).fetch_one(&pool).await?;
+            anyhow::ensure!(
+                blocked == 0,
+                "automatic recovery source authority changed during preparation"
+            );
+            fence.release().await?;
+            let mut next = source.0;
+            next["transport_identities"] = json!(identities);
+            next["preparation_phase"] = json!("prepared");
+            sqlx::query("UPDATE reroute_bundles SET source_json=? WHERE id=? AND state='planned'")
+                .bind(sqlx::types::Json(next))
+                .bind(bundle_id)
+                .execute(&pool)
+                .await?;
+            crate::reroute::bundle::persist_actions(&pool, bundle_id, &actions).await?;
+            let outcome = port
+                .run_bundle(
+                    &pool,
+                    &cfg,
+                    crate::reroute::bundle::BundleRun::automatic_recovery(
+                        bundle_id,
+                        crate::reroute::bundle::FailurePolicy::AbortAndCompensate,
+                        rule.id,
+                    ),
+                    actions,
+                )
+                .await;
+            anyhow::ensure!(
+                outcome.state == "succeeded",
+                "recovery ended {}",
+                outcome.state
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = crate::db::advisory::foreground_scope(runtime, work).await;
+        if let Err(error) = result.and_then(|value| value) {
+            let _ = crate::reroute::recovery::finalize_recovery_child(
+                &pool,
+                bundle_id,
+                "failed",
+                Some(&format!("{error:#}")),
+                &format!("recovery:bundle:{bundle_id}"),
+            )
+            .await;
+        }
+    });
+    let job = SupervisedJob {
+        future,
+        pool: Some(job_pool),
+        bundle_id,
+        kind: JobKind::Recovery,
+    };
+    if let Err(error) = queue.submit(job).await {
+        settle_worker_failure(
+            &settle_pool,
+            bundle_id,
+            JobKind::Recovery,
+            &format!("worker submission failed: {error:#}"),
+        )
+        .await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Roll back successful automatic reroutes from the latest firing event, in
 /// reverse execution order. Uses each reroute's persisted resolved parameters,
 /// never the rule's mutable action definition. Returns false while any corrective
 /// action is blocked, failed, or uncertain; the next evaluation retries it.
+#[allow(dead_code)]
 async fn run_recovery_rollback(
     pool: &MySqlPool,
     cfg: &Config,
@@ -1593,10 +2666,18 @@ async fn run_recovery_rollback(
         actor_user_id.is_none(),
         "operator recovery requires an authorized preview plan"
     );
+    let current_revert: Option<bool> =
+        sqlx::query_scalar("SELECT automatic_revert_enabled FROM rules WHERE id=? AND enabled=1")
+            .bind(rule_id)
+            .fetch_optional(pool)
+            .await?;
+    if current_revert != Some(true) {
+        return Ok(false);
+    }
     // Ownership is the durable action ledger, not the latest retained event.
     let unresolved: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reroutes r WHERE r.rule_id = ? AND r.trigger_type = 'automatic' \
-         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND owner.automatic_recovery_cancelled_at IS NOT NULL) \
+         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND (owner.automatic_recovery_cancelled_at IS NOT NULL OR owner.automatic_recovery_block_reason IS NOT NULL)) \
          AND (r.state IN ('planned','pending','running','verifying','uncertain') \
               OR (r.state = 'succeeded' AND r.mutation_effect IN ('pending','unknown'))) \
          AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded')")
@@ -1606,7 +2687,7 @@ async fn run_recovery_rollback(
     }
     let originals: Vec<u64> = sqlx::query_scalar(
         "SELECT r.id FROM reroutes r WHERE r.rule_id = ? AND r.trigger_type = 'automatic' \
-         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND owner.automatic_recovery_cancelled_at IS NOT NULL) \
+         AND NOT EXISTS (SELECT 1 FROM reroute_bundles owner WHERE owner.id=r.bundle_id AND (owner.automatic_recovery_cancelled_at IS NOT NULL OR owner.automatic_recovery_block_reason IS NOT NULL)) \
          AND r.mutation_effect = 'changed' AND r.state IN ('succeeded','failed') \
          AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded') ORDER BY r.id DESC")
         .bind(rule_id).fetch_all(pool).await?;
@@ -1626,16 +2707,9 @@ async fn run_recovery_rollback(
         return Ok(false);
     }
     let policy_fence = crate::reroute::guard::policy_fence(pool).await?;
-    let source_bundles:Vec<u64>=sqlx::query_scalar("SELECT DISTINCT original.bundle_id FROM reroutes original JOIN reroute_bundles owner ON owner.id=original.bundle_id WHERE original.rule_id=? AND original.trigger_type='automatic' AND original.mutation_effect='changed' AND owner.automatic_recovery_cancelled_at IS NULL AND NOT EXISTS(SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id=original.id AND rb.state='succeeded') AND original.bundle_id IS NOT NULL ORDER BY original.bundle_id")
+    let source_bundles:Vec<u64>=sqlx::query_scalar("SELECT DISTINCT original.bundle_id FROM reroutes original JOIN reroute_bundles owner ON owner.id=original.bundle_id WHERE original.rule_id=? AND original.trigger_type='automatic' AND original.mutation_effect='changed' AND owner.automatic_recovery_cancelled_at IS NULL AND owner.automatic_recovery_block_reason IS NULL AND NOT EXISTS(SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id=original.id AND rb.state='succeeded') AND original.bundle_id IS NOT NULL ORDER BY original.bundle_id")
         .bind(rule_id).fetch_all(pool).await?;
     let claim_token = format!("rule-recovery:{}", crate::auth::sessions::generate_token());
-    if let Err(e) =
-        crate::reroute::recovery::claim_source_bundles(pool, &source_bundles, &claim_token).await
-    {
-        policy_fence.release().await?;
-        tracing::warn!(event_type="automatic_recovery_claim_refused",rule_id,error=%e);
-        return Ok(false);
-    }
     let reason = format!("automatic recovery of rule '{rule_name}'");
     let actions = match crate::reroute::preparation::prepare_rollbacks(
         pool, &originals, &reason, true,
@@ -1644,26 +2718,12 @@ async fn run_recovery_rollback(
     {
         Ok(actions) => actions,
         Err(e) => {
-            crate::reroute::recovery::release_unstarted_source_claims(
-                pool,
-                &source_bundles,
-                &claim_token,
-                &format!("{e:#}"),
-            )
-            .await?;
             policy_fence.release().await?;
             tracing::warn!(event_type="automatic_recovery_refused",rule_id,error=%e,"recovery remains pending");
             return Ok(false);
         }
     };
     if actions.is_empty() {
-        crate::reroute::recovery::release_unstarted_source_claims(
-            pool,
-            &source_bundles,
-            &claim_token,
-            "no owned inverse remained",
-        )
-        .await?;
         policy_fence.release().await?;
         return Ok(true);
     }
@@ -1673,14 +2733,7 @@ async fn run_recovery_rollback(
         .await
     {
         Ok(value) => value,
-        Err(e) => {
-            crate::reroute::recovery::release_unstarted_source_claims(
-                pool,
-                &source_bundles,
-                &claim_token,
-                &format!("{e:#}"),
-            )
-            .await?;
+        Err(_e) => {
             policy_fence.release().await?;
             return Ok(false);
         }
@@ -1701,33 +2754,26 @@ async fn run_recovery_rollback(
     {
         Ok(id) => id,
         Err(e) => {
-            crate::reroute::recovery::release_unstarted_source_claims(
-                pool,
-                &source_bundles,
-                &claim_token,
-                &format!("{e:#}"),
-            )
-            .await?;
             return Err(e);
         }
     };
     let setup=async {
-        for source_id in &source_bundles {sqlx::query("UPDATE reroute_bundles SET recovery_bundle_id=?,recovery_started_at=UTC_TIMESTAMP(),lifecycle_state='recovery_running' WHERE id=? AND recovery_claim_token=?")
-            .bind(bundle_id).bind(source_id).bind(&claim_token).execute(pool).await?;}
+        let mut tx=pool.begin().await?;
+        crate::reroute::recovery::claim_sources_for_child_on(&mut tx,bundle_id,&source_bundles,&originals,&claim_token,false).await?;
         sqlx::query("UPDATE reroute_bundles SET source_json = ? WHERE id = ?")
-            .bind(sqlx::types::Json(json!({"kind":"recovery","rule_id":rule_id,"original_reroute_ids":originals,"transport_identities":identities}))).bind(bundle_id).execute(pool).await?;
+            .bind(sqlx::types::Json(json!({"kind":"recovery","rule_id":rule_id,"original_reroute_ids":originals,"transport_identities":identities}))).bind(bundle_id).execute(&mut *tx).await?;
+        tx.commit().await?;
         crate::reroute::bundle::persist_actions(pool,bundle_id,&actions).await
     }.await;
     if let Err(e) = setup {
-        for source_id in &source_bundles {
-            crate::reroute::recovery::release_claim_if_proven_no_write(
-                pool,
-                *source_id,
-                Some(bundle_id),
-                &format!("{e:#}"),
-            )
-            .await?;
-        }
+        let _ = crate::reroute::recovery::finalize_recovery_child(
+            pool,
+            bundle_id,
+            "failed",
+            Some(&format!("{e:#}")),
+            &format!("recovery:bundle:{bundle_id}"),
+        )
+        .await;
         return Err(e);
     }
     let result = crate::reroute::bundle::run(
@@ -1737,19 +2783,6 @@ async fn run_recovery_rollback(
         actions,
     )
     .await;
-    if result.state != "succeeded" {
-        let reason = result
-            .failure_reason
-            .clone()
-            .unwrap_or_else(|| format!("automatic recovery ended {}", result.state));
-        crate::reroute::recovery::settle_failed_recovery_sources(
-            pool,
-            &source_bundles,
-            bundle_id,
-            &reason,
-        )
-        .await?;
-    }
     Ok(result.state == "succeeded")
 }
 
@@ -1763,9 +2796,132 @@ pub async fn reset_rule_state(pool: &MySqlPool, rule_id: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Timelike, Utc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use super::{flow_observation, persistence_satisfied, should_auto_execute, InterfaceRule};
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn supervised_queue_drains_with_two_active_jobs() {
+        let queue = super::AutomaticWorkQueue::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        for _ in 0..5 {
+            let active = active.clone();
+            let peak = peak.clone();
+            let gate = gate.clone();
+            let done = done.clone();
+            queue
+                .submit(super::SupervisedJob {
+                    future: Box::pin(async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        gate.notified().await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        done.notify_one();
+                    }),
+                    pool: None,
+                    bundle_id: 0,
+                    kind: super::JobKind::Activation,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        for _ in 0..5 {
+            gate.notify_one();
+            done.notified().await;
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        queue
+            .submit(super::SupervisedJob {
+                future: Box::pin(async { panic!("injected worker panic") }),
+                pool: None,
+                bundle_id: 0,
+                kind: super::JobKind::Activation,
+            })
+            .await
+            .unwrap();
+        let survived = Arc::new(tokio::sync::Notify::new());
+        let signal = survived.clone();
+        queue
+            .submit(super::SupervisedJob {
+                future: Box::pin(async move { signal.notify_one() }),
+                pool: None,
+                bundle_id: 0,
+                kind: super::JobKind::Activation,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), survived.notified())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_worker_queue_refuses_without_waiting() {
+        let queue = super::AutomaticWorkQueue::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let gate = gate.clone();
+            let active = active.clone();
+            queue
+                .submit(super::SupervisedJob {
+                    future: Box::pin(async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _ = gate.acquire().await;
+                    }),
+                    pool: None,
+                    bundle_id: 0,
+                    kind: super::JobKind::Activation,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..4096 {
+            queue
+                .submit(super::SupervisedJob {
+                    future: Box::pin(async {}),
+                    pool: None,
+                    bundle_id: 0,
+                    kind: super::JobKind::Activation,
+                })
+                .await
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        assert!(queue
+            .submit(super::SupervisedJob {
+                future: Box::pin(async {}),
+                pool: None,
+                bundle_id: 0,
+                kind: super::JobKind::Activation
+            })
+            .await
+            .is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        gate.add_permits(2);
+    }
 
     #[test]
     fn aggregate_progress_requires_every_member_to_advance() {
@@ -1889,7 +3045,16 @@ mod tests {
         let latest =
             Utc::now().with_nanosecond(0).expect("valid timestamp") - Duration::seconds(60);
         let older = latest - Duration::seconds(60);
+        sqlx::query("UPDATE flow_publication_barrier SET registry_ready=1 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO flow_exporter_interfaces(exporter_id,device_id,interface_id,if_index,direction,first_seen_at,last_seen_at) VALUES(?,?,?,42,'ingress',?,?)")
+            .bind(exporter_id).bind(device_id).bind(interface_id).bind(older).bind(latest)
+            .execute(&pool).await.unwrap();
         for bucket_ts in [older, latest] {
+            sqlx::query("INSERT INTO flow_bucket_quality(exporter_id,bucket_ts,iface_complete,port_complete) VALUES(?,?,1,1)")
+                .bind(exporter_id).bind(bucket_ts).execute(&pool).await.unwrap();
             sqlx::query(
                 "INSERT INTO flow_iface_buckets \
                  (exporter_id, device_id, interface_id, if_index, direction, bucket_ts, \
@@ -1952,6 +3117,14 @@ mod tests {
         assert_eq!(observation.value, 0.0);
         assert_eq!(observation.sampled_at, Some(latest));
         assert!(observation.low_confidence);
+
+        // Selector absence inherits proven high sampling confidence when the
+        // complete bucket is corroborated by fresh interface telemetry.
+        sqlx::query("INSERT INTO interface_metrics_current(interface_id,device_id,sampled_at,valid_sample,rx_pps) VALUES(?,?,UTC_TIMESTAMP(),1,100)")
+            .bind(interface_id).bind(device_id).execute(&pool).await.unwrap();
+        let corroborated = flow_observation(&pool, &cfg, &rule).await.unwrap().unwrap();
+        assert_eq!(corroborated.value, 0.0);
+        assert!(!corroborated.low_confidence);
 
         sqlx::query("DELETE FROM flow_exporters WHERE id = ?")
             .bind(exporter_id)

@@ -3,10 +3,22 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    advisory_runtime: Arc<tokio::sync::OnceCell<Arc<crate::db::advisory::LockRuntime>>>,
+    #[serde(skip)]
+    pub automatic_work_queue: Arc<crate::detection::engine::AutomaticWorkQueue>,
+    #[serde(skip)]
+    pub automatic_work_port: Option<Arc<dyn crate::detection::engine::AutomaticWorkPort>>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub fail_automatic_decision_before_commit: bool,
+    #[serde(skip)]
+    pub flow_wake: Arc<crate::detection::wake::FlowWakeQueue>,
     pub server: Server,
     pub database: Database,
     #[serde(default)]
@@ -19,6 +31,23 @@ pub struct Config {
     pub retention: Retention,
     #[serde(default)]
     pub flow: Flow,
+}
+
+impl Config {
+    pub async fn advisory_runtime(
+        &self,
+        data_pool: &sqlx::MySqlPool,
+    ) -> Result<Arc<crate::db::advisory::LockRuntime>> {
+        let runtime = self
+            .advisory_runtime
+            .get_or_try_init(|| crate::db::advisory::LockRuntime::from_data_pool(data_pool))
+            .await?;
+        anyhow::ensure!(
+            runtime.is_source_pool(data_pool),
+            "configuration was reused with a different data-pool endpoint identity"
+        );
+        Ok(runtime.clone())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

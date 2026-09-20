@@ -213,6 +213,48 @@ all four bucket tables (see [database.md](database.md#retention-defaults)).
 `flow_exporters` is durable state (pruned only once idle past the flow bucket
 window, so its cascade never removes still-retained buckets).
 
+Collection completeness is stored separately in `flow_bucket_quality`, one row
+per exporter and bucket. Interface, port, AS and talker completeness are
+independent. Each has its own dropped-cardinality count: exhausting the talker
+map or applying the configured talker top-K marks only talkers incomplete, while
+interface and port totals remain usable. Decode loss marks every dimension
+incomplete for that bucket. A bucket already in progress when an exporter
+generation is first seen or recreated is incomplete; the next full bucket starts clean. The cumulative exporter
+backlog-drop counter is health information only and never contaminates a later
+bucket.
+
+Detectable datagram sequence gaps also mark the affected bucket incomplete.
+NetFlow v9's header sequence increments once per export packet in an observation
+domain ([RFC 3954 section 5.1](https://www.rfc-editor.org/rfc/rfc3954.html#section-5.1));
+sFlow v5 increments once per datagram for each sub-agent
+([sFlow v5 specification](https://sflow.org/sflow_version_5.txt)). Both paths
+handle `u32` wrap, preserve the newest watermark across small reordering, and
+start a new incomplete exporter generation after a proven uptime reset.
+
+`flow_exporter_interfaces` records which enrolled exporters have contributed to
+each discovered interface and direction. Membership is restricted by the
+`device_interfaces` foreign key, stays bound to the exporter's current device,
+and does not expire when a source becomes silent. Evidence for a requested
+bucket requires every known contributor to have both its exact interface row and
+its exact quality row. No membership, a missing contributor, or historical data
+from before quality tracking is **unavailable**, never a measured zero.
+Before a flush publishes an aggregate or quality row, it deduplicates contributors
+from the entire flush snapshot, bulk-resolves enrolled interfaces, and registers
+them in bounded 128-row transactions with cooperative yields. Quality publication
+is guarded by a durable singleton generation: preparation marks the registry not
+ready, invalidates quality for the cohort, and compare-and-sets the same generation
+ready only after every registration chunk succeeds. Each bucket transaction locks
+and verifies that ready generation, so stale work from a failed/restarted pass
+cannot publish. Completeness readers return unavailable while the barrier is not
+ready. If preparation fails, the
+whole unflushed snapshot is retained; already committed membership is idempotent
+and remains conservative because no quality row was exposed. If a later exporter write
+fails, its durable membership and missing exact bucket keep peers unavailable;
+the first successfully written exporter cannot look complete transiently.
+Sampling confidence and `pkts_available` / `bytes_available` remain separate
+evidence. Consequently, an absent port selector can be a high-confidence zero
+when its interface base is complete and sampled with high confidence.
+
 Top-N queries are then `ORDER BY SUM(bytes|pkts) DESC LIMIT 10` over the window,
 grouped by the relevant dimension.
 
@@ -229,9 +271,22 @@ A `flow::collector::run(pool, cfg)` task spawns from `scheduler::run()` alongsid
 3. Decoded `FlowRecord`s fold into in-memory bucket accumulators keyed by the
    three dimensions above.
 4. On bucket close, resolve the effective sampling rate, truncate talkers to
-   top-K, and flush to the bucket tables in one transaction.
-5. Expired buckets are trimmed by the central `scheduler::retention_cleanup`
+   top-K, and atomically flush aggregates, contributor membership and quality.
+5. After every exporter in that flush snapshot has been attempted, publish one
+   coalesced wake containing every interface whose aggregate and quality
+   transaction committed, including newer buckets committed before an older
+bucket failed. Only the failed and not-yet-written buckets are requeued. The
+   exporter work is attempted in groups of at most 32 with a cooperative yield
+   between groups, so a large recovered backlog drains progressively without one
+   unbounded executor turn. The
+   bounded queue retains at most 4096 distinct IDs;
+   overflow requests a full flow-rule rescan. Failed evaluation requeues the
+   lease, so a wake is never silently lost. A failed contributor still makes the
+   public quality helper reject that interface even when a healthy peer wakes it.
+6. Expired aggregate and `flow_bucket_quality` rows are trimmed by the central `scheduler::retention_cleanup`
    (not the collector), unified with `interface_samples` and `alerts` retention.
+   The exporter/interface contributor registry is durable source-coverage state
+   and is not aged out as ordinary telemetry.
 
 Templates are **in-memory** in v1: after a controller restart, data records are
 dropped until each template is re-advertised (seconds-to-minutes). This gap is
@@ -245,7 +300,9 @@ single bucket), and matches "never assume state survived a restart".
   `estimated` + `sampling_confidence` so the UI can badge it.
 - `GET /api/devices/{id}/flow-exporters` → exporter health: effective rate,
   source, confidence, last packet, dropped/unknown-template counters, SNMP
-  cross-cal delta.
+  cross-cal delta, cumulative backlog drops, and the latest per-dimension bucket
+  quality/drop counts. A missing latest quality row or a not-ready publication
+  registry is shown as unknown rather than displaying the previous complete row.
 - UI: a **Flows** panel on the device/interface view — three ranked tables, with
   an "estimated (sampled N:1)" badge and a low-confidence warning when the rate is
   unknown or the SNMP cross-check disagrees.

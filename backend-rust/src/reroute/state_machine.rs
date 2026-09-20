@@ -31,31 +31,41 @@ pub async fn reconcile_uncertain(
         String,
         Option<u64>,
         Option<u64>,
+        Option<u64>,
+        String,
         Option<sqlx::types::Json<serde_json::Value>>,
         Option<sqlx::types::Json<serde_json::Value>>,
     );
     let row: Row = sqlx::query_as(
-        "SELECT state, device_id, bundle_id, prior_state_json, after_state_json \
+        "SELECT state, device_id, bundle_id, rollback_of_reroute_id,mutation_effect,prior_state_json, after_state_json \
          FROM reroutes WHERE id = ?",
     )
     .bind(reroute_id)
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| anyhow::anyhow!("reroute not found"))?;
-    anyhow::ensure!(row.0 == "uncertain", "reroute is not uncertain");
+    let failed_changed_inverse = row.0 == "failed" && row.3.is_some() && row.4 == "changed";
+    anyhow::ensure!(
+        row.0 == "uncertain" || failed_changed_inverse,
+        "reroute is not eligible for evidence-bound reconciliation"
+    );
     let device_id = row
         .1
         .ok_or_else(|| anyhow::anyhow!("reroute has no device"))?;
     let before: Vec<crate::reroute::device_plan::DeviceStateSnapshot> = serde_json::from_value(
-        row.3
+        row.5
             .ok_or_else(|| anyhow::anyhow!("missing before snapshot"))?
             .0,
     )?;
     let after: Vec<crate::reroute::device_plan::DeviceStateSnapshot> = serde_json::from_value(
-        row.4
+        row.6
             .ok_or_else(|| anyhow::anyhow!("missing after snapshot"))?
             .0,
     )?;
+    anyhow::ensure!(
+        !before.is_empty() && !after.is_empty(),
+        "reconciliation requires non-empty before and after evidence"
+    );
 
     let matches_after =
         crate::reroute::device_plan::verify_snapshots_read_only(pool, device_id, &after).await?;
@@ -71,13 +81,13 @@ pub async fn reconcile_uncertain(
     };
 
     let mut tx = pool.begin().await?;
-    let locked: Option<String> =
-        sqlx::query_scalar("SELECT state FROM reroutes WHERE id = ? FOR UPDATE")
+    let locked: Option<(String, String)> =
+        sqlx::query_as("SELECT state,mutation_effect FROM reroutes WHERE id = ? FOR UPDATE")
             .bind(reroute_id)
             .fetch_optional(&mut *tx)
             .await?;
     anyhow::ensure!(
-        locked.as_deref() == Some("uncertain"),
+        matches!(locked.as_ref(),Some((state,effect)) if state=="uncertain" || (state=="failed" && effect=="changed" && row.3.is_some())),
         "reroute changed during reconciliation"
     );
     match result {
@@ -86,7 +96,7 @@ pub async fn reconcile_uncertain(
                 "UPDATE reroutes SET state = 'succeeded', success = 1, \
                         verification_status = 'reconciled_after', mutation_effect = 'changed', \
                         failure_reason = CONCAT(COALESCE(failure_reason,''), ?) \
-                  WHERE id = ? AND state = 'uncertain'",
+                  WHERE id = ? AND (state = 'uncertain' OR (state='failed' AND mutation_effect='changed'))",
             )
             .bind(format!(" | reconciled exact after-state: {note}"))
             .bind(reroute_id)
@@ -105,7 +115,7 @@ pub async fn reconcile_uncertain(
                 "UPDATE reroutes SET state = 'failed', success = 0, \
                         verification_status = 'reconciled_before', mutation_effect = 'noop', \
                         failure_reason = CONCAT(COALESCE(failure_reason,''), ?) \
-                  WHERE id = ? AND state = 'uncertain'",
+                  WHERE id = ? AND (state = 'uncertain' OR (state='failed' AND mutation_effect='changed'))",
             )
             .bind(format!(" | reconciled exact before-state: {note}"))
             .bind(reroute_id)
@@ -144,7 +154,17 @@ pub async fn reconcile_uncertain(
         .execute(&mut *tx)
         .await?;
     }
+    let mut mapped_child = None;
     if let Some(bundle_id) = row.2 {
+        let mapped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+        )
+        .bind(bundle_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if mapped > 0 {
+            mapped_child = Some(bundle_id);
+        }
         let unknown: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM reroutes \
              WHERE bundle_id = ? AND (state = 'uncertain' OR mutation_effect = 'unknown')",
@@ -168,8 +188,12 @@ pub async fn reconcile_uncertain(
         .bind(bundle_id)
         .fetch_one(&mut *tx)
         .await?;
-        if unknown == 0 && owned == 0 {
+        if unknown == 0 && owned == 0 && mapped == 0 {
             sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ?")
+                .bind(bundle_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
                 .bind(bundle_id)
                 .execute(&mut *tx)
                 .await?;
@@ -188,6 +212,29 @@ pub async fn reconcile_uncertain(
             .await?;
     }
     tx.commit().await?;
+    if result != ReconciliationResult::Conflict {
+        if let Some(child_id) = mapped_child {
+            if crate::reroute::bundle::outstanding_owned_originals(pool, child_id)
+                .await?
+                .is_empty()
+            {
+                let owner: Option<String> = sqlx::query_scalar(
+                    "SELECT owner_token FROM device_change_windows WHERE bundle_id=? LIMIT 1",
+                )
+                .bind(child_id)
+                .fetch_optional(pool)
+                .await?;
+                crate::reroute::recovery::finalize_recovery_child(
+                    pool,
+                    child_id,
+                    "succeeded",
+                    Some("reconciliation proved recovery completion"),
+                    owner.as_deref().unwrap_or("reconcile-repair"),
+                )
+                .await?;
+            }
+        }
+    }
     Ok(result)
 }
 

@@ -14,6 +14,8 @@ use sqlx::{Executor, MySqlConnection, MySqlPool};
 
 use crate::config::Config;
 
+pub mod advisory;
+
 /// Compile-time embedded migrations from backend-rust/migrations/.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 

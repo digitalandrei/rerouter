@@ -88,33 +88,25 @@ async fn bundle_rate_scope(
 
 fn rate_values(scope: &RateScope) -> (u32, u64, String) {
     match scope {
-        RateScope::Routing { limit, window } => (*limit, *window, "reroute:rate-global".into()),
+        RateScope::Routing { limit, window } => (*limit, *window, "20:reroute:rate-global".into()),
         RateScope::ConfigurationOnly {
             device_id,
             limit,
             window,
-        } => (*limit, *window, format!("reroute:rate-lab:{device_id}")),
+        } => (*limit, *window, format!("20:reroute:rate-lab:{device_id}")),
     }
 }
 
-/// Cross-component policy fence. The detached connection is never returned to
-/// the pool while it owns the MySQL advisory lock; cancellation/drop closes the
-/// socket and MySQL releases the lock with the session.
+/// Cross-component policy fence backed by the current bounded advisory-lock
+/// operation. Nested gates reuse that operation's one database session.
 pub struct PolicyFence {
-    conn: Option<MySqlConnection>,
-    lock_name: String,
+    guard: Option<crate::db::advisory::AdvisoryGuard>,
 }
 
 impl PolicyFence {
     pub async fn release(mut self) -> anyhow::Result<()> {
-        if let Some(mut conn) = self.conn.take() {
-            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-                .bind(&self.lock_name)
-                .execute(&mut conn)
-                .await;
-            // Closing the owning MySQL session is the authoritative release and
-            // remains correct if the explicit RELEASE response is lost.
-            let _ = conn.close().await;
+        if let Some(guard) = self.guard.take() {
+            guard.release().await?;
         }
         Ok(())
     }
@@ -122,20 +114,9 @@ impl PolicyFence {
 
 /// Acquire the policy fence used by both actuation and safety-policy mutations.
 /// The caller must keep the returned guard alive through exact verification.
-pub async fn policy_fence(pool: &MySqlPool) -> anyhow::Result<PolicyFence> {
-    let mut pooled = pool.acquire().await?;
-    let lock_name = crate::db::scoped_advisory_lock_name(&mut pooled, "execution:policy").await?;
-    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
-        .bind(&lock_name)
-        .fetch_one(&mut *pooled)
-        .await?;
-    anyhow::ensure!(
-        got == Some(1),
-        "execution policy is being changed; retry later"
-    );
+pub async fn policy_fence(_pool: &MySqlPool) -> anyhow::Result<PolicyFence> {
     Ok(PolicyFence {
-        conn: Some(pooled.detach()),
-        lock_name,
+        guard: Some(crate::db::advisory::acquire("10:execution:policy").await?),
     })
 }
 
@@ -563,29 +544,40 @@ pub async fn admit_bundle(
     bundle_id: u64,
     size: u32,
 ) -> Result<(), BlockReason> {
+    let runtime = cfg
+        .advisory_runtime(pool)
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    // Erase the very large guard future at this public scope boundary. These
+    // entry points are also called from the executor's already-large future;
+    // embedding the inner state machine there can overflow ordinary worker
+    // thread stacks before the first database await is polled.
+    crate::db::advisory::foreground_scope(
+        runtime,
+        Box::pin(admit_bundle_inner(pool, cfg, bundle_id, size)),
+    )
+    .await
+    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?
+}
+
+async fn admit_bundle_inner(
+    pool: &MySqlPool,
+    cfg: &Config,
+    bundle_id: u64,
+    size: u32,
+) -> Result<(), BlockReason> {
     let scope = bundle_rate_scope(pool, cfg, bundle_id).await?;
     let (limit, window, rate_lock_suffix) = rate_values(&scope);
     if limit == 0 {
         return Ok(());
     }
+    let rate_guard = crate::db::advisory::acquire(&rate_lock_suffix)
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-
-    let rate_lock = crate::db::scoped_advisory_lock_name(&mut conn, &rate_lock_suffix)
-        .await
-        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-    conn.close_on_drop();
-    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
-        .bind(&rate_lock)
-        .fetch_one(&mut *conn)
-        .await
-        .ok()
-        .flatten();
-    if got != Some(1) {
-        return Err(BlockReason::GuardBusy);
-    }
 
     let lab_device = match scope {
         RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
@@ -596,10 +588,10 @@ pub async fn admit_bundle(
         scoped_outstanding_bundle_actions(&mut conn, window, bundle_id, lab_device).await;
     let projected = already.saturating_add(outstanding);
     if projected.saturating_add(size as i64) > limit as i64 {
-        let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-            .bind(&rate_lock)
-            .execute(&mut *conn)
-            .await;
+        rate_guard
+            .release()
+            .await
+            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
         return Err(BlockReason::RateLimit {
             recent: projected,
             window_secs: window,
@@ -623,19 +615,19 @@ pub async fn admit_bundle(
                 .await
                 .map_err(|e| BlockReason::PersistFailed(e.to_string()))?;
         if existing != Some(size) {
-            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-                .bind(&rate_lock)
-                .execute(&mut *conn)
-                .await;
+            rate_guard
+                .release()
+                .await
+                .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
             return Err(BlockReason::PersistFailed(
                 "bundle was not in an admissible planned state".into(),
             ));
         }
     }
-    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-        .bind(&rate_lock)
-        .execute(&mut *conn)
-        .await;
+    rate_guard
+        .release()
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     Ok(())
 }
 
@@ -732,6 +724,26 @@ pub async fn reserve_and_persist(
     req: &ActionRequest,
     plan: &RenderedPlan,
 ) -> Result<u64, BlockReason> {
+    let runtime = cfg
+        .advisory_runtime(pool)
+        .await
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    // Keep the public runtime boundary small when this is nested inside the
+    // executor and compensation futures.
+    crate::db::advisory::foreground_scope(
+        runtime,
+        Box::pin(reserve_and_persist_inner(pool, cfg, req, plan)),
+    )
+    .await
+    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?
+}
+
+async fn reserve_and_persist_inner(
+    pool: &MySqlPool,
+    cfg: &Config,
+    req: &ActionRequest,
+    plan: &RenderedPlan,
+) -> Result<u64, BlockReason> {
     let rate_scope = match req.bundle {
         Some(bundle) => bundle_rate_scope(pool, cfg, bundle.bundle_id).await?,
         None => RateScope::Routing {
@@ -740,30 +752,25 @@ pub async fn reserve_and_persist(
         },
     };
     let (rate_limit, rate_window, rate_lock_suffix) = rate_values(&rate_scope);
+    // Global rate-limit critical section. Every non-corrective trigger participates
+    // so concurrent manual and automatic requests share one authoritative budget.
+    let use_global = req.trigger_type != "rollback" && rate_limit > 0;
+    let mut rate_guard = if use_global {
+        Some(
+            crate::db::advisory::acquire(&rate_lock_suffix)
+                .await
+                .map_err(|e| BlockReason::GuardConnection(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    // Never consume an application-data connection while waiting for bounded
+    // advisory capacity or the server-side lock.
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-
-    // Global rate-limit critical section. Every non-corrective trigger participates
-    // so concurrent manual and automatic requests share one authoritative budget.
-    let use_global = req.trigger_type != "rollback" && rate_limit > 0;
-    let mut rate_lock = None;
     if use_global {
-        let name = crate::db::scoped_advisory_lock_name(&mut conn, &rate_lock_suffix)
-            .await
-            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-        conn.close_on_drop();
-        let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
-            .bind(&name)
-            .fetch_one(&mut *conn)
-            .await
-            .ok()
-            .flatten();
-        if got != Some(1) {
-            return Err(BlockReason::GuardBusy);
-        }
-        rate_lock = Some(name);
         let lab_device = match rate_scope {
             RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
             _ => None,
@@ -808,10 +815,12 @@ pub async fn reserve_and_persist(
         if (req.bundle.is_some() && own_reserved == 0)
             || (req.bundle.is_none() && projected >= rate_limit as i64)
         {
-            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-                .bind(rate_lock.as_deref().expect("rate lock acquired"))
-                .execute(&mut *conn)
-                .await;
+            if let Some(guard) = rate_guard.take() {
+                guard
+                    .release()
+                    .await
+                    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+            }
             return Err(BlockReason::RateLimit {
                 recent: projected,
                 window_secs: rate_window,
@@ -820,47 +829,27 @@ pub async fn reserve_and_persist(
         }
     }
 
-    let lock_name = crate::db::scoped_advisory_lock_name(
-        &mut conn,
-        &format!("reroute:device:{}", req.device_id),
-    )
-    .await
-    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-    conn.close_on_drop();
-    let got: Option<i64> = sqlx::query_scalar::<_, Option<i64>>("SELECT GET_LOCK(?, 5)")
-        .bind(&lock_name)
-        .fetch_one(&mut *conn)
+    let device_guard =
+        crate::db::advisory::acquire(&format!("30:reroute:device:{}", req.device_id))
+            .await
+            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+
+    let reserved = reserve_slot(&mut conn, req, plan, use_global).await;
+    device_guard
+        .release()
         .await
-        .ok()
-        .flatten();
-    if got != Some(1) {
-        if use_global {
-            let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-                .bind(rate_lock.as_deref().expect("rate lock acquired"))
-                .execute(&mut *conn)
-                .await;
-        }
-        return Err(BlockReason::GuardBusy);
-    }
-
-    let reserved = reserve_slot(pool, &mut conn, req, plan, use_global).await;
-
-    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-        .bind(&lock_name)
-        .execute(&mut *conn)
-        .await;
-    if use_global {
-        let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-            .bind(rate_lock.as_deref().expect("rate lock acquired"))
-            .execute(&mut *conn)
-            .await;
+        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    if let Some(guard) = rate_guard {
+        guard
+            .release()
+            .await
+            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     }
     drop(conn);
     reserved
 }
 
 async fn reserve_slot(
-    pool: &MySqlPool,
     conn: &mut MySqlConnection,
     req: &ActionRequest,
     plan: &RenderedPlan,
@@ -869,23 +858,32 @@ async fn reserve_slot(
     // Authoritative re-check under the advisory lock: an admin lock set after the
     // lock-free early check must still stop this action (same pattern as the
     // global rate limit above). Both reads fail closed.
-    if crate::api::settings::bool_setting(pool, "global_maintenance_lock", false).await {
+    let maintenance = sqlx::query_scalar::<_, String>(
+        "SELECT `value` FROM system_settings WHERE `key`='global_maintenance_lock'",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?
+    .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes" | "on"));
+    if maintenance {
         return Err(BlockReason::MaintenanceLock);
     }
-    if locks::is_blocked(pool, "device", &req.device_id.to_string())
-        .await
-        .unwrap_or(true)
-    {
+    let blocked:i64=sqlx::query_scalar("SELECT COUNT(*) FROM locks WHERE cleared_at IS NULL AND (scope='global' OR (scope='device' AND scope_ref=?))")
+        .bind(req.device_id.to_string()).fetch_one(&mut *conn).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
+    if blocked > 0 {
         return Err(BlockReason::DeviceLocked);
     }
     let owner_token = req
         .authorization
         .as_ref()
         .map(|auth| auth.owner_token.as_str());
-    if !locks::change_window_allows(pool, req.device_id, owner_token)
-        .await
-        .unwrap_or(false)
-    {
+    let window_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_token FROM device_change_windows WHERE device_id=?")
+            .bind(req.device_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
+    if window_owner.is_some_and(|owner| owner_token != Some(owner.as_str())) {
         return Err(BlockReason::DeviceLocked);
     }
     if running_on_device(conn, req.device_id).await {

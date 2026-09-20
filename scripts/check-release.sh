@@ -12,6 +12,13 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 env -u DATABASE_URL cargo test --locked --all-targets -- --test-threads=1 --nocapture
 
+cd "$repo_dir"
+python3 scripts/test-retune-sample-counts.py
+python3 scripts/test-report-hardening-timing.py
+python3 scripts/test-prepare-hardening-release.py
+python3 scripts/test-hardening-migrations-unit.py
+python3 scripts/test-hardening-capture-sql-db.py
+
 cd "$repo_dir/frontend"
 npm run typecheck
 npm test -- --run

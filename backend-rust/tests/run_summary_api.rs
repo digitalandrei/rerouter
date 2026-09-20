@@ -369,6 +369,9 @@ async fn latest_manual_recovery_is_derived_during_claim_and_after_settlement() {
     let newest = sqlx::query("INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,source_json,started_at) \
         VALUES(?,'manual',?,'running','abort_and_compensate',8,4,'recovery_running',0,JSON_OBJECT('kind','bundle_revert','original_bundle_id',?),UTC_TIMESTAMP())")
         .bind(source).bind(user).bind(source).execute(&pool).await.unwrap().last_insert_id();
+    let unrelated = sqlx::query("INSERT INTO reroute_bundles(trigger_type,triggered_by_user_id,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,source_json,started_at) \
+        VALUES('manual',?,'running','abort_and_compensate',1,0,'recovery_running',0,JSON_OBJECT('kind','bundle_revert','original_bundle_id',?),UTC_TIMESTAMP())")
+        .bind(user).bind(source).execute(&pool).await.unwrap().last_insert_id();
 
     let (status, claimed) = get(&app, &cookie, &format!("/api/reroute-bundles/{source}")).await;
     assert_eq!(status, StatusCode::OK, "{claimed}");
@@ -386,6 +389,10 @@ async fn latest_manual_recovery_is_derived_during_claim_and_after_settlement() {
     assert_ne!(
         claimed["latest_recovery_bundle_id"], older,
         "newest child wins"
+    );
+    assert_ne!(
+        claimed["latest_recovery_bundle_id"], unrelated,
+        "a newer bundle without parent or inverse evidence is not associated"
     );
 
     let (_, child) = get(&app, &cookie, &format!("/api/reroute-bundles/{newest}")).await;
@@ -458,9 +465,10 @@ async fn latest_manual_recovery_is_derived_during_claim_and_after_settlement() {
         .iter()
         .any(|run| run["id"] == source));
 
-    sqlx::query("DELETE FROM reroute_bundles WHERE id IN (?,?)")
+    sqlx::query("DELETE FROM reroute_bundles WHERE id IN (?,?,?)")
         .bind(newest)
         .bind(older)
+        .bind(unrelated)
         .execute(&pool)
         .await
         .unwrap();

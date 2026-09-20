@@ -237,6 +237,11 @@ async fn whole_run_revert_binds_exact_remaining_set_and_is_idempotent() {
         .await
         .unwrap();
     if let Some(id) = failed_bundle {
+        sqlx::query("DELETE FROM recovery_attempt_sources WHERE recovery_bundle_id=?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
             .bind(id)
             .execute(pool)
@@ -327,6 +332,16 @@ async fn whole_run_revert_binds_exact_remaining_set_and_is_idempotent() {
         .unwrap();
     sqlx::query("DELETE FROM execution_plans WHERE id=?")
         .bind(plan)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM recovery_attempt_sources WHERE recovery_bundle_id=?")
+        .bind(accepted.bundle_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+        .bind(source)
         .execute(pool)
         .await
         .unwrap();

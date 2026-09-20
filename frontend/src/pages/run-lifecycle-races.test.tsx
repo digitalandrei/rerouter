@@ -2,7 +2,7 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { createMemoryRouter, MemoryRouter, RouterProvider } from "react-router-dom";
 import { api, type ManualMitigationPreview, type RerouteBundle } from "@/lib/api";
 import { AuthProvider } from "@/lib/auth";
 import { ActiveRunsTab, HistoryTab } from "@/pages/Mitigations";
@@ -12,6 +12,47 @@ const preview = { plan_id: 12, preview_token: "token-b", results: [], operating_
 
 function auth() { vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "trigger_manual_reroute"] }); }
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
+
+it("keeps a 150-run refresh to one list request and selected detail only", async () => {
+  auth();
+  const items=Array.from({length:25},(_,index)=>({...run,id:index+1}));
+  const list=vi.spyOn(api.bundles,"list").mockResolvedValue({items,page:1,per_page:25,total:150});
+  const get=vi.spyOn(api.bundles,"get").mockResolvedValue({...run,id:1});
+  const router=createMemoryRouter([{path:"/mitigations",element:<ActiveRunsTab/>}],{initialEntries:["/mitigations"]});
+  const user=userEvent.setup(); render(<AuthProvider><RouterProvider router={router}/></AuthProvider>);
+  await screen.findByText("Page 1 of 6");
+  expect(list).toHaveBeenCalledTimes(1); expect(list).toHaveBeenCalledWith(expect.objectContaining({page:1,per_page:25})); expect(get).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button",{name:"Review run 1"}));
+  await screen.findByRole("dialog"); expect(get.mock.calls.length).toBeLessThanOrEqual(2);
+});
+
+it("coalesces periodic refreshes while a slow same-filter batch is in flight", async () => {
+  auth();
+  const polls: Array<() => void> = [];
+  vi.spyOn(globalThis, "setInterval").mockImplementation((callback) => { polls.push(callback as () => void); return polls.length as unknown as ReturnType<typeof setInterval>; });
+  vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+  let resolveList!: (value: { items: RerouteBundle[]; page: number; per_page: number; total: number }) => void;
+  const list = vi.spyOn(api.bundles, "list").mockImplementation(() => new Promise((resolve) => { resolveList = resolve; }));
+  render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+
+  polls.forEach((poll) => { poll(); poll(); });
+  expect(list).toHaveBeenCalledTimes(1);
+
+  resolveList({ items: [run], page: 1, per_page: 25, total: 1 });
+  expect(await screen.findByText("#7")).toBeTruthy();
+  expect(list).toHaveBeenCalledTimes(1);
+});
+
+it("uses the server-clamped page so one Previous goes from six to five", async () => {
+  auth();
+  const list=vi.spyOn(api.bundles,"list").mockImplementation(async (options) => ({items:[{...run,id:options?.page===5?125:150}],page:Math.min(options?.page??1,6),per_page:25,total:150}));
+  const user=userEvent.setup();
+  render(<AuthProvider><MemoryRouter initialEntries={["/mitigations?page=99"]}><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await screen.findByText("Page 6 of 6");
+  await user.click(screen.getByRole("button",{name:"Previous"}));
+  await vi.waitFor(()=>expect(list).toHaveBeenCalledWith(expect.objectContaining({page:5,per_page:25})));
+});
 
 it("shows one honest pending state while preparing and confirming a whole-run revert", async () => {
   auth(); vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 }); vi.spyOn(api.bundles, "get").mockResolvedValue(run);
@@ -27,6 +68,42 @@ it("shows one honest pending state while preparing and confirming a whole-run re
   await user.click(screen.getByRole("button", { name: "Apply reviewed revert" }));
   expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Reason A", plan_id: 12, preview_token: "token-b" });
   expect((await screen.findAllByText(/recovery #99/i)).length).toBeGreaterThan(0);
+});
+
+it("shows cancellation only when automatic recovery actually exists", async () => {
+  auth();
+  const manualOnly = { ...run, take_control: { available: false, block_reasons: ["run has no automatic recovery to cancel"] } } as RerouteBundle;
+  const automatic = { ...run, recovery_deadline: "2026-09-19T09:00:00Z", take_control: { available: true, block_reasons: [] } } as RerouteBundle;
+  const list = vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [manualOnly], page: 1, per_page: 25, total: 1 });
+  const get = vi.spyOn(api.bundles, "get").mockResolvedValue(manualOnly);
+  const takeControl = vi.spyOn(api.bundles, "takeControl").mockResolvedValue({ ok: true, bundle_id: 7, automatic_recovery_cancelled: true });
+  const user = userEvent.setup();
+  render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  expect(screen.queryByRole("button", { name: "Cancel automatic recovery" })).toBeNull();
+  cleanup();
+
+  list.mockResolvedValue({ items: [automatic], page: 1, per_page: 25, total: 1 });
+  get.mockResolvedValue(automatic);
+  render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+  await user.click(await screen.findByRole("button", { name: "Review run 7" }));
+  expect(await screen.findByText(/does not send router commands/i)).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "Cancel automatic recovery" }));
+  expect(takeControl).toHaveBeenCalledWith(7);
+});
+
+it("filter changes during a pending preview do not wedge action state", async () => {
+  auth(); vi.spyOn(api.bundles,"list").mockResolvedValue({items:[run],page:1,per_page:25,total:1}); vi.spyOn(api.bundles,"get").mockResolvedValue(run);
+  let resolvePreview!: (value: ManualMitigationPreview)=>void;
+  vi.spyOn(api.bundles,"revert").mockImplementation(()=>new Promise(resolve=>{resolvePreview=resolve as (value:ManualMitigationPreview)=>void;}));
+  const router=createMemoryRouter([{path:"/mitigations",element:<ActiveRunsTab/>}],{initialEntries:["/mitigations"]});
+  const user=userEvent.setup(); render(<AuthProvider><RouterProvider router={router}/></AuthProvider>);
+  await user.click(await screen.findByRole("button",{name:"Review run 7"}));
+  await user.type(await screen.findByLabelText("Audit reason"),"Reason A");
+  await user.click(screen.getByRole("button",{name:"Preview revert"}));
+  await router.navigate("/mitigations?run_search=manual&run=7");
+  resolvePreview(preview);
+  expect((await screen.findByRole("button",{name:"Apply reviewed revert"}) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it("pages through run history beyond the first fifty records", async () => {

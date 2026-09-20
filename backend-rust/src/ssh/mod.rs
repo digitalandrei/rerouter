@@ -356,6 +356,17 @@ pub fn redact_results(results: &[CommandResult]) -> Vec<CommandResult> {
         .collect()
 }
 
+fn diagnostic_excerpt(text: &str) -> String {
+    // Redact the complete response before applying either bound. Otherwise a
+    // credential beginning just before the old excerpt boundary can survive.
+    let redacted = redact_device_output(text);
+    let lines = redacted.lines().rev().take(8).collect::<Vec<_>>();
+    let joined = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let chars = joined.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(1024);
+    chars[start..].iter().collect()
+}
+
 fn redact_line(line: &str, in_key_block: &mut bool) -> String {
     let trimmed = line.trim();
     let indent = &line[..line.len() - line.trim_start().len()];
@@ -1100,33 +1111,15 @@ pub async fn discover_prefixes_and_store(pool: &MySqlPool, device_id: u64) -> Re
     // advisory lock covers the complete read -> reconcile -> audit generation so
     // an older SSH snapshot cannot commit after a newer one and acquire a fresh
     // timestamp. Dropping the connection on cancellation releases the lock.
-    let mut lock_conn = pool.acquire().await?;
-    let lock_name = crate::db::scoped_advisory_lock_name(
-        &mut lock_conn,
-        &format!("inventory:device:{device_id}"),
-    )
-    .await?;
-    lock_conn.close_on_drop();
-    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 5)")
-        .bind(&lock_name)
-        .fetch_one(&mut *lock_conn)
-        .await?;
-    if acquired != Some(1) {
-        return Err(anyhow!(
-            "routing inventory discovery for device {device_id} is already running"
-        ));
-    }
+    let guard = crate::db::advisory::acquire(&format!("00:inventory:device:{device_id}"))
+        .await
+        .with_context(|| {
+            format!("routing inventory discovery for device {device_id} is already running")
+        })?;
     let result = discover_prefixes_and_store_inner(pool, device_id).await;
-    let released: std::result::Result<Option<i64>, sqlx::Error> =
-        sqlx::query_scalar("SELECT RELEASE_LOCK(?)")
-            .bind(&lock_name)
-            .fetch_one(&mut *lock_conn)
-            .await;
+    let released = guard.release().await;
     match (result, released) {
-        (Ok(count), Ok(Some(1))) => Ok(count),
-        (Ok(_), Ok(_)) => Err(anyhow!(
-            "routing inventory refreshed but its serialization lock was not owned at release"
-        )),
+        (Ok(count), Ok(())) => Ok(count),
         (Ok(_), Err(error)) => Err(error).context("releasing routing inventory discovery lock"),
         (Err(error), _) => Err(error),
     }
@@ -2867,8 +2860,7 @@ async fn read_until(
                 if done(&buf) {
                     break;
                 }
-                let tail: String = buf.chars().rev().take(400).collect();
-                let tail: String = tail.chars().rev().collect();
+                let tail = diagnostic_excerpt(&buf);
                 tracing::warn!(
                     event_type = "ssh_prompt_timeout",
                     bytes = buf.len(),
@@ -3180,6 +3172,21 @@ mod tests {
             "070C285F4D061A33",
             &["neighbor 1.2.3.4 password 7"],
         );
+    }
+
+    #[test]
+    fn diagnostic_excerpt_redacts_before_bounding() {
+        let secret = "credential-crossing-the-old-400-character-boundary";
+        let response = format!(
+            "{}\nneighbor 192.0.2.1 password {secret}\n{}",
+            "x".repeat(900),
+            "y".repeat(500)
+        );
+        let excerpt = diagnostic_excerpt(&response);
+        assert!(!excerpt.contains(secret));
+        assert!(excerpt.contains(REDACTED));
+        assert!(excerpt.chars().count() <= 1024);
+        assert!(excerpt.lines().count() <= 8);
     }
 
     #[test]

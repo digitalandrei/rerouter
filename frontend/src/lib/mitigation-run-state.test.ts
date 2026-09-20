@@ -39,6 +39,8 @@ describe("presentMitigationRun", () => {
     expect(recoveryFieldLabel(liveFixture, { ...liveFixture, id: 2, parent_bundle_id: 1, state: "failed" })).toBe("Needs attention · recovery #2");
     expect(recoveryFieldLabel(liveFixture, { ...liveFixture, id: 2, parent_bundle_id: 1, state: "succeeded", finished_at: null })).toBe("Completed · recovery #2");
     expect(recoveryFieldLabel({ ...liveFixture, latest_recovery_bundle_id: null, latest_recovery: null })).toBe("Until manually reverted");
+    expect(recoveryFieldLabel({ ...liveFixture, latest_recovery_bundle_id: null, latest_recovery: null, take_control: { available: true, block_reasons: [] } })).toBe("Rule-driven automatic recovery eligible");
+    expect(recoveryFieldLabel({ ...liveFixture, latest_recovery_bundle_id: null, latest_recovery: null, automatic_recovery_cancelled_at: "2026-09-20T10:00:00Z" })).toBe("Automatic recovery cancelled · manual revert only");
     const stale: RerouteBundle = { ...liveFixture, latest_recovery_bundle_id: 98, latest_recovery: { id: 98, parent_bundle_id: 1, state: "succeeded", total_actions: 8, completed_actions: 8, started_at: null, finished_at: null, failure_reason: null } };
     expect(recoveryFieldLabel(stale, null, 99)).toBe("Revert accepted · recovery #99");
     const current: RerouteBundle = { ...liveFixture, latest_recovery_bundle_id: 99, latest_recovery: { id: 99, parent_bundle_id: 1, state: "succeeded", total_actions: 8, completed_actions: 8, started_at: null, finished_at: "2026-09-19T11:00:00Z", failure_reason: null } };

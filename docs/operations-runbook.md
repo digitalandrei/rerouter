@@ -165,10 +165,11 @@ Resolve in this order:
    show running-config | include <network>). Do not trust the UI here.
 3. Reconcile each uncertain reroute from the UI. Only exact recorded state
    resolves uncertainty; conflicting evidence retains quarantine.
-4. Roll back each still-applied reroute individually from /mitigations
-   (POST /api/reroutes/{id}/rollback), in reverse order of bundle_position:
-   undo the most recent change first.
-5. Re-check the bundle and the device: no uncertain rows, no open locks.
+4. Open the source run in Active Runs and prepare a fresh whole-run revert
+   preview. Confirmation targets only its currently owned originals, in reverse
+   order; successful inverses are excluded. Resolve the displayed blockers first.
+5. Re-check the source and its recovery child. Preserve quarantine belonging to
+   other source runs on the same devices.
 6. Only then consider re-running the mitigation, after fixing what made the
    original action fail.
 ```
@@ -193,11 +194,13 @@ mitigation the all-or-nothing admission prevents.
 
 ### A mitigation needs to be lifted
 
-Run the original action's **rollback** from `/mitigations`. Recovery uses the
-persisted inverse of its owned change, including exact pre-existing values.
-Rollbacks are themselves audited and verified. In enforce mode the UI first obtains a server-rendered rollback plan,
-then consumes its five-minute one-time preview token. There is no auto-expiry: a
-mitigation stays in effect until you explicitly run its rollback.
+Open the source run in Active Runs and preview its revert. Recovery uses the
+persisted inverses of owned changes, including exact pre-existing values.
+Confirmation consumes the actor-bound preview in either Observe or Enforce.
+Optional timed recovery is anchored once to successful activation completion;
+unattended recovery still requires Enforce, the automatic master switch, and
+current safety authority. Disarming leaves the timer pending. Known no-write
+failure permits a fresh manual preview; ambiguous effects require reconciliation.
 
 ### Telemetry went stale
 
@@ -244,3 +247,12 @@ Git. Test restore into a staging DB periodically.
   bundle left `aborted` / `compensation_blocked`.
 - Verify retention jobs are pruning `interface_samples` and keeping audit logs.
 - Rotate device SNMP communities and SSH credentials on schedule.
+# Scheduler behavior
+
+Device polling uses live `poll_interval_seconds` values with a five-second
+floor. Interval edits reset the next deadline, overruns skip missed deadlines,
+and disabling a device requests cooperative shutdown between phases; an active
+writer is never aborted. SSH reachability, daily interface/BGP inventory, and
+hourly routing discovery run outside the sample-and-detect critical path.
+Routing discovery admits at most two devices concurrently and uses a stable
+per-device stagger, avoiding hourly fleet bursts.

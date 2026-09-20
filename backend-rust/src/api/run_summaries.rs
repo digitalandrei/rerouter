@@ -36,6 +36,198 @@ pub(crate) struct RunSummaryRow {
     pub recovery_claim_token: Option<String>,
     pub automatic_recovery_cancelled_at: Option<DateTime<Utc>>,
     pub automatic_recovery_block_reason: Option<String>,
+    pub automatic_recovery_possible: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use sqlx::{mysql::MySqlPoolOptions, Execute};
+    use std::time::Instant;
+
+    #[test]
+    fn substring_filters_use_literal_locate_not_like_wildcards() {
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT b.id FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id",
+        );
+        push_filters(
+            &mut query,
+            &RunSummaryFilter {
+                q: Some("100%_\\"),
+                device: Some("edge_%\\"),
+                ..Default::default()
+            },
+        );
+        let built = query.build();
+        let sql = built.sql();
+        assert!(sql.contains("LOCATE("));
+        assert!(!sql.contains(" LIKE "));
+    }
+
+    async fn session_selects(pool: &MySqlPool) -> anyhow::Result<u64> {
+        let (_, value): (String, String) = sqlx::query_as("SHOW SESSION STATUS LIKE 'Com_select'")
+            .fetch_one(pool)
+            .await?;
+        Ok(value.parse()?)
+    }
+
+    fn process_rss_kib() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+    }
+
+    #[tokio::test]
+    async fn manual_recovery_does_not_offer_automatic_recovery_cancellation() {
+        let database = crate::db::connect_test_database().await;
+        let bundle_id = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations) VALUES('manual','succeeded','abort_and_compensate',1,1,'active',1)")
+            .execute(database.pool()).await.unwrap().last_insert_id();
+
+        let manual = one(database.pool(), bundle_id).await.unwrap().unwrap();
+        assert_eq!(manual["take_control"]["available"], false);
+        assert_eq!(
+            manual["take_control"]["block_reasons"][0],
+            "run has no automatic recovery to cancel"
+        );
+
+        sqlx::query("UPDATE reroute_bundles SET lifecycle_state='recovery_scheduled',recovery_deadline=DATE_ADD(UTC_TIMESTAMP(),INTERVAL 1 HOUR) WHERE id=?")
+            .bind(bundle_id).execute(database.pool()).await.unwrap();
+        let timed = one(database.pool(), bundle_id).await.unwrap().unwrap();
+        assert_eq!(timed["take_control"]["available"], true);
+
+        sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+            .bind(bundle_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_run_pages_keep_a_constant_real_query_budget() {
+        const PAGE_SIZE: u32 = 25;
+        const PAGES: u64 = 6;
+        const SELECTS_PER_PAGE: u64 = 5;
+
+        let database = crate::db::connect_test_database().await;
+        // A single physical connection makes the session counter authoritative:
+        // every count/list/enrichment query and both status reads use this same
+        // server session.
+        let options = database.pool().connect_options().as_ref().clone();
+        let measured = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect measured one-connection pool");
+
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let literal = format!("load-{token}-%_\\source");
+        let device_name = format!("edge-{token}-%_\\device");
+        let device_id = sqlx::query("INSERT INTO devices(name,hostname,enabled) VALUES(?,?,0)")
+            .bind(&device_name)
+            .bind(format!("{token}.invalid"))
+            .execute(&measured)
+            .await
+            .expect("insert load fixture device")
+            .last_insert_id();
+        let lower = Utc::now() - Duration::hours(1);
+        let upper = Utc::now() + Duration::hours(1);
+        let mut bundle_ids = Vec::with_capacity((PAGE_SIZE as u64 * PAGES) as usize);
+        let mut action_ids = Vec::with_capacity(bundle_ids.capacity() / 2);
+        let mut reroute_ids = Vec::with_capacity(bundle_ids.capacity() / 2);
+
+        let outcome: anyhow::Result<(u64, usize, u128, Option<u64>)> = async {
+            for position in 0..PAGE_SIZE as u64 * PAGES {
+                let source_name = format!("{literal}-{position:03}");
+                let bundle_id = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,completed_actions,source_json,lifecycle_state,remaining_mutations,created_at) VALUES('manual','succeeded','abort_and_compensate',1,1,?,'active',1,UTC_TIMESTAMP())")
+                    .bind(sqlx::types::Json(json!({"kind":"manual","name":source_name})))
+                    .execute(&measured).await?.last_insert_id();
+                bundle_ids.push(bundle_id);
+                if position % 2 == 0 {
+                    let action_id = sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,state,mutation_effect) VALUES(?,0,?,'{}','{}','{}','succeeded','changed')")
+                        .bind(bundle_id).bind(device_id).execute(&measured).await?.last_insert_id();
+                    action_ids.push(action_id);
+                } else {
+                    let reroute_id = sqlx::query("INSERT INTO reroutes(bundle_id,bundle_position,device_id,trigger_type,state,mutation_effect) VALUES(?,0,?,'manual','succeeded','changed')")
+                        .bind(bundle_id).bind(device_id).execute(&measured).await?.last_insert_id();
+                    reroute_ids.push(reroute_id);
+                }
+            }
+
+            let started = Instant::now();
+            let rss_before = process_rss_kib();
+            let mut total_selects = 0u64;
+            let mut response_bytes = 0usize;
+            for page in 0..PAGES {
+                let filter = RunSummaryFilter {
+                    q: Some(&literal),
+                    source_kind: Some("manual"),
+                    device: Some(&device_name),
+                    created_from: Some(lower),
+                    created_to: Some(upper),
+                    original_only: true,
+                    ..Default::default()
+                };
+                let before = session_selects(&measured).await?;
+                let total = count(&measured, &filter).await?;
+                anyhow::ensure!(total == (PAGE_SIZE as u64 * PAGES) as i64, "literal/date filters lost fixtures: {total}");
+                let rows = list(&measured, &filter, PAGE_SIZE, page * PAGE_SIZE as u64).await?;
+                anyhow::ensure!(rows.len() == PAGE_SIZE as usize, "page {page} returned {} rows", rows.len());
+                response_bytes += serde_json::to_vec(&rows)?.len();
+                let used = session_selects(&measured).await?.saturating_sub(before);
+                anyhow::ensure!(used <= SELECTS_PER_PAGE, "page {page} used {used} SELECTs; expected count + list + three enrichments");
+                total_selects += used;
+            }
+            Ok((total_selects, response_bytes, started.elapsed().as_millis(), rss_before.zip(process_rss_kib()).map(|(before, after)| after.saturating_sub(before))))
+        }
+        .await;
+
+        for id in action_ids {
+            let _ = sqlx::query("DELETE FROM reroute_bundle_actions WHERE id=?")
+                .bind(id)
+                .execute(&measured)
+                .await;
+        }
+        for id in reroute_ids {
+            let _ = sqlx::query("DELETE FROM reroutes WHERE id=?")
+                .bind(id)
+                .execute(&measured)
+                .await;
+        }
+        for id in bundle_ids {
+            let _ = sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+                .bind(id)
+                .execute(&measured)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM devices WHERE id=?")
+            .bind(device_id)
+            .execute(&measured)
+            .await;
+
+        let (query_count, response_bytes, elapsed_ms, rss_delta_kib) =
+            outcome.expect("bounded active-runs load regression");
+        eprintln!(
+            "HARDENING_ACTIVE_RUNS_LOAD {}",
+            json!({
+                "fixtures": PAGE_SIZE as u64 * PAGES,
+                "pages": PAGES,
+                "page_size": PAGE_SIZE,
+                "selects": query_count,
+                "max_selects_per_page": SELECTS_PER_PAGE,
+                "elapsed_ms": elapsed_ms,
+                "response_bytes": response_bytes,
+                "rss_delta_kib": rss_delta_kib,
+            })
+        );
+    }
 }
 
 const SELECT: &str =
@@ -43,7 +235,10 @@ const SELECT: &str =
     b.state,b.failure_policy,b.reason,b.total_actions,b.completed_actions,b.failure_reason,\
     b.started_at,b.finished_at,b.created_at,b.source_json,b.triggered_by_user_id,\
     u.email AS triggered_by,b.lifecycle_state,b.remaining_mutations,b.recovery_deadline,\
-    b.recovery_claim_token,b.automatic_recovery_cancelled_at,b.automatic_recovery_block_reason \
+    b.recovery_claim_token,b.automatic_recovery_cancelled_at,b.automatic_recovery_block_reason,\
+    (b.recovery_deadline IS NOT NULL OR (b.trigger_type='automatic' AND EXISTS(\
+      SELECT 1 FROM rules recovery_rule WHERE recovery_rule.id=b.rule_id \
+      AND recovery_rule.enabled=1 AND recovery_rule.automatic_revert_enabled=1))) AS automatic_recovery_possible \
     FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id";
 
 #[derive(Default)]
@@ -53,6 +248,11 @@ pub(crate) struct RunSummaryFilter<'a> {
     pub rule_id: Option<u64>,
     pub preset_id: Option<u64>,
     pub original_only: bool,
+    pub q: Option<&'a str>,
+    pub source_kind: Option<&'a str>,
+    pub device: Option<&'a str>,
+    pub created_from: Option<DateTime<Utc>>,
+    pub created_to: Option<DateTime<Utc>>,
 }
 
 fn push_filters<'a>(query: &mut QueryBuilder<'a, MySql>, filter: &RunSummaryFilter<'a>) {
@@ -86,10 +286,52 @@ fn push_filters<'a>(query: &mut QueryBuilder<'a, MySql>, filter: &RunSummaryFilt
             .push(" AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.preset_id'))=")
             .push_bind(preset_id.to_string());
     }
+    if let Some(source_kind) = filter.source_kind.filter(|v| !v.is_empty()) {
+        query
+            .push(
+                " AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.kind')),b.trigger_type)=",
+            )
+            .push_bind(source_kind);
+    }
+    if let Some(from) = filter.created_from.as_ref() {
+        query.push(" AND b.created_at>=").push_bind(from.to_owned());
+    }
+    if let Some(to) = filter.created_to.as_ref() {
+        query.push(" AND b.created_at<").push_bind(to.to_owned());
+    }
+    if let Some(device) = filter.device.filter(|v| !v.trim().is_empty()) {
+        let value = device.trim();
+        let numeric = value.parse::<u64>().ok();
+        let needle = value.to_lowercase();
+        query.push(" AND (EXISTS(SELECT 1 FROM reroute_bundle_actions fba JOIN devices fd ON fd.id=fba.device_id WHERE fba.bundle_id=b.id AND (");
+        if let Some(id) = numeric {
+            query.push("fba.device_id=").push_bind(id).push(" OR ");
+        }
+        query
+            .push("LOCATE(").push_bind(needle.clone()).push(",LOWER(fd.name))>0")
+            .push(")) OR EXISTS(SELECT 1 FROM reroutes fr JOIN devices fd ON fd.id=fr.device_id WHERE fr.bundle_id=b.id AND (");
+        if let Some(id) = numeric {
+            query.push("fr.device_id=").push_bind(id).push(" OR ");
+        }
+        query
+            .push("LOCATE(")
+            .push_bind(needle)
+            .push(",LOWER(fd.name))>0)))");
+    }
+    if let Some(q) = filter.q.filter(|v| !v.trim().is_empty()) {
+        let needle = q.trim().to_lowercase();
+        query.push(" AND (LOCATE(").push_bind(needle.clone()).push(",CAST(b.id AS CHAR))>0")
+            .push(" OR LOCATE(").push_bind(needle.clone()).push(",LOWER(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.preset_name')),JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.name')),'')))>0")
+            .push(" OR LOCATE(").push_bind(needle.clone()).push(",LOWER(b.trigger_type))>0")
+            .push(" OR LOCATE(").push_bind(needle.clone()).push(",LOWER(b.lifecycle_state))>0")
+            .push(" OR LOCATE(").push_bind(needle).push(",LOWER(COALESCE(u.email,'')))>0)");
+    }
 }
 
 pub(crate) async fn count(pool: &MySqlPool, filter: &RunSummaryFilter<'_>) -> anyhow::Result<i64> {
-    let mut query = QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM reroute_bundles b");
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT COUNT(*) FROM reroute_bundles b LEFT JOIN users u ON u.id=b.triggered_by_user_id",
+    );
     push_filters(&mut query, filter);
     Ok(query.build_query_scalar().fetch_one(pool).await?)
 }
@@ -242,17 +484,39 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
         .map(|row| (row.bundle_id, row.unknown_effects.max(0) as u32))
         .collect::<BTreeMap<_, _>>();
 
-    // Manual recovery children intentionally do not populate the scheduler's
-    // `recovery_bundle_id` column. Derive the newest child independently so the
-    // read model preserves both meanings and remains correct after settlement.
+    // The association ledger covers current manual, scheduled and multi-source
+    // children. Older runs are associated only by a durable direct parent or an
+    // inverse linked to one of the source's root actions. Any explicit mapping
+    // wins as a group, even when a newer legacy-looking child exists.
     let mut recovery_query = QueryBuilder::<MySql>::new(
-        "SELECT child.parent_bundle_id,child.id,child.state,child.total_actions,child.completed_actions,\
+        "SELECT latest.source_bundle_id AS parent_bundle_id,child.id,child.state,child.total_actions,child.completed_actions,\
          child.started_at,child.finished_at,child.failure_reason FROM reroute_bundles child \
-         JOIN (SELECT parent_bundle_id,MAX(id) AS id FROM reroute_bundles \
-         WHERE parent_bundle_id IN (",
+         JOIN (SELECT candidates.source_bundle_id,\
+         COALESCE(MAX(CASE WHEN candidates.explicit_assoc=1 THEN candidates.child_id END),\
+                  MAX(CASE WHEN candidates.explicit_assoc=0 THEN candidates.child_id END)) AS id \
+         FROM (SELECT source_bundle_id,recovery_bundle_id AS child_id,1 AS explicit_assoc \
+         FROM recovery_attempt_sources WHERE source_bundle_id IN (",
     );
     push_ids(&mut recovery_query, &ids);
-    recovery_query.push(") GROUP BY parent_bundle_id) latest ON latest.id=child.id");
+    recovery_query.push(
+        ") UNION ALL SELECT legacy_child.parent_bundle_id AS source_bundle_id,legacy_child.id AS child_id,0 AS explicit_assoc \
+         FROM reroute_bundles legacy_child WHERE legacy_child.parent_bundle_id IN (",
+    );
+    push_ids(&mut recovery_query, &ids);
+    recovery_query.push(
+        ") AND NOT EXISTS(SELECT 1 FROM recovery_attempt_sources explicit_child \
+         WHERE explicit_child.recovery_bundle_id=legacy_child.id) \
+         UNION ALL SELECT original.bundle_id AS source_bundle_id,inverse.bundle_id AS child_id,0 AS explicit_assoc \
+         FROM reroutes inverse JOIN reroutes original ON original.id=inverse.rollback_of_reroute_id \
+         WHERE original.rollback_of_reroute_id IS NULL AND original.bundle_id IN (",
+    );
+    push_ids(&mut recovery_query, &ids);
+    recovery_query.push(
+        ") AND inverse.bundle_id IS NOT NULL AND inverse.bundle_id<>original.bundle_id \
+         AND NOT EXISTS(SELECT 1 FROM recovery_attempt_sources explicit_child \
+         WHERE explicit_child.recovery_bundle_id=inverse.bundle_id)) candidates \
+         GROUP BY candidates.source_bundle_id) latest ON latest.id=child.id",
+    );
     let recovery_rows = recovery_query
         .build_query_as::<RecoveryRow>()
         .fetch_all(pool)
@@ -293,9 +557,6 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
             if row.parent_bundle_id.is_some() {
                 block_reasons.push("recovery runs are evidence beneath their source mitigation".to_string());
             }
-            if let Some(reason) = row.automatic_recovery_block_reason.as_ref() {
-                block_reasons.push(reason.clone());
-            }
             if row.recovery_claim_token.is_some()
                 || matches!(row.lifecycle_state.as_str(), "recovery_claimed" | "recovery_running")
             {
@@ -307,7 +568,16 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
             if unknown_effects > 0 {
                 block_reasons.push("one or more action effects are unknown; reconcile them before recovery".to_string());
             }
+            if latest_recovery.as_ref().and_then(|r|r.get("state")).and_then(Value::as_str)
+                .is_some_and(|state| matches!(state,"planned"|"pending"|"running"|"verifying"|"compensating")) {
+                block_reasons.push("a recovery run is already in flight".to_string());
+            }
             let revert_available = block_reasons.is_empty();
+            let mut take_control_reasons=Vec::new();
+            if !row.automatic_recovery_possible { take_control_reasons.push("run has no automatic recovery to cancel".to_string()); }
+            if !matches!(row.lifecycle_state.as_str(),"active"|"recovery_scheduled") { take_control_reasons.push("run has no cancellable automatic recovery".to_string()); }
+            if row.recovery_claim_token.is_some() { take_control_reasons.push("recovery is already claimed or running".to_string()); }
+            let take_control_available=take_control_reasons.is_empty();
             let verification_mode = source
                 .get("verification_mode")
                 .cloned()
@@ -329,6 +599,7 @@ async fn enrich(pool: &MySqlPool, rows: Vec<RunSummaryRow>) -> anyhow::Result<Ve
                 "automatic_recovery_cancelled_at":row.automatic_recovery_cancelled_at,
                 "automatic_recovery_block_reason":row.automatic_recovery_block_reason,
                 "revert":{"available":revert_available,"block_reasons":block_reasons,"noop":row.remaining_mutations==0},
+                "take_control":{"available":take_control_available,"block_reasons":take_control_reasons},
                 "verification_mode":verification_mode,"routing_verified":routing_verified,
             })
         })

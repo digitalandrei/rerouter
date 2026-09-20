@@ -16,6 +16,7 @@
 //! DB integration test — runs only when REROUTER_TEST_DATABASE_URL points at a MariaDB/MySQL the
 //! test may migrate + write to; missing configuration fails the suite. Cleans up its rows.
 
+use rerouter_controller::config::Config;
 use rerouter_controller::reroute::inventory_audit::{audit_device, InventoryRead};
 use serde_json::json;
 use sqlx::mysql::MySqlPoolOptions;
@@ -35,6 +36,20 @@ struct Fixture {
     device_id: u64,
     rule_id: u64,
     action_id: u64,
+}
+
+async fn audit_scoped(
+    pool: &MySqlPool,
+    device_id: u64,
+    read: InventoryRead,
+) -> anyhow::Result<rerouter_controller::reroute::inventory_audit::AuditSummary> {
+    let cfg = Config::default();
+    let runtime = cfg.advisory_runtime(pool).await?;
+    rerouter_controller::db::advisory::background_scope(
+        runtime,
+        audit_device(pool, device_id, read),
+    )
+    .await?
 }
 
 /// One device with two BGP peers, a freshly discovered announced prefix, and a
@@ -190,7 +205,7 @@ async fn confirmed_drift_marks_the_action_and_disarms_only_automatic_execution()
     let pool = test_db.pool().clone();
     let f = seed(&pool, "confirmed", DRIFTED_PEER).await;
 
-    let summary = audit_device(&pool, f.device_id, InventoryRead::Conclusive)
+    let summary = audit_scoped(&pool, f.device_id, InventoryRead::Conclusive)
         .await
         .expect("audit runs");
 
@@ -252,7 +267,7 @@ async fn an_inconclusive_read_never_marks_and_never_disarms() {
     // nothing — which must be enough to change nothing.
     let f = seed(&pool, "inconclusive", DRIFTED_PEER).await;
 
-    let summary = audit_device(
+    let summary = audit_scoped(
         &pool,
         f.device_id,
         InventoryRead::Inconclusive("route_map_discovery_denied"),
@@ -312,7 +327,7 @@ async fn recovery_clears_the_drift_marker_but_never_re_arms() {
     .await
     .expect("pre-disarm rule");
 
-    let summary = audit_device(&pool, f.device_id, InventoryRead::Conclusive)
+    let summary = audit_scoped(&pool, f.device_id, InventoryRead::Conclusive)
         .await
         .expect("audit runs");
 
@@ -385,7 +400,7 @@ async fn a_rule_that_is_mid_incident_is_never_disarmed() {
         .await
         .expect("insert rule state");
 
-    let summary = audit_device(&pool, f.device_id, InventoryRead::Conclusive)
+    let summary = audit_scoped(&pool, f.device_id, InventoryRead::Conclusive)
         .await
         .expect("audit runs");
 
@@ -414,7 +429,7 @@ async fn an_in_flight_reroute_defers_the_whole_device() {
     .await
     .expect("insert in-flight reroute");
 
-    let summary = audit_device(&pool, f.device_id, InventoryRead::Conclusive)
+    let summary = audit_scoped(&pool, f.device_id, InventoryRead::Conclusive)
         .await
         .expect("audit runs");
 
@@ -450,7 +465,7 @@ async fn expired_routing_inventory_alerts_without_disarming() {
     .await
     .expect("age the route context");
 
-    audit_device(
+    audit_scoped(
         &pool,
         f.device_id,
         InventoryRead::Inconclusive("route_map_discovery_failed"),

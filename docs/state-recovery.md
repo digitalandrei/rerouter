@@ -40,6 +40,11 @@ routing. The default assumption after a crash mid-action is **uncertainty**.
    the current router state with durable action snapshots.
 8. Conflicting or incomplete evidence leaves uncertainty and ownership intact.
    A recorded acknowledgement note cannot override the evidence.
+9. Recovery-child repair derives sources from the durable association and action
+   ledgers, including older manual children with no compatibility pointer. The
+   same idempotent finalizer settles terminal children, source claims,
+   lifecycles, remaining ownership, device memberships, audit, and alerts in one
+   transaction. It never issues router commands during startup.
 ```
 
 Do **not** assume no reroute happened just because the process crashed. A
@@ -62,6 +67,11 @@ configuration. The transport may have failed after only part of the plan,
 including an unverified companion command such as a BGP soft clear, so the
 controller locks the device for review instead of claiming success or a clean
 failure.
+
+A failed inverse recorded with a changed effect remains frozen, but it is
+eligible for the same read-only reconciliation endpoint as an uncertain action.
+Only an exact persisted before/after match can resolve it; conflict leaves the
+whole recovery set blocked.
 
 ## Manual verification after recovery
 

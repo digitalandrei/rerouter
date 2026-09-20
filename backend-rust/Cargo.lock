@@ -2708,6 +2708,7 @@ dependencies = [
  "csnmp",
  "dotenvy",
  "event-listener",
+ "futures-util",
  "h2",
  "hex",
  "lettre",

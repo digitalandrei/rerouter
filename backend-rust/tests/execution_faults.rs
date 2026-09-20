@@ -15,7 +15,7 @@ use rerouter_controller::ssh::{
 use serde_json::json;
 use sqlx::MySqlPool;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Fault {
     BeforeWrite,
     MiddleWrite,
@@ -66,9 +66,9 @@ impl LockedDeviceSetPort for FaultLocks {
             Ok(CommandResult {
                 command: command.into(),
                 output: if shutdown {
-                    " shutdown".into()
+                    "interface Loopback0\n shutdown".into()
                 } else {
-                    String::new()
+                    "interface Loopback0\n no ip redirects".into()
                 },
             })
         })
@@ -244,7 +244,7 @@ struct Fixture {
 async fn fixture(pool: &MySqlPool, devices: usize) -> Fixture {
     sqlx::query(
         "INSERT INTO system_settings (`key`,`value`) VALUES \
-            ('operating_mode','enforce'),('automatic_actions_enabled','true') \
+            ('operating_mode','enforce'),('automatic_actions_enabled','true'),('global_maintenance_lock','false') \
          ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)",
     )
     .execute(pool)
@@ -360,6 +360,19 @@ async fn cleanup(pool: &MySqlPool, f: &Fixture, bundles: &[u64]) {
             .execute(pool)
             .await
             .ok();
+        sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "DELETE FROM recovery_attempt_sources WHERE source_bundle_id=? OR recovery_bundle_id=?",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .ok();
         sqlx::query(
             "DELETE FROM locks WHERE reroute_id IN (SELECT id FROM reroutes WHERE bundle_id=?)",
         )
@@ -465,23 +478,38 @@ async fn apply_failure_boundaries_preserve_effect_certainty() {
             &ssh,
         )
         .await;
-        let (state, effect): (String, String) = sqlx::query_as(
+        let row: Option<(String, String)> = sqlx::query_as(
             "SELECT state,mutation_effect FROM reroutes WHERE bundle_id=? ORDER BY id LIMIT 1",
         )
         .bind(bundle_id)
-        .fetch_one(&pool)
+        .fetch_optional(&pool)
         .await
         .unwrap();
+        let (state, effect) = row.unwrap_or_else(|| {
+            panic!(
+                "fault {fault:?} created no reroute row; bundle outcome={} reason={:?}",
+                outcome.state, outcome.failure_reason
+            )
+        });
         if matches!(fault, Fault::BeforeWrite) {
             assert_eq!((state.as_str(), effect.as_str()), ("failed", "noop"));
-            assert_eq!(outcome.state, "aborted");
+            assert_eq!(outcome.state, "aborted", "{:?}", outcome.failure_reason);
             assert!(ssh.writes.lock().unwrap().is_empty());
         } else {
             assert_eq!((state.as_str(), effect.as_str()), ("uncertain", "unknown"));
-            assert_eq!(outcome.state, "compensation_blocked");
+            assert_eq!(
+                outcome.state, "compensation_blocked",
+                "{:?}",
+                outcome.failure_reason
+            );
             assert_eq!(ssh.writes.lock().unwrap().as_slice(), &[f.devices[0]]);
         }
         sqlx::query("DELETE FROM device_change_windows WHERE bundle_id=?")
+            .bind(bundle_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
             .bind(bundle_id)
             .execute(&pool)
             .await
@@ -563,7 +591,11 @@ async fn ambiguous_compensation_stops_before_any_earlier_inverse() {
         &ssh,
     )
     .await;
-    assert_eq!(outcome.state, "compensation_blocked");
+    assert_eq!(
+        outcome.state, "compensation_blocked",
+        "{:?}",
+        outcome.failure_reason
+    );
     assert_eq!(
         ssh.writes.lock().unwrap().as_slice(),
         &[f.devices[0], f.devices[1], f.devices[1]],
@@ -639,7 +671,11 @@ async fn terminal_publication_failure_remains_durably_recoverable() {
         &ssh,
     )
     .await;
-    assert_eq!(outcome.state, "compensation_blocked");
+    assert_eq!(
+        outcome.state, "compensation_blocked",
+        "{:?}",
+        outcome.failure_reason
+    );
     let reroute_id: u64 = sqlx::query_scalar("SELECT id FROM reroutes WHERE bundle_id=?")
         .bind(bundle_id)
         .fetch_one(&pool)

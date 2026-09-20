@@ -114,6 +114,7 @@ impl SshExecutor for LockedSshExecutor<'_> {
 }
 
 /// What to run and on whose behalf.
+#[derive(Clone)]
 pub struct ActionRequest {
     pub device_id: u64,
     pub template: Template,
@@ -319,6 +320,33 @@ pub(crate) async fn execute_with<S: SshExecutor>(
     pool: &MySqlPool,
     cfg: &Config,
     ssh: &S,
+    req: ActionRequest,
+    dry_run: bool,
+) -> ExecOutcome {
+    let refused = req.clone();
+    let runtime = match cfg.advisory_runtime(pool).await {
+        Ok(value) => value,
+        Err(error) => return blocked(&req, None, format!("lock runtime unavailable: {error}")),
+    };
+    match crate::db::advisory::foreground_scope(
+        runtime,
+        Box::pin(execute_with_inner(pool, cfg, ssh, req, dry_run)),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => blocked(
+            &refused,
+            None,
+            format!("execution capacity unavailable: {error}"),
+        ),
+    }
+}
+
+async fn execute_with_inner<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    ssh: &S,
     mut req: ActionRequest,
     dry_run: bool,
 ) -> ExecOutcome {
@@ -417,7 +445,7 @@ pub(crate) async fn execute_with<S: SshExecutor>(
             "automatic actions are globally disabled".into(),
         );
     }
-    if let Err(e) = validate_execution_authorization(pool, &req).await {
+    if let Err(e) = validate_execution_authorization(pool, cfg, &req).await {
         return blocked(
             &req,
             device_name,
@@ -698,6 +726,7 @@ async fn configuration_test_identity_matches(
 
 async fn validate_execution_authorization(
     pool: &MySqlPool,
+    cfg: &Config,
     req: &ActionRequest,
 ) -> anyhow::Result<()> {
     let auth = req
@@ -797,6 +826,13 @@ async fn validate_execution_authorization(
             .fetch_one(pool)
             .await?;
             anyhow::ensure!(valid == 1, "automatic activation is not runnable");
+            if let Some(rule_id) = req.rule_id {
+                anyhow::ensure!(
+                    crate::detection::engine::automatic_flow_evidence_qualified(pool, cfg, rule_id)
+                        .await?,
+                    "flow evidence is stale, incomplete, or no longer SNMP-corroborated"
+                );
+            }
         }
         ExecutionAuthorityKind::Compensation => {
             anyhow::ensure!(req.trigger_type == "rollback");
@@ -841,7 +877,7 @@ async fn validate_execution_authorization(
                     AND source_owner.recovery_claim_token IS NOT NULL \
                     AND source_owner.recovery_bundle_id=b.id \
                     AND (b.rule_id IS NULL OR (original.rule_id=b.rule_id \
-                         AND rule_row.automatic_revert_enabled=1 AND rs.current_state IN ('firing','recovered_awaiting_revert'))) \
+                         AND rule_row.automatic_revert_enabled=1 AND rs.current_state='recovered_awaiting_revert')) \
                     AND NOT EXISTS (SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=original.id \
                          AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
             )
@@ -850,6 +886,15 @@ async fn validate_execution_authorization(
             .fetch_one(pool)
             .await?;
             anyhow::ensure!(valid == 1, "automatic recovery ownership check failed");
+            if let Some(rule_id) = req.rule_id {
+                anyhow::ensure!(
+                    crate::detection::engine::automatic_condition_recovery_qualified(
+                        pool, cfg, rule_id
+                    )
+                    .await?,
+                    "condition recovery evidence is stale or no longer recovered"
+                );
+            }
         }
     }
     if req.rollback_of_reroute_id.is_none() {
@@ -916,9 +961,10 @@ async fn validate_execution_authorization(
 #[doc(hidden)]
 pub async fn validate_execution_authorization_for_test(
     pool: &MySqlPool,
+    cfg: &Config,
     req: &ActionRequest,
 ) -> anyhow::Result<()> {
-    validate_execution_authorization(pool, req).await
+    validate_execution_authorization(pool, cfg, req).await
 }
 
 #[doc(hidden)]
@@ -1082,6 +1128,7 @@ async fn run_state_machine<S: SshExecutor>(
     require_verification: bool,
     prepared_action: Option<&crate::reroute::device_plan::PreparedDeviceAction>,
 ) -> anyhow::Result<MachineResult> {
+    let mut timing = crate::timing::Stage::start("router_execution", reroute_id);
     // -> pending: committed to act, persisted BEFORE any side effect. Crash
     // recovery treats pending/running/verifying as in-flight (=> uncertain), so
     // a crash from here on locks the device rather than being assumed harmless.
@@ -1387,6 +1434,11 @@ async fn run_state_machine<S: SshExecutor>(
         None,
     )
     .await;
+    timing.complete(match state.as_str() {
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        _ => "uncertain",
+    });
     Ok(MachineResult {
         state,
         note: skip,
@@ -1592,7 +1644,7 @@ async fn persist_resolved_sequence(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     Pass,
     Fail,
@@ -1629,21 +1681,21 @@ async fn verify<S: SshExecutor>(
     };
     match ssh.verify_read(req.device_id, &vstep.command).await {
         Ok(output) => {
-            let pass = judge(&output, vstep);
+            let verdict = legacy_verdict(&output, vstep);
             let persisted = persist_verification(
                 pool,
                 reroute_id,
                 vstep,
                 &output,
-                if pass { "pass" } else { "fail" },
+                match verdict {
+                    Verdict::Pass => "pass",
+                    Verdict::Fail => "fail",
+                    _ => "uncertain",
+                },
             )
             .await
             .is_ok();
-            if pass {
-                (Verdict::Pass, persisted)
-            } else {
-                (Verdict::Fail, persisted)
-            }
+            (verdict, persisted)
         }
         Err(e) => {
             let persisted = persist_verification(
@@ -1674,6 +1726,152 @@ fn judge(output: &str, v: &VerifyStep) -> bool {
         .map(|s| !hay.contains(&s.to_lowercase()))
         .unwrap_or(true);
     expect_ok && reject_ok
+}
+
+fn legacy_static_filter_matches(command: &str, output: &str) -> bool {
+    let Some(pattern) = command
+        .strip_prefix("show running-config | include ^")
+        .and_then(|value| value.strip_suffix('$'))
+    else {
+        return false;
+    };
+    let wanted = pattern.split_whitespace().collect::<Vec<_>>();
+    let supported = match wanted.as_slice() {
+        ["ip", "route", network, mask, _] => {
+            network.parse::<std::net::Ipv4Addr>().is_ok()
+                && mask.parse::<std::net::Ipv4Addr>().is_ok()
+        }
+        ["ip", "route", network, mask, _, "tag", tag] => {
+            network.parse::<std::net::Ipv4Addr>().is_ok()
+                && mask.parse::<std::net::Ipv4Addr>().is_ok()
+                && tag.parse::<u32>().is_ok()
+        }
+        ["ipv6", "route", prefix, _] => {
+            crate::reroute::device_plan::normalize_cidr(prefix).is_some_and(|p| p.contains(':'))
+        }
+        ["ipv6", "route", prefix, _, "tag", tag] => {
+            crate::reroute::device_plan::normalize_cidr(prefix).is_some_and(|p| p.contains(':'))
+                && tag.parse::<u32>().is_ok()
+        }
+        _ => false,
+    };
+    if !supported {
+        return false;
+    }
+    output.lines().all(|line| {
+        let actual = line.split_whitespace().collect::<Vec<_>>();
+        match (wanted.as_slice(), actual.as_slice()) {
+            (["ip", "route", wn, wm, wh], ["ip", "route", an, am, ah]) => {
+                wn.parse::<std::net::Ipv4Addr>().ok() == an.parse().ok()
+                    && wm.parse::<std::net::Ipv4Addr>().ok() == am.parse().ok()
+                    && wh == ah
+            }
+            (["ip", "route", wn, wm, wh, "tag", wt], ["ip", "route", an, am, ah, "tag", at]) => {
+                wn.parse::<std::net::Ipv4Addr>().ok() == an.parse().ok()
+                    && wm.parse::<std::net::Ipv4Addr>().ok() == am.parse().ok()
+                    && wh == ah
+                    && wt.parse::<u32>().ok() == at.parse().ok()
+            }
+            (["ipv6", "route", wp, wh], ["ipv6", "route", ap, ah]) => {
+                crate::reroute::device_plan::normalize_cidr(wp)
+                    == crate::reroute::device_plan::normalize_cidr(ap)
+                    && wh == ah
+            }
+            (["ipv6", "route", wp, wh, "tag", wt], ["ipv6", "route", ap, ah, "tag", at]) => {
+                crate::reroute::device_plan::normalize_cidr(wp)
+                    == crate::reroute::device_plan::normalize_cidr(ap)
+                    && wh == ah
+                    && wt.parse::<u32>().ok() == at.parse().ok()
+            }
+            _ => false,
+        }
+    })
+}
+
+fn legacy_mss_filter_matches(command: &str, output: &str) -> bool {
+    let Some(_interface) = command
+        .strip_prefix("show running-config interface ")
+        .and_then(|rest| rest.strip_suffix(" | include ip tcp adjust-mss"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.chars().any(char::is_whitespace))
+    else {
+        return false;
+    };
+    output.lines().all(|line| {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        matches!(words.as_slice(), ["ip", "tcp", "adjust-mss", value] if value.parse::<u32>().is_ok())
+    })
+}
+
+fn legacy_verdict(output: &str, v: &VerifyStep) -> Verdict {
+    let command = v.command.trim();
+    let filtered_static = legacy_static_filter_matches(command, "");
+    let filtered_mss = legacy_mss_filter_matches(command, "");
+    let supported_filtered = filtered_static || filtered_mss;
+    let empty_filtered_config = supported_filtered && output.trim().is_empty();
+    if output.trim().is_empty() && !empty_filtered_config {
+        return Verdict::Uncertain;
+    }
+    let structured = if command.starts_with("show interfaces ") {
+        let interface = command.trim_start_matches("show interfaces ").trim();
+        output
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{interface} is ")))
+    } else if command.starts_with("show ip bgp neighbors ")
+        && command.ends_with(" advertised-routes")
+    {
+        let exact_expected = v
+            .expect
+            .as_deref()
+            .is_some_and(|prefix| crate::reroute::device_plan::has_exact_cidr(output, prefix));
+        exact_expected || crate::reroute::device_plan::complete_advertisement_table(output)
+    } else if command.starts_with("show ip route ") || command.starts_with("show ipv6 route ") {
+        let requested = command.split_whitespace().last().unwrap_or("");
+        let route_headers = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Routing entry for "))
+            .collect::<Vec<_>>();
+        (!route_headers.is_empty()
+            && route_headers.iter().all(|rest| {
+                let observed = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(',');
+                observed == requested || observed.starts_with(&format!("{requested}/"))
+            }))
+            || output.lines().any(|line| {
+                matches!(
+                    line.trim().to_ascii_lowercase().as_str(),
+                    "% network not in table"
+                        | "network not in table"
+                        | "% route not found"
+                        | "route not found"
+                )
+            })
+    } else if command.starts_with("show running-config interface ") && !supported_filtered {
+        let interface = command
+            .trim_start_matches("show running-config interface ")
+            .trim();
+        let headers = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("interface "))
+            .collect::<Vec<_>>();
+        headers.len() == 1 && headers[0] == interface
+    } else if filtered_static {
+        legacy_static_filter_matches(command, output)
+    } else if filtered_mss {
+        legacy_mss_filter_matches(command, output)
+    } else {
+        false
+    };
+    if !structured {
+        Verdict::Uncertain
+    } else if judge(output, v) {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    }
 }
 
 /// Write the terminal state + side effects (lock on uncertain, alerts, audit).
@@ -2016,9 +2214,9 @@ fn blocked(req: &ActionRequest, device_name: Option<String>, reason: String) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{final_state_for, session_plan_for, Verdict};
+    use super::{final_state_for, legacy_verdict, session_plan_for, Verdict};
     use crate::reroute::prefix_list::SequencePlan;
-    use crate::reroute::templates::Template;
+    use crate::reroute::templates::{Template, VerifyStep};
     use crate::ssh::SessionPlan;
     use serde_json::{json, Value};
 
@@ -2153,6 +2351,86 @@ mod tests {
     #[test]
     fn no_verify_step_is_success_when_verification_not_required() {
         assert_eq!(final_state_for(true, Verdict::None, false), "succeeded");
+    }
+
+    #[test]
+    fn legacy_verification_keeps_empty_filtered_absence_but_rejects_empty_router_state() {
+        let filtered = VerifyStep {
+            command: "show running-config | include ^ip route 203.0.113.0 255.255.255.0 Null0$"
+                .into(),
+            expect: None,
+            reject: Some("ip route 203.0.113.0 255.255.255.0 Null0".into()),
+        };
+        assert_eq!(legacy_verdict("", &filtered), Verdict::Pass);
+        let advertisement = VerifyStep {
+            command: "show ip bgp neighbors 192.0.2.1 advertised-routes".into(),
+            expect: Some("203.0.113.0/24".into()),
+            reject: None,
+        };
+        assert_eq!(legacy_verdict("", &advertisement), Verdict::Uncertain);
+        assert_eq!(
+            legacy_verdict(
+                "Network Next Hop\nTotal number of prefixes 0",
+                &advertisement
+            ),
+            Verdict::Fail
+        );
+    }
+
+    #[test]
+    fn legacy_reject_only_evidence_is_bound_to_the_supported_command_target() {
+        let static_absent = VerifyStep {
+            command: "show running-config | include ^ip route 203.0.113.0 255.255.255.0 Null0$"
+                .into(),
+            expect: None,
+            reject: Some("ip route 203.0.113.0 255.255.255.0 Null0".into()),
+        };
+        assert_eq!(
+            legacy_verdict("ip route 198.51.100.0 255.255.255.0 Null0", &static_absent),
+            Verdict::Uncertain
+        );
+
+        let unsupported = VerifyStep {
+            command: "show running-config | include ^arbitrary operator text$".into(),
+            expect: None,
+            reject: Some("arbitrary operator text".into()),
+        };
+        assert_eq!(legacy_verdict("", &unsupported), Verdict::Uncertain);
+
+        let mss_absent = VerifyStep {
+            command: "show running-config interface GigabitEthernet0/0 | include ip tcp adjust-mss"
+                .into(),
+            expect: None,
+            reject: Some("ip tcp adjust-mss".into()),
+        };
+        assert_eq!(legacy_verdict("", &mss_absent), Verdict::Pass);
+        assert_eq!(
+            legacy_verdict(
+                "interface GigabitEthernet0/1\n ip tcp adjust-mss 1400",
+                &mss_absent
+            ),
+            Verdict::Uncertain
+        );
+    }
+
+    #[test]
+    fn legacy_advertisement_reject_needs_a_complete_table() {
+        let absent = VerifyStep {
+            command: "show ip bgp neighbors 192.0.2.1 advertised-routes".into(),
+            expect: None,
+            reject: Some("203.0.113.0/24".into()),
+        };
+        assert_eq!(
+            legacy_verdict("Network Next Hop\n*> 198.51.100.0/24 0.0.0.0", &absent),
+            Verdict::Uncertain
+        );
+        assert_eq!(
+            legacy_verdict(
+                "Network Next Hop\n*> 198.51.100.0/24 0.0.0.0\nTotal number of prefixes 1",
+                &absent
+            ),
+            Verdict::Pass
+        );
     }
 
     #[test]

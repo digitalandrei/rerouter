@@ -437,6 +437,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
         .layer(middleware::from_fn(require_same_origin_mutation))
         .layer(middleware::from_fn(no_store_api_response))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            advisory_foreground_scope,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -446,6 +450,35 @@ pub fn router(state: AppState) -> Router {
     let app = app.fallback(crate::ui::serve_spa);
 
     app
+}
+
+async fn advisory_foreground_scope(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let runtime = match state.config.advisory_runtime(&state.pool).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(event_type="advisory_runtime_unavailable",error=%error);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"lock_runtime_unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    match crate::db::advisory::foreground_scope(runtime, next.run(request)).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(event_type="advisory_foreground_capacity_exhausted",error=%error);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"server_busy"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Extract the real client IP: trust CF-Connecting-IP (Nginx forwards it),

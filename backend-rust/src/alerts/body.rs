@@ -24,7 +24,7 @@ pub fn subject(event_type: &str, severity: &str, payload: &Value) -> String {
                 format!("[{sev}] Rule fired: {rule} ({iface})")
             }
         }
-        e if e.starts_with("reroute_") => {
+        e @ ("reroute_started" | "reroute_succeeded" | "reroute_failed" | "reroute_uncertain") => {
             let state = e.strip_prefix("reroute_").unwrap_or(e);
             let template = payload
                 .get("template_display_name")
@@ -44,6 +44,18 @@ pub fn subject(event_type: &str, severity: &str, payload: &Value) -> String {
             } else {
                 format!("[{sev}] {event_type} -> {after}")
             }
+        }
+        "reroute_bundle_partial" => format!("[{sev}] Mitigation bundle requires intervention"),
+        "rule_auto_disarmed" => format!("[{sev}] Automatic rule disarmed"),
+        "rule_action_inventory_drift" => format!("[{sev}] Rule action inventory drift"),
+        "routing_inventory_expired" => format!("[{sev}] Routing inventory expired"),
+        "account_locked" => format!("[{sev}] Account locked"),
+        "2fa_recovery_used" => format!("[{sev}] 2FA recovery code used"),
+        "automatic_action_failed" => format!("[{sev}] Automatic action failed"),
+        "automatic_recovery_planned" => format!("[{sev}] Automatic recovery queued"),
+        "recovery_degraded" => format!("[{sev}] Recovery degraded"),
+        "alert_delivery_permanently_failed" => {
+            format!("[{sev}] Alert delivery permanently failed")
         }
         other => format!("[{sev}] {other}"),
     }
@@ -71,22 +83,88 @@ pub fn render(
     }
     s.push('\n');
 
-    if event_type == "rule_fired" {
-        render_rule_fired(&mut s, payload);
-    } else if event_type.starts_with("reroute_") {
-        render_reroute(&mut s, event_type, payload);
-    } else if matches!(
-        event_type,
-        "operating_mode_changed" | "automatic_actions_changed" | "global_lock_changed"
-    ) {
-        render_mode_change(&mut s, payload);
-    } else if let Some(msg) = payload.get("message").and_then(Value::as_str) {
-        s.push_str(msg);
-        s.push('\n');
+    match event_type {
+        "rule_fired" => render_rule_fired(&mut s, payload),
+        "reroute_started" | "reroute_succeeded" | "reroute_failed" | "reroute_uncertain" => {
+            render_reroute(&mut s, event_type, payload)
+        }
+        "reroute_bundle_partial" => render_bundle_partial(&mut s, payload),
+        "automatic_recovery_planned" => {
+            s.push_str(
+                "Automatic recovery was queued after the rule's recovery condition was met.\n",
+            );
+            for (key, label) in [("rule_id", "Rule"), ("bundle_id", "Recovery run")] {
+                if let Some(id) = payload.get(key).and_then(Value::as_u64) {
+                    s.push_str(&format!("{label}: #{id}\n"));
+                }
+            }
+            s.push_str("Restoration is not yet verified. Review the recovery run in Active Runs for its current outcome.\n");
+        }
+        "operating_mode_changed" | "automatic_actions_changed" | "global_lock_changed" => {
+            render_mode_change(&mut s, payload)
+        }
+        "rule_auto_disarmed"
+        | "rule_action_inventory_drift"
+        | "routing_inventory_expired"
+        | "account_locked"
+        | "2fa_recovery_used"
+        | "automatic_action_failed"
+        | "recovery_degraded"
+        | "alert_delivery_permanently_failed" => render_operational(&mut s, payload),
+        _ => push_message(&mut s, payload),
     }
 
     s.push_str("\n--\nThis is an automated message from the Rerouter controller.\n");
     s
+}
+
+fn push_message(s: &mut String, payload: &Value) {
+    if let Some(message) = payload.get("message").and_then(Value::as_str) {
+        if !message.is_empty() {
+            s.push_str(message);
+            s.push('\n');
+        }
+    }
+}
+
+fn render_operational(s: &mut String, payload: &Value) {
+    push_message(s, payload);
+    for (label, key) in [
+        ("Rule", "rule_name"),
+        ("Device", "device_name"),
+        ("Reason", "reason"),
+        ("Action", "operator_action"),
+        ("Channel", "channel"),
+    ] {
+        if let Some(value) = payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            s.push_str(&format!("{label}: {value}\n"));
+        }
+    }
+    push_actor(s, payload);
+}
+
+fn render_bundle_partial(s: &mut String, payload: &Value) {
+    if let Some(bundle_id) = payload.get("bundle_id").and_then(Value::as_u64) {
+        s.push_str(&format!("Bundle:    #{bundle_id}\n"));
+    }
+    if let Some(ids) = payload
+        .get("still_applied_reroute_ids")
+        .and_then(Value::as_array)
+    {
+        let ids = ids
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            s.push_str(&format!("Still applied reroutes: {}\n", ids.join(", ")));
+        }
+    }
+    render_operational(s, payload);
 }
 
 /// The acting user, when the payload carries an `actor` object. Manual and rollback
@@ -279,6 +357,17 @@ fn render_rule_fired(s: &mut String, payload: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_recovery_has_catalog_coverage_and_does_not_claim_restoration() {
+        let event = "automatic_recovery_planned";
+        assert!(crate::api::notifications::EVENT_TYPES.contains(&event));
+        let payload = json!({"rule_id": 7, "bundle_id": 12});
+        let body = render(event, "info", 1, chrono::Utc::now(), &payload);
+        assert!(subject(event, "info", &payload).contains("queued"));
+        assert!(body.contains("Recovery run: #12"));
+        assert!(body.contains("not yet verified"));
+    }
     use serde_json::json;
 
     #[test]
@@ -387,5 +476,27 @@ mod tests {
         let subj = subject("operating_mode_changed", "critical", &payload);
         assert!(subj.contains("CRITICAL"));
         assert!(subj.contains("enforce"));
+    }
+
+    #[test]
+    fn partial_bundle_has_an_explicit_operator_payload() {
+        let payload = json!({
+            "bundle_id": 17,
+            "still_applied_reroute_ids": [41, 43],
+            "reason": "rollback verification was ambiguous",
+            "operator_action": "reconcile the affected devices"
+        });
+        let body = render(
+            "reroute_bundle_partial",
+            "critical",
+            1,
+            chrono::Utc::now(),
+            &payload,
+        );
+        assert!(body.contains("Bundle:    #17"));
+        assert!(body.contains("Still applied reroutes: 41, 43"));
+        assert!(body.contains("rollback verification was ambiguous"));
+        assert!(subject("reroute_bundle_partial", "critical", &payload)
+            .contains("Mitigation bundle requires intervention"));
     }
 }

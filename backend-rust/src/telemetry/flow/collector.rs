@@ -123,6 +123,10 @@ const MAX_AS_KEYS: usize = 65_536;
 /// anchors on the latest closed bucket, so old data is the least valuable,
 /// and the drop is counted and logged.
 const MAX_OPEN_BUCKETS: usize = 120;
+const REGISTRATION_CHUNK: usize = 128;
+const EXPORTER_FLUSH_CHUNK: usize = 32;
+const SEQUENCE_REORDER_HALF_RANGE: u32 = u32::MAX / 2;
+const UPTIME_REORDER_TOLERANCE_MS: u32 = 5 * 60 * 1000;
 
 fn add_bounded<K: Eq + Hash>(
     map: &mut HashMap<K, Counts>,
@@ -143,7 +147,7 @@ fn add_bounded<K: Eq + Hash>(
 }
 
 /// One bucket's aggregation across the reporting dimensions.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Accum {
     iface: HashMap<IfaceKey, Counts>,
     port: HashMap<PortKey, Counts>,
@@ -152,8 +156,29 @@ struct Accum {
     /// Distinct talker tuples refused this bucket after hitting MAX_TALKER_KEYS
     /// (surfaced at flush; never silent).
     talker_dropped: u64,
-    /// Interface/port/ASN keys refused after their cardinality caps.
-    rollup_dropped: u64,
+    /// Per-dimension loss is independent: talker truncation must never make an
+    /// interface or port aggregate unavailable.
+    iface_dropped: u64,
+    port_dropped: u64,
+    asn_dropped: u64,
+    /// False when this exporter generation began after the bucket opened.
+    base_complete: bool,
+}
+
+impl Default for Accum {
+    fn default() -> Self {
+        Self {
+            iface: HashMap::new(),
+            port: HashMap::new(),
+            as_: HashMap::new(),
+            talker: HashMap::new(),
+            talker_dropped: 0,
+            iface_dropped: 0,
+            port_dropped: 0,
+            asn_dropped: 0,
+            base_complete: true,
+        }
+    }
 }
 
 impl Accum {
@@ -173,7 +198,7 @@ impl Accum {
             fr.bytes,
             MAX_IFACE_KEYS,
         ) {
-            self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+            self.iface_dropped = self.iface_dropped.saturating_add(1);
         }
 
         if fr.has_ports() {
@@ -185,7 +210,7 @@ impl Accum {
                     fr.bytes,
                     MAX_PORT_KEYS,
                 ) {
-                    self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                    self.port_dropped = self.port_dropped.saturating_add(1);
                 }
             }
             if let Some(dp) = fr.dst_port {
@@ -196,7 +221,7 @@ impl Accum {
                     fr.bytes,
                     MAX_PORT_KEYS,
                 ) {
-                    self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                    self.port_dropped = self.port_dropped.saturating_add(1);
                 }
             }
         }
@@ -211,7 +236,7 @@ impl Accum {
                 fr.bytes,
                 MAX_AS_KEYS,
             ) {
-                self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                self.asn_dropped = self.asn_dropped.saturating_add(1);
             }
         }
         if let Some(asn) = fr.dst_as.filter(|a| *a != 0) {
@@ -222,7 +247,7 @@ impl Accum {
                 fr.bytes,
                 MAX_AS_KEYS,
             ) {
-                self.rollup_dropped = self.rollup_dropped.saturating_add(1);
+                self.asn_dropped = self.asn_dropped.saturating_add(1);
             }
         }
 
@@ -249,6 +274,88 @@ impl Accum {
             self.talker_dropped = self.talker_dropped.saturating_add(1);
         }
     }
+
+    fn mark_all_dropped(&mut self, count: u64) {
+        self.iface_dropped = self.iface_dropped.saturating_add(count);
+        self.port_dropped = self.port_dropped.saturating_add(count);
+        self.asn_dropped = self.asn_dropped.saturating_add(count);
+        self.talker_dropped = self.talker_dropped.saturating_add(count);
+    }
+
+    fn quality(&self, top_k: usize) -> BucketQuality {
+        let talker_tail = self.talker.len().saturating_sub(top_k) as u64;
+        let talker_dropped = self.talker_dropped.saturating_add(talker_tail);
+        BucketQuality {
+            iface_complete: self.base_complete && self.iface_dropped == 0,
+            port_complete: self.base_complete && self.port_dropped == 0,
+            asn_complete: self.base_complete && self.asn_dropped == 0,
+            talker_complete: self.base_complete && talker_dropped == 0,
+            iface_dropped: self.iface_dropped,
+            port_dropped: self.port_dropped,
+            asn_dropped: self.asn_dropped,
+            talker_dropped,
+        }
+    }
+
+    fn merge_from(&mut self, other: Accum) {
+        self.base_complete &= other.base_complete;
+        self.iface_dropped = self.iface_dropped.saturating_add(other.iface_dropped);
+        self.port_dropped = self.port_dropped.saturating_add(other.port_dropped);
+        self.asn_dropped = self.asn_dropped.saturating_add(other.asn_dropped);
+        self.talker_dropped = self.talker_dropped.saturating_add(other.talker_dropped);
+        merge_counts_map(
+            &mut self.iface,
+            other.iface,
+            MAX_IFACE_KEYS,
+            &mut self.iface_dropped,
+        );
+        merge_counts_map(
+            &mut self.port,
+            other.port,
+            MAX_PORT_KEYS,
+            &mut self.port_dropped,
+        );
+        merge_counts_map(&mut self.as_, other.as_, MAX_AS_KEYS, &mut self.asn_dropped);
+        merge_counts_map(
+            &mut self.talker,
+            other.talker,
+            MAX_TALKER_KEYS,
+            &mut self.talker_dropped,
+        );
+    }
+}
+
+fn merge_counts_map<K: Eq + Hash>(
+    into: &mut HashMap<K, Counts>,
+    from: HashMap<K, Counts>,
+    cap: usize,
+    dropped: &mut u64,
+) {
+    for (key, counts) in from {
+        if let Some(existing) = into.get_mut(&key) {
+            existing.pkts = existing.pkts.saturating_add(counts.pkts);
+            existing.bytes = existing.bytes.saturating_add(counts.bytes);
+            existing.flows = existing.flows.saturating_add(counts.flows);
+            existing.pkts_available &= counts.pkts_available;
+            existing.bytes_available &= counts.bytes_available;
+        } else if into.len() < cap {
+            into.insert(key, counts);
+        } else {
+            *dropped = dropped.saturating_add(counts.flows.max(1));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BucketQuality {
+    iface_complete: bool,
+    port_complete: bool,
+    asn_complete: bool,
+    talker_complete: bool,
+    iface_dropped: u64,
+    port_dropped: u64,
+    asn_dropped: u64,
+    talker_dropped: u64,
 }
 
 /// In-memory per-exporter state. Keyed by source IP in [`State::exporters`].
@@ -276,13 +383,23 @@ struct Exporter {
     /// [`MAX_OPEN_BUCKETS`] (evicted-oldest or refused-stale during a DB outage).
     dropped_bucket_backlog: u64,
     last_sequence: Option<u32>,
+    last_sequence_bucket: Option<i64>,
+    last_uptime: Option<u32>,
     /// Unix seconds of the most recent datagram — drives LRU eviction when the
     /// exporter map hits [`MAX_EXPORTERS`].
     last_seen: i64,
+    /// Exporter-generation start time. A bucket already open when this exporter
+    /// was first seen or restarted lacks its first segment.
+    generation_started_at: i64,
 }
 
 impl Exporter {
-    fn new(device_id: Option<u64>, version: u16, observation_domain: u32) -> Self {
+    fn new(
+        device_id: Option<u64>,
+        version: u16,
+        observation_domain: u32,
+        generation_started_at: i64,
+    ) -> Self {
         Self {
             db_id: 0,
             device_id,
@@ -298,7 +415,10 @@ impl Exporter {
             dropped_malformed: 0,
             dropped_bucket_backlog: 0,
             last_sequence: None,
+            last_sequence_bucket: None,
+            last_uptime: None,
             last_seen: 0,
+            generation_started_at,
         }
     }
 
@@ -313,7 +433,11 @@ impl Exporter {
             return self.buckets.get_mut(&ts);
         }
         if self.buckets.len() < MAX_OPEN_BUCKETS {
-            return Some(self.buckets.entry(ts).or_default());
+            let complete = ts >= self.generation_started_at;
+            return Some(self.buckets.entry(ts).or_insert_with(|| Accum {
+                base_complete: complete,
+                ..Accum::default()
+            }));
         }
         // Full and `ts` is not present: make room by dropping the oldest, but
         // only if `ts` is newer than it — never evict fresher data for staler.
@@ -327,7 +451,96 @@ impl Exporter {
             return None;
         }
         self.buckets.remove(&oldest);
-        Some(self.buckets.entry(ts).or_default())
+        let complete = ts >= self.generation_started_at;
+        Some(self.buckets.entry(ts).or_insert_with(|| Accum {
+            base_complete: complete,
+            ..Accum::default()
+        }))
+    }
+
+    fn reset_generation(&mut self, now: i64, bucket_ts: i64) {
+        self.generation_started_at = now;
+        if let Some(bucket) = self.buckets.get_mut(&bucket_ts) {
+            bucket.base_complete = false;
+        }
+    }
+
+    /// Observe a per-exporter datagram sequence. Forward jumps identify packet
+    /// loss; wrap is handled by wrapping subtraction, while duplicates and old
+    /// out-of-order datagrams do not move the watermark. Uptime reset starts a
+    /// new generation instead of manufacturing a huge gap.
+    fn observe_sequence(
+        &mut self,
+        sequence: u32,
+        uptime: Option<u32>,
+        explicit_restart: bool,
+        now: i64,
+        bucket_ts: i64,
+    ) -> u64 {
+        let uptime_wrapped = self
+            .last_uptime
+            .zip(uptime)
+            .is_some_and(|(previous, current)| {
+                previous > u32::MAX - UPTIME_REORDER_TOLERANCE_MS
+                    && current < UPTIME_REORDER_TOLERANCE_MS
+            });
+        let uptime_restarted = self
+            .last_uptime
+            .zip(uptime)
+            .is_some_and(|(previous, current)| {
+                !uptime_wrapped && previous.saturating_sub(current) > UPTIME_REORDER_TOLERANCE_MS
+            });
+        if explicit_restart || uptime_restarted {
+            self.reset_generation(now, bucket_ts);
+            self.last_sequence = Some(sequence);
+            self.last_sequence_bucket = Some(bucket_ts);
+            self.last_uptime = uptime;
+            return 0;
+        }
+
+        // A small uptime regression may be reordering or an early restart. It
+        // is not enough evidence to rewind the sequence watermark, but neither
+        // interpretation proves a complete bucket.
+        if self
+            .last_uptime
+            .zip(uptime)
+            .is_some_and(|(previous, current)| !uptime_wrapped && current < previous)
+        {
+            if let Some(bucket) = self.bucket_entry_bounded(bucket_ts) {
+                bucket.base_complete = false;
+            }
+        }
+
+        let missing = match self.last_sequence {
+            None => 0,
+            Some(previous) => {
+                let delta = sequence.wrapping_sub(previous);
+                if delta > 1 && delta < SEQUENCE_REORDER_HALF_RANGE {
+                    u64::from(delta - 1)
+                } else {
+                    0
+                }
+            }
+        };
+        if missing > 0 {
+            if let Some(previous_bucket) = self.last_sequence_bucket {
+                if previous_bucket != bucket_ts {
+                    if let Some(accum) = self.buckets.get_mut(&previous_bucket) {
+                        accum.mark_all_dropped(missing);
+                    }
+                }
+            }
+        }
+        let advances = self.last_sequence.is_none_or(|previous| {
+            let delta = sequence.wrapping_sub(previous);
+            delta > 0 && delta < SEQUENCE_REORDER_HALF_RANGE
+        });
+        if advances {
+            self.last_sequence = Some(sequence);
+            self.last_sequence_bucket = Some(bucket_ts);
+            self.last_uptime = uptime.or(self.last_uptime);
+        }
+        missing
     }
 }
 
@@ -501,7 +714,7 @@ async fn recv_loop(
         let exporter = st
             .exporters
             .entry(exporter_key)
-            .or_insert_with(|| Exporter::new(device_id, proto.version(), observation_domain));
+            .or_insert_with(|| Exporter::new(device_id, proto.version(), observation_domain, now));
         exporter.datagrams_total = exporter.datagrams_total.saturating_add(1);
         exporter.last_seen = now;
 
@@ -525,25 +738,57 @@ async fn recv_loop(
                     exporter.dropped_no_template = exporter
                         .dropped_no_template
                         .saturating_add(d.data_without_template as u64);
-                    (d.sequence, d.reported_sampling, d.records)
+                    (
+                        d.sequence,
+                        Some(d.sys_uptime),
+                        d.exporter_restarted,
+                        d.reported_sampling,
+                        d.records,
+                        d.data_without_template as u64,
+                    )
                 })
                 .map_err(|e| e.to_string()),
             Protocol::Sflow => sflow::decode(&buf[..len])
-                .map(|d| (d.sequence, d.reported_sampling, d.records))
+                .map(|d| {
+                    (
+                        d.sequence,
+                        Some(d.uptime),
+                        false,
+                        d.reported_sampling,
+                        d.records,
+                        0,
+                    )
+                })
                 .map_err(|e| e.to_string()),
         };
 
         match decoded {
-            Ok((sequence, reported_sampling, records)) => {
-                exporter.last_sequence = Some(sequence);
+            Ok((sequence, uptime, restarted, reported_sampling, records, decode_dropped)) => {
+                let previous_sequence = exporter.last_sequence;
+                let previous_generation = exporter.generation_started_at;
+                let sequence_dropped =
+                    exporter.observe_sequence(sequence, uptime, restarted, now, bucket_ts);
+                if previous_sequence.is_some()
+                    && exporter.last_sequence == previous_sequence
+                    && exporter.generation_started_at == previous_generation
+                    && !restarted
+                {
+                    // Do not count a duplicate twice or attribute a reordered
+                    // old datagram to its arrival bucket as fresh traffic.
+                    if let Some(accum) = exporter.bucket_entry_bounded(bucket_ts) {
+                        accum.mark_all_dropped(1);
+                    }
+                    continue;
+                }
                 if let Some(rate) = reported_sampling {
                     exporter.reported_rate = Some(rate);
                 }
-                if !records.is_empty() {
+                if !records.is_empty() || decode_dropped > 0 || sequence_dropped > 0 {
                     // `None` means this datagram's bucket lost the backlog-cap
                     // eviction race during a DB outage; the drop is counted
                     // inside the helper, so just skip folding.
                     if let Some(accum) = exporter.bucket_entry_bounded(bucket_ts) {
+                        accum.mark_all_dropped(decode_dropped.saturating_add(sequence_dropped));
                         for fr in &records {
                             accum.fold(fr);
                         }
@@ -552,6 +797,14 @@ async fn recv_loop(
             }
             Err(e) => {
                 exporter.dropped_malformed = exporter.dropped_malformed.saturating_add(1);
+                let sequence_dropped = wire_sequence_and_uptime(proto, &buf[..len])
+                    .map(|(sequence, uptime)| {
+                        exporter.observe_sequence(sequence, uptime, false, now, bucket_ts)
+                    })
+                    .unwrap_or(0);
+                if let Some(accum) = exporter.bucket_entry_bounded(bucket_ts) {
+                    accum.mark_all_dropped(1u64.saturating_add(sequence_dropped));
+                }
                 tracing::debug!(event_type = "flow_decode_failed", source = %src_ip, proto = ?proto, error = %e, "dropped malformed flow datagram");
             }
         }
@@ -581,6 +834,30 @@ fn wire_observation_domain(proto: Protocol, buf: &[u8]) -> Option<u32> {
                 _ => return None,
             };
             u32_at(buf, 8usize.checked_add(agent_len)?)
+        }
+    }
+}
+
+/// Read only the fixed sequence/uptime header fields. This remains available
+/// when full decoding fails, so a malformed datagram advances the sequence
+/// watermark once and the following valid packet is not counted as another gap.
+fn wire_sequence_and_uptime(proto: Protocol, buf: &[u8]) -> Option<(u32, Option<u32>)> {
+    fn u32_at(buf: &[u8], offset: usize) -> Option<u32> {
+        let bytes: [u8; 4] = buf.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
+    match proto {
+        Protocol::NetflowV9 => Some((u32_at(buf, 12)?, Some(u32_at(buf, 4)?))),
+        Protocol::Sflow => {
+            let agent_len = match u32_at(buf, 4)? {
+                1 => 4,
+                2 => 16,
+                _ => return None,
+            };
+            Some((
+                u32_at(buf, 12usize.checked_add(agent_len)?)?,
+                Some(u32_at(buf, 16usize.checked_add(agent_len)?)?),
+            ))
         }
     }
 }
@@ -633,6 +910,7 @@ struct ExporterFlush {
     datagrams_total: u64,
     dropped_no_template: u64,
     dropped_malformed: u64,
+    dropped_bucket_backlog: u64,
     last_sequence: Option<u32>,
     last_seen: i64,
     closed: Vec<(i64, Accum)>,
@@ -678,6 +956,7 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
                     datagrams_total: ex.datagrams_total,
                     dropped_no_template: ex.dropped_no_template,
                     dropped_malformed: ex.dropped_malformed,
+                    dropped_bucket_backlog: ex.dropped_bucket_backlog,
                     last_sequence: ex.last_sequence,
                     last_seen: ex.last_seen,
                     closed,
@@ -685,63 +964,275 @@ async fn flush_loop(pool: MySqlPool, cfg: Arc<Config>, state: Arc<Mutex<State>>)
             }
         }
 
-        for mut f in flushes {
-            match flush_exporter(&pool, &cfg, &mut f).await {
-                Ok(Some((ip, protocol, db_id, derived, ratio))) => {
-                    // Write back DB id + values derived this flush (carried forward).
-                    let mut st = match state.lock() {
-                        Ok(st) => st,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if let Some(ex) = st.exporters.get_mut(&(ip, protocol, f.observation_domain)) {
-                        if ex.db_id == 0 {
-                            ex.db_id = db_id;
-                        }
-                        if derived.is_some() {
-                            ex.snmp_derived_rate = derived;
-                        }
-                        if ratio.is_some() {
-                            ex.snmp_xcal_ratio = ratio;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let retry_count = f.closed.len();
-                    if retry_count > 0 {
+        let publication_generation = match prepare_flush_batch(&pool, &flushes).await {
+            Ok(generation) => generation,
+            Err(e) => {
+                let retry_count: usize = flushes.iter().map(|f| f.closed.len()).sum();
+                requeue_flushes(&state, &mut flushes);
+                tracing::warn!(event_type = "flow_flush_prepare_failed", retry_buckets = retry_count, error = %e, "preparing flow contributor coverage failed; no bucket quality was published");
+                continue;
+            }
+        };
+
+        let mut published_interfaces = std::collections::BTreeSet::new();
+        for cohort in flushes.chunks_mut(EXPORTER_FLUSH_CHUNK) {
+            for f in cohort {
+                let mut committed = std::collections::BTreeSet::new();
+                match flush_exporter(
+                    &pool,
+                    &cfg,
+                    f,
+                    &mut committed,
+                    None,
+                    &publication_generation,
+                )
+                .await
+                {
+                    Ok(Some((ip, protocol, db_id, derived, ratio))) => {
+                        // Write back DB id + values derived this flush (carried forward).
                         let mut st = match state.lock() {
                             Ok(st) => st,
                             Err(poisoned) => poisoned.into_inner(),
                         };
                         if let Some(ex) =
-                            st.exporters
-                                .get_mut(&(f.src_ip, f.protocol, f.observation_domain))
+                            st.exporters.get_mut(&(ip, protocol, f.observation_domain))
                         {
-                            let dropped_before = ex.dropped_bucket_backlog;
-                            for (ts, acc) in f.closed.drain(..) {
-                                // Preserve or_insert semantics: an already-open
-                                // bucket for this ts wins; the retried copy is
-                                // discarded. Otherwise re-queue under the backlog
-                                // cap, which may evict the oldest or refuse `acc`.
-                                if ex.buckets.contains_key(&ts) {
-                                    continue;
-                                }
-                                if let Some(slot) = ex.bucket_entry_bounded(ts) {
-                                    *slot = acc;
-                                }
+                            if ex.db_id == 0 {
+                                ex.db_id = db_id;
                             }
-                            if ex.dropped_bucket_backlog != dropped_before {
-                                // Once per flush cycle per exporter — a long
-                                // outage must not log-flood.
-                                tracing::warn!(event_type = "flow_bucket_backlog_capped", source = %f.src_ip, proto = ?f.protocol, dropped_bucket_backlog = ex.dropped_bucket_backlog, open_buckets = ex.buckets.len(), "open-bucket backlog cap reached during flush retry; oldest/excess buckets dropped")
+                            if derived.is_some() {
+                                ex.snmp_derived_rate = derived;
+                            }
+                            if ratio.is_some() {
+                                ex.snmp_xcal_ratio = ratio;
                             }
                         }
                     }
-                    tracing::warn!(event_type = "flow_flush_failed", retry_buckets = retry_count, error = %e, "flushing flow buckets failed; uncommitted buckets retained for retry")
+                    Ok(None) => {}
+                    Err(e) => {
+                        let retry_count = f.closed.len();
+                        requeue_flushes(&state, std::slice::from_mut(f));
+                        tracing::warn!(event_type = "flow_flush_failed", retry_buckets = retry_count, error = %e, "flushing flow buckets failed; uncommitted buckets retained for retry")
+                    }
                 }
+                published_interfaces.extend(committed);
+            }
+            tokio::task::yield_now().await;
+        }
+        if !published_interfaces.is_empty() {
+            let mut ids = Vec::new();
+            for (device_id, if_index) in published_interfaces {
+                if let Ok(Some(id)) = sqlx::query_scalar::<_, u64>(
+                    "SELECT id FROM device_interfaces WHERE device_id=? AND if_index=?",
+                )
+                .bind(device_id)
+                .bind(if_index)
+                .fetch_optional(&pool)
+                .await
+                {
+                    ids.push(id);
+                }
+            }
+            if !ids.is_empty() {
+                cfg.flow_wake.mark_interfaces(ids);
             }
         }
     }
+}
+
+fn requeue_flushes(state: &Arc<Mutex<State>>, flushes: &mut [ExporterFlush]) {
+    let mut st = match state.lock() {
+        Ok(st) => st,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for f in flushes {
+        let Some(ex) = st
+            .exporters
+            .get_mut(&(f.src_ip, f.protocol, f.observation_domain))
+        else {
+            continue;
+        };
+        let dropped_before = ex.dropped_bucket_backlog;
+        for (ts, acc) in f.closed.drain(..) {
+            if let Some(current) = ex.buckets.get_mut(&ts) {
+                current.merge_from(acc);
+            } else if let Some(slot) = ex.bucket_entry_bounded(ts) {
+                *slot = acc;
+            }
+        }
+        if ex.dropped_bucket_backlog != dropped_before {
+            tracing::warn!(event_type = "flow_bucket_backlog_capped", source = %f.src_ip, proto = ?f.protocol, dropped_bucket_backlog = ex.dropped_bucket_backlog, open_buckets = ex.buckets.len(), "open-bucket backlog cap reached during flush retry; oldest/excess buckets dropped")
+        }
+    }
+}
+
+/// Establish every contributor in the snapshot before any bucket quality row
+/// becomes visible. If a later exporter write fails, its membership remains and
+/// the missing exact interface row makes already-written peers unavailable.
+async fn prepare_flush_batch(
+    pool: &MySqlPool,
+    flushes: &[ExporterFlush],
+) -> anyhow::Result<String> {
+    if flushes.iter().all(|flush| flush.closed.is_empty()) {
+        return Ok("no-buckets".into());
+    }
+    prepare_flush_batch_inner(pool, flushes, None)
+        .await
+        .map(|(_, generation)| generation)
+}
+
+#[derive(Debug, Default)]
+struct RegistrationStats {
+    rows: usize,
+    chunks: usize,
+}
+
+async fn prepare_flush_batch_inner(
+    pool: &MySqlPool,
+    flushes: &[ExporterFlush],
+    fail_after_chunks_for_test: Option<usize>,
+) -> anyhow::Result<(RegistrationStats, String)> {
+    let mut stats = RegistrationStats::default();
+    let generation = uuid::Uuid::new_v4().to_string();
+    let mut barrier = pool.begin().await?;
+    let changed =
+        sqlx::query("UPDATE flow_publication_barrier SET generation=?,registry_ready=0 WHERE id=1")
+            .bind(&generation)
+            .execute(&mut *barrier)
+            .await?
+            .rows_affected();
+    anyhow::ensure!(changed == 1, "flow publication barrier singleton missing");
+    barrier.commit().await?;
+    for f in flushes {
+        if f.closed.is_empty() {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO flow_exporters (device_id, source_addr, observation_domain, version, template_count) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE device_id = VALUES(device_id), version = VALUES(version), \
+                template_count = VALUES(template_count)",
+        )
+        .bind(f.device_id)
+        .bind(f.src_ip.to_string())
+        .bind(f.observation_domain)
+        .bind(f.version)
+        .bind(f.template_count)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(device_id) = f.device_id else {
+            continue;
+        };
+        let exporter_id: u64 = sqlx::query_scalar(
+            "SELECT id FROM flow_exporters WHERE source_addr=? AND observation_domain=? AND version=?",
+        )
+        .bind(f.src_ip.to_string())
+        .bind(f.observation_domain)
+        .bind(f.version)
+        .fetch_one(pool)
+        .await?;
+        let bucket_times = f
+            .closed
+            .iter()
+            .map(|(ts, _)| *ts)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in bucket_times.chunks(REGISTRATION_CHUNK) {
+            let mut tx = pool.begin().await?;
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "DELETE FROM flow_bucket_quality WHERE exporter_id=",
+            );
+            query.push_bind(exporter_id).push(" AND bucket_ts IN (");
+            let mut separated = query.separated(",");
+            for ts in chunk {
+                separated.push_bind(Utc.timestamp_opt(*ts, 0).single().unwrap_or_else(Utc::now));
+            }
+            query.push(")");
+            query.build().execute(&mut *tx).await?;
+            tx.commit().await?;
+            tokio::task::yield_now().await;
+        }
+        let mut wanted = HashMap::<(u32, Direction), (i64, i64)>::new();
+        for (bucket_ts, acc) in &f.closed {
+            for key in acc.iface.keys() {
+                wanted
+                    .entry(*key)
+                    .and_modify(|range| {
+                        range.0 = range.0.min(*bucket_ts);
+                        range.1 = range.1.max(*bucket_ts);
+                    })
+                    .or_insert((*bucket_ts, *bucket_ts));
+            }
+        }
+        let indexes = wanted
+            .keys()
+            .map(|(index, _)| *index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut resolved = HashMap::new();
+        for chunk in indexes.chunks(REGISTRATION_CHUNK) {
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT id,if_index FROM device_interfaces WHERE device_id=",
+            );
+            query.push_bind(device_id).push(" AND if_index IN (");
+            let mut separated = query.separated(",");
+            for index in chunk {
+                separated.push_bind(*index);
+            }
+            query.push(")");
+            for (id, index) in query.build_query_as::<(u64, u32)>().fetch_all(pool).await? {
+                resolved.insert(index, id);
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut rows = wanted
+            .into_iter()
+            .filter_map(|((if_index, direction), (first, last))| {
+                resolved
+                    .get(&if_index)
+                    .copied()
+                    .map(|interface_id| (interface_id, if_index, direction, first, last))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(_, if_index, direction, _, _)| (*if_index, direction.as_str()));
+        for chunk in rows.chunks(REGISTRATION_CHUNK) {
+            let mut tx = pool.begin().await?;
+            for (interface_id, if_index, direction, first, last) in chunk {
+                sqlx::query(
+                    "INSERT INTO flow_exporter_interfaces \
+                        (exporter_id,device_id,interface_id,if_index,direction,first_seen_at,last_seen_at) \
+                     VALUES (?,?,?,?,?,?,?) \
+                     ON DUPLICATE KEY UPDATE first_seen_at=LEAST(first_seen_at,VALUES(first_seen_at)), \
+                        last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)), \
+                        device_id=VALUES(device_id),if_index=VALUES(if_index)",
+                )
+                .bind(exporter_id)
+                .bind(device_id)
+                .bind(interface_id)
+                .bind(if_index)
+                .bind(direction.as_str())
+                .bind(Utc.timestamp_opt(*first,0).single().unwrap_or_else(Utc::now))
+                .bind(Utc.timestamp_opt(*last,0).single().unwrap_or_else(Utc::now))
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            stats.rows += chunk.len();
+            stats.chunks += 1;
+            tokio::task::yield_now().await;
+            if fail_after_chunks_for_test == Some(stats.chunks) {
+                anyhow::bail!("injected contributor registration failure");
+            }
+        }
+    }
+    let ready=sqlx::query("UPDATE flow_publication_barrier SET registry_ready=1 WHERE id=1 AND generation=? AND registry_ready=0")
+        .bind(&generation).execute(pool).await?.rows_affected();
+    anyhow::ensure!(ready == 1, "flow publication generation was superseded");
+    Ok((stats, generation))
 }
 
 /// Persist one exporter: upsert its row, resolve its sampling, write any closed
@@ -753,6 +1244,9 @@ async fn flush_exporter(
     pool: &MySqlPool,
     cfg: &Config,
     f: &mut ExporterFlush,
+    committed: &mut std::collections::BTreeSet<(u64, u32)>,
+    fail_bucket_for_test: Option<i64>,
+    publication_generation: &str,
 ) -> anyhow::Result<Option<FlushBack>> {
     // Upsert the exporter row and read back operator-set sampling override + id.
     sqlx::query(
@@ -804,18 +1298,31 @@ async fn flush_exporter(
         f.closed.sort_by_key(|(ts, _)| *ts);
         let mut newest = true;
         while let Some((ts, acc)) = f.closed.pop() {
+            if fail_bucket_for_test == Some(ts) {
+                f.closed.push((ts, acc));
+                anyhow::bail!("injected bucket flush failure");
+            }
             let bucket_ts = Utc.timestamp_opt(ts, 0).single().unwrap_or_else(Utc::now);
             let ctx = BucketCtx {
                 exporter_id,
                 device_id,
                 bucket_ts,
             };
-            if let Err(e) =
-                write_bucket(pool, cfg, &ctx, &acc, &sampling, &mut iface_id_cache).await
+            if let Err(e) = write_bucket(
+                pool,
+                cfg,
+                &ctx,
+                &acc,
+                &sampling,
+                &mut iface_id_cache,
+                publication_generation,
+            )
+            .await
             {
                 f.closed.push((ts, acc));
                 return Err(e);
             }
+            committed.extend(acc.iface.keys().map(|(if_index, _)| (device_id, *if_index)));
             if newest {
                 if let Some((ratio, derived)) = cross_calibrate(
                     pool,
@@ -851,6 +1358,7 @@ async fn flush_exporter(
             reported_sampling_rate = ?, snmp_derived_rate = ?, effective_sampling_rate = ?, \
             sampling_source = ?, sampling_confidence = ?, snmp_xcal_ratio = COALESCE(?, snmp_xcal_ratio), \
             last_sequence = ?, datagrams_total = ?, dropped_no_template = ?, dropped_malformed = ?, \
+            dropped_bucket_backlog = ?, \
             last_packet_at = CASE \
                 WHEN last_packet_at IS NULL OR last_packet_at < FROM_UNIXTIME(?) \
                 THEN FROM_UNIXTIME(?) ELSE last_packet_at END \
@@ -866,6 +1374,7 @@ async fn flush_exporter(
     .bind(f.datagrams_total)
     .bind(f.dropped_no_template)
     .bind(f.dropped_malformed)
+    .bind(f.dropped_bucket_backlog)
     .bind(f.last_seen)
     .bind(f.last_seen)
     .bind(exporter_id)
@@ -917,24 +1426,35 @@ async fn write_bucket(
     acc: &Accum,
     sampling: &super::Sampling,
     iface_cache: &mut HashMap<u32, Option<u64>>,
+    publication_generation: &str,
 ) -> anyhow::Result<()> {
     let BucketCtx {
         exporter_id,
         device_id,
         bucket_ts,
     } = *ctx;
+    let mut timing = crate::timing::Stage::start("bucket_commit", exporter_id);
     let rate = sampling.rate;
     let conf = sampling.confidence_str();
-    if acc.rollup_dropped > 0 {
+    if acc.iface_dropped > 0 || acc.port_dropped > 0 || acc.asn_dropped > 0 {
         tracing::warn!(
             event_type = "flow_rollup_cardinality_capped",
             exporter_id,
             device_id,
-            dropped = acc.rollup_dropped,
+            iface_dropped = acc.iface_dropped,
+            port_dropped = acc.port_dropped,
+            asn_dropped = acc.asn_dropped,
             "flow interface/port/ASN cardinality exceeded a bounded bucket cap"
         );
     }
     let mut tx = pool.begin().await?;
+    let ready:Option<String>=sqlx::query_scalar("SELECT generation FROM flow_publication_barrier WHERE id=1 AND registry_ready=1 AND generation=? FOR UPDATE")
+        .bind(publication_generation).fetch_optional(&mut *tx).await?;
+    anyhow::ensure!(
+        ready.as_deref() == Some(publication_generation),
+        "flow publication generation is not ready or was superseded"
+    );
+    let quality = acc.quality(cfg.flow.top_k_talkers.max(1));
 
     // Interface totals.
     for ((if_index, dir), c) in &acc.iface {
@@ -951,6 +1471,29 @@ async fn write_bucket(
         .bind(bucket_ts).bind(c.pkts).bind(c.pkts_available).bind(c.bytes).bind(c.bytes_available)
         .bind(c.flows).bind(rate).bind(conf)
         .execute(&mut *tx).await?;
+
+        // Only discovered/enrolled interfaces enter the contributor registry;
+        // this bounds membership by device_interfaces and prevents arbitrary
+        // wire ifIndex values from creating durable identities.
+        if let Some(interface_id) = iface_id {
+            sqlx::query(
+                "INSERT INTO flow_exporter_interfaces \
+                    (exporter_id, device_id, interface_id, if_index, direction, first_seen_at, last_seen_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE first_seen_at = LEAST(first_seen_at, VALUES(first_seen_at)), \
+                    last_seen_at = GREATEST(last_seen_at, VALUES(last_seen_at)), \
+                    device_id = VALUES(device_id), if_index = VALUES(if_index)",
+            )
+            .bind(exporter_id)
+            .bind(device_id)
+            .bind(interface_id)
+            .bind(*if_index)
+            .bind(dir.as_str())
+            .bind(bucket_ts)
+            .bind(bucket_ts)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     // Port rollups.
@@ -1027,7 +1570,35 @@ async fn write_bucket(
         .execute(&mut *tx).await?;
     }
 
+    sqlx::query(
+        "INSERT INTO flow_bucket_quality \
+            (exporter_id, bucket_ts, iface_complete, port_complete, asn_complete, talker_complete, \
+             iface_dropped, port_dropped, asn_dropped, talker_dropped) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON DUPLICATE KEY UPDATE iface_complete = VALUES(iface_complete), \
+            port_complete = VALUES(port_complete), asn_complete = VALUES(asn_complete), \
+            talker_complete = VALUES(talker_complete), iface_dropped = VALUES(iface_dropped), \
+            port_dropped = VALUES(port_dropped), asn_dropped = VALUES(asn_dropped), \
+            talker_dropped = VALUES(talker_dropped)",
+    )
+    .bind(exporter_id)
+    .bind(bucket_ts)
+    .bind(quality.iface_complete)
+    .bind(quality.port_complete)
+    .bind(quality.asn_complete)
+    .bind(quality.talker_complete)
+    .bind(quality.iface_dropped)
+    .bind(quality.port_dropped)
+    .bind(quality.asn_dropped)
+    .bind(quality.talker_dropped)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
+    timing.complete("committed");
+    tracing::info!(event_type = "flow_bucket_committed", exporter_id, device_id,
+        bucket_ts = %bucket_ts, bucket_width_seconds = cfg.flow.bucket_seconds,
+        "flow aggregates and quality published together");
     Ok(())
 }
 
@@ -1103,9 +1674,16 @@ async fn cross_calibrate(
 #[cfg(test)]
 mod tests {
     use super::{
-        wire_observation_domain, Accum, Direction, Exporter, FlowRecord, Protocol,
-        MAX_OPEN_BUCKETS, MAX_TALKER_KEYS,
+        flush_exporter, prepare_flush_batch, prepare_flush_batch_inner, wire_observation_domain,
+        write_bucket, Accum, BucketCtx, Direction, Exporter, ExporterFlush, FlowRecord, Protocol,
+        MAX_OPEN_BUCKETS, MAX_PORT_KEYS, MAX_TALKER_KEYS, REGISTRATION_CHUNK,
     };
+    use crate::telemetry::flow::quality::{
+        bucket_evidence, EvidenceAvailability, QualityDimension,
+    };
+    use crate::telemetry::flow::{Sampling, SamplingSource};
+    use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn rec(src: u32) -> FlowRecord {
@@ -1140,6 +1718,108 @@ mod tests {
             "expected >=1000 dropped, got {}",
             acc.talker_dropped
         );
+        assert_eq!(acc.iface_dropped, 0);
+        assert_eq!(acc.port_dropped, 0);
+        assert_eq!(acc.asn_dropped, 0);
+        assert!(!acc.quality(100).talker_complete);
+        assert!(acc.quality(100).iface_complete);
+        assert!(acc.quality(100).port_complete);
+        assert_eq!(
+            acc.iface.get(&(1, Direction::Ingress)).unwrap().flows,
+            MAX_TALKER_KEYS as u64 + 1000,
+            "talker loss must not change interface totals"
+        );
+    }
+
+    #[test]
+    fn port_cap_only_marks_port_dimension_incomplete() {
+        let mut acc = Accum::default();
+        for port in 0..=u16::MAX {
+            let mut flow = rec(port as u32);
+            flow.src_port = Some(port);
+            flow.dst_port = Some(port);
+            acc.fold(&flow);
+        }
+        let mut overflow = rec(u32::MAX);
+        overflow.protocol = 6;
+        acc.fold(&overflow);
+
+        assert_eq!(acc.port.len(), MAX_PORT_KEYS);
+        let quality = acc.quality(usize::MAX);
+        assert!(!quality.port_complete);
+        assert!(quality.iface_complete);
+        assert!(quality.asn_complete);
+    }
+
+    #[test]
+    fn bucket_started_before_collector_is_incomplete_but_next_bucket_is_fresh() {
+        let mut acc = Accum {
+            base_complete: false,
+            ..Default::default()
+        };
+        let partial = acc.quality(100);
+        assert!(!partial.iface_complete);
+        assert!(!partial.port_complete);
+        assert!(!partial.asn_complete);
+        assert!(!partial.talker_complete);
+
+        acc.base_complete = true;
+        let fresh = acc.quality(100);
+        assert!(fresh.iface_complete);
+        assert!(fresh.port_complete);
+        assert!(fresh.asn_complete);
+        assert!(fresh.talker_complete);
+
+        let mut discovered_mid_bucket = Exporter::new(None, 9, 0, 95);
+        assert!(
+            !discovered_mid_bucket
+                .bucket_entry_bounded(60)
+                .unwrap()
+                .quality(100)
+                .iface_complete
+        );
+        assert!(
+            discovered_mid_bucket
+                .bucket_entry_bounded(120)
+                .unwrap()
+                .quality(100)
+                .iface_complete
+        );
+    }
+
+    #[test]
+    fn sequence_gaps_wrap_reorder_and_restart_are_conservative() {
+        let mut ex = Exporter::new(None, 5, 7, 60);
+        assert_eq!(ex.observe_sequence(u32::MAX, Some(1000), false, 61, 60), 0);
+        assert_eq!(ex.observe_sequence(0, Some(1010), false, 62, 60), 0);
+        assert_eq!(ex.observe_sequence(3, Some(1020), false, 63, 60), 2);
+        assert_eq!(ex.observe_sequence(2, Some(1015), false, 64, 60), 0);
+        assert_eq!(
+            ex.last_sequence,
+            Some(3),
+            "reorder does not rewind watermark"
+        );
+
+        ex.bucket_entry_bounded(60).unwrap();
+        assert_eq!(ex.observe_sequence(1, Some(5), false, 95, 60), 0);
+        assert!(!ex.buckets.get(&60).unwrap().quality(100).iface_complete);
+    }
+
+    #[test]
+    fn retry_collision_merges_counts_and_never_restores_completeness() {
+        let mut current = Accum::default();
+        current.fold(&rec(1));
+        let mut retry = Accum::default();
+        retry.fold(&rec(2));
+        retry.base_complete = false;
+        retry.mark_all_dropped(1);
+
+        current.merge_from(retry);
+        let totals = current.iface.get(&(1, Direction::Ingress)).unwrap();
+        assert_eq!(totals.flows, 2);
+        assert_eq!(totals.pkts, 2);
+        assert!(!current.quality(100).iface_complete);
+        assert_eq!(current.quality(100).iface_dropped, 1);
     }
 
     #[test]
@@ -1162,7 +1842,7 @@ mod tests {
         // (via the same helper the flush path uses) while the receive loop opens
         // new ones. The per-exporter open-bucket map must stay capped, retain the
         // NEWEST buckets, and count every drop — never grow toward OOM.
-        let mut ex = Exporter::new(None, 9, 0);
+        let mut ex = Exporter::new(None, 9, 0, 0);
         let extra = 50i64;
         for ts in 0..(MAX_OPEN_BUCKETS as i64 + extra) {
             assert!(ex.bucket_entry_bounded(ts).is_some());
@@ -1183,6 +1863,7 @@ mod tests {
         assert_eq!(ex.buckets.len(), len_before);
         assert_eq!(ex.dropped_bucket_backlog, dropped_before + 1);
         assert!(ex.buckets.contains_key(&min_kept));
+        assert!(Accum::default().quality(100).iface_complete);
     }
 
     #[test]
@@ -1215,5 +1896,337 @@ mod tests {
         ipv6[24..28].copy_from_slice(&901u32.to_be_bytes());
         assert_eq!(wire_observation_domain(Protocol::Sflow, &ipv6), Some(901));
         assert_eq!(wire_observation_domain(Protocol::Sflow, &ipv6[..20]), None);
+    }
+
+    #[tokio::test]
+    async fn flush_batch_coverage_blocks_partial_public_evidence() {
+        let database = crate::db::connect_test_database().await;
+        let pool = (*database).clone();
+        let suffix = uuid::Uuid::new_v4();
+        let device_id = sqlx::query("INSERT INTO devices (name,hostname,enabled) VALUES (?,?,0)")
+            .bind(format!("quality-{suffix}"))
+            .bind(format!("quality-{suffix}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+        sqlx::query("INSERT INTO device_interfaces (device_id,if_index) VALUES (?,1)")
+            .bind(device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bucket_ts = Utc.timestamp_opt(1_700_000_040, 0).single().unwrap();
+
+        let make_acc = |src| {
+            let mut acc = Accum::default();
+            acc.fold(&rec(src));
+            acc
+        };
+        let mut flushes = [
+            ExporterFlush {
+                src_ip: "192.0.2.1".parse().unwrap(),
+                protocol: Protocol::NetflowV9,
+                device_id: Some(device_id),
+                version: 9,
+                observation_domain: 1,
+                template_count: 1,
+                reported_rate: Some(1),
+                snmp_derived_rate: None,
+                datagrams_total: 1,
+                dropped_no_template: 0,
+                dropped_malformed: 0,
+                dropped_bucket_backlog: 0,
+                last_sequence: Some(1),
+                last_seen: bucket_ts.timestamp(),
+                closed: vec![(bucket_ts.timestamp(), make_acc(1))],
+            },
+            ExporterFlush {
+                src_ip: "192.0.2.2".parse().unwrap(),
+                protocol: Protocol::NetflowV9,
+                device_id: Some(device_id),
+                version: 9,
+                observation_domain: 2,
+                template_count: 1,
+                reported_rate: Some(1),
+                snmp_derived_rate: None,
+                datagrams_total: 1,
+                dropped_no_template: 0,
+                dropped_malformed: 0,
+                dropped_bucket_backlog: 0,
+                last_sequence: Some(1),
+                last_seen: bucket_ts.timestamp(),
+                closed: vec![(bucket_ts.timestamp(), make_acc(2))],
+            },
+        ];
+        let generation = prepare_flush_batch(&pool, &flushes).await.unwrap();
+        let exporters: Vec<u64> = sqlx::query_scalar(
+            "SELECT id FROM flow_exporters WHERE device_id=? ORDER BY observation_domain",
+        )
+        .bind(device_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let sampling = Sampling {
+            rate: 1,
+            source: SamplingSource::Reported,
+            high_confidence: true,
+        };
+        let cfg = crate::config::Config::default();
+        let mut cache = HashMap::new();
+        write_bucket(
+            &pool,
+            &cfg,
+            &BucketCtx {
+                exporter_id: exporters[0],
+                device_id,
+                bucket_ts,
+            },
+            &flushes[0].closed[0].1,
+            &sampling,
+            &mut cache,
+            &generation,
+        )
+        .await
+        .unwrap();
+        let partial = bucket_evidence(
+            &pool,
+            device_id,
+            1,
+            Direction::Ingress,
+            bucket_ts,
+            QualityDimension::Port,
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial.availability, EvidenceAvailability::Unavailable);
+        assert_eq!(
+            (partial.expected_exporters, partial.observed_exporters),
+            (2, 1)
+        );
+
+        write_bucket(
+            &pool,
+            &cfg,
+            &BucketCtx {
+                exporter_id: exporters[1],
+                device_id,
+                bucket_ts,
+            },
+            &flushes[1].closed[0].1,
+            &sampling,
+            &mut cache,
+            &generation,
+        )
+        .await
+        .unwrap();
+        let complete = bucket_evidence(
+            &pool,
+            device_id,
+            1,
+            Direction::Ingress,
+            bucket_ts,
+            QualityDimension::Port,
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete.availability, EvidenceAvailability::Available);
+        assert!(complete.sampling_high_confidence && complete.pkts_available);
+
+        sqlx::query("DELETE FROM devices WHERE id=?")
+            .bind(device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        flushes.iter_mut().for_each(|f| f.closed.clear());
+    }
+
+    #[tokio::test]
+    async fn committed_newer_bucket_survives_older_failure_and_remains_wakeable() {
+        let database = crate::db::connect_test_database().await;
+        let pool = (*database).clone();
+        let suffix = uuid::Uuid::new_v4();
+        let device_id = sqlx::query("INSERT INTO devices(name,hostname,enabled) VALUES(?,?,0)")
+            .bind(format!("wake-{suffix}"))
+            .bind(format!("wake-{suffix}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+        let interface_id =
+            sqlx::query("INSERT INTO device_interfaces(device_id,if_index) VALUES (?,1)")
+                .bind(device_id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_id();
+        let make = |src| {
+            let mut acc = Accum::default();
+            acc.fold(&rec(src));
+            acc
+        };
+        let older = 1_700_000_040i64;
+        let newer = older + 60;
+        let mut flush = ExporterFlush {
+            src_ip: "192.0.2.91".parse().unwrap(),
+            protocol: Protocol::NetflowV9,
+            device_id: Some(device_id),
+            version: 9,
+            observation_domain: 91,
+            template_count: 1,
+            reported_rate: Some(1),
+            snmp_derived_rate: None,
+            datagrams_total: 2,
+            dropped_no_template: 0,
+            dropped_malformed: 0,
+            dropped_bucket_backlog: 0,
+            last_sequence: Some(2),
+            last_seen: newer,
+            closed: vec![(older, make(1)), (newer, make(2))],
+        };
+        let generation = prepare_flush_batch(&pool, std::slice::from_ref(&flush))
+            .await
+            .unwrap();
+        let mut committed = std::collections::BTreeSet::new();
+        let error = flush_exporter(
+            &pool,
+            &crate::config::Config::default(),
+            &mut flush,
+            &mut committed,
+            Some(older),
+            &generation,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert_eq!(
+            committed,
+            std::collections::BTreeSet::from([(device_id, 1)])
+        );
+        assert_eq!(flush.closed.len(), 1);
+        assert_eq!(flush.closed[0].0, older);
+        let stored:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_iface_buckets WHERE device_id=? AND interface_id=? AND bucket_ts=FROM_UNIXTIME(?)").bind(device_id).bind(interface_id).bind(newer).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored,1,"committed newest bucket remains durable and its interface is returned for wake publication");
+        sqlx::query("DELETE FROM devices WHERE id=?")
+            .bind(device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn contributor_registration_is_chunked_and_partial_phase_publishes_no_quality() {
+        let database = crate::db::connect_test_database().await;
+        let pool = (*database).clone();
+        let suffix = uuid::Uuid::new_v4();
+        let device_id = sqlx::query("INSERT INTO devices(name,hostname,enabled) VALUES(?,?,0)")
+            .bind(format!("chunk-{suffix}"))
+            .bind(format!("chunk-{suffix}"))
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+        for index in 1..=(REGISTRATION_CHUNK as u32 + 1) {
+            sqlx::query("INSERT INTO device_interfaces(device_id,if_index) VALUES (?,?)")
+                .bind(device_id)
+                .bind(index)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut acc = Accum::default();
+        for index in 1..=(REGISTRATION_CHUNK as u32 + 1) {
+            let mut flow = rec(index);
+            flow.in_if_index = Some(index);
+            acc.fold(&flow);
+        }
+        let bucket = 1_700_000_160i64;
+        let flush = ExporterFlush {
+            src_ip: "192.0.2.92".parse().unwrap(),
+            protocol: Protocol::NetflowV9,
+            device_id: Some(device_id),
+            version: 9,
+            observation_domain: 92,
+            template_count: 1,
+            reported_rate: Some(1),
+            snmp_derived_rate: None,
+            datagrams_total: 1,
+            dropped_no_template: 0,
+            dropped_malformed: 0,
+            dropped_bucket_backlog: 0,
+            last_sequence: Some(1),
+            last_seen: bucket,
+            closed: vec![(bucket, acc)],
+        };
+        assert!(
+            prepare_flush_batch_inner(&pool, std::slice::from_ref(&flush), Some(1))
+                .await
+                .is_err()
+        );
+        let (stale_generation, ready): (String, bool) = sqlx::query_as(
+            "SELECT generation,registry_ready FROM flow_publication_barrier WHERE id=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !ready,
+            "failed registry preparation leaves publication closed"
+        );
+        let partial:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_exporter_interfaces m JOIN flow_exporters e ON e.id=m.exporter_id WHERE e.observation_domain=92").fetch_one(&pool).await.unwrap();
+        assert_eq!(partial, REGISTRATION_CHUNK as i64);
+        let quality:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_bucket_quality q JOIN flow_exporters e ON e.id=q.exporter_id WHERE e.observation_domain=92").fetch_one(&pool).await.unwrap();
+        assert_eq!(quality, 0, "registration phase never publishes quality");
+        let evidence = bucket_evidence(
+            &pool,
+            device_id,
+            1,
+            Direction::Ingress,
+            Utc.timestamp_opt(bucket, 0).single().unwrap(),
+            QualityDimension::Interface,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.availability, EvidenceAvailability::Unavailable);
+        let (stats, _generation) =
+            prepare_flush_batch_inner(&pool, std::slice::from_ref(&flush), None)
+                .await
+                .unwrap();
+        assert_eq!((stats.rows, stats.chunks), (REGISTRATION_CHUNK + 1, 2));
+        let complete:i64=sqlx::query_scalar("SELECT COUNT(*) FROM flow_exporter_interfaces m JOIN flow_exporters e ON e.id=m.exporter_id WHERE e.observation_domain=92").fetch_one(&pool).await.unwrap();
+        assert_eq!(complete, (REGISTRATION_CHUNK + 1) as i64);
+        let exporter_id: u64 =
+            sqlx::query_scalar("SELECT id FROM flow_exporters WHERE observation_domain=92")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut cache = HashMap::new();
+        let sampling = Sampling {
+            rate: 1,
+            source: SamplingSource::Reported,
+            high_confidence: true,
+        };
+        let stale = write_bucket(
+            &pool,
+            &crate::config::Config::default(),
+            &BucketCtx {
+                exporter_id,
+                device_id,
+                bucket_ts: Utc.timestamp_opt(bucket, 0).single().unwrap(),
+            },
+            &flush.closed[0].1,
+            &sampling,
+            &mut cache,
+            &stale_generation,
+        )
+        .await;
+        assert!(
+            stale.is_err(),
+            "an old preparation generation cannot publish after a newer ready cohort"
+        );
+        sqlx::query("DELETE FROM devices WHERE id=?")
+            .bind(device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

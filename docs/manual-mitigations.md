@@ -79,6 +79,20 @@ hard-deleted; active recovery evidence and undelivered notification intents are
 protected from retention. Legacy actions without sufficient snapshots require
 operator reconciliation and cannot obtain an invented automatic inverse.
 
+A recovery child records every source activation in
+`recovery_attempt_sources`; the older single `recovery_bundle_id` pointer is
+only compatibility metadata. Confirmation claims all sources and compares the
+exact remaining original IDs in one transaction. Execution then transfers all
+claimed device windows together. A separate device/source membership ledger
+retains every quarantine when several source activations touched the same
+device, so settling one root cannot unlock another root's mutation.
+
+Successful changed and verified-no-op inverses permanently close their original
+and are never selected again. A recovery that provably made no write releases
+its claim for a fresh manual preview while recording a reason that blocks blind
+automatic retry. Any in-flight, unknown, conflicting, or failed changed inverse
+freezes the complete source set until evidence-bound reconciliation.
+
 ## API and permissions
 
 | Operation | Endpoint | Permission |

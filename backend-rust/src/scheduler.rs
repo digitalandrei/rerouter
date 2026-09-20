@@ -14,13 +14,15 @@
 //! `run` spawns the supervisor and returns immediately so the caller can then
 //! start the API server (the loops live for the process lifetime).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use sqlx::MySqlPool;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
@@ -47,12 +49,18 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
     });
     spawn_supervised("prefix_discovery", {
         let pool = pool.clone();
-        move || discover_prefixes_hourly(pool.clone())
+        let cfg = cfg.clone();
+        move || discover_prefixes_hourly(pool.clone(), cfg.clone())
     });
     spawn_supervised("aggregate_detection", {
         let pool = pool.clone();
         let cfg = cfg.clone();
         move || evaluate_aggregate_loop(pool.clone(), cfg.clone())
+    });
+    spawn_supervised("flow_detection_wake", {
+        let pool = pool.clone();
+        let cfg = cfg.clone();
+        move || flow_detection_wake_loop(pool.clone(), cfg.clone())
     });
     spawn_supervised("scheduled_recovery", {
         let pool = pool.clone();
@@ -74,6 +82,64 @@ pub async fn run(pool: MySqlPool, cfg: Config) -> Result<()> {
         "scheduler supervisor spawned (per-device SNMP poll loops)"
     );
     Ok(())
+}
+
+async fn flow_detection_wake_loop(pool: MySqlPool, cfg: Arc<Config>) {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        let batch = cfg.flow_wake.wait_and_take().await;
+        let started = Instant::now();
+        let evaluation = if batch.full_rescan {
+            background_operation(
+                &pool,
+                &cfg,
+                detection::engine::evaluate_all_flow_rules(&pool, &cfg),
+            )
+            .await
+        } else {
+            background_operation(
+                &pool,
+                &cfg,
+                detection::engine::evaluate_flow_interfaces(&pool, &cfg, &batch.interface_ids),
+            )
+            .await
+        };
+        match evaluation {
+            Ok(fired) => {
+                retry_delay = Duration::from_secs(1);
+                let interfaces = batch.interface_ids.len();
+                let full_rescan = batch.full_rescan;
+                cfg.flow_wake.complete_success(batch);
+                tracing::debug!(
+                    event_type = "flow_wake_evaluated",
+                    interfaces,
+                    full_rescan,
+                    fired,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "committed flow buckets evaluated"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(event_type="flow_wake_evaluation_failed",error=%error,"flow evaluation failed; wake returned to queue");
+                tokio::time::sleep(retry_delay).await;
+                cfg.flow_wake.complete_failure(batch);
+                retry_delay = next_flow_retry_delay(retry_delay);
+            }
+        }
+    }
+}
+
+fn next_flow_retry_delay(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(30))
+}
+
+async fn background_operation<T>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let runtime = cfg.advisory_runtime(pool).await?;
+    crate::db::advisory::background_scope(runtime, future).await?
 }
 
 async fn scheduled_recovery_loop(pool: MySqlPool, cfg: Arc<Config>) {
@@ -131,6 +197,82 @@ const PREFIX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Upper bound of the random pre-read delay applied to EACH device, so a fleet
 /// does not open SSH sessions to every router in the same second.
 const PREFIX_DISCOVERY_DEVICE_JITTER: Duration = Duration::from_secs(300);
+const PREFIX_DISCOVERY_CONCURRENCY: usize = 2;
+const PREFIX_DISCOVERY_BACKLOG_CAPACITY: usize = 256;
+const PREFIX_DISCOVERY_RESCAN: Duration = Duration::from_secs(30);
+
+struct DiscoverySchedule {
+    anchor: tokio::time::Instant,
+    next_due: HashMap<u64, tokio::time::Instant>,
+    queued: HashSet<u64>,
+    active: HashSet<u64>,
+    backlog: VecDeque<u64>,
+}
+
+impl DiscoverySchedule {
+    fn new(anchor: tokio::time::Instant) -> Self {
+        Self {
+            anchor,
+            next_due: HashMap::new(),
+            queued: HashSet::new(),
+            active: HashSet::new(),
+            backlog: VecDeque::new(),
+        }
+    }
+
+    fn reconcile(&mut self, enabled: &[u64], now: tokio::time::Instant) -> usize {
+        let enabled: HashSet<u64> = enabled.iter().copied().collect();
+        self.next_due.retain(|id, _| enabled.contains(id));
+        self.backlog.retain(|id| enabled.contains(id));
+        self.queued.retain(|id| enabled.contains(id));
+        for id in &enabled {
+            self.next_due
+                .entry(*id)
+                .or_insert(self.anchor + stable_discovery_stagger(*id));
+        }
+
+        let mut due: Vec<_> = self
+            .next_due
+            .iter()
+            .filter(|(id, deadline)| {
+                **deadline <= now && !self.queued.contains(id) && !self.active.contains(id)
+            })
+            .map(|(id, deadline)| (*id, *deadline))
+            .collect();
+        due.sort_by_key(|(id, deadline)| (*deadline, *id));
+        let available = PREFIX_DISCOVERY_BACKLOG_CAPACITY.saturating_sub(self.backlog.len());
+        let deferred = due.len().saturating_sub(available);
+        for (id, _) in due.into_iter().take(available) {
+            self.backlog.push_back(id);
+            self.queued.insert(id);
+        }
+        deferred
+    }
+
+    fn start_ready(&mut self) -> Vec<(u64, tokio::time::Instant)> {
+        let slots = PREFIX_DISCOVERY_CONCURRENCY.saturating_sub(self.active.len());
+        (0..slots)
+            .filter_map(|_| {
+                let id = self.backlog.pop_front()?;
+                self.queued.remove(&id);
+                self.active.insert(id);
+                Some((id, self.next_due[&id]))
+            })
+            .collect()
+    }
+
+    fn complete(&mut self, id: u64, now: tokio::time::Instant) {
+        self.active.remove(&id);
+        let Some(deadline) = self.next_due.get_mut(&id) else {
+            return;
+        };
+        // Advance to the first future hourly slot. A slow operation therefore
+        // never creates an immediate catch-up burst.
+        while *deadline <= now {
+            *deadline += PREFIX_DISCOVERY_INTERVAL;
+        }
+    }
+}
 
 /// Discover each device's routing inventory over SSH, shortly after boot and then
 /// hourly. Best-effort: a device without working SSH is logged and skipped
@@ -145,40 +287,84 @@ const PREFIX_DISCOVERY_DEVICE_JITTER: Duration = Duration::from_secs(300);
 /// executor already gates on cheaper, stricter liveness signals — the reachability
 /// probe plus `reroute::reachability::STABILITY_WINDOW`. Adding an inline refresh
 /// would spend incident time re-learning what this loop already knows.
-async fn discover_prefixes_hourly(pool: MySqlPool) {
+async fn discover_prefixes_hourly(pool: MySqlPool, cfg: Arc<Config>) {
     tokio::time::sleep(Duration::from_secs(120)).await; // let the box settle after boot
+    let mut schedule = DiscoverySchedule::new(tokio::time::Instant::now());
+    let mut rescan = tokio::time::interval(PREFIX_DISCOVERY_RESCAN);
+    rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut running = FuturesUnordered::new();
+    let mut completed_duration = Duration::ZERO;
+    let mut completed_count = 0u64;
+    let mut next_capacity_report = tokio::time::Instant::now() + PREFIX_DISCOVERY_INTERVAL;
     loop {
-        match snmp::load_enabled_devices(&pool).await {
-            Ok(devices) => {
-                for d in devices {
-                    // Per-device jitter: spread the fleet's SSH sessions across the
-                    // window instead of hitting every router at the top of the hour.
-                    tokio::time::sleep(device_discovery_jitter()).await;
-                    match crate::ssh::discover_prefixes_and_store(&pool, d.id).await {
-                        Ok(n) => tracing::debug!(
-                            event_type = "prefix_discovery",
-                            device_id = d.id,
-                            prefixes = n,
-                            "announced prefixes refreshed"
-                        ),
-                        Err(e) => {
-                            tracing::debug!(event_type = "prefix_discovery_failed", device_id = d.id, error = %e, "announced-prefix discovery failed (non-fatal)")
+        tokio::select! {
+            _ = rescan.tick() => {
+                match snmp::load_enabled_devices(&pool).await {
+                    Ok(devices) => {
+                        let ids: Vec<_> = devices.into_iter().map(|device| device.id).collect();
+                        let fleet_size = ids.len();
+                        let now = tokio::time::Instant::now();
+                        let deferred = schedule.reconcile(&ids, now);
+                        if deferred > 0 {
+                            tracing::warn!(event_type="prefix_discovery_capacity_exhausted", deferred, backlog=schedule.backlog.len(), capacity=PREFIX_DISCOVERY_BACKLOG_CAPACITY, "due routing-inventory discoveries remain queued for a later rescan");
+                        }
+                        if now >= next_capacity_report {
+                            let mean_ms = (completed_duration.as_millis() as u64).checked_div(completed_count).unwrap_or(0);
+                            let required_worker_ms = mean_ms.saturating_mul(fleet_size as u64);
+                            let available_worker_ms = PREFIX_DISCOVERY_INTERVAL.as_millis() as u64 * PREFIX_DISCOVERY_CONCURRENCY as u64;
+                            tracing::info!(event_type="prefix_discovery_capacity", fleet_size, completed_samples=completed_count, mean_operation_ms=mean_ms, required_worker_ms_per_hour=required_worker_ms, available_worker_ms_per_hour=available_worker_ms, "measured routing-inventory discovery duty and fleet capacity");
+                            completed_duration = Duration::ZERO;
+                            completed_count = 0;
+                            while next_capacity_report <= now { next_capacity_report += PREFIX_DISCOVERY_INTERVAL; }
                         }
                     }
+                    Err(e) => tracing::warn!(event_type = "prefix_discovery_load_failed", error = %e, "could not load devices for prefix discovery"),
                 }
             }
-            Err(e) => {
-                tracing::warn!(event_type = "prefix_discovery_load_failed", error = %e, "could not load devices for prefix discovery")
+            Some((device_id, elapsed, result)) = running.next(), if !running.is_empty() => {
+                schedule.complete(device_id, tokio::time::Instant::now());
+                completed_duration = completed_duration.saturating_add(elapsed);
+                completed_count = completed_count.saturating_add(1);
+                match result {
+                    Ok(n) => tracing::debug!(event_type="prefix_discovery", device_id, prefixes=n, elapsed_ms=elapsed.as_millis() as u64, "announced prefixes refreshed"),
+                    Err(e) => tracing::debug!(event_type="prefix_discovery_failed", device_id, elapsed_ms=elapsed.as_millis() as u64, error=%e, "announced-prefix discovery failed (non-fatal)"),
+                }
             }
         }
-        tokio::time::sleep(PREFIX_DISCOVERY_INTERVAL).await;
+        for (device_id, deadline) in schedule.start_ready() {
+            let overdue = tokio::time::Instant::now().saturating_duration_since(deadline);
+            // The scheduler observes deadlines on a 30-second rescan. That
+            // expected quantization is not a missed deadline; warn only when
+            // work waited beyond one complete rescan, normally due to capacity.
+            if overdue > PREFIX_DISCOVERY_RESCAN {
+                tracing::warn!(
+                    event_type = "prefix_discovery_deadline_missed",
+                    device_id,
+                    overdue_ms = overdue.as_millis() as u64,
+                    backlog = schedule.backlog.len(),
+                    "routing-inventory discovery started after its fixed deadline"
+                );
+            }
+            let pool = pool.clone();
+            let cfg = cfg.clone();
+            running.push(Box::pin(async move {
+                let started = tokio::time::Instant::now();
+                let result = background_operation(
+                    &pool,
+                    &cfg,
+                    crate::ssh::discover_prefixes_and_store(&pool, device_id),
+                )
+                .await;
+                (device_id, started.elapsed(), result)
+            }));
+        }
     }
 }
 
-/// A uniform random delay in `0..=PREFIX_DISCOVERY_DEVICE_JITTER`, drawn fresh per
-/// device per pass so the spread does not settle into a fixed order.
-fn device_discovery_jitter() -> Duration {
-    Duration::from_secs(rand::rng().random_range(0..=PREFIX_DISCOVERY_DEVICE_JITTER.as_secs()))
+fn stable_discovery_stagger(device_id: u64) -> Duration {
+    Duration::from_secs(
+        device_id.wrapping_mul(2_654_435_761) % (PREFIX_DISCOVERY_DEVICE_JITTER.as_secs() + 1),
+    )
 }
 
 /// One day-windowed retention rule: delete rows whose `ts_column` is older than
@@ -189,6 +375,13 @@ struct RetentionSpec {
     ts_column: &'static str,
     index: &'static str,
     days: u32,
+    key: RetentionKey,
+}
+
+#[derive(Clone, Copy)]
+enum RetentionKey {
+    Id,
+    ExporterBucket,
 }
 
 /// Build the day-windowed retention rules from `[retention]` config. Pure (no
@@ -207,18 +400,25 @@ fn retention_specs(cfg: &Config) -> Vec<RetentionSpec> {
         ts_column: "sampled_at",
         index: "idx_interface_samples_sampled_at",
         days: r.traffic_samples_days,
+        key: RetentionKey::Id,
     }];
     for (table, index) in [
         ("flow_iface_buckets", "idx_flow_iface_bucket_ts"),
         ("flow_port_buckets", "idx_flow_port_bucket_ts"),
         ("flow_as_buckets", "idx_flow_as_bucket_ts"),
         ("flow_talker_buckets", "idx_flow_talker_bucket_ts"),
+        ("flow_bucket_quality", "idx_flow_bucket_quality_ts"),
     ] {
         specs.push(RetentionSpec {
             table,
             ts_column: "bucket_ts",
             index,
             days: r.flow_buckets_days,
+            key: if table == "flow_bucket_quality" {
+                RetentionKey::ExporterBucket
+            } else {
+                RetentionKey::Id
+            },
         });
     }
     specs.push(RetentionSpec {
@@ -226,14 +426,40 @@ fn retention_specs(cfg: &Config) -> Vec<RetentionSpec> {
         ts_column: "created_at",
         index: "idx_alerts_created",
         days: r.alerts_days,
+        key: RetentionKey::Id,
     });
     specs.push(RetentionSpec {
         table: "rule_events",
         ts_column: "created_at",
         index: "idx_rule_events_created",
         days: r.rule_events_days,
+        key: RetentionKey::Id,
     });
     specs
+}
+
+fn retention_delete_sql(spec: &RetentionSpec, protected: &str) -> String {
+    let (select_key, join_key) = match spec.key {
+        RetentionKey::Id => ("id", "target.id = expired.id"),
+        RetentionKey::ExporterBucket => (
+            "exporter_id, bucket_ts",
+            "target.exporter_id = expired.exporter_id AND target.bucket_ts = expired.bucket_ts",
+        ),
+    };
+    format!(
+        "DELETE target FROM ( \
+             SELECT {select_key} FROM {} FORCE INDEX ({}) \
+             WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) {} \
+             ORDER BY {} LIMIT {} \
+         ) AS expired STRAIGHT_JOIN {} AS target ON {join_key}",
+        spec.table,
+        spec.index,
+        spec.ts_column,
+        protected,
+        spec.ts_column,
+        RETENTION_DELETE_BATCH,
+        spec.table
+    )
 }
 
 /// Periodically enforce the configured retention windows: delete telemetry
@@ -262,20 +488,7 @@ async fn retention_cleanup(pool: MySqlPool, cfg: Arc<Config>) {
                     "rule_events" => " AND NOT EXISTS (SELECT 1 FROM reroutes r WHERE r.rule_event_id = rule_events.id AND (r.state IN ('planned','pending','running','verifying','uncertain') OR r.mutation_effect IN ('changed','unknown') OR (r.state = 'succeeded' AND r.mutation_effect = 'pending')) AND NOT EXISTS (SELECT 1 FROM reroutes rb WHERE rb.rollback_of_reroute_id = r.id AND rb.state = 'succeeded'))",
                     _ => "",
                 };
-                let sql = format!(
-                    "DELETE target FROM ( \
-                         SELECT id FROM {} FORCE INDEX ({}) \
-                         WHERE {} < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY) {} \
-                         ORDER BY {} LIMIT {} \
-                     ) AS expired STRAIGHT_JOIN {} AS target ON target.id = expired.id",
-                    spec.table,
-                    spec.index,
-                    spec.ts_column,
-                    protected,
-                    spec.ts_column,
-                    RETENTION_DELETE_BATCH,
-                    spec.table
-                );
+                let sql = retention_delete_sql(spec, protected);
                 match sqlx::query(&sql).bind(days).execute(&pool).await {
                     Ok(r) => {
                         let rows = r.rows_affected();
@@ -370,7 +583,13 @@ async fn evaluate_aggregate_loop(pool: MySqlPool, cfg: Arc<Config>) {
     // Let device loops populate interface_metrics_current before the first pass.
     tokio::time::sleep(Duration::from_secs(20)).await;
     loop {
-        match detection::engine::evaluate_aggregate_rules(&pool, &cfg).await {
+        match background_operation(
+            &pool,
+            &cfg,
+            detection::engine::evaluate_aggregate_rules(&pool, &cfg),
+        )
+        .await
+        {
             Ok(fired) if fired > 0 => {
                 tracing::info!(
                     event_type = "aggregate_detection",
@@ -389,7 +608,12 @@ async fn evaluate_aggregate_loop(pool: MySqlPool, cfg: Arc<Config>) {
 
 /// Reconcile per-device poll loops with the set of enabled devices, forever.
 async fn supervise(pool: MySqlPool, cfg: Arc<Config>) {
-    let mut running: HashMap<u64, JoinHandle<()>> = HashMap::new();
+    struct Worker {
+        handle: JoinHandle<()>,
+        control: watch::Sender<Option<u32>>,
+        interval: u32,
+    }
+    let mut running: HashMap<u64, Worker> = HashMap::new();
 
     loop {
         match snmp::load_enabled_devices(&pool).await {
@@ -398,29 +622,39 @@ async fn supervise(pool: MySqlPool, cfg: Arc<Config>) {
                     devices.iter().map(|d| d.id).collect();
 
                 // Drop loops for devices that are gone, disabled, or finished.
-                running.retain(|id, handle| {
-                    if !enabled_ids.contains(id) || handle.is_finished() {
-                        handle.abort();
-                        false
-                    } else {
-                        true
+                for (id, worker) in &running {
+                    if !enabled_ids.contains(id) {
+                        let _ = worker.control.send(None);
                     }
-                });
+                }
+                running.retain(|_, worker| !worker.handle.is_finished());
 
                 // Spawn loops for newly enabled devices.
                 for dev in devices {
+                    let interval = dev.poll_interval_seconds.max(5);
+                    if let Some(worker) = running.get_mut(&dev.id) {
+                        if worker.interval != interval {
+                            worker.interval = interval;
+                            let _ = worker.control.send(Some(interval));
+                        }
+                        continue;
+                    }
                     running.entry(dev.id).or_insert_with(|| {
                         let pool = pool.clone();
                         let cfg = cfg.clone();
                         let device_id = dev.id;
-                        let interval = dev.poll_interval_seconds.max(5);
+                        let (control, receiver) = watch::channel(Some(interval));
                         tracing::info!(
                             event_type = "device_loop_started",
                             device_id,
                             interval_seconds = interval,
                             "starting SNMP poll loop"
                         );
-                        tokio::spawn(device_loop(pool, cfg, device_id, interval))
+                        Worker {
+                            handle: tokio::spawn(device_loop(pool, cfg, device_id, receiver)),
+                            control,
+                            interval,
+                        }
                     });
                 }
             }
@@ -434,10 +668,24 @@ async fn supervise(pool: MySqlPool, cfg: Arc<Config>) {
 
 /// One device's poll+detect loop. Tolerates per-tick failure; a poll error is
 /// already recorded as the device's last_error by the poller.
-async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_interval_secs: u32) {
+async fn device_loop(
+    pool: MySqlPool,
+    cfg: Arc<Config>,
+    device_id: u64,
+    mut control: watch::Receiver<Option<u32>>,
+) {
+    let Some(mut base_interval_secs) = *control.borrow() else {
+        return;
+    };
     // Small initial spread so freshly-spawned loops don't all fire at t=0.
     let initial = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
-    tokio::time::sleep(Duration::from_millis((initial * 1000.0) as u64 / 4)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis((initial * 1000.0) as u64 / 4)) => {}
+        changed = control.changed() => {
+            if changed.is_err() || control.borrow().is_none() { return; }
+            base_interval_secs = (*control.borrow()).unwrap_or(5).max(5);
+        }
+    }
 
     // SSH reachability is probed on its own (slow) cadence, NOT every poll — an SSH
     // session is heavier than an SNMP poll and we must not hammer the device's SSH.
@@ -447,40 +695,114 @@ async fn device_loop(pool: MySqlPool, cfg: Arc<Config>, device_id: u64, base_int
         Duration::from_secs(cfg.telemetry.reachability_interval_seconds.max(60));
     let mut last_ssh_probe: Option<Instant> = None;
     let mut last_interface_discovery: Option<Instant> = None;
+    let mut ssh_probe_task: Option<JoinHandle<()>> = None;
+    let mut interface_discovery_task: Option<JoinHandle<()>> = None;
+    let mut next = tokio::time::Instant::now();
 
     loop {
-        if last_interface_discovery.is_none_or(|t| t.elapsed() >= Duration::from_secs(24 * 3600)) {
-            match snmp::discover_and_store(&pool, device_id).await {
-                Ok(count) => tracing::debug!(
-                    event_type = "interface_inventory_refreshed",
-                    device_id,
-                    interfaces = count,
-                    "interface inventory refreshed"
-                ),
-                Err(e) => {
-                    tracing::warn!(event_type = "interface_inventory_refresh_failed", device_id, error = %e, "periodic interface inventory refresh failed")
+        tokio::select! {
+            changed = control.changed() => {
+                if changed.is_err() || control.borrow().is_none() {
+                    // These tasks can be inside a store operation. Let them
+                    // finish cooperatively rather than aborting a writer when a
+                    // device is disabled or the supervisor is reconfigured.
+                    if let Some(task) = ssh_probe_task.take() { let _ = task.await; }
+                    if let Some(task) = interface_discovery_task.take() { let _ = task.await; }
+                    return;
                 }
+                base_interval_secs = (*control.borrow()).unwrap_or(5).max(5);
+                next = tokio::time::Instant::now() + Duration::from_secs(base_interval_secs.into());
+                continue;
             }
-            last_interface_discovery = Some(Instant::now());
+            _ = tokio::time::sleep_until(next) => {}
         }
-        let tick = poll_and_detect(&pool, &cfg, device_id).await;
+        let tick = background_operation(&pool, &cfg, poll_and_detect(&pool, &cfg, device_id)).await;
         if let Err(e) = tick {
             tracing::warn!(event_type = "device_tick_failed", device_id, error = %e, "device poll/detect tick failed");
         }
 
-        if last_ssh_probe.is_none_or(|t| t.elapsed() >= ssh_probe_interval) {
-            let status = crate::reroute::reachability::probe_ssh_and_store(&pool, device_id).await;
-            tracing::debug!(
-                event_type = "ssh_reachability_probed",
-                device_id,
-                status,
-                "periodic SSH reachability probe"
-            );
+        if ssh_probe_task.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(task) = ssh_probe_task.take() {
+                let _ = task.await;
+            }
+        }
+        if ssh_probe_task.is_none()
+            && last_ssh_probe.is_none_or(|t| t.elapsed() >= ssh_probe_interval)
+        {
+            let probe_pool = pool.clone();
+            let probe_cfg = cfg.clone();
+            ssh_probe_task = Some(tokio::spawn(async move {
+                let operation = async {
+                    let status =
+                        crate::reroute::reachability::probe_ssh_and_store(&probe_pool, device_id)
+                            .await;
+                    Ok::<_, anyhow::Error>(status)
+                };
+                if let Ok(status) = background_operation(&probe_pool, &probe_cfg, operation).await {
+                    tracing::debug!(
+                        event_type = "ssh_reachability_probed",
+                        device_id,
+                        status,
+                        "periodic SSH reachability probe"
+                    );
+                }
+            }));
             last_ssh_probe = Some(Instant::now());
         }
-
+        if interface_discovery_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(task) = interface_discovery_task.take() {
+                let _ = task.await;
+            }
+        }
+        if interface_discovery_task.is_none()
+            && last_interface_discovery
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(24 * 3600))
+        {
+            let discovery_pool = pool.clone();
+            let discovery_cfg = cfg.clone();
+            let jitter = f64::from(cfg.telemetry.jitter_percent.min(90)) / 100.0;
+            let minimum_poll_gap = (f64::from(base_interval_secs) * (1.0 - jitter)).max(1.0);
+            let budget = Duration::from_millis(
+                ((minimum_poll_gap * 1000.0) as u64)
+                    .saturating_sub(250)
+                    .max(250),
+            );
+            interface_discovery_task = Some(tokio::spawn(async move {
+                let operation = async {
+                    tokio::time::timeout(budget, async {
+                        let _ = snmp::discover_and_store(&discovery_pool, device_id).await;
+                        let _ = snmp::discover_bgp_and_store(&discovery_pool, device_id).await;
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("device inventory background budget elapsed"))?;
+                    Ok::<_, anyhow::Error>(())
+                };
+                let _ = background_operation(&discovery_pool, &discovery_cfg, operation).await;
+            }));
+            last_interface_discovery = Some(Instant::now());
+        }
         let secs = jittered(base_interval_secs, cfg.telemetry.jitter_percent);
-        tokio::time::sleep(Duration::from_millis((secs * 1000.0) as u64)).await;
+        next = advance_deadline(
+            next,
+            tokio::time::Instant::now(),
+            Duration::from_millis((secs * 1000.0) as u64),
+        );
+    }
+}
+
+fn advance_deadline(
+    previous: tokio::time::Instant,
+    now: tokio::time::Instant,
+    period: Duration,
+) -> tokio::time::Instant {
+    let scheduled = previous + period;
+    if scheduled <= now {
+        now + period
+    } else {
+        scheduled
     }
 }
 
@@ -490,8 +812,10 @@ async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Resu
     // Poll: stores interface_metrics_current + interface_samples. A transport
     // failure marks the device unreachable and returns Err — detection then has
     // nothing fresh and harmlessly no-ops.
+    let mut collection = crate::timing::Stage::start("collection", device_id);
     match snmp::poll(pool, device_id).await {
         Ok(updated) => {
+            collection.complete("committed");
             tracing::debug!(
                 event_type = "device_polled",
                 device_id,
@@ -504,13 +828,7 @@ async fn poll_and_detect(pool: &MySqlPool, cfg: &Config, device_id: u64) -> Resu
             return Err(e);
         }
     }
-
-    // Refresh BGP session state (read-only; keeps the UI's session up/down live).
-    // Best-effort: a device that doesn't run BGP (or lacks BGP4-MIB) is a no-op,
-    // and a transport error here must not block detection.
-    if let Err(e) = snmp::discover_bgp_and_store(pool, device_id).await {
-        tracing::debug!(event_type = "bgp_discover_failed", device_id, error = %e, "BGP peer discovery failed (non-fatal)");
-    }
+    drop(collection);
 
     // Detection for this device's monitored interfaces.
     match detection::engine::evaluate_device(pool, cfg, device_id).await {
@@ -545,6 +863,41 @@ fn jittered(base_secs: u32, jitter_percent: u8) -> f64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn quality_retention_executes_with_composite_keys_and_preserves_current_bucket() {
+        let db = crate::db::connect_test_database().await;
+        let mut tx = db.begin().await.unwrap();
+        let exporter = sqlx::query(
+            "INSERT INTO flow_exporters(source_addr,observation_domain) VALUES('192.0.2.247',?)",
+        )
+        .bind(rand::random::<u32>())
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .last_insert_id();
+        sqlx::query("INSERT INTO flow_bucket_quality(exporter_id,bucket_ts) VALUES(?,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 500 DAY)),(?,UTC_TIMESTAMP())")
+            .bind(exporter).bind(exporter).execute(&mut *tx).await.unwrap();
+        let spec = retention_specs(&Config::default())
+            .into_iter()
+            .find(|spec| spec.table == "flow_bucket_quality")
+            .unwrap();
+        // Isolate this test's fixture while exercising the production key join.
+        let sql = retention_delete_sql(&spec, &format!(" AND exporter_id={exporter}"));
+        assert_eq!(
+            sqlx::query(&sql)
+                .bind(100)
+                .execute(&mut *tx)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM flow_bucket_quality WHERE exporter_id=? AND bucket_ts>DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 DAY)")
+            .bind(exporter).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(current, 1);
+        tx.rollback().await.unwrap();
+    }
+
     /// The discovery cadence is what keeps SSH routing inventory inside the
     /// validator window. If the two ever drift apart (cadence lengthened, or the
     /// max age shortened) the controller starts silently refusing dependent
@@ -565,10 +918,85 @@ mod tests {
     }
 
     #[test]
-    fn per_device_jitter_stays_inside_its_window() {
-        for _ in 0..200 {
-            assert!(device_discovery_jitter() <= PREFIX_DISCOVERY_DEVICE_JITTER);
+    fn overrun_skips_missed_deadlines_without_catchup_burst() {
+        let now = tokio::time::Instant::now();
+        let next = advance_deadline(now - Duration::from_secs(20), now, Duration::from_secs(5));
+        assert_eq!(next, now + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn discovery_stagger_is_stable_and_within_window() {
+        for device in 1..100 {
+            assert_eq!(
+                stable_discovery_stagger(device),
+                stable_discovery_stagger(device)
+            );
+            assert!(stable_discovery_stagger(device) <= PREFIX_DISCOVERY_DEVICE_JITTER);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_deadlines_are_fixed_and_overruns_do_not_catch_up() {
+        let anchor = tokio::time::Instant::now();
+        let mut schedule = DiscoverySchedule::new(anchor);
+        let id = 17;
+        let deadline = anchor + stable_discovery_stagger(id);
+
+        assert_eq!(schedule.reconcile(&[id], deadline), 0);
+        assert_eq!(schedule.start_ready(), vec![(id, deadline)]);
+        // A rescan while the device is active must never enqueue an overlapping
+        // discovery, even several nominal periods later.
+        let late = deadline + PREFIX_DISCOVERY_INTERVAL * 3 + Duration::from_secs(1);
+        tokio::time::advance(late - tokio::time::Instant::now()).await;
+        assert_eq!(schedule.reconcile(&[id], late), 0);
+        assert!(schedule.start_ready().is_empty());
+
+        schedule.complete(id, late);
+        let next = schedule.next_due[&id];
+        assert!(next > late);
+        assert!(next <= late + PREFIX_DISCOVERY_INTERVAL);
+        assert_eq!(schedule.reconcile(&[id], late), 0);
+        assert!(schedule.start_ready().is_empty(), "no catch-up burst");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_backlog_is_bounded_and_overflow_remains_due_for_rescan() {
+        let anchor = tokio::time::Instant::now();
+        let mut schedule = DiscoverySchedule::new(anchor);
+        let devices: Vec<u64> = (1..=PREFIX_DISCOVERY_BACKLOG_CAPACITY as u64 + 44).collect();
+        tokio::time::advance(PREFIX_DISCOVERY_DEVICE_JITTER + Duration::from_secs(1)).await;
+        let now = tokio::time::Instant::now();
+
+        assert_eq!(schedule.reconcile(&devices, now), 44);
+        assert_eq!(schedule.backlog.len(), PREFIX_DISCOVERY_BACKLOG_CAPACITY);
+        let started = schedule.start_ready();
+        assert_eq!(started.len(), PREFIX_DISCOVERY_CONCURRENCY);
+
+        // Finishing work opens exactly two queue slots. The next rescan retains
+        // every other overdue device and admits two of them; none is forgotten.
+        for (id, _) in started {
+            schedule.complete(id, now);
+        }
+        assert_eq!(schedule.reconcile(&devices, now), 42);
+        assert_eq!(schedule.backlog.len(), PREFIX_DISCOVERY_BACKLOG_CAPACITY);
+        let still_due = schedule.backlog.len() + schedule.active.len() + 42;
+        assert_eq!(still_due, devices.len() - PREFIX_DISCOVERY_CONCURRENCY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flow_retry_backoff_is_bounded_and_resets_after_success() {
+        let mut delay = Duration::from_secs(1);
+        for expected in [2, 4, 8, 16, 30, 30] {
+            let sleeper = tokio::spawn(tokio::time::sleep(delay));
+            tokio::task::yield_now().await;
+            assert!(!sleeper.is_finished());
+            tokio::time::advance(delay).await;
+            sleeper.await.unwrap();
+            delay = next_flow_retry_delay(delay);
+            assert_eq!(delay, Duration::from_secs(expected));
+        }
+        delay = Duration::from_secs(1);
+        assert_eq!(delay, Duration::from_secs(1));
     }
 
     #[test]
@@ -581,8 +1009,8 @@ mod tests {
 
         let specs = retention_specs(&cfg);
 
-        // interface_samples + 4 flow bucket tables + alerts + rule_events.
-        assert_eq!(specs.len(), 7);
+        // interface_samples + 4 aggregates + flow quality + alerts + rule_events.
+        assert_eq!(specs.len(), 8);
         let by_table = |t: &str| {
             specs
                 .iter()
@@ -600,10 +1028,11 @@ mod tests {
             "flow_port_buckets",
             "flow_as_buckets",
             "flow_talker_buckets",
+            "flow_bucket_quality",
         ] {
             let s = by_table(t);
             assert_eq!(s.ts_column, "bucket_ts", "{t} prunes on bucket_ts");
-            assert!(s.index.ends_with("_bucket_ts"));
+            assert!(s.index.ends_with("_bucket_ts") || t == "flow_bucket_quality");
             assert_eq!(s.days, 5, "{t} uses flow_buckets_days");
         }
 
@@ -616,5 +1045,31 @@ mod tests {
         assert_eq!(rule_events.ts_column, "created_at");
         assert_eq!(rule_events.index, "idx_rule_events_created");
         assert_eq!(rule_events.days, 4, "rule_events use rule_events_days");
+    }
+
+    #[test]
+    fn retention_delete_uses_each_tables_real_primary_key() {
+        let mut cfg = Config::default();
+        cfg.retention.flow_buckets_days = 5;
+        let specs = retention_specs(&cfg);
+
+        let quality = specs
+            .iter()
+            .find(|spec| spec.table == "flow_bucket_quality")
+            .expect("flow quality retention spec");
+        let quality_sql = retention_delete_sql(quality, "");
+        assert!(quality_sql.contains("SELECT exporter_id, bucket_ts"));
+        assert!(quality_sql.contains(
+            "target.exporter_id = expired.exporter_id AND target.bucket_ts = expired.bucket_ts"
+        ));
+        assert!(!quality_sql.contains("target.id"));
+
+        let iface = specs
+            .iter()
+            .find(|spec| spec.table == "flow_iface_buckets")
+            .expect("interface bucket retention spec");
+        let iface_sql = retention_delete_sql(iface, "");
+        assert!(iface_sql.contains("SELECT id"));
+        assert!(iface_sql.contains("target.id = expired.id"));
     }
 }

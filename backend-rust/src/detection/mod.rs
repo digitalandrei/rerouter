@@ -7,6 +7,7 @@
 pub mod condition;
 pub mod cooldown;
 pub mod engine;
+pub mod wake;
 
 /// Lifecycle of a detection rule's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

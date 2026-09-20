@@ -36,7 +36,21 @@ pub async fn acquire_bundle_change_windows(
     devices.sort_unstable();
     devices.dedup();
     let mut tx = pool.begin().await?;
+    let recovery_child: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(bundle_id)
+    .fetch_one(&mut *tx)
+    .await?;
     for device_id in devices {
+        if recovery_child == 0 {
+            let quarantined:i64=sqlx::query_scalar("SELECT COUNT(*) FROM device_change_window_sources WHERE device_id=? AND source_bundle_id<>?")
+                .bind(device_id).bind(bundle_id).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(
+                quarantined == 0,
+                "device {device_id} retains recovery ownership from another activation"
+            );
+        }
         let existing = sqlx::query_as::<_, ChangeWindow>(
             "SELECT device_id, bundle_id, reroute_id, owner_token, phase \
              FROM device_change_windows WHERE device_id = ? FOR UPDATE",
@@ -64,6 +78,10 @@ pub async fn acquire_bundle_change_windows(
                 .execute(&mut *tx)
                 .await?;
             }
+        }
+        if recovery_child == 0 {
+            sqlx::query("INSERT IGNORE INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)")
+                .bind(device_id).bind(bundle_id).execute(&mut *tx).await?;
         }
     }
     tx.commit().await?;
@@ -150,48 +168,82 @@ pub async fn claim_change_windows_for_recovery(
         "duplicate recovery original"
     );
     let mut tx = pool.begin().await?;
-    let source_bundle: Option<u64> =
-        sqlx::query_scalar("SELECT bundle_id FROM reroutes WHERE id = ? FOR UPDATE")
-            .bind(ids[0])
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
-    let source_bundle = source_bundle.ok_or_else(|| anyhow::anyhow!("original has no bundle"))?;
-    for original_id in ids {
-        let valid: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reroutes original \
-             WHERE original.id = ? AND original.bundle_id = ? \
-               AND original.state = 'succeeded' AND original.mutation_effect = 'changed' \
-               AND NOT EXISTS (SELECT 1 FROM reroutes inverse \
-                 WHERE inverse.rollback_of_reroute_id = original.id \
-                   AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
-        )
-        .bind(original_id)
-        .bind(source_bundle)
-        .fetch_one(&mut *tx)
-        .await?;
-        anyhow::ensure!(
-            valid == 1,
-            "original #{original_id} is not recoverable owned state"
+    let mut sources: Vec<u64> = Vec::new();
+    for original_id in &ids {
+        let source: Option<u64> = sqlx::query_scalar(
+            "SELECT bundle_id FROM reroutes WHERE id=? AND rollback_of_reroute_id IS NULL FOR UPDATE",
+        ).bind(original_id).fetch_optional(&mut *tx).await?.flatten();
+        sources.push(
+            source
+                .ok_or_else(|| anyhow::anyhow!("original #{original_id} has no source bundle"))?,
         );
     }
-    let unknown: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM reroutes \
-         WHERE bundle_id = ? AND (state = 'uncertain' OR mutation_effect = 'unknown')",
-    )
-    .bind(source_bundle)
-    .fetch_one(&mut *tx)
-    .await?;
-    anyhow::ensure!(unknown == 0, "source bundle still has ambiguous siblings");
-    sqlx::query(
-        "UPDATE device_change_windows SET bundle_id = ?, reroute_id = NULL, \
-                owner_token = ?, phase = 'prepared' WHERE bundle_id = ?",
-    )
-    .bind(recovery_bundle_id)
-    .bind(owner_token)
-    .bind(source_bundle)
-    .execute(&mut *tx)
-    .await?;
+    sources.sort_unstable();
+    sources.dedup();
+    let ownership = super::recovery::ownership_for_sources_on(&mut tx, &sources).await?;
+    let mut owned = ownership.original_reroute_ids;
+    owned.sort_unstable();
+    anyhow::ensure!(
+        owned == ids,
+        "recovery originals no longer equal the complete owned set"
+    );
+    for source_id in &sources {
+        let mapped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM recovery_attempt_sources ras JOIN reroute_bundles source ON source.id=ras.source_bundle_id \
+             WHERE ras.recovery_bundle_id=? AND ras.source_bundle_id=? AND ras.settlement='active' \
+               AND source.recovery_claim_token=ras.claim_token",
+        ).bind(recovery_bundle_id).bind(source_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            mapped == 1,
+            "source bundle #{source_id} is not claimed by this recovery child"
+        );
+    }
+    let devices: Vec<u64> = sqlx::query_scalar(
+        "SELECT DISTINCT device_id FROM reroutes WHERE id IN (SELECT original_reroute_id FROM reroute_bundle_actions WHERE bundle_id=?) ORDER BY device_id FOR UPDATE",
+    ).bind(recovery_bundle_id).fetch_all(&mut *tx).await?;
+    for device_id in devices {
+        let foreign: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM device_change_window_sources membership \
+             LEFT JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=? AND ras.source_bundle_id=membership.source_bundle_id AND ras.settlement='active' \
+             WHERE membership.device_id=? AND ras.source_bundle_id IS NULL",
+        ).bind(recovery_bundle_id).bind(device_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            foreign == 0,
+            "device {device_id} also quarantines an unclaimed source activation"
+        );
+        let existing: Option<(Option<u64>, String)> = sqlx::query_as(
+            "SELECT bundle_id,owner_token FROM device_change_windows WHERE device_id=? FOR UPDATE",
+        )
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match existing {
+            Some((Some(bundle), _))
+                if sources.contains(&bundle) || bundle == recovery_bundle_id =>
+            {
+                sqlx::query("UPDATE device_change_windows SET bundle_id=?,reroute_id=NULL,owner_token=?,phase='prepared' WHERE device_id=?")
+                    .bind(recovery_bundle_id).bind(owner_token).bind(device_id).execute(&mut *tx).await?;
+            }
+            Some((None, _)) => {
+                sqlx::query("UPDATE device_change_windows SET bundle_id=?,reroute_id=NULL,owner_token=?,phase='prepared' WHERE device_id=?")
+                    .bind(recovery_bundle_id).bind(owner_token).bind(device_id).execute(&mut *tx).await?;
+            }
+            Some(_) => anyhow::bail!("device {device_id} has a foreign live change-window owner"),
+            None => {
+                sqlx::query("INSERT INTO device_change_windows(device_id,bundle_id,owner_token,phase) VALUES(?,?,?,'prepared')")
+                    .bind(device_id).bind(recovery_bundle_id).bind(owner_token).execute(&mut *tx).await?;
+            }
+        }
+    }
+    let started = sqlx::query(
+        "UPDATE reroute_bundles source JOIN recovery_attempt_sources ras ON ras.source_bundle_id=source.id \
+         SET source.lifecycle_state='recovery_running',source.recovery_started_at=COALESCE(source.recovery_started_at,UTC_TIMESTAMP()) \
+         WHERE ras.recovery_bundle_id=? AND ras.settlement='active' AND source.recovery_claim_token=ras.claim_token",
+    ).bind(recovery_bundle_id).execute(&mut *tx).await?;
+    anyhow::ensure!(
+        started.rows_affected() == sources.len() as u64,
+        "not every source claim transferred at recovery start"
+    );
     tx.commit().await?;
     Ok(())
 }

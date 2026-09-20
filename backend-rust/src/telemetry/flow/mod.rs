@@ -15,6 +15,7 @@
 //! decoder would be additive in the same way).
 
 pub mod collector;
+pub mod quality;
 pub mod sflow;
 pub mod v9;
 

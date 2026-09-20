@@ -40,13 +40,25 @@ fn bundle_list_payload(
     }
 }
 
+fn parse_created_bound(
+    value: &Option<String>,
+) -> Result<Option<DateTime<Utc>>, chrono::ParseError> {
+    value
+        .as_deref()
+        .map(|v| DateTime::parse_from_rfc3339(v).map(|d| d.with_timezone(&Utc)))
+        .transpose()
+}
+
 #[derive(sqlx::FromRow)]
 struct RerouteRow {
     id: u64,
     bundle_id: Option<u64>,
     mutation_effect: String,
+    rollback_of_reroute_id: Option<u64>,
     source_json: Option<sqlx::types::Json<Value>>,
     planned_steps_json: Option<sqlx::types::Json<Value>>,
+    prior_state_json: Option<sqlx::types::Json<Value>>,
+    after_state_json: Option<sqlx::types::Json<Value>>,
     device_id: Option<u64>,
     device_name: Option<String>,
     reroute_template_id: Option<u64>,
@@ -65,7 +77,7 @@ struct RerouteRow {
     created_at: DateTime<Utc>,
 }
 
-const REROUTE_SELECT: &str = "SELECT r.id, r.bundle_id, r.mutation_effect, b.source_json, r.planned_steps_json, r.device_id, d.name AS device_name, \
+const REROUTE_SELECT: &str = "SELECT r.id, r.bundle_id, r.mutation_effect,r.rollback_of_reroute_id, b.source_json, r.planned_steps_json,r.prior_state_json,r.after_state_json, r.device_id, d.name AS device_name, \
      r.reroute_template_id, t.name AS template_name, t.display_name AS template_display_name, \
      r.trigger_type, r.state, \
      r.reason, r.success, r.verification_status, r.failure_reason, r.rule_id, u.email AS triggered_by, \
@@ -75,6 +87,15 @@ const REROUTE_SELECT: &str = "SELECT r.id, r.bundle_id, r.mutation_effect, b.sou
      LEFT JOIN reroute_templates t ON t.id = r.reroute_template_id \
      LEFT JOIN reroute_bundles b ON b.id = r.bundle_id \
      LEFT JOIN users u ON u.id = r.triggered_by_user_id";
+
+fn has_snapshot_proof(snapshot: &Option<sqlx::types::Json<Value>>) -> bool {
+    snapshot.as_ref().is_some_and(|value| {
+        serde_json::from_value::<Vec<crate::reroute::device_plan::DeviceStateSnapshot>>(
+            value.0.clone(),
+        )
+        .is_ok_and(|items| !items.is_empty())
+    })
+}
 
 fn reroute_json(r: &RerouteRow) -> Value {
     json!({
@@ -100,6 +121,7 @@ fn reroute_json(r: &RerouteRow) -> Value {
         "started_at": r.started_at.map(|t| t.to_rfc3339()),
         "finished_at": r.finished_at.map(|t| t.to_rfc3339()),
         "created_at": r.created_at.to_rfc3339(),
+        "reconcile_available": r.device_id.is_some() && has_snapshot_proof(&r.prior_state_json) && has_snapshot_proof(&r.after_state_json) && (r.state == "uncertain" || (r.state == "failed" && r.mutation_effect == "changed" && r.rollback_of_reroute_id.is_some())),
     })
 }
 
@@ -606,6 +628,11 @@ pub struct BundleListQuery {
     preset_id: Option<u64>,
     #[serde(default, alias = "original_only")]
     logical_only: bool,
+    q: Option<String>,
+    source_kind: Option<String>,
+    device: Option<String>,
+    created_from: Option<String>,
+    created_to: Option<String>,
 }
 
 pub async fn bundle_list(
@@ -619,19 +646,37 @@ pub async fn bundle_list(
         && query.trigger_type.is_none()
         && query.rule_id.is_none()
         && query.preset_id.is_none()
+        && query.q.is_none()
+        && query.source_kind.is_none()
+        && query.device.is_none()
+        && query.created_from.is_none()
+        && query.created_to.is_none()
         && !query.logical_only;
     let requested_page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
-        .unwrap_or(if legacy { 100 } else { 50 })
+        .unwrap_or(if legacy { 100 } else { 25 })
         .clamp(1, 200);
     let lifecycle = query.lifecycle.as_deref().filter(|v| *v != "all");
+    let created_from = match parse_created_bound(&query.created_from) {
+        Ok(v) => v,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "invalid created_from"),
+    };
+    let created_to = match parse_created_bound(&query.created_to) {
+        Ok(v) => v,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "invalid created_to"),
+    };
     let filter = super::run_summaries::RunSummaryFilter {
         lifecycle,
         trigger_type: query.trigger_type.as_deref(),
         rule_id: query.rule_id,
         preset_id: query.preset_id,
         original_only: query.logical_only,
+        q: query.q.as_deref(),
+        source_kind: query.source_kind.as_deref(),
+        device: query.device.as_deref(),
+        created_from,
+        created_to,
     };
     let total = match super::run_summaries::count(&state.pool, &filter).await {
         Ok(value) => value,
@@ -880,14 +925,17 @@ pub async fn bundle_take_control(
     };
     let changed = match sqlx::query("UPDATE reroute_bundles SET automatic_recovery_cancelled_at=UTC_TIMESTAMP(), \
         automatic_recovery_cancelled_by=?, recovery_deadline=NULL, lifecycle_state=IF(remaining_mutations>0,'active','inactive') \
-        WHERE id=? AND lifecycle_state IN ('active','recovery_scheduled') AND recovery_claim_token IS NULL")
+        WHERE id=? AND lifecycle_state IN ('active','recovery_scheduled') AND recovery_claim_token IS NULL \
+          AND (recovery_deadline IS NOT NULL OR (trigger_type='automatic' AND EXISTS(\
+            SELECT 1 FROM rules recovery_rule WHERE recovery_rule.id=reroute_bundles.rule_id \
+            AND recovery_rule.enabled=1 AND recovery_rule.automatic_revert_enabled=1)))")
         .bind(g.session.user_id).bind(id).execute(&mut *tx).await {
             Ok(result) => result.rows_affected(), Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR,"db_error")
         };
     if changed != 1 {
         return err(
             StatusCode::CONFLICT,
-            "automatic recovery is absent, claimed, or already in flight",
+            "automatic recovery is absent, disabled, claimed, or already in flight",
         );
     }
     if super::audit_mutation_on(
@@ -912,6 +960,7 @@ pub async fn bundle_take_control(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     #[test]
     fn maximum_page_is_clamped_without_offset_wrap() {
         assert_eq!(super::pagination_bounds(401, u32::MAX, 200), (3, 400));
@@ -923,5 +972,29 @@ mod tests {
         let paged = super::bundle_list_payload(vec![], 1, 50, 0, false);
         assert!(paged.is_object());
         assert_eq!(paged["page"], 1);
+    }
+    #[test]
+    fn reconciliation_requires_typed_nonempty_snapshot_evidence() {
+        assert!(!super::has_snapshot_proof(&None));
+        assert!(!super::has_snapshot_proof(&Some(sqlx::types::Json(json!(
+            []
+        )))));
+        assert!(!super::has_snapshot_proof(&Some(sqlx::types::Json(
+            json!({"bad":true})
+        ))));
+        let snapshot =
+            json!([{"kind":"interface_admin","interface":"GigabitEthernet0/0","shutdown":false}]);
+        assert!(super::has_snapshot_proof(&Some(sqlx::types::Json(
+            snapshot
+        ))));
+    }
+    #[test]
+    fn created_bounds_require_rfc3339_and_normalize_offsets() {
+        assert!(super::parse_created_bound(&Some("2026-09-20".into())).is_err());
+        assert!(super::parse_created_bound(&Some("not-a-date".into())).is_err());
+        let parsed = super::parse_created_bound(&Some("2026-09-20T12:00:00+03:00".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-09-20T09:00:00+00:00");
     }
 }

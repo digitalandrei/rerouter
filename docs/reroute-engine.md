@@ -183,6 +183,22 @@ iface_no_shutdown     interface {interface} ; no shutdown
 `end` block closes, never inside it. Verification `expect`/`reject` substrings may
 reference `{params}` (e.g. `{prefix_net}`), substituted at render time.
 
+Router read-back uses three internal outcomes: matched, proven mismatch, and
+unproven. Only a completed, command-specific filtered configuration read may use
+an empty body as proof that an object is absent. Empty interface, BGP
+advertisement, BGP route, and route-resolution responses are unproven and freeze
+the action or inverse. Configuration stanzas and operational responses must name
+the requested object. Valid IOS regular-expression filters remain part of the
+read command, and a valid object row does not require an image-specific footer.
+Multi-row advertisement output may prove absence only when its completion count
+matches the parsed rows; a matching row can prove presence without that footer.
+Communities and routing next hops are evaluated inside the exact matching route
+block. Exact IPv4 configuration filters reject foreign route lines, while the
+intentional IPv6 family-wide read may use valid foreign IPv6 rows to prove that
+the requested prefix is absent. Legacy template verification recognizes only
+the catalog's command families and binds reject-only evidence to that command's
+route or interface target.
+
 A **combination** (remove-from-saturated-upstream + advertise-on-others + MSS
 clamp) is expressed as several ordered `rule_actions` on one rule — each its own
 verification and rollback — not a single composite template. The runtime record

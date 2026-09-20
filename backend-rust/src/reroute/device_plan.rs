@@ -496,35 +496,227 @@ fn bgp_status_token(token: &str) -> bool {
 /// suitable for output of `show ip bgp <exact-prefix>`; callers must not feed a
 /// multi-prefix table because community lines are associated by command scope.
 pub fn has_exact_bgp_route(output: &str, prefix: &str, community: Option<&str>) -> bool {
-    has_exact_cidr(output, prefix)
-        && community
-            .map(|wanted| {
-                output
+    let lines = output.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(start, line)| {
+        if !bgp_line_has_exact_prefix(line, prefix) {
+            return false;
+        }
+        let end = lines[start + 1..]
+            .iter()
+            .position(|candidate| bgp_line_prefix(candidate).is_some())
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        community.is_none_or(|wanted| {
+            lines[start..end].iter().any(|block_line| {
+                block_line
                     .split_whitespace()
                     .any(|token| token.trim_matches([',', '(', ')']) == wanted)
             })
-            .unwrap_or(true)
+        })
+    })
 }
 
 pub fn has_exact_route_resolution(output: &str, prefix: &str, next_hop: &str) -> bool {
     let Some(expected) = normalize_cidr(prefix) else {
         return false;
     };
-    let exact_entry = output.lines().any(|line| {
-        let Some(rest) = line.trim().strip_prefix("Routing entry for ") else {
+    let lines = output.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(start, line)| {
+        let exact = line
+            .trim()
+            .strip_prefix("Routing entry for ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|candidate| candidate.trim_matches([',', '(', ')']))
+            .and_then(normalize_cidr)
+            .as_deref()
+            == Some(expected.as_str());
+        if !exact {
             return false;
-        };
-        let candidate = rest
+        }
+        let end = lines[start + 1..]
+            .iter()
+            .position(|candidate| candidate.trim().starts_with("Routing entry for "))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        lines[start..end].iter().any(|block_line| {
+            block_line
+                .split_whitespace()
+                .any(|token| token.trim_matches([',', '*', '(', ')']) == next_hop)
+        })
+    })
+}
+
+fn bgp_line_prefix(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("BGP routing table entry for ") {
+        return rest
             .split_whitespace()
             .next()
-            .unwrap_or("")
-            .trim_matches([',', '(', ')']);
-        normalize_cidr(candidate).as_deref() == Some(expected.as_str())
-    });
-    exact_entry
-        && output
+            .map(|token| token.trim_matches([',', '(', ')']))
+            .and_then(normalize_cidr);
+    }
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    let candidate = match tokens.as_slice() {
+        [first, ..] if normalize_cidr(first).is_some() => *first,
+        [status, cidr, ..] if bgp_status_token(status) => *cidr,
+        [status_a, status_b, cidr, ..]
+            if bgp_status_token(status_a) && bgp_status_token(status_b) =>
+        {
+            *cidr
+        }
+        _ => return None,
+    };
+    normalize_cidr(candidate)
+}
+
+fn bgp_line_has_exact_prefix(line: &str, prefix: &str) -> bool {
+    bgp_line_prefix(line).as_deref() == normalize_cidr(prefix).as_deref()
+}
+
+pub(crate) fn complete_advertisement_table(output: &str) -> bool {
+    let lines = output.lines().collect::<Vec<_>>();
+    let Some(header) = lines.iter().position(|line| {
+        line.to_ascii_lowercase()
             .split_whitespace()
-            .any(|token| token.trim_matches([',', '*']) == next_hop)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w == ["network", "next"])
+    }) else {
+        return false;
+    };
+    let Some((footer, declared)) =
+        lines
+            .iter()
+            .enumerate()
+            .skip(header + 1)
+            .find_map(|(i, line)| {
+                let lower = line.trim().to_ascii_lowercase();
+                lower
+                    .strip_prefix("total number of prefixes ")
+                    .and_then(|count| count.trim().parse::<usize>().ok())
+                    .map(|count| (i, count))
+            })
+    else {
+        return false;
+    };
+    let rows = &lines[header + 1..footer];
+    rows.iter()
+        .all(|line| line.trim().is_empty() || bgp_line_prefix(line).is_some())
+        && rows
+            .iter()
+            .filter(|line| bgp_line_prefix(line).is_some())
+            .count()
+            == declared
+        && lines[footer + 1..]
+            .iter()
+            .all(|line| line.trim().is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceVerdict {
+    Matched,
+    ProvenMismatch,
+    Unproven,
+}
+
+fn evidence_matches(verdict: EvidenceVerdict, subject: &str) -> Result<bool> {
+    match verdict {
+        EvidenceVerdict::Matched => Ok(true),
+        EvidenceVerdict::ProvenMismatch => Ok(false),
+        EvidenceVerdict::Unproven => {
+            bail!("{subject} response did not prove either presence or absence")
+        }
+    }
+}
+
+fn explicit_absence(output: &str) -> bool {
+    output.lines().any(|line| {
+        matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "% network not in table"
+                | "network not in table"
+                | "% route not found"
+                | "route not found"
+                | "% no matching route"
+                | "no matching route"
+        )
+    })
+}
+
+fn bgp_evidence(
+    output: &str,
+    prefix: &str,
+    community: Option<&str>,
+    advertisement: bool,
+    expected_present: bool,
+) -> EvidenceVerdict {
+    if output.trim().is_empty() {
+        return EvidenceVerdict::Unproven;
+    }
+    let exact_prefix = has_exact_cidr(output, prefix);
+    let exact_value = has_exact_bgp_route(output, prefix, community);
+    if exact_prefix {
+        return if expected_present && exact_value {
+            EvidenceVerdict::Matched
+        } else {
+            EvidenceVerdict::ProvenMismatch
+        };
+    }
+    let advertisement_table = advertisement && complete_advertisement_table(output);
+    let exact_detail_absent = !advertisement && explicit_absence(output);
+    if advertisement_table || exact_detail_absent {
+        if expected_present {
+            EvidenceVerdict::ProvenMismatch
+        } else {
+            EvidenceVerdict::Matched
+        }
+    } else {
+        EvidenceVerdict::Unproven
+    }
+}
+
+fn route_resolution_evidence(
+    output: &str,
+    prefix: &str,
+    next_hop: &str,
+    expected_present: bool,
+) -> EvidenceVerdict {
+    let exact_prefix = has_exact_route_resolution(output, prefix, next_hop)
+        || output.lines().any(|line| {
+            line.trim()
+                .strip_prefix("Routing entry for ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(normalize_cidr)
+                .as_deref()
+                == normalize_cidr(prefix).as_deref()
+        });
+    if exact_prefix {
+        let exact_value = has_exact_route_resolution(output, prefix, next_hop);
+        if expected_present && exact_value {
+            EvidenceVerdict::Matched
+        } else {
+            EvidenceVerdict::ProvenMismatch
+        }
+    } else if explicit_absence(output) {
+        if expected_present {
+            EvidenceVerdict::ProvenMismatch
+        } else {
+            EvidenceVerdict::Matched
+        }
+    } else {
+        EvidenceVerdict::Unproven
+    }
+}
+
+fn validate_interface_stanza(output: &str, interface: &str) -> Result<()> {
+    let headers = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("interface "))
+        .collect::<Vec<_>>();
+    if headers.len() != 1 || headers[0] != interface {
+        bail!("interface configuration response was not exactly the requested {interface} stanza");
+    }
+    Ok(())
 }
 
 /// Prepare the sequenced one-peer prefix-list action entirely from read-only
@@ -770,12 +962,18 @@ pub async fn verify_current(
             DeviceStateSnapshot::Ipv4StaticRoute { present, .. } => {
                 let command = static_config_read_command(state)?;
                 let output = locked.read(device_id, &command).await?;
-                static_snapshot_matches(&output.output, state)? == *present
+                evidence_matches(
+                    static_expected_evidence(&output.output, state, *present)?,
+                    "IPv4 static-route",
+                )?
             }
             DeviceStateSnapshot::Ipv6StaticRoute { present, .. } => {
                 let command = static_config_read_command(state)?;
                 let output = locked.read(device_id, &command).await?;
-                static_snapshot_matches(&output.output, state)? == *present
+                evidence_matches(
+                    static_expected_evidence(&output.output, state, *present)?,
+                    "IPv6 static-route",
+                )?
             }
             DeviceStateSnapshot::BgpAdvertisement {
                 neighbor,
@@ -789,7 +987,10 @@ pub async fn verify_current(
                         &format!("show ip bgp neighbors {neighbor} advertised-routes"),
                     )
                     .await?;
-                has_exact_bgp_route(&output.output, prefix, community.as_deref()) == *present
+                evidence_matches(
+                    bgp_evidence(&output.output, prefix, community.as_deref(), true, *present),
+                    "BGP advertisement",
+                )?
             }
             DeviceStateSnapshot::RouteResolution {
                 prefix,
@@ -807,7 +1008,10 @@ pub async fn verify_current(
                     format!("show ip route {network}")
                 };
                 let output = locked.read(device_id, &command).await?;
-                has_exact_route_resolution(&output.output, &normalized, next_hop) == *present
+                evidence_matches(
+                    route_resolution_evidence(&output.output, &normalized, next_hop, *present),
+                    "route-resolution",
+                )?
             }
             DeviceStateSnapshot::BgpRoute {
                 prefix,
@@ -820,7 +1024,16 @@ pub async fn verify_current(
                     format!("show ip bgp {prefix}")
                 };
                 let output = locked.read(device_id, &command).await?;
-                has_exact_bgp_route(&output.output, prefix, community.as_deref()) == *present
+                evidence_matches(
+                    bgp_evidence(
+                        &output.output,
+                        prefix,
+                        community.as_deref(),
+                        false,
+                        *present,
+                    ),
+                    "BGP route",
+                )?
             }
             DeviceStateSnapshot::NeighborShutdown {
                 local_asn,
@@ -941,6 +1154,7 @@ pub async fn verify_current(
                         &format!("show running-config interface {interface}"),
                     )
                     .await?;
+                validate_interface_stanza(&output.output, interface)?;
                 has_exact_config_line(&output.output, "shutdown") == *shutdown
             }
             DeviceStateSnapshot::InterfaceOperational {
@@ -968,6 +1182,7 @@ pub async fn verify_current(
                         &format!("show running-config interface {interface}"),
                     )
                     .await?;
+                validate_interface_stanza(&output.output, interface)?;
                 let actual = output.output.lines().find_map(|line| {
                     let tokens = line.split_whitespace().collect::<Vec<_>>();
                     match tokens.as_slice() {
@@ -2043,8 +2258,12 @@ async fn prepare_static_route(
                     format!("show ip bgp {prefix}")
                 };
                 let bgp_output = reader.read_one(input.device_id, &bgp_command).await?;
-                let bgp_present = has_exact_cidr(&bgp_output, &prefix);
-                if bgp_present && !has_exact_bgp_route(&bgp_output, &prefix, Some(&community)) {
+                let exact = bgp_evidence(&bgp_output, &prefix, Some(&community), false, true);
+                if exact == EvidenceVerdict::Unproven {
+                    bail!("BGP route preparation response was unproven");
+                }
+                let bgp_present = exact == EvidenceVerdict::Matched;
+                if !bgp_present && has_exact_cidr(&bgp_output, &prefix) {
                     bail!("the existing exact BGP route does not carry the catalogued RTBH community; refusing an unclassifiable restore state");
                 }
                 DeviceStateSnapshot::BgpRoute {
@@ -2092,12 +2311,20 @@ async fn read_static_route(
     set_static_present(&mut absent, false)?;
     let command = static_config_read_command(desired)?;
     let output = reader.read_one(device_id, &command).await?;
-    if static_snapshot_matches(&output, desired)? {
+    let present_evidence = static_expected_evidence(&output, desired, true)?;
+    let absent_evidence = static_expected_evidence(&output, desired, false)?;
+    if present_evidence == EvidenceVerdict::Unproven || absent_evidence == EvidenceVerdict::Unproven
+    {
+        bail!("static-route preparation response was unproven");
+    }
+    if present_evidence == EvidenceVerdict::Matched {
         let mut present = desired.clone();
         set_static_present(&mut present, true)?;
         Ok(present)
-    } else {
+    } else if absent_evidence == EvidenceVerdict::Matched {
         Ok(absent)
+    } else {
+        bail!("same-prefix static route has different attributes; restore state is unclassifiable")
     }
 }
 
@@ -2118,10 +2345,14 @@ async fn read_route_resolution(
         format!("show ip route {network}")
     };
     let output = reader.read_one(device_id, &command).await?;
+    let evidence = route_resolution_evidence(&output, &normalized, next_hop, true);
+    if evidence == EvidenceVerdict::Unproven {
+        bail!("route-resolution preparation response was unproven");
+    }
     Ok(DeviceStateSnapshot::RouteResolution {
         prefix: normalized.clone(),
         next_hop: next_hop.to_string(),
-        present: has_exact_route_resolution(&output, &normalized, next_hop),
+        present: evidence == EvidenceVerdict::Matched,
     })
 }
 
@@ -2270,6 +2501,84 @@ fn static_snapshot_matches(output: &str, expected: &DeviceStateSnapshot) -> Resu
         }
         _ => bail!("not a static route snapshot"),
     }
+}
+
+fn static_config_evidence(output: &str, expected: &DeviceStateSnapshot) -> Result<EvidenceVerdict> {
+    // A completed empty `show running-config | include ...` body proves that
+    // the filtered configuration object is absent.
+    if output.trim().is_empty() {
+        return Ok(EvidenceVerdict::ProvenMismatch);
+    }
+    let valid = match expected {
+        // This command contains the complete expected line inside an anchored
+        // IOS include expression. A different otherwise-valid route means the
+        // response is not from the requested filter and proves nothing.
+        DeviceStateSnapshot::Ipv4StaticRoute { .. } => {
+            let expected_line = static_config_line(expected)?;
+            output
+                .lines()
+                .all(|line| has_exact_config_line(line, &expected_line))
+        }
+        DeviceStateSnapshot::Ipv6StaticRoute { .. } => output.lines().all(|line| {
+            let t = line.split_whitespace().collect::<Vec<_>>();
+            matches!(t.as_slice(), ["ipv6", "route", prefix, hop]
+                if normalize_cidr(prefix).is_some_and(|p| p.contains(':')) && (*hop == "Null0" || hop.parse::<std::net::IpAddr>().is_ok()))
+                || matches!(t.as_slice(), ["ipv6", "route", prefix, hop, "tag", tag]
+                if normalize_cidr(prefix).is_some_and(|p| p.contains(':')) && (*hop == "Null0" || hop.parse::<std::net::IpAddr>().is_ok()) && tag.parse::<u32>().is_ok())
+        }),
+        _ => false,
+    };
+    if !valid {
+        return Ok(EvidenceVerdict::Unproven);
+    }
+    Ok(if static_snapshot_matches(output, expected)? {
+        EvidenceVerdict::Matched
+    } else {
+        EvidenceVerdict::ProvenMismatch
+    })
+}
+
+fn static_expected_evidence(
+    output: &str,
+    expected: &DeviceStateSnapshot,
+    expected_present: bool,
+) -> Result<EvidenceVerdict> {
+    let parsed = static_config_evidence(output, expected)?;
+    if parsed == EvidenceVerdict::Unproven {
+        return Ok(parsed);
+    }
+    let exact = parsed == EvidenceVerdict::Matched;
+    let wanted_prefix = match expected {
+        DeviceStateSnapshot::Ipv4StaticRoute { prefix, .. }
+        | DeviceStateSnapshot::Ipv6StaticRoute { prefix, .. } => normalize_cidr(prefix),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("invalid static route prefix"))?;
+    let same_prefix = output.lines().any(|line| {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        match (expected, tokens.as_slice()) {
+            (
+                DeviceStateSnapshot::Ipv4StaticRoute { prefix, .. },
+                ["ip", "route", network, mask, ..],
+            ) => ipv4_network_mask(prefix)
+                .is_ok_and(|wanted| wanted.0 == *network && wanted.1 == *mask),
+            (DeviceStateSnapshot::Ipv6StaticRoute { .. }, ["ipv6", "route", candidate, ..]) => {
+                normalize_cidr(candidate).as_deref() == Some(wanted_prefix.as_str())
+            }
+            _ => false,
+        }
+    }) || exact;
+    Ok(if expected_present {
+        if exact {
+            EvidenceVerdict::Matched
+        } else {
+            EvidenceVerdict::ProvenMismatch
+        }
+    } else if same_prefix {
+        EvidenceVerdict::ProvenMismatch
+    } else {
+        EvidenceVerdict::Matched
+    })
 }
 
 fn static_route_commands(
@@ -2596,12 +2905,7 @@ async fn prepare_interface_mss(
                     &format!("show running-config interface {interface}"),
                 )
                 .await?;
-            if !output
-                .lines()
-                .any(|line| line.trim() == format!("interface {interface}"))
-            {
-                bail!("fresh running-config did not prove interface {interface}");
-            }
+            validate_interface_stanza(&output, &interface)?;
             let mss = output.lines().find_map(|line| {
                 let tokens = line.split_whitespace().collect::<Vec<_>>();
                 match tokens.as_slice() {
@@ -2673,12 +2977,7 @@ async fn prepare_interface_admin(
                     &format!("show running-config interface {interface}"),
                 )
                 .await?;
-            if !output
-                .lines()
-                .any(|line| line.trim() == format!("interface {interface}"))
-            {
-                bail!("fresh running-config did not prove interface {interface}");
-            }
+            validate_interface_stanza(&output, &interface)?;
             DeviceStateSnapshot::InterfaceAdmin {
                 interface: interface.clone(),
                 shutdown: has_exact_config_line(&output, "shutdown"),
@@ -2897,7 +3196,7 @@ fn render_prefix_list_snapshot(name: &str, entries: &[PrefixListSnapshotEntry]) 
     output
 }
 
-fn normalize_cidr(value: &str) -> Option<String> {
+pub(crate) fn normalize_cidr(value: &str) -> Option<String> {
     let (addr, len) = value.split_once('/')?;
     let ip: IpAddr = addr.parse().ok()?;
     let len: u32 = len.parse().ok()?;
@@ -3145,6 +3444,188 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn evidence_distinguishes_absence_from_an_unproven_empty_response() {
+        let route = DeviceStateSnapshot::Ipv4StaticRoute {
+            prefix: "203.0.113.0/24".into(),
+            next_hop: "Null0".into(),
+            tag: Some(666),
+            present: false,
+        };
+        assert_eq!(
+            static_config_evidence("", &route).unwrap(),
+            EvidenceVerdict::ProvenMismatch
+        );
+        assert_eq!(
+            bgp_evidence("", "203.0.113.0/24", None, true, false),
+            EvidenceVerdict::Unproven
+        );
+        assert_eq!(
+            route_resolution_evidence("", "203.0.113.0/24", "Null0", false),
+            EvidenceVerdict::Unproven
+        );
+        assert_eq!(
+            bgp_evidence(
+                "Network Next Hop\nTotal number of prefixes 0",
+                "203.0.113.0/24",
+                None,
+                true,
+                false
+            ),
+            EvidenceVerdict::Matched
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_interface_config_is_unproven_not_an_absence_proof() {
+        let mut fake = FakeLocked {
+            outputs: BTreeMap::from([(
+                "show running-config interface GigabitEthernet0/0".into(),
+                String::new(),
+            )]),
+        };
+        let state = DeviceStateSnapshot::InterfaceMss {
+            interface: "GigabitEthernet0/0".into(),
+            mss: None,
+        };
+        assert!(verify_current(&mut fake, 1, &[state]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn expected_absence_rejects_conflicting_or_foreign_evidence() {
+        let state = DeviceStateSnapshot::BgpAdvertisement {
+            neighbor: "192.0.2.2".into(),
+            prefix: "203.0.113.0/24".into(),
+            present: false,
+            community: Some("65000:666".into()),
+        };
+        let mut fake = FakeLocked { outputs: BTreeMap::from([("show ip bgp neighbors 192.0.2.2 advertised-routes".into(), "Network Next Hop Metric LocPrf Weight Path\n*> 203.0.113.0/24 0.0.0.0 0 32768 i\nCommunity: 65000:999".into())]) };
+        assert!(!verify_current(&mut fake, 1, &[state]).await.unwrap());
+
+        let state = DeviceStateSnapshot::RouteResolution {
+            prefix: "203.0.113.0/24".into(),
+            next_hop: "Null0".into(),
+            present: false,
+        };
+        let mut fake = FakeLocked {
+            outputs: BTreeMap::from([(
+                "show ip route 203.0.113.0".into(),
+                "Routing entry for 203.0.113.0/24\n * 192.0.2.1".into(),
+            )]),
+        };
+        assert!(!verify_current(&mut fake, 1, &[state]).await.unwrap());
+
+        let state = DeviceStateSnapshot::BgpRoute {
+            prefix: "203.0.113.0/24".into(),
+            present: false,
+            community: None,
+        };
+        let mut fake = FakeLocked {
+            outputs: BTreeMap::from([(
+                "show ip bgp 203.0.113.0/24".into(),
+                "BGP routing table entry for 203.0.114.0/24".into(),
+            )]),
+        };
+        assert!(verify_current(&mut fake, 1, &[state]).await.is_err());
+
+        let state = DeviceStateSnapshot::InterfaceMss {
+            interface: "GigabitEthernet0/0".into(),
+            mss: None,
+        };
+        let mut fake = FakeLocked { outputs: BTreeMap::from([("show running-config interface GigabitEthernet0/0".into(), "interface GigabitEthernet0/0\ninterface GigabitEthernet0/1\n ip tcp adjust-mss 1400".into())]) };
+        assert!(verify_current(&mut fake, 1, &[state]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_filtered_ipv4_absence_rejects_a_foreign_route_response() {
+        let state = DeviceStateSnapshot::Ipv4StaticRoute {
+            prefix: "203.0.113.0/24".into(),
+            next_hop: "Null0".into(),
+            tag: Some(666),
+            present: false,
+        };
+        let command = static_config_read_command(&state).unwrap();
+        let mut fake = FakeLocked {
+            outputs: BTreeMap::from([(
+                command,
+                "ip route 198.51.100.0 255.255.255.0 Null0 tag 666".into(),
+            )]),
+        };
+        assert!(verify_current(&mut fake, 1, &[state]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn broad_ipv6_route_read_can_prove_one_prefix_absent_among_foreign_routes() {
+        let state = DeviceStateSnapshot::Ipv6StaticRoute {
+            prefix: "2001:db8:1::/48".into(),
+            next_hop: "Null0".into(),
+            tag: Some(666),
+            present: false,
+        };
+        let mut fake = FakeLocked {
+            outputs: BTreeMap::from([(
+                "show running-config | include ^ipv6 route".into(),
+                "ipv6 route 2001:db8:2::/48 Null0 tag 666".into(),
+            )]),
+        };
+        assert!(verify_current(&mut fake, 1, &[state]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn advertisement_absence_requires_a_complete_consistent_table() {
+        let state = DeviceStateSnapshot::BgpAdvertisement {
+            neighbor: "192.0.2.2".into(),
+            prefix: "203.0.113.0/24".into(),
+            present: false,
+            community: None,
+        };
+        let command = "show ip bgp neighbors 192.0.2.2 advertised-routes".to_string();
+        for incomplete in [
+            "Network Next Hop Metric LocPrf Weight Path\n*> 198.51.100.0/24 0.0.0.0 0 32768 i",
+            "Network Next Hop Metric LocPrf Weight Path\n*> 198.51.100.0/24 0.0.0.0 0 32768 i\nmalformed row\nTotal number of prefixes 1",
+            "Network Next Hop Metric LocPrf Weight Path\n*> 198.51.100.0/24 0.0.0.0 0 32768 i\nTotal number of prefixes 2",
+        ] {
+            let mut fake = FakeLocked {
+                outputs: BTreeMap::from([(command.clone(), incomplete.into())]),
+            };
+            assert!(verify_current(&mut fake, 1, std::slice::from_ref(&state))
+                .await
+                .is_err());
+        }
+        let mut complete = FakeLocked {
+            outputs: BTreeMap::from([(
+                command,
+                "Network Next Hop Metric LocPrf Weight Path\n*> 198.51.100.0/24 0.0.0.0 0 32768 i\nTotal number of prefixes 1".into(),
+            )]),
+        };
+        assert!(verify_current(&mut complete, 1, &[state]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn route_attributes_are_bound_to_the_exact_route_block() {
+        let bgp = DeviceStateSnapshot::BgpRoute {
+            prefix: "203.0.113.0/24".into(),
+            present: true,
+            community: Some("65000:666".into()),
+        };
+        let mut fake = FakeLocked { outputs: BTreeMap::from([(
+            "show ip bgp 203.0.113.0/24".into(),
+            "BGP routing table entry for 203.0.113.0/24\n Community: 65000:999\nBGP routing table entry for 198.51.100.0/24\n Community: 65000:666".into(),
+        )]) };
+        assert!(!verify_current(&mut fake, 1, &[bgp]).await.unwrap());
+
+        let route = DeviceStateSnapshot::RouteResolution {
+            prefix: "203.0.113.0/24".into(),
+            next_hop: "Null0".into(),
+            present: true,
+        };
+        let mut fake = FakeLocked { outputs: BTreeMap::from([(
+            "show ip route 203.0.113.0".into(),
+            "Routing entry for 203.0.113.0/24\n * 192.0.2.1\nRouting entry for 198.51.100.0/24\n * directly connected, via Null0".into(),
+        )]) };
+        assert!(!verify_current(&mut fake, 1, &[route]).await.unwrap());
+    }
+
     #[tokio::test]
     async fn typed_verifier_covers_every_catalog_family_and_rejects_near_matches() {
         let bgp_config = "router bgp 65000\n neighbor 192.0.2.1 remote-as 65001\n neighbor 192.0.2.1 shutdown\n neighbor 192.0.2.1 route-map EXPORT out\n neighbor 192.0.2.2 remote-as 65002\n neighbor 192.0.2.2 prefix-list EDGE out";
@@ -3183,7 +3664,8 @@ mod tests {
         );
         outputs.insert(
             "show ip bgp neighbors 192.0.2.2 advertised-routes".into(),
-            "*> 203.0.113.0/24 0.0.0.0 0 32768 i".into(),
+            "Network Next Hop Metric LocPrf Weight Path\n*> 203.0.113.0/24 0.0.0.0 0 32768 i\nTotal number of prefixes 1"
+                .into(),
         );
         outputs.insert(
             "show ip bgp 203.0.113.0/24".into(),

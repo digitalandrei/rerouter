@@ -21,6 +21,7 @@ use crate::config::Config;
 /// so they always page.
 pub const ALWAYS_IMMEDIATE: &[&str] = &[
     "reroute_uncertain",
+    "reroute_bundle_partial",
     "reroute_failed",
     "2fa_recovery_used",
     "account_locked",
@@ -34,6 +35,34 @@ pub const ALWAYS_IMMEDIATE: &[&str] = &[
     "rule_auto_disarmed",
     "alert_delivery_permanently_failed",
 ];
+
+/// Format an error for logs, API responses, and durable diagnostics without
+/// retaining URL credentials or webhook capability tokens. Keep the surrounding
+/// cause chain so operators can still distinguish DNS, TLS, HTTP, and policy
+/// failures.
+pub(crate) fn safe_diagnostic(error: &anyhow::Error) -> String {
+    redact_urls(&format!("{error:#}"))
+}
+
+fn redact_urls(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some((offset, prefix_len)) = ["https://", "http://"]
+        .iter()
+        .filter_map(|prefix| rest.find(prefix).map(|offset| (offset, prefix.len())))
+        .min_by_key(|(offset, _)| *offset)
+    {
+        out.push_str(&rest[..offset]);
+        out.push_str("[redacted URL]");
+        let tail = &rest[offset + prefix_len..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '}' | '"' | '\''))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Resolve an acting user id to a compact `{id, email, name}` object for alert
 /// payloads, so an email can state WHO made a manual decision. Returns
@@ -76,4 +105,19 @@ pub fn spawn_dispatcher(pool: MySqlPool, cfg: Config) {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn diagnostic_redacts_urls_and_preserves_the_cause() {
+        let secret = "synthetic-secret-token";
+        let error = anyhow::anyhow!("TLS certificate rejected for https://tenant.webhook.office.com/path/{secret}?sig={secret}")
+            .context("posting to Teams webhook");
+        let detail = super::safe_diagnostic(&error);
+        assert!(detail.contains("posting to Teams webhook"));
+        assert!(detail.contains("TLS certificate rejected"));
+        assert!(detail.contains("[redacted URL]"));
+        assert!(!detail.contains(secret));
+    }
 }

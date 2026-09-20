@@ -210,6 +210,7 @@ impl TemplateCache {
 #[derive(Debug, Default, PartialEq)]
 pub struct Decoded {
     pub source_id: u32,
+    pub sys_uptime: u32,
     pub sequence: u32,
     pub records: Vec<FlowRecord>,
     pub reported_sampling: Option<u32>,
@@ -289,6 +290,7 @@ pub fn decode(datagram: &[u8], cache: &mut TemplateCache) -> Result<Decoded, Flo
 
     let mut out = Decoded {
         source_id,
+        sys_uptime,
         sequence,
         exporter_restarted,
         sampling_state_expired,

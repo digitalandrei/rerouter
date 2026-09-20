@@ -317,7 +317,8 @@ function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
               <TableHead>Sampling</TableHead>
               <TableHead>SNMP cross-check</TableHead>
               <TableHead>Datagrams</TableHead>
-              <TableHead className="pr-6">Drops (no-tmpl / bad)</TableHead>
+              <TableHead>Latest bucket quality</TableHead>
+              <TableHead className="pr-6">Drops (no-tmpl / bad / backlog)</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -351,8 +352,22 @@ function ExportersCard({ exporters }: { exporters: FlowExporter[] }) {
                     {e.snmp_xcal_ratio == null ? "—" : `${e.snmp_xcal_ratio.toFixed(2)}×`}
                   </TableCell>
                   <TableCell className="text-xs">{e.datagrams_total}</TableCell>
+                  <TableCell className="text-xs" title={e.quality_bucket_ts ?? undefined}>
+                    {e.quality_bucket_ts == null ? (
+                      <Badge variant="outline">unknown</Badge>
+                    ) : e.iface_complete && e.port_complete && e.asn_complete && e.talker_complete ? (
+                      <Badge variant="secondary">complete</Badge>
+                    ) : (
+                      <span className="inline-flex gap-1">
+                        {!e.iface_complete && <Badge variant="destructive">iface</Badge>}
+                        {!e.port_complete && <Badge variant="destructive">port</Badge>}
+                        {!e.asn_complete && <Badge variant="destructive">AS</Badge>}
+                        {!e.talker_complete && <Badge variant="destructive">talker</Badge>}
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell className="pr-6 text-xs">
-                    {e.dropped_no_template} / {e.dropped_malformed}
+                    {e.dropped_no_template} / {e.dropped_malformed} / {e.dropped_bucket_backlog}
                   </TableCell>
                 </TableRow>
               );

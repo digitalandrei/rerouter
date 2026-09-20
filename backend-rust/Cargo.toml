@@ -18,6 +18,7 @@ embed-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -68,3 +69,4 @@ rustls = { version = "0.23.45", default-features = false, features = ["std"] }
 [dev-dependencies]
 # fixtures + parser tests live under tests/
 tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["test-util"] }

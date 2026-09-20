@@ -78,6 +78,7 @@ pub struct Decoded {
     pub agent_addr: Option<IpAddr>,
     pub sub_agent_id: u32,
     pub sequence: u32,
+    pub uptime: u32,
     pub records: Vec<FlowRecord>,
     pub reported_sampling: Option<u32>,
     pub samples_total: usize,
@@ -140,13 +141,14 @@ pub fn decode(datagram: &[u8]) -> Result<Decoded, SflowError> {
     let agent_addr = read_address(&mut r)?;
     let sub_agent_id = r.u32()?;
     let sequence = r.u32()?;
-    let _uptime = r.u32()?;
+    let uptime = r.u32()?;
     let num_samples = r.u32()?;
 
     let mut out = Decoded {
         agent_addr: Some(agent_addr),
         sub_agent_id,
         sequence,
+        uptime,
         ..Default::default()
     };
 

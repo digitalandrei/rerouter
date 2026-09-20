@@ -86,7 +86,16 @@ async fn reroute_count(pool: &MySqlPool, device_id: u64) -> i64 {
 async fn reservation_rechecks_maintenance_and_device_locks() {
     let test_db = common::test_database().await;
     let pool = test_db.pool().clone();
-    let cfg = Config::default();
+    let prior_maintenance: Option<String> = sqlx::query_scalar(
+        "SELECT `value` FROM system_settings WHERE `key`='global_maintenance_lock'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("read global_maintenance_lock");
+    let mut cfg = Config::default();
+    // The assertions below isolate maintenance/admin-lock ordering. Historical
+    // reroutes from other fixtures must not make the unrelated rate gate win.
+    cfg.safety.global_action_rate_limit_count = 0;
 
     let device_id = sqlx::query(
         "INSERT INTO devices (name, hostname) VALUES ('guard-reservation-test', '127.0.0.1')",
@@ -148,4 +157,21 @@ async fn reservation_rechecks_maintenance_and_device_locks() {
         .bind(device_id)
         .execute(&pool)
         .await;
+    match prior_maintenance {
+        Some(value) => {
+            let _ = sqlx::query(
+                "INSERT INTO system_settings(`key`,`value`) VALUES('global_maintenance_lock',?) \
+                 ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)",
+            )
+            .bind(value)
+            .execute(&pool)
+            .await;
+        }
+        None => {
+            let _ =
+                sqlx::query("DELETE FROM system_settings WHERE `key`='global_maintenance_lock'")
+                    .execute(&pool)
+                    .await;
+        }
+    }
 }

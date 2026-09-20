@@ -93,6 +93,7 @@ pub async fn post_teams(url: &str, title: &str, severity: &str, text: &str) -> R
         .json(&card)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("posting to Teams webhook")?;
     if !resp.status().is_success() {
         bail!("Teams webhook returned HTTP {}", resp.status().as_u16());

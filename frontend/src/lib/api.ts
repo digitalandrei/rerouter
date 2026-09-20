@@ -301,6 +301,16 @@ export interface FlowExporter {
   datagrams_total: number;
   dropped_no_template: number;
   dropped_malformed: number;
+  dropped_bucket_backlog: number;
+  quality_bucket_ts: string | null;
+  iface_complete: boolean | null;
+  port_complete: boolean | null;
+  asn_complete: boolean | null;
+  talker_complete: boolean | null;
+  iface_dropped: number | null;
+  port_dropped: number | null;
+  asn_dropped: number | null;
+  talker_dropped: number | null;
 }
 
 export interface DeviceTestResult {
@@ -558,6 +568,7 @@ export interface RerouteDetail extends Reroute {
   steps: RerouteStep[];
   outputs: RerouteOutput[];
   verifications: RerouteVerification[];
+  reconcile_available: boolean;
 }
 
 /** Result of executing/previewing one action against one device. */
@@ -748,7 +759,7 @@ export interface RecoveryRunSummary {
   failure_reason: string | null;
 }
 
-export interface RerouteBundle {
+export interface RunSummary {
   id: number;
   rule_id: number | null;
   trigger_type: string;
@@ -759,10 +770,8 @@ export interface RerouteBundle {
   failure_reason: string | null;
   started_at: string | null;
   finished_at: string | null;
-  actions: RerouteBundleAction[];
   /** Siblings that RAN and were NOT reversed. Non-empty means traffic is still
    *  diverted and a manual rollback is required — never hide this. */
-  still_applied_reroute_ids: number[];
   source_preset_id?: number | null;
   source_preset_name?: string | null;
   source_preset_revision?: number | null;
@@ -788,10 +797,16 @@ export interface RerouteBundle {
   revert?: { available: boolean; block_reasons: string[]; noop?: boolean };
   verification_mode?: VerificationMode;
   routing_verified?: boolean;
+  take_control?: { available: boolean; block_reasons: string[] };
 }
+export interface RunDetail extends RunSummary {
+  actions: RerouteBundleAction[];
+  still_applied_reroute_ids: number[];
+}
+export type RerouteBundle = RunDetail;
 
 export interface RerouteBundlePage {
-  items: RerouteBundle[];
+  items: RunSummary[];
   page: number;
   per_page: number;
   total: number;
@@ -1307,12 +1322,12 @@ export const api = {
 
   /** Progress and lifecycle of an ordered mitigation bundle. */
   bundles: {
-    list: (opts?: { page?: number; per_page?: number; lifecycle?: "active" | "inactive" | "all"; trigger_type?: string; rule_id?: number; preset_id?: number; logical_only?: boolean }) => {
+    list: (opts?: { page?: number; per_page?: number; lifecycle?: string; trigger_type?: string; rule_id?: number; preset_id?: number; logical_only?: boolean; q?: string; source_kind?: string; device?: string; created_from?: string; created_to?: string; signal?: AbortSignal }) => {
       const query = new URLSearchParams();
-      for (const [key, value] of Object.entries(opts ?? {})) if (value !== undefined) query.set(key, String(value));
-      return request<RerouteBundlePage | RerouteBundle[]>(`/api/reroute-bundles${query.size ? `?${query}` : ""}`);
+      for (const [key, value] of Object.entries(opts ?? {})) if (key !== "signal" && value !== undefined) query.set(key, String(value));
+      return request<RerouteBundlePage | RunSummary[]>(`/api/reroute-bundles${query.size ? `?${query}` : ""}`, { signal: opts?.signal });
     },
-    get: (id: number) => request<RerouteBundle>(`/api/reroute-bundles/${id}`),
+    get: (id: number, signal?: AbortSignal) => request<RunDetail>(`/api/reroute-bundles/${id}`, { signal }),
     revert: (id: number, body: { dry_run: boolean; reason?: string; plan_id?: number; preview_token?: string }) =>
       request<ManualMitigationPreview | ManualMitigationAccepted>(`/api/reroute-bundles/${id}/revert`, { method: "POST", body }),
     takeControl: (id: number) => request<{ ok: true; bundle_id: number; automatic_recovery_cancelled: true }>(`/api/reroute-bundles/${id}/take-control`, { method: "POST" }),

@@ -86,6 +86,19 @@ can cause a duplicate delivery; external delivery is not exactly-once.
 Eligible work reserves capacity for both critical and ordinary alerts. Settled
 intents no longer occupy retry slots. An empty audience receives an explicit
 settled `no_audience` record, so old unroutable alerts cannot block newer work.
+Each materialization pass reserves 40 slots for critical alerts and 10 for
+ordinary alerts, matching delivery selection so either class continues to make
+progress under a sustained backlog.
+
+The upgrade repair reconstructs one intent per historical alert, channel, and
+recipient or endpoint. A historical success wins; deliberate suppression stays
+settled; rate-limited and under-budget failed work resumes with its attempt count
+and backoff; bounced or exhausted work remains permanent. Existing settled
+intents are unchanged, while an existing pending intent is settled when the
+history proves delivery. Deleted or otherwise missing target identities are
+kept as permanently failed diagnostics and are never turned into a new routing
+target. Historical Teams errors that contained a URL are replaced wholesale by
+a generic redaction without changing attempt identity, status, or timestamps.
 
 ## De-duplication & rate limiting
 
@@ -109,6 +122,8 @@ Attacks are bursty; detection rules can fire repeatedly. To avoid mailstorms:
   (`alert_recipients`).
 - Subscriptions (`alert_subscriptions`): by event type (a NULL event type matches
   all).
+- Event subscriptions are exact. Selecting one event does not subscribe the
+  target to related events; the NULL all-events subscription remains unchanged.
 - Critical alerts (`uncertain`, `failed`, security events) always fan out to the
   verified recipients linked to the current admin tier (`admin` / `superadmin`).
   Recipient creation links an unambiguous normalized user email; external

@@ -335,6 +335,25 @@ pub struct BundleOutcome {
     pub failure_reason: Option<String>,
 }
 
+fn finalization_failure_outcome(
+    bundle_id: u64,
+    results: Vec<Value>,
+    still_applied: Vec<u64>,
+    error: anyhow::Error,
+) -> BundleOutcome {
+    let reason = format!(
+        "terminal persistence failed; recovery ownership remains quarantined for startup repair: {error:#}"
+    );
+    tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%error, "bundle outcome is unproven because terminal persistence failed");
+    BundleOutcome {
+        bundle_id,
+        state: "compensation_blocked".into(),
+        results,
+        still_applied,
+        failure_reason: Some(reason),
+    }
+}
+
 /// Who authorized this bundle and how it must behave — everything the runner
 /// needs besides the actions themselves.
 pub struct BundleRun {
@@ -353,6 +372,8 @@ pub struct BundleRun {
     pub trigger_type: &'static str,
     pub authorization_plan_id: Option<u64>,
     pub owner_token: String,
+    #[doc(hidden)]
+    pub force_terminal_persistence_failure: bool,
 }
 
 impl BundleRun {
@@ -375,6 +396,7 @@ impl BundleRun {
             trigger_type: "manual",
             authorization_plan_id: None,
             owner_token: format!("bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
         }
     }
 
@@ -398,6 +420,7 @@ impl BundleRun {
             trigger_type: "automatic",
             authorization_plan_id: None,
             owner_token: format!("bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
         }
     }
 
@@ -417,6 +440,7 @@ impl BundleRun {
             trigger_type: "rollback",
             authorization_plan_id: None,
             owner_token: format!("bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
         }
     }
 
@@ -431,6 +455,7 @@ impl BundleRun {
             trigger_type: "recovery",
             authorization_plan_id: None,
             owner_token: format!("recovery:bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
         }
     }
 
@@ -445,6 +470,7 @@ impl BundleRun {
             trigger_type: "recovery",
             authorization_plan_id: None,
             owner_token: format!("recovery:bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
         }
     }
 
@@ -455,6 +481,12 @@ impl BundleRun {
     ) -> Self {
         self.authorization_plan_id = plan_id;
         self.owner_token = owner_token.into();
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_forced_terminal_persistence_failure(mut self) -> Self {
+        self.force_terminal_persistence_failure = true;
         self
     }
 }
@@ -485,6 +517,43 @@ pub async fn run_with_ssh<S: SshExecutor>(
     actions: Vec<BundleAction>,
     ssh: &S,
 ) -> BundleOutcome {
+    let bundle_id = run.bundle_id;
+    let runtime = match cfg.advisory_runtime(pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            return BundleOutcome {
+                bundle_id: run.bundle_id,
+                state: "failed".into(),
+                results: vec![],
+                still_applied: vec![],
+                failure_reason: Some(format!("lock runtime unavailable: {error}")),
+            }
+        }
+    };
+    match crate::db::advisory::foreground_scope(
+        runtime,
+        Box::pin(run_with_ssh_inner(pool, cfg, run, actions, ssh)),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => BundleOutcome {
+            bundle_id,
+            state: "failed".into(),
+            results: vec![],
+            still_applied: vec![],
+            failure_reason: Some(format!("execution capacity unavailable: {error}")),
+        },
+    }
+}
+
+async fn run_with_ssh_inner<S: SshExecutor>(
+    pool: &MySqlPool,
+    cfg: &Config,
+    run: BundleRun,
+    actions: Vec<BundleAction>,
+    ssh: &S,
+) -> BundleOutcome {
     let BundleRun {
         bundle_id,
         policy,
@@ -495,6 +564,7 @@ pub async fn run_with_ssh<S: SshExecutor>(
         trigger_type,
         authorization_plan_id,
         owner_token,
+        force_terminal_persistence_failure,
     } = run;
     debug_assert!(
         matches!(
@@ -505,7 +575,11 @@ pub async fn run_with_ssh<S: SshExecutor>(
     );
     if let Err(e) = persist_actions(pool, bundle_id, &actions).await {
         let reason = format!("bundle preparation failed before execution: {e}");
-        finish(pool, bundle_id, "failed", Some(&reason)).await;
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+        {
+            return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
+        }
         return BundleOutcome {
             bundle_id,
             state: "failed".into(),
@@ -517,7 +591,11 @@ pub async fn run_with_ssh<S: SshExecutor>(
     if let Some(plan_id) = authorization_plan_id {
         if let Err(e) = validate_manual_snapshot(pool, plan_id, bundle_id, &actions).await {
             let reason = format!("authorized bundle snapshot mismatch: {e}");
-            finish(pool, bundle_id, "failed", Some(&reason)).await;
+            if let Err(finalize) =
+                finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+            {
+                return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
+            }
             return BundleOutcome {
                 bundle_id,
                 state: "failed".into(),
@@ -538,7 +616,11 @@ pub async fn run_with_ssh<S: SshExecutor>(
                 .await
         {
             let reason = format!("could not claim original action ownership for recovery: {e}");
-            finish(pool, bundle_id, "failed", Some(&reason)).await;
+            if let Err(finalize) =
+                finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+            {
+                return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
+            }
             return BundleOutcome {
                 bundle_id,
                 state: "failed".into(),
@@ -552,7 +634,11 @@ pub async fn run_with_ssh<S: SshExecutor>(
         locks::acquire_bundle_change_windows(pool, bundle_id, &owner_token, &device_ids).await
     {
         let reason = format!("could not acquire the bundle device change window: {e}");
-        finish(pool, bundle_id, "failed", Some(&reason)).await;
+        if let Err(finalize) =
+            finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
+        {
+            return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
+        }
         return BundleOutcome {
             bundle_id,
             state: "failed".into(),
@@ -570,7 +656,7 @@ pub async fn run_with_ssh<S: SshExecutor>(
             if let Err(finalize) =
                 finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
             {
-                tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+                return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
             }
             return BundleOutcome {
                 bundle_id,
@@ -612,7 +698,8 @@ pub async fn run_with_ssh<S: SshExecutor>(
         if let Err(finalize) =
             finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
         {
-            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
         }
         let _ = native_locks.unlock_all().await;
         return BundleOutcome {
@@ -650,7 +737,8 @@ pub async fn run_with_ssh<S: SshExecutor>(
         if let Err(finalize) =
             finish_and_release(pool, bundle_id, "failed", Some(&reason), &owner_token).await
         {
-            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, Vec::new(), Vec::new(), finalize);
         }
         let _ = native_locks.unlock_all().await;
         return BundleOutcome {
@@ -888,15 +976,7 @@ pub async fn run_with_ssh<S: SshExecutor>(
     }
     if stopped_at.is_none() && matches!(trigger_type, "rollback" | "recovery") {
         match outstanding_owned_originals(pool, bundle_id).await {
-            Ok(outstanding) if outstanding.is_empty() => {
-                if let Err(e) = settle_source_activations(pool, bundle_id).await {
-                    corrective_failure = true;
-                    stopped_at = Some((
-                        u32::MAX,
-                        format!("could not settle original activation ownership: {e}"),
-                    ));
-                }
-            }
+            Ok(outstanding) if outstanding.is_empty() => {}
             Ok(_) => {
                 corrective_failure = true;
                 stopped_at = Some((
@@ -933,7 +1013,16 @@ pub async fn run_with_ssh<S: SshExecutor>(
             if let Err(finalize) =
                 finish_and_release(pool, bundle_id, "aborted", Some(&summary), &owner_token).await
             {
-                tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+                let _ = locks::set_bundle_change_window_phase(
+                    pool,
+                    bundle_id,
+                    &owner_token,
+                    "uncertain",
+                )
+                .await;
+                drop(locked_ssh);
+                let _ = native_locks.unlock_all().await;
+                return finalization_failure_outcome(bundle_id, results, still, finalize);
             }
             if !still.is_empty() {
                 alert_still_applied(pool, bundle_id, &still, &summary).await;
@@ -948,10 +1037,18 @@ pub async fn run_with_ssh<S: SshExecutor>(
                 failure_reason: Some(summary),
             };
         }
-        if let Err(finalize) =
+        let finalized = if force_terminal_persistence_failure {
+            Err(anyhow::anyhow!("injected terminal persistence failure"))
+        } else {
             finish_and_release(pool, bundle_id, "succeeded", None, &owner_token).await
-        {
-            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+        };
+        if let Err(finalize) = finalized {
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, results, Vec::new(), finalize);
         }
         if let Err(e) = super::recovery::schedule_if_eligible(pool, bundle_id).await {
             tracing::error!(event_type="bundle_lifecycle_refresh_failed",bundle_id,error=%e);
@@ -976,8 +1073,15 @@ pub async fn run_with_ssh<S: SshExecutor>(
         let still: Vec<u64> = outstanding.into_iter().map(|(id, _)| id).collect();
         let _ =
             locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
-        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still, &summary).await {
-            tracing::error!(event_type = "corrective_bundle_finalize_failed", bundle_id, error = %e);
+        if let Err(e) =
+            finish_blocked_with_alert(pool, bundle_id, &still, &summary, &owner_token).await
+        {
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, results, still, e);
         }
         drop(locked_ssh);
         let _ = native_locks.unlock_all().await;
@@ -1008,8 +1112,15 @@ pub async fn run_with_ssh<S: SshExecutor>(
         }
         let _ =
             locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
-        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still, &summary).await {
-            tracing::error!(event_type = "bundle_blocked_finalize_failed", bundle_id, error = %e, "bundle remains recoverable as in-flight");
+        if let Err(e) =
+            finish_blocked_with_alert(pool, bundle_id, &still, &summary, &owner_token).await
+        {
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, results, still, e);
         }
         drop(locked_ssh);
         let _ = native_locks.unlock_all().await;
@@ -1028,7 +1139,13 @@ pub async fn run_with_ssh<S: SshExecutor>(
         if let Err(finalize) =
             finish_and_release(pool, bundle_id, "aborted", Some(&summary), &owner_token).await
         {
-            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            let still: Vec<u64> = applied.iter().map(|a| a.reroute_id).collect();
+            return finalization_failure_outcome(bundle_id, results, still, finalize);
         }
         let still: Vec<u64> = applied.iter().map(|a| a.reroute_id).collect();
         if !still.is_empty() {
@@ -1123,8 +1240,15 @@ pub async fn run_with_ssh<S: SshExecutor>(
         "compensation_blocked"
     };
     if !still_applied.is_empty() {
-        if let Err(e) = finish_blocked_with_alert(pool, bundle_id, &still_applied, &summary).await {
-            tracing::error!(event_type = "bundle_blocked_finalize_failed", bundle_id, error = %e, "bundle remains recoverable as in-flight");
+        if let Err(e) =
+            finish_blocked_with_alert(pool, bundle_id, &still_applied, &summary, &owner_token).await
+        {
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, results, still_applied, e);
         }
         let _ =
             locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain").await;
@@ -1132,7 +1256,12 @@ pub async fn run_with_ssh<S: SshExecutor>(
         if let Err(finalize) =
             finish_and_release(pool, bundle_id, state, Some(&summary), &owner_token).await
         {
-            tracing::error!(event_type="bundle_finalize_failed", bundle_id, error=%finalize);
+            let _ =
+                locks::set_bundle_change_window_phase(pool, bundle_id, &owner_token, "uncertain")
+                    .await;
+            drop(locked_ssh);
+            let _ = native_locks.unlock_all().await;
+            return finalization_failure_outcome(bundle_id, results, Vec::new(), finalize);
         }
     }
     drop(locked_ssh);
@@ -1198,35 +1327,29 @@ async fn validate_manual_snapshot(
     Ok(())
 }
 
-async fn finish(pool: &MySqlPool, bundle_id: u64, state: &str, failure_reason: Option<&str>) {
-    if let Err(e) = sqlx::query(
-        "UPDATE reroute_bundles SET state = ?, failure_reason = ?, finished_at = UTC_TIMESTAMP() \
-                , rate_reserved_actions = 0 \
-         WHERE id = ?",
-    )
-    .bind(state)
-    .bind(failure_reason)
-    .bind(bundle_id)
-    .execute(pool)
-    .await
-    {
-        tracing::error!(
-            event_type = "bundle_finalize_failed",
-            bundle_id,
-            state,
-            error = %e,
-            "could not persist terminal bundle state"
-        );
-    }
-}
-
-async fn finish_and_release(
+pub(crate) async fn finish_and_release(
     pool: &MySqlPool,
     bundle_id: u64,
     state: &str,
     failure_reason: Option<&str>,
     owner_token: &str,
 ) -> anyhow::Result<()> {
+    let recovery_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(bundle_id)
+    .fetch_one(pool)
+    .await?;
+    if recovery_sources > 0 {
+        return super::recovery::finalize_recovery_child(
+            pool,
+            bundle_id,
+            state,
+            failure_reason,
+            owner_token,
+        )
+        .await;
+    }
     let mut tx = pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE reroute_bundles SET state = ?, failure_reason = ?, \
@@ -1242,11 +1365,12 @@ async fn finish_and_release(
         updated.rows_affected() == 1,
         "bundle terminal state conflict"
     );
-    sqlx::query("DELETE FROM device_change_windows WHERE bundle_id = ? AND owner_token = ?")
-        .bind(bundle_id)
-        .bind(owner_token)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("DELETE membership FROM device_change_window_sources membership WHERE membership.source_bundle_id=? AND (?='succeeded' OR NOT EXISTS(SELECT 1 FROM reroutes original WHERE original.bundle_id=? AND original.rollback_of_reroute_id IS NULL AND original.mutation_effect IN ('changed','unknown') AND NOT EXISTS(SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=original.id AND inverse.state='succeeded' AND inverse.mutation_effect IN ('changed','noop'))))")
+        .bind(bundle_id).bind(state).bind(bundle_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE w FROM device_change_windows w WHERE w.bundle_id=? AND w.owner_token=? AND NOT EXISTS(SELECT 1 FROM device_change_window_sources membership WHERE membership.device_id=w.device_id)")
+        .bind(bundle_id).bind(owner_token).execute(&mut *tx).await?;
+    sqlx::query("UPDATE device_change_windows SET bundle_id=NULL,reroute_id=NULL,owner_token=CONCAT('quarantine:device:',device_id),phase='uncertain' WHERE bundle_id=? AND owner_token=?")
+        .bind(bundle_id).bind(owner_token).execute(&mut *tx).await?;
     tx.commit().await?;
     super::recovery::refresh(pool, bundle_id).await?;
     Ok(())
@@ -1301,7 +1425,24 @@ async fn finish_blocked_with_alert(
     bundle_id: u64,
     still: &[u64],
     summary: &str,
+    owner_token: &str,
 ) -> anyhow::Result<()> {
+    let recovery_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(bundle_id)
+    .fetch_one(pool)
+    .await?;
+    if recovery_sources > 0 {
+        return super::recovery::finalize_recovery_child(
+            pool,
+            bundle_id,
+            "compensation_blocked",
+            Some(summary),
+            owner_token,
+        )
+        .await;
+    }
     let payload = json!({
         "bundle_id": bundle_id,
         "still_applied_reroute_ids": still,
@@ -1406,6 +1547,28 @@ pub async fn settle_source_activations(
     pool: &MySqlPool,
     recovery_bundle_id: u64,
 ) -> anyhow::Result<()> {
+    let mapped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(recovery_bundle_id)
+    .fetch_one(pool)
+    .await?;
+    if mapped > 0 {
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT owner_token FROM device_change_windows WHERE bundle_id=? LIMIT 1",
+        )
+        .bind(recovery_bundle_id)
+        .fetch_optional(pool)
+        .await?;
+        return super::recovery::finalize_recovery_child(
+            pool,
+            recovery_bundle_id,
+            "succeeded",
+            Some("all original mutations were verified restored"),
+            owner.as_deref().unwrap_or("legacy-settlement"),
+        )
+        .await;
+    }
     let source_bundles: Vec<u64> = sqlx::query_scalar(
         "SELECT DISTINCT original.bundle_id \
            FROM reroute_bundle_actions ba \
@@ -1436,6 +1599,10 @@ pub async fn settle_source_activations(
             .bind(source_bundle)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+            .bind(source_bundle)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         super::recovery::refresh(pool, source_bundle).await?;
         sqlx::query(
@@ -1454,6 +1621,27 @@ pub async fn settle_source_activations(
 /// [`super::state_machine::recover_on_startup`]; this closes the bundle row so the
 /// UI never shows a mitigation as still progressing after a crash.
 pub async fn recover_on_startup(pool: &MySqlPool) -> anyhow::Result<()> {
+    super::recovery::repair_legacy_associations(pool).await?;
+    let recovery_children: Vec<(u64,String)> = sqlx::query_as(
+        "SELECT DISTINCT child.id,child.state FROM reroute_bundles child JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=child.id WHERE ras.settlement='active' ORDER BY child.id",
+    ).fetch_all(pool).await?;
+    for (child_id, state) in recovery_children {
+        let owner_token: Option<String> = sqlx::query_scalar("SELECT owner_token FROM device_change_windows WHERE bundle_id=? ORDER BY device_id LIMIT 1")
+            .bind(child_id).fetch_optional(pool).await?;
+        let terminal = match state.as_str() {
+            "succeeded" => "succeeded",
+            "failed" | "aborted" => "failed",
+            _ => "compensation_blocked",
+        };
+        super::recovery::finalize_recovery_child(
+            pool,
+            child_id,
+            terminal,
+            Some("startup repaired recovery ownership"),
+            owner_token.as_deref().unwrap_or("startup-repair"),
+        )
+        .await?;
+    }
     let bundles: Vec<u64> = sqlx::query_scalar(
         "SELECT id FROM reroute_bundles \
          WHERE state IN ('planned', 'running', 'compensating') ORDER BY id",
@@ -1583,6 +1771,109 @@ pub async fn recover_on_startup(pool: &MySqlPool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verified_success_releases_only_its_membership_for_serial_activation() {
+        let database = crate::db::connect_test_database().await;
+        let pool = (*database).clone();
+        let device =
+            sqlx::query("INSERT INTO devices(name,hostname,enabled) VALUES(?, '127.0.0.1', 0)")
+                .bind(format!("serial-success-{}", uuid::Uuid::new_v4()))
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_id();
+        let first = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','running',1,'active')")
+            .execute(&pool).await.unwrap().last_insert_id();
+        let first_owner = format!("test:first:{first}");
+        locks::acquire_bundle_change_windows(&pool, first, &first_owner, &[device])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO reroutes(device_id,bundle_id,bundle_position,trigger_type,state,mutation_effect) VALUES(?,?,0,'manual','succeeded','changed')")
+            .bind(device).bind(first).execute(&pool).await.unwrap();
+        finish_and_release(&pool, first, "succeeded", None, &first_owner)
+            .await
+            .unwrap();
+
+        let second = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','running',0,'active')")
+            .execute(&pool).await.unwrap().last_insert_id();
+        let second_owner = format!("test:second:{second}");
+        locks::acquire_bundle_change_windows(&pool, second, &second_owner, &[device])
+            .await
+            .expect("a fully verified prior activation must not quarantine the device");
+
+        let foreign = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','compensation_blocked',1,'recovery_blocked')")
+            .execute(&pool).await.unwrap().last_insert_id();
+        sqlx::query(
+            "INSERT INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)",
+        )
+        .bind(device)
+        .bind(foreign)
+        .execute(&pool)
+        .await
+        .unwrap();
+        finish_and_release(&pool, second, "succeeded", None, &second_owner)
+            .await
+            .unwrap();
+        let window: (Option<u64>, String, String) = sqlx::query_as(
+            "SELECT bundle_id,owner_token,phase FROM device_change_windows WHERE device_id=?",
+        )
+        .bind(device)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            window,
+            (
+                None,
+                format!("quarantine:device:{device}"),
+                "uncertain".into()
+            )
+        );
+        let third = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','planned',0,'active')")
+            .execute(&pool).await.unwrap().last_insert_id();
+        let blocked = locks::acquire_bundle_change_windows(
+            &pool,
+            third,
+            &format!("test:third:{third}"),
+            &[device],
+        )
+        .await;
+        assert!(
+            blocked
+                .unwrap_err()
+                .to_string()
+                .contains("retains recovery ownership"),
+            "releasing one successful source must preserve a foreign quarantine"
+        );
+        sqlx::query("DELETE FROM device_change_windows WHERE device_id=?")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM device_change_window_sources WHERE device_id=?")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM reroutes WHERE bundle_id=?")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [first, second, third, foreign] {
+            sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM devices WHERE id=?")
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     /// The trigger type decides which gates bind: `guard::decide` enforces the
     /// `automatic_actions_enabled` master switch and verify-or-refuse ONLY for

@@ -69,6 +69,23 @@ freezes recovery; inspect and reconcile rather than inventing an inverse. Taking
 manual control cancels a future automatic deadline. A manual revert always gets
 a fresh exact preview and explicit confirmation.
 
+The **Active Runs** view is server-paginated at 25 logical runs per page. Search
+matches run id, saved/source name, trigger, lifecycle, or operator. Device accepts
+an exact numeric id or a case-insensitive name fragment. Date inputs are browser
+local calendar days converted to inclusive UTC lower and exclusive next-day UTC
+upper bounds against run creation time. Opening a row loads that run's full
+action evidence and, when present, its latest recovery child; list refreshes do
+not fetch every action or every page.
+
+Manual-revert blockers and automatic-recovery errors are displayed separately.
+**Cancel automatic recovery** appears only when a timer-based or rule-driven
+automatic recovery is still eligible and unclaimed. It cancels that future
+automatic revert without sending router commands; the current changes remain
+until an operator previews and confirms a manual revert. Runs configured for
+manual recovery do not show this action. **Reconcile device state** is available for an
+uncertain action and for a failed inverse that has persisted changed evidence;
+it remains a read-only comparison and does not acknowledge arbitrary failures.
+
 ## EMDD policy prerequisites
 
 These snippets are reference material for a network administrator. The release

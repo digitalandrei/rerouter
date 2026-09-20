@@ -25,10 +25,10 @@ import {
   type RerouteDetail,
   type RerouteResult,
   type RerouteBundle,
+  type RunSummary,
   type Rule,
   type SystemSettings,
   type ManualMitigationPreview,
-  bundleVerificationMode,
 } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -77,7 +77,6 @@ import { chooseRecoveryChildId, presentMitigationRun, recoveryFieldLabel, recove
 
 const ALERTS_PAGE_SIZE = 50;
 const ALERTS_DAYS = 7;
-const exposeSourceVerificationMode = (run: RerouteBundle): RerouteBundle => ({ ...run, verification_mode: bundleVerificationMode(run) });
 
 // ---------------------------------------------------------------------------
 // Detections tab
@@ -534,7 +533,8 @@ export function ActiveRunsTab() {
   const ruleFilter = Number(pageParams.get("rule_id")) || undefined;
   const { hasPermission } = useAuth();
   const canAct = hasPermission("trigger_manual_reroute");
-  const [runs, setRuns] = useState<RerouteBundle[]>([]);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runTotal, setRunTotal] = useState(0);
   const [selected, setSelected] = useState<RerouteBundle | null>(null);
   const [recoveryRun, setRecoveryRun] = useState<RerouteBundle | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
@@ -550,6 +550,11 @@ export function ActiveRunsTab() {
   const closedRunRef = useRef<number | null>(null);
   const lastSelectedRunRef = useRef<number | null>(null);
   const previewGeneration = useRef(0);
+  const actionGeneration = useRef(0);
+  const listAbort = useRef<AbortController | null>(null);
+  const detailAbort = useRef<AbortController | null>(null);
+  const recoveryAbort = useRef<AbortController | null>(null);
+  const requestGeneration = useRef(0);
   const [previewReason, setPreviewReason] = useState<string | null>(null);
   const query = pageParams.get("run_search") ?? "";
   const statusFilter = pageParams.get("status") ?? "";
@@ -568,7 +573,8 @@ export function ActiveRunsTab() {
     if (recoveryRunRef.current?.id !== childId) { recoveryRunRef.current = null; setRecoveryRun(null); }
     recoveryIdRef.current = childId;
     try {
-      const child = await api.bundles.get(childId);
+      recoveryAbort.current?.abort(); const controller=new AbortController(); recoveryAbort.current=controller;
+      const child = await api.bundles.get(childId,controller.signal);
       if (child.parent_bundle_id !== source.id) throw new Error("Recovery run does not belong to this mitigation");
       if (selectedIdRef.current === source.id && (generation === undefined || generation === previewGeneration.current) && recoveryIdRef.current === childId) { recoveryRunRef.current = child; setRecoveryRun(child); setRecoveryError(null); }
     } catch {
@@ -576,42 +582,38 @@ export function ActiveRunsTab() {
     }
   }
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    if (!force && listAbort.current && !listAbort.current.signal.aborted) return;
+    listAbort.current?.abort(); const controller=new AbortController(); listAbort.current=controller; const generation=++requestGeneration.current;
     try {
-      const all: RerouteBundle[] = []; let serverPage = 1;
-      while (true) { const response = await api.bundles.list({ lifecycle: "active", page: serverPage, per_page: 200, preset_id: presetFilter, rule_id: ruleFilter }); const items = Array.isArray(response) ? response : response.items; all.push(...items); if (Array.isArray(response) || serverPage * response.per_page >= response.total) break; serverPage += 1; }
-      const detailed = await Promise.all(all.map(async (run) => { try { return await api.bundles.get(run.id); } catch { return run; } }));
-      setRuns(detailed.map(exposeSourceVerificationMode)); setError(null);
-      if (requestedRun && selectedIdRef.current === null && closedRunRef.current !== requestedRun) void open(requestedRun);
-      const selectedId = selectedIdRef.current;
-      if (selectedId !== null) {
-        try { const current = await api.bundles.get(selectedId); if (selectedIdRef.current === selectedId) { setSelected(current); await refreshRecovery(current); } }
-        catch { setSelected((current) => current?.id === selectedId ? detailed.find((item) => item.id === selectedId) ?? current : current); setError("Selected run could not be refreshed. Showing retained evidence."); }
-      }
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not refresh active runs"); }
-  }, [presetFilter, ruleFilter, requestedRun]);
-  useEffect(() => { void load(); const timer = setInterval(() => void load(), 5000); return () => clearInterval(timer); }, [load]);
+      const localBound=(value:string,next:boolean)=>{if(!value)return undefined;const date=new Date(`${value}T00:00:00`);if(next)date.setDate(date.getDate()+1);return date.toISOString();};
+      const response = await api.bundles.list({ lifecycle: statusFilter||"active", logical_only:true, page, per_page: 25, preset_id: presetFilter, rule_id: ruleFilter,q:query||undefined,source_kind:sourceFilter||undefined,device:deviceFilter||undefined,created_from:localBound(afterFilter,false),created_to:localBound(beforeFilter,true),signal:controller.signal });
+      if(generation!==requestGeneration.current)return;
+      const items=Array.isArray(response)?response:response.items; setRuns(items); setRunTotal(Array.isArray(response)?items.length:response.total); setError(null);
+      if (!Array.isArray(response) && response.page !== page) { const next=new URLSearchParams(pageParams); next.set("page",String(response.page)); setPageParams(next,{replace:true}); }
+      if (requestedRun && selectedIdRef.current !== requestedRun && closedRunRef.current !== requestedRun) void open(requestedRun);
+      const selectedId=selectedIdRef.current;
+      if(selectedId!==null){detailAbort.current?.abort();const detailController=new AbortController();detailAbort.current=detailController;try{const current=await api.bundles.get(selectedId,detailController.signal);if(generation===requestGeneration.current&&selectedIdRef.current===selectedId){setSelected(current);await refreshRecovery(current);}}catch(detailCause){if(!detailController.signal.aborted&&generation===requestGeneration.current){setError(`Selected run could not be refreshed. Showing retained evidence.${detailCause instanceof Error?` ${detailCause.message}`:""}`);}}}
+    } catch (cause) { if(!controller.signal.aborted&&generation===requestGeneration.current)setError(cause instanceof Error ? cause.message : "Could not refresh active runs"); }
+    finally { if (listAbort.current === controller) listAbort.current = null; }
+  }, [presetFilter, ruleFilter, requestedRun,page,query,statusFilter,sourceFilter,deviceFilter,afterFilter,beforeFilter]);
+  useEffect(() => { void load(); const timer = setInterval(() => void load(), 5000); return () => {clearInterval(timer);listAbort.current?.abort();detailAbort.current?.abort();recoveryAbort.current?.abort();requestGeneration.current+=1;previewGeneration.current+=1;}; }, [load]);
   useEffect(() => {
     if (selected) lastSelectedRunRef.current = selected.id;
     else if (lastSelectedRunRef.current !== null) closedRunRef.current = lastSelectedRunRef.current;
   }, [selected]);
 
-  async function open(id: number) { if (busy || openingRunId !== null) return; recoveryIdRef.current = null; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); setOpeningRunId(id); const next = new URLSearchParams(pageParams); next.set("tab", "active"); next.set("run", String(id)); setPageParams(next, { replace: true }); const generation = ++previewGeneration.current; selectedIdRef.current = id; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.get(id); if (generation === previewGeneration.current && selectedIdRef.current === id) { setSelected(value); await refreshRecovery(value, generation); } } catch (cause) { toast.error(cause instanceof Error ? cause.message : "Could not load run"); } finally { if (generation === previewGeneration.current) setBusy(false); setOpeningRunId(null); } }
-  function closeSelectedRun() { previewGeneration.current += 1; closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; recoveryIdRef.current = null; recoveryRunRef.current = null; setSelected(null); setRecoveryRun(null); setRecoveryError(null); setPreview(null); setPreviewReason(null); setPendingAction(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
-  async function previewRevert() { if (!selected || busy || pendingAction) return; const runId = selected.id; const requestedReason = reason; const generation = ++previewGeneration.current; setBusy(true); setPendingAction("preview_revert"); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.revert(runId, { dry_run: true, reason: requestedReason || undefined }); if (generation === previewGeneration.current && selectedIdRef.current === runId && reason === requestedReason && "plan_id" in value) { setPreview(value); setPreviewReason(requestedReason); } } catch (cause) { if (generation === previewGeneration.current) toast.error(cause instanceof Error ? cause.message : "Revert preview failed"); } finally { if (generation === previewGeneration.current) { setBusy(false); setPendingAction(null); } } }
-  async function confirmRevert() { if (!selected || busy || pendingAction || !preview?.plan_id || !preview.preview_token || previewReason !== reason) return; setBusy(true); setPendingAction("confirm_revert"); try { const value = await api.bundles.revert(selected.id, { dry_run: false, reason: previewReason || undefined, plan_id: preview.plan_id, preview_token: preview.preview_token }); setPreview(null); setPreviewReason(null); if ("bundle_id" in value) { recoveryIdRef.current = value.bundle_id; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); toast.success(`Revert run #${value.bundle_id} started`); } await load(); } catch (cause) { setPreview(null); setPreviewReason(null); toast.error(`${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh preview.`); } finally { setBusy(false); setPendingAction(null); } }
-  async function takeControl() { if (!selected || busy || pendingAction) return; setBusy(true); setPendingAction("take_control"); try { await api.bundles.takeControl(selected.id); toast.success("Manual control recorded"); await load(); } catch (cause) { toast.error(cause instanceof Error ? cause.message : "Takeover failed"); } finally { setBusy(false); setPendingAction(null); } }
-  const filteredRuns = runs.filter((run) => {
-    const haystack = `${run.id} ${run.source?.preset_name ?? run.source?.name ?? ""} ${run.trigger_type} ${run.lifecycle_state ?? ""} ${run.triggered_by ?? ""}`.toLowerCase();
-    const when = run.created_at ? new Date(run.created_at).getTime() : 0;
-    return haystack.includes(query.toLowerCase()) && (!statusFilter || (run.lifecycle_state ?? run.state) === statusFilter) && (!sourceFilter || (run.source?.kind ?? run.trigger_type) === sourceFilter) && (!deviceFilter || run.actions?.some((action) => String(action.device_id) === deviceFilter || action.device_name?.toLowerCase().includes(deviceFilter.toLowerCase()))) && (!afterFilter || when >= new Date(afterFilter).getTime()) && (!beforeFilter || when <= new Date(`${beforeFilter}T23:59:59`).getTime());
-  });
-  const pageSize = 25; const shown = filteredRuns.slice((page - 1) * pageSize, page * pageSize); const pages = Math.max(1, Math.ceil(filteredRuns.length / pageSize));
+  async function open(id: number) { if (busy || openingRunId !== null) return; detailAbort.current?.abort(); const controller=new AbortController();detailAbort.current=controller; recoveryIdRef.current = null; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); setOpeningRunId(id); const next = new URLSearchParams(pageParams); next.set("tab", "active"); next.set("run", String(id)); setPageParams(next, { replace: true }); const generation = ++previewGeneration.current; selectedIdRef.current = id; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.get(id,controller.signal); if (generation === previewGeneration.current && selectedIdRef.current === id) { setSelected(value); await refreshRecovery(value, generation); } } catch (cause) { if(!controller.signal.aborted)toast.error(cause instanceof Error ? cause.message : "Could not load run"); } finally { setBusy(false); setOpeningRunId(null); } }
+  function closeSelectedRun() { previewGeneration.current += 1; actionGeneration.current += 1; detailAbort.current?.abort(); recoveryAbort.current?.abort(); closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; recoveryIdRef.current = null; recoveryRunRef.current = null; setSelected(null); setRecoveryRun(null); setRecoveryError(null); setPreview(null); setPreviewReason(null); setBusy(false); setPendingAction(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
+  async function previewRevert() { if (!selected || busy || pendingAction) return; const runId = selected.id; const requestedReason = reason; const generation = ++actionGeneration.current; setBusy(true); setPendingAction("preview_revert"); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.revert(runId, { dry_run: true, reason: requestedReason || undefined }); if (generation === actionGeneration.current && selectedIdRef.current === runId && reason === requestedReason && "plan_id" in value) { setPreview(value); setPreviewReason(requestedReason); } } catch (cause) { if (generation === actionGeneration.current) toast.error(cause instanceof Error ? cause.message : "Revert preview failed"); } finally { if (generation === actionGeneration.current) { setBusy(false); setPendingAction(null); } } }
+  async function confirmRevert() { if (!selected || busy || pendingAction || !preview?.plan_id || !preview.preview_token || previewReason !== reason) return; const generation=++actionGeneration.current; setBusy(true); setPendingAction("confirm_revert"); try { const value = await api.bundles.revert(selected.id, { dry_run: false, reason: previewReason || undefined, plan_id: preview.plan_id, preview_token: preview.preview_token }); if(generation!==actionGeneration.current)return; setPreview(null); setPreviewReason(null); if ("bundle_id" in value) { recoveryIdRef.current = value.bundle_id; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); toast.success(`Revert run #${value.bundle_id} started`); } await load(true); } catch (cause) { if(generation===actionGeneration.current){setPreview(null); setPreviewReason(null); toast.error(`${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh preview.`);} } finally { if(generation===actionGeneration.current){setBusy(false); setPendingAction(null);} } }
+  async function takeControl() { if (!selected || busy || pendingAction) return; const generation=++actionGeneration.current; setBusy(true); setPendingAction("take_control"); try { await api.bundles.takeControl(selected.id); if(generation!==actionGeneration.current)return; toast.success("Automatic recovery cancelled. Revert remains available manually."); await load(true); } catch (cause) { if(generation===actionGeneration.current)toast.error(cause instanceof Error ? cause.message : "Automatic recovery could not be cancelled"); } finally { if(generation===actionGeneration.current){setBusy(false); setPendingAction(null);} } }
+  const shown = runs; const pages = Math.max(1, Math.ceil(runTotal / 25));
   const displayedRecoveryId = selected ? recoveryIdRef.current ?? selected.recovery_bundle_id ?? selected.latest_recovery_bundle_id ?? null : null;
   const displayedRecoveryState = displayedRecoveryId === null ? undefined : recoveryRun?.id === displayedRecoveryId ? recoveryRun.state : selected?.latest_recovery?.id === displayedRecoveryId ? selected.latest_recovery.state : undefined;
 
   return <>
-    {error && <div role="alert" className="mb-3 rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">Refresh failed. Showing retained run data. {error} <AsyncRetryButton onRetry={load} /></div>}
+    {error && <div role="alert" className="mb-3 rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">Refresh failed. Showing retained run data. {error} <AsyncRetryButton onRetry={() => load(true)} /></div>}
     {presetFilter && <p className="text-sm text-muted-foreground">Showing active runs for saved mitigation #{presetFilter}. Choose the exact run to inspect before reverting.</p>}
     {ruleFilter && <p className="text-sm text-muted-foreground">Showing active runs owned by rule #{ruleFilter}. Choose the original run to inspect before reverting.</p>}
     <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6"><Input aria-label="Search active mitigation runs" placeholder="Search run or operator…" value={query} onChange={(event) => setFilter("run_search", event.target.value)} /><select className="rounded-md border bg-background px-3 py-2 text-sm" aria-label="Lifecycle status" value={statusFilter} onChange={(event) => setFilter("status", event.target.value)}><option value="">All statuses</option><option value="active">Active</option><option value="recovery_scheduled">Recovery scheduled</option></select><select className="rounded-md border bg-background px-3 py-2 text-sm" aria-label="Run source" value={sourceFilter} onChange={(event) => setFilter("source", event.target.value)}><option value="">All sources</option><option value="manual">Manual</option><option value="preset">Saved mitigation</option><option value="rule">Rule</option></select><Input aria-label="Filter by device" placeholder="Device name or ID" value={deviceFilter} onChange={(event) => setFilter("device", event.target.value)} /><Input type="date" aria-label="Started after" value={afterFilter} onChange={(event) => setFilter("after", event.target.value)} /><Input type="date" aria-label="Started before" value={beforeFilter} onChange={(event) => setFilter("before", event.target.value)} /></div>
@@ -619,11 +621,14 @@ export function ActiveRunsTab() {
     <Dialog open={selected !== null} onOpenChange={(open) => { if (!open && !busy) closeSelectedRun(); }}><DialogContent className="sm:max-w-3xl"><DialogHeader><DialogTitle>Mitigation run #{selected?.id}</DialogTitle><DialogDescription>Execution outcome and current router changes are separate. Revert always targets this explicitly selected run.</DialogDescription></DialogHeader>{selected && <div className="max-h-[70vh] space-y-4 overflow-y-auto">
       <div className="grid gap-2 text-sm sm:grid-cols-2"><p>Current state: <ToneBadge tone={presentMitigationRun(selected).tone}>{presentMitigationRun(selected).label}</ToneBadge></p><p>Lifecycle: <strong>{humanizeToken(selected.lifecycle_state ?? "unknown")}</strong></p><p>Known changes: <strong>{selected.remaining_changes ?? selected.remaining_mutations ?? selected.still_applied_reroute_ids.length}</strong></p><p>Unknown effects: <strong>{selected.unknown_effects ?? 0}</strong></p><p>Recovery: {recoveryFieldLabel(selected, recoveryRun, displayedRecoveryId)}</p></div>
       <p className="text-xs text-muted-foreground">{presentMitigationRun(selected).detail}</p>
+      {selected.revert?.block_reasons?.length ? <div role="status" className="rounded-md border p-3 text-sm"><strong>Manual revert unavailable</strong><ul className="mt-1 list-disc pl-5 text-muted-foreground">{selected.revert.block_reasons.map((blockReason)=><li key={blockReason}>{blockReason}</li>)}</ul></div>:null}
+      {selected.automatic_recovery_block_reason && <div role="alert" className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"><strong>Automatic recovery blocked</strong><p className="mt-1 break-words">{selected.automatic_recovery_block_reason}</p></div>}
+      {canAct && selected.take_control?.available && <div role="status" className="rounded-md border border-border bg-muted/40 p-3 text-sm"><strong>Automatic recovery is still eligible</strong><p className="mt-1 text-muted-foreground">Cancel automatic recovery to keep the current router changes in place until an operator explicitly previews and confirms a revert. Cancelling it does not send router commands.</p></div>}
       {displayedRecoveryId ? <section className="space-y-3"><h3 className="text-sm font-semibold">{recoveryProgressHeading(displayedRecoveryState)} · recovery #{displayedRecoveryId}</h3>{recoveryError && <p role="alert" className="text-sm text-amber-700 dark:text-amber-300">{recoveryError}</p>}{recoveryRun?.id === displayedRecoveryId ? <><h4 className="text-sm font-medium">Revert progress</h4><BundleProgressView bundle={recoveryRun} bundleId={recoveryRun.id} totalHint={selected.total_actions} pollError={recoveryError} /></> : <p role="status" className="text-sm text-muted-foreground">Revert accepted · loading progress…</p>}<details><summary className="cursor-pointer text-sm font-medium">Original application</summary><div className="mt-2"><BundleProgressView bundle={selected} bundleId={selected.id} totalHint={selected.total_actions} pollError={null} /></div></details></section> : selected.lifecycle_state === "recovery_claimed" ? <div role="status" className="rounded-md border p-3 text-sm"><strong>Preparing revert</strong><p className="text-xs text-muted-foreground">The recovery run is being created.</p></div> : <BundleProgressView bundle={selected} bundleId={selected.id} totalHint={selected.total_actions} pollError={null} />}
       {!preview && <p className="text-xs text-muted-foreground">Step 1 · Preview revert — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions.</p>}
       {preview && <div className="space-y-2 rounded-md border p-3"><strong>Step 2 · Review and explicitly confirm the revert</strong>{preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}<p className="text-xs text-muted-foreground">The persisted inverses run in reverse order with the original verification scope. Confirmation is required in both Observe and Enforce.</p></div>}
-      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} disabled={busy} onChange={(event) => { previewGeneration.current += 1; setReason(event.target.value); setPreview(null); setPreviewReason(null); setBusy(false); setPendingAction(null); }} placeholder="Why is this run being reverted or taken over?" /></label>}
-      <DialogFooter className="gap-2 sm:justify-between">{canAct && selected.recovery_deadline && <Button variant="outline" onClick={() => void takeControl()} disabled={busy} loading={pendingAction === "take_control"} loadingLabel="Taking manual control…">Take manual control</Button>}<div className="flex gap-2"><Button variant="outline" onClick={closeSelectedRun} disabled={busy}>Close</Button>{canAct && !preview && <Button variant="outline" onClick={() => void previewRevert()} disabled={busy || selected.revert?.available === false} loading={pendingAction === "preview_revert"} loadingLabel="Preparing revert preview…">Preview revert</Button>}{canAct && preview && <Button variant="destructive" onClick={() => void confirmRevert()} disabled={busy || !preview.plan_id || !preview.preview_token} loading={pendingAction === "confirm_revert"} loadingLabel="Starting revert…">Apply reviewed revert</Button>}</div></DialogFooter>
+      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} disabled={busy} onChange={(event) => { actionGeneration.current += 1; setReason(event.target.value); setPreview(null); setPreviewReason(null); setBusy(false); setPendingAction(null); }} placeholder="Why is this run being reverted?" /></label>}
+      <DialogFooter className="flex-wrap items-center gap-2"><Button variant="outline" onClick={closeSelectedRun} disabled={busy}>Close</Button>{canAct && selected.take_control?.available && <Button variant="outline" onClick={() => void takeControl()} disabled={busy} loading={pendingAction === "take_control"} loadingLabel="Cancelling automatic recovery…">Cancel automatic recovery</Button>}{canAct && !preview && <Button variant="outline" onClick={() => void previewRevert()} disabled={busy || selected.revert?.available === false} loading={pendingAction === "preview_revert"} loadingLabel="Preparing revert preview…">Preview revert</Button>}{canAct && preview && <Button variant="destructive" onClick={() => void confirmRevert()} disabled={busy || !preview.plan_id || !preview.preview_token} loading={pendingAction === "confirm_revert"} loadingLabel="Starting revert…">Apply reviewed revert</Button>}</DialogFooter>
     </div>}</DialogContent></Dialog>
   </>;
 }
@@ -823,7 +828,7 @@ function RerouteDrawer({
                     Cancel
                   </Button>
                 )}
-                {detail.state === "uncertain" && hasPermission("acknowledge_uncertain_reroute") && (
+                {detail.reconcile_available && hasPermission("acknowledge_uncertain_reroute") && (
                   <>
                     <Button
                       size="sm"
@@ -857,7 +862,7 @@ function RerouteDrawer({
         <PromptDialog
           open={reconcileOpen}
           onOpenChange={setReconcileOpen}
-          title="Reconcile uncertain mitigation"
+          title="Reconcile mitigation evidence"
           description="The controller will read the router and compare it with the action's intended before/after state. This does not push configuration."
           label="Operator note"
           multiline
@@ -1002,7 +1007,7 @@ export function HistoryTab({ initialOpenId }: { initialOpenId?: number | null })
   const historyPreset = Number(historyParams.get("history_preset")) || undefined;
   const setHistoryFilter = (name: string, value: string) => { const next = new URLSearchParams(historyParams); if (value) next.set(name, value); else next.delete(name); next.set("history_page", "1"); setHistoryParams(next, { replace: true }); };
   const [reroutes, setReroutes] = useState<Reroute[]>([]);
-  const [bundles, setBundles] = useState<RerouteBundle[]>([]);
+  const [bundles, setBundles] = useState<RunSummary[]>([]);
   const [bundleError, setBundleError] = useState<string | null>(null);
   const [rerouteError, setRerouteError] = useState<string | null>(null);
   const [lockError, setLockError] = useState<string | null>(null);
@@ -1016,7 +1021,7 @@ export function HistoryTab({ initialOpenId }: { initialOpenId?: number | null })
     return Promise.allSettled([
       api.reroutes.list().then((value) => { setReroutes(value); setRerouteError(null); }).catch((cause) => setRerouteError(cause instanceof Error ? cause.message : "Could not load action history")),
       api.locks.list().then((value) => { setLocks(value); setLockError(null); }).catch((cause) => setLockError(cause instanceof Error ? cause.message : "Could not load safety locks")),
-      api.bundles.list({ lifecycle: "all", page: historyPage, per_page: 50, trigger_type: historyTrigger || undefined, rule_id: historyRule, preset_id: historyPreset }).then((response) => { const items = Array.isArray(response) ? response : response.items; setBundles(items.map(exposeSourceVerificationMode)); setBundleTotal(Array.isArray(response) ? response.length : response.total); setBundleError(null); }).catch((error) => setBundleError(error instanceof Error ? error.message : "Could not load mitigation runs")),
+      api.bundles.list({ lifecycle: "all", page: historyPage, per_page: 50, trigger_type: historyTrigger || undefined, rule_id: historyRule, preset_id: historyPreset }).then((response) => { const items = Array.isArray(response) ? response : response.items; setBundles(items); setBundleTotal(Array.isArray(response) ? response.length : response.total); setBundleError(null); }).catch((error) => setBundleError(error instanceof Error ? error.message : "Could not load mitigation runs")),
     ]);
   }, [historyPage, historyTrigger, historyRule, historyPreset]);
   useEffect(() => {

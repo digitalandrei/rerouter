@@ -19,5 +19,6 @@ pub mod reroute;
 pub mod scheduler;
 pub mod ssh;
 pub mod telemetry;
+pub(crate) mod timing;
 #[cfg(feature = "embed-ui")]
 pub mod ui;

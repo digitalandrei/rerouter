@@ -19,6 +19,35 @@ use crate::auth::rbac::{markers, RequirePermission};
 
 type JsonResp = (StatusCode, Json<Value>);
 
+#[derive(sqlx::FromRow)]
+struct ExporterHealthRow {
+    id: u64,
+    source_addr: String,
+    observation_domain: u32,
+    configured_sampling_rate: Option<u32>,
+    reported_sampling_rate: Option<u32>,
+    snmp_derived_rate: Option<u32>,
+    effective_sampling_rate: u32,
+    sampling_source: String,
+    sampling_confidence: String,
+    snmp_xcal_ratio: Option<f64>,
+    last_packet_at: Option<chrono::DateTime<chrono::Utc>>,
+    template_count: u32,
+    datagrams_total: u64,
+    dropped_no_template: u64,
+    dropped_malformed: u64,
+    dropped_bucket_backlog: u64,
+    quality_bucket_ts: Option<chrono::DateTime<chrono::Utc>>,
+    iface_complete: Option<bool>,
+    port_complete: Option<bool>,
+    asn_complete: Option<bool>,
+    talker_complete: Option<bool>,
+    iface_dropped: Option<u64>,
+    port_dropped: Option<u64>,
+    asn_dropped: Option<u64>,
+    talker_dropped: Option<u64>,
+}
+
 /// Tuple shape for an aggregated talker row (search + top_talkers share it):
 /// src, dst, src_port, dst_port, protocol, direction, then the six agg columns.
 type TalkerAggRow = (
@@ -623,29 +652,20 @@ pub async fn exporters(
     if !device_exists(&state.pool, device_id).await {
         return err(StatusCode::NOT_FOUND, "device not found");
     }
-    type Row = (
-        u64,
-        String,
-        u32,
-        Option<u32>,
-        Option<u32>,
-        Option<u32>,
-        u32,
-        String,
-        String,
-        Option<f64>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        u32,
-        u64,
-        u64,
-        u64,
-    );
-    let rows = sqlx::query_as::<_, Row>(
-        "SELECT id, source_addr, observation_domain, configured_sampling_rate, reported_sampling_rate, \
-                snmp_derived_rate, effective_sampling_rate, sampling_source, sampling_confidence, \
-                snmp_xcal_ratio, last_packet_at, template_count, datagrams_total, \
-                dropped_no_template, dropped_malformed \
-         FROM flow_exporters WHERE device_id = ? ORDER BY source_addr",
+    let rows = sqlx::query_as::<_, ExporterHealthRow>(
+        "SELECT e.id, e.source_addr, e.observation_domain, e.configured_sampling_rate, \
+                e.reported_sampling_rate, e.snmp_derived_rate, e.effective_sampling_rate, \
+                e.sampling_source, e.sampling_confidence, e.snmp_xcal_ratio, e.last_packet_at, \
+                e.template_count, e.datagrams_total, e.dropped_no_template, e.dropped_malformed, \
+                e.dropped_bucket_backlog, q.bucket_ts AS quality_bucket_ts, q.iface_complete, \
+                q.port_complete, q.asn_complete, q.talker_complete, q.iface_dropped, \
+                q.port_dropped, q.asn_dropped, q.talker_dropped \
+         FROM flow_exporters e \
+         LEFT JOIN flow_publication_barrier publication ON publication.id=1 AND publication.registry_ready=1 \
+         LEFT JOIN flow_bucket_quality q ON publication.id IS NOT NULL AND q.exporter_id = e.id \
+              AND q.bucket_ts = (SELECT MAX(q2.bucket_ts) FROM flow_bucket_quality q2 \
+                                 WHERE q2.exporter_id = e.id) \
+         WHERE e.device_id = ? ORDER BY e.source_addr",
     )
     .bind(device_id)
     .fetch_all(&state.pool)
@@ -657,21 +677,31 @@ pub async fn exporters(
                 .into_iter()
                 .map(|r| {
                     json!({
-                        "id": r.0,
-                        "source_addr": r.1,
-                        "observation_domain": r.2,
-                        "configured_sampling_rate": r.3,
-                        "reported_sampling_rate": r.4,
-                        "snmp_derived_rate": r.5,
-                        "effective_sampling_rate": r.6,
-                        "sampling_source": r.7,
-                        "sampling_confidence": r.8,
-                        "snmp_xcal_ratio": r.9,
-                        "last_packet_at": r.10.map(|t| t.to_rfc3339()),
-                        "template_count": r.11,
-                        "datagrams_total": r.12,
-                        "dropped_no_template": r.13,
-                        "dropped_malformed": r.14,
+                        "id": r.id,
+                        "source_addr": r.source_addr,
+                        "observation_domain": r.observation_domain,
+                        "configured_sampling_rate": r.configured_sampling_rate,
+                        "reported_sampling_rate": r.reported_sampling_rate,
+                        "snmp_derived_rate": r.snmp_derived_rate,
+                        "effective_sampling_rate": r.effective_sampling_rate,
+                        "sampling_source": r.sampling_source,
+                        "sampling_confidence": r.sampling_confidence,
+                        "snmp_xcal_ratio": r.snmp_xcal_ratio,
+                        "last_packet_at": r.last_packet_at.map(|t| t.to_rfc3339()),
+                        "template_count": r.template_count,
+                        "datagrams_total": r.datagrams_total,
+                        "dropped_no_template": r.dropped_no_template,
+                        "dropped_malformed": r.dropped_malformed,
+                        "dropped_bucket_backlog": r.dropped_bucket_backlog,
+                        "quality_bucket_ts": r.quality_bucket_ts.map(|t| t.to_rfc3339()),
+                        "iface_complete": r.iface_complete,
+                        "port_complete": r.port_complete,
+                        "asn_complete": r.asn_complete,
+                        "talker_complete": r.talker_complete,
+                        "iface_dropped": r.iface_dropped,
+                        "port_dropped": r.port_dropped,
+                        "asn_dropped": r.asn_dropped,
+                        "talker_dropped": r.talker_dropped,
                     })
                 })
                 .collect();

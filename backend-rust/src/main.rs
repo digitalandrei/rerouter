@@ -298,13 +298,26 @@ async fn main() -> Result<()> {
     // reroutes are marked uncertain (and their devices locked) first; closing the
     // bundle rows afterwards means a bundle is never left looking "in progress"
     // while its actions are already quarantined.
-    reroute::state_machine::recover_on_startup(&pool).await?;
-    reroute::bundle::recover_on_startup(&pool).await?;
+    let advisory_runtime = cfg.advisory_runtime(&pool).await?;
+    db::advisory::foreground_scope(
+        advisory_runtime.clone(),
+        reroute::state_machine::recover_on_startup(&pool),
+    )
+    .await??;
+    db::advisory::foreground_scope(
+        advisory_runtime.clone(),
+        reroute::bundle::recover_on_startup(&pool),
+    )
+    .await??;
 
     // Reset the device stability clocks: after a restart a device must be freshly
     // re-confirmed SSH-reachable for the stability window before AUTOMATIC
     // mitigations resume (manual is unaffected). The poll loop re-establishes it.
-    reroute::reachability::reset_stability(&pool).await?;
+    db::advisory::foreground_scope(
+        advisory_runtime,
+        reroute::reachability::reset_stability(&pool),
+    )
+    .await??;
 
     // Internal alert dispatcher (replaces any external queue worker): polls the
     // alerts table and sends email via SMTP. Never blocks the control plane.

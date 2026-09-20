@@ -208,10 +208,14 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   const preview = vi.spyOn(api.manualMitigations, "preview").mockResolvedValue({ plan_id: 8, preview_token: "token", results: [], operating_mode: "observe", verification_mode: "routing", routing_verified: false });
   const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
   const user = userEvent.setup(); render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
-  await user.click(await screen.findByRole("radio", { name: /configuration-only lab test — ema3 lab/i }));
+  await user.click(await screen.findByRole("radio", { name: /^configuration only/i }));
+  expect(screen.getByText(/does not verify advertised routes or the routing outcome/i)).toBeTruthy();
+  const schedule = screen.getByRole("combobox", { name: /revert schedule/i }) as HTMLSelectElement;
+  expect(schedule.disabled).toBe(true);
+  expect(schedule.className).toContain("disabled:bg-muted");
   await user.click(screen.getByRole("button", { name: "Refresh" }));
   expect(await screen.findByText(/lab eligibility is unavailable/i)).toBeTruthy();
-  expect((screen.getByRole("radio", { name: /configuration-only lab test — ema3 lab/i }) as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByRole("radio", { name: /^configuration only/i }) as HTMLInputElement).checked).toBe(true);
   expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
   expect(preview).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button", { name: "Retry lab eligibility" }));
@@ -221,6 +225,6 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   expect(screen.queryByRole("button", { name: "Apply reviewed changes" })).toBeNull();
   await user.click(screen.getByRole("button", { name: "Override action 1" }));
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
-  await waitFor(() => expect((screen.getByRole("radio", { name: /normal routing verification/i }) as HTMLInputElement).checked).toBe(true));
+  await waitFor(() => expect((screen.getByRole("radio", { name: /^routing verification/i }) as HTMLInputElement).checked).toBe(true));
   expect(screen.queryByText(/router configuration will change; BGP advertisement is not verified/i)).toBeNull();
 });

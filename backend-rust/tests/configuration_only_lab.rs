@@ -201,6 +201,221 @@ fn actor(user_id: u64) -> Session {
     }
 }
 
+async fn successful_fake_ssh_run_with_timer(
+    revert_after_seconds: Option<u32>,
+    force_terminal_failure: bool,
+) {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let user =
+        sqlx::query("INSERT INTO users(name,email,password) VALUES('timer fixture',?,'unused')")
+            .bind(format!("timer-{}@example.test", uuid::Uuid::new_v4()))
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+    let device = sqlx::query("INSERT INTO devices(name,hostname,ssh_port,ssh_host_fingerprint,ssh_status,last_ssh_ok_at,ssh_reachable_since) VALUES(?,?,22,?,'reachable',UTC_TIMESTAMP(),DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE))")
+        .bind(format!("timer-device-{}", uuid::Uuid::new_v4())).bind(HOST).bind(PIN).execute(pool).await.unwrap().last_insert_id();
+    rerouter_controller::reroute::reachability::stamp_ssh_ok(pool, device)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_interfaces(device_id,if_index,if_name,if_descr,last_seen_at) VALUES(?,1,'Po1','Port-channel1',UTC_TIMESTAMP())").bind(device).execute(pool).await.unwrap();
+    let template_id: u64 =
+        sqlx::query_scalar("SELECT id FROM reroute_templates WHERE name='iface_tcp_adjust_mss'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let template = templates::load(pool, template_id).await.unwrap();
+    let input = device_plan::PrepareInput {
+        device_id: device,
+        template_id,
+        template_name: template.name.clone(),
+        canonical_params: json!({"interface":"Port-channel1","mss":1400}),
+    };
+    let prepared = device_plan::prepare_actions_read_only_with_reader(
+        pool,
+        std::slice::from_ref(&input),
+        &MssReader(None, "no-export"),
+    )
+    .await
+    .unwrap();
+    let action = BundleAction {
+        device_id: device,
+        template,
+        params: input.canonical_params,
+        reason: "timed proof".into(),
+        position: 0,
+        auto_target: None,
+        auto_target_low_confidence: None,
+        prepared: Some(prepared[0].clone()),
+        original_reroute_id: None,
+    };
+    let mut cfg = Config::default();
+    cfg.safety.global_action_rate_limit_count = 0;
+    cfg.safety.same_device_cooldown_seconds = 0;
+    let state = api::AppState {
+        pool: pool.clone(),
+        config: cfg.clone(),
+        cookie_key: Key::from(&[43; 64]),
+    };
+    let (status, axum::Json(preview)) = manual_mitigations::preview_actions_with_reader(
+        &state,
+        &actor(user),
+        "manual_mitigation",
+        None,
+        vec![action],
+        json!({"kind":"manual","name":"Run once"}),
+        "timed proof".into(),
+        json!({"actions":[],"revert_after_seconds":revert_after_seconds}),
+        revert_after_seconds,
+        &MssReader(None, "no-export"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{preview}");
+    let accepted = manual_mitigations::accept_plan(
+        &state,
+        &actor(user),
+        preview["plan_id"].as_u64().unwrap(),
+        preview["preview_token"].as_str().unwrap(),
+        "manual_mitigation",
+        None,
+    )
+    .await
+    .unwrap();
+    let ssh = StatefulMssSsh {
+        state: Arc::new(Mutex::new(("no-export".into(), None))),
+        device,
+        fail_mss: false,
+    };
+    let snapshot: sqlx::types::Json<Value> =
+        sqlx::query_scalar("SELECT snapshot_json FROM execution_plans WHERE id=?")
+            .bind(accepted.plan_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let actions: Vec<BundleAction> = serde_json::from_value(snapshot.0["actions"].clone()).unwrap();
+    let mut run = bundle::BundleRun::manual(
+        accepted.bundle_id,
+        FailurePolicy::AbortAndCompensate,
+        None,
+        user,
+        ActorContext {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "timer-test".into(),
+        },
+    )
+    .with_authorization(Some(accepted.plan_id), format!("plan:{}", accepted.plan_id));
+    if force_terminal_failure {
+        run = run.with_forced_terminal_persistence_failure();
+    }
+    let outcome = bundle::run_with_ssh(pool, &cfg, run, actions, &ssh).await;
+    if force_terminal_failure {
+        assert_eq!(outcome.state, "compensation_blocked");
+        assert_eq!(*ssh.state.lock().unwrap(), ("no-export".into(), Some(1400)));
+        let durable: String = sqlx::query_scalar("SELECT state FROM reroute_bundles WHERE id=?")
+            .bind(accepted.bundle_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            durable, "running",
+            "startup repair retains in-flight evidence"
+        );
+        let phase: String = sqlx::query_scalar(
+            "SELECT phase FROM device_change_windows WHERE bundle_id=? AND device_id=?",
+        )
+        .bind(accepted.bundle_id)
+        .bind(device)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(phase, "uncertain");
+        return;
+    }
+    assert_eq!(outcome.state, "succeeded", "{:?}", outcome.failure_reason);
+    let (source_timer, finished_at, deadline, lifecycle): (Option<u32>, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>, String) = sqlx::query_as("SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.revert_after_seconds')) AS UNSIGNED),finished_at,recovery_deadline,lifecycle_state FROM reroute_bundles WHERE id=?").bind(accepted.bundle_id).fetch_one(pool).await.unwrap();
+    assert_eq!(source_timer, revert_after_seconds);
+    assert_eq!(
+        deadline.map(|value| (value - finished_at).num_seconds()),
+        revert_after_seconds.map(i64::from)
+    );
+    assert_eq!(
+        lifecycle,
+        if revert_after_seconds.is_some() {
+            "recovery_scheduled"
+        } else {
+            "active"
+        }
+    );
+    rerouter_controller::reroute::recovery::schedule_if_eligible(pool, accepted.bundle_id)
+        .await
+        .unwrap();
+    let anchored: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT recovery_deadline FROM reroute_bundles WHERE id=?")
+            .bind(accepted.bundle_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(anchored, deadline);
+    if revert_after_seconds.is_some() {
+        let mut legacy: sqlx::types::Json<Value> =
+            sqlx::query_scalar("SELECT snapshot_json FROM execution_plans WHERE id=?")
+                .bind(accepted.plan_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        legacy.0["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("revert_after_seconds");
+        let legacy_hash = manual_mitigations::hash_snapshot(&legacy.0);
+        sqlx::query("UPDATE execution_plans SET snapshot_json=?,plan_hash=? WHERE id=?")
+            .bind(&legacy)
+            .bind(legacy_hash)
+            .bind(accepted.plan_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let repeated = manual_mitigations::accept_plan(
+            &state,
+            &actor(user),
+            accepted.plan_id,
+            preview["preview_token"].as_str().unwrap(),
+            "manual_mitigation",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(repeated.already_accepted);
+        assert_eq!(repeated.bundle_id, accepted.bundle_id);
+        let actions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=?")
+                .bind(accepted.bundle_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            actions, 1,
+            "idempotent legacy replay must not duplicate actions"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timed_preview_accept_and_successful_fake_ssh_run_anchor_one_deadline() {
+    successful_fake_ssh_run_with_timer(Some(300), false).await;
+}
+
+#[tokio::test]
+async fn untimed_preview_accept_and_successful_fake_ssh_run_stays_active() {
+    successful_fake_ssh_run_with_timer(None, false).await;
+}
+
+#[tokio::test]
+async fn terminal_persistence_failure_after_fake_write_is_never_reported_succeeded() {
+    successful_fake_ssh_run_with_timer(None, true).await;
+}
+
 #[tokio::test]
 async fn real_preview_consume_and_locked_execution_verify_configuration_without_routing() {
     let db = common::test_database().await;
@@ -726,6 +941,16 @@ async fn real_preview_consume_and_locked_execution_verify_configuration_without_
         revert_outcome.failure_reason
     );
     assert_eq!(*ssh.state.lock().unwrap(), ("no-export".into(), None));
+    let stale_memberships: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_change_window_sources WHERE device_id=?")
+            .bind(device)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stale_memberships, 0,
+        "successful revert must release every source membership before the next run"
+    );
 
     let (failure_status, axum::Json(failure_preview)) =
         manual_mitigations::preview_actions_with_reader_mode(

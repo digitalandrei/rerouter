@@ -884,6 +884,7 @@ async fn store_metrics(
     rx_power_dbm: Option<f64>,
 ) -> Result<()> {
     let sampled_at = counters.sampled_at.naive_utc();
+    let mut timing = crate::timing::Stage::start("evidence_advance", interface_id);
     let valid = rates.valid as i32;
 
     let mut tx = pool.begin().await?;
@@ -1004,6 +1005,10 @@ async fn store_metrics(
     .await
     .context("refreshing interface inventory timestamp")?;
     tx.commit().await?;
+    timing.complete("committed");
+    tracing::info!(event_type = "evidence_advanced", device_id, interface_id,
+        sampled_at = %counters.sampled_at, valid = rates.valid,
+        "interface evidence persisted");
 
     Ok(())
 }

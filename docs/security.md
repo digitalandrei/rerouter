@@ -87,6 +87,11 @@ layered, fail-closed controls rather than per-click friction:
 - **verify, don't assume** — every action confirms the resulting routing state
   with a `show` read-back before it is called succeeded (see
   [state-recovery.md](state-recovery.md) and [reroute-engine.md](reroute-engine.md));
+- **absence needs typed evidence** — an empty bounded configuration filter can
+  prove an absent configuration object, while empty interface, BGP, and routing
+  responses are uncertain and fail closed;
+- **redact before excerpting** — SSH timeout diagnostics redact the complete
+  response before retaining a bounded eight-line, 1024-character excerpt;
 - **full audit** — user / real client IP (`CF-Connecting-IP`) / time on every
   action and lifecycle transition.
 

@@ -193,6 +193,11 @@ fn snapshot(action: &BundleAction, prepared: &PreparedDeviceAction, source: Valu
 #[tokio::test]
 async fn plans_bind_actor_scope_expiry_source_and_exact_prepared_set() {
     let pool = common::test_database().await;
+    let prior_mode: String =
+        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key`='operating_mode'")
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
     sqlx::query("UPDATE system_settings SET `value`='enforce' WHERE `key`='operating_mode'")
         .execute(&*pool)
         .await
@@ -201,9 +206,13 @@ async fn plans_bind_actor_scope_expiry_source_and_exact_prepared_set() {
     let (operator_a, cookie_a) = user(&pool, "operator", &key).await;
     let (operator_b, cookie_b) = user(&pool, "operator", &key).await;
     let (viewer, cookie_viewer) = user(&pool, "viewer", &key).await;
+    let mut config = Config::default();
+    // This test exercises immutable-plan authorization, not the shared global
+    // history budget populated by unrelated integration fixtures.
+    config.safety.global_action_rate_limit_count = 0;
     let app = api::router(api::AppState {
         pool: (*pool).clone(),
-        config: Config::default(),
+        config,
         cookie_key: key,
     });
     let (_device, action, prepared) = fixture(&pool).await;
@@ -507,4 +516,8 @@ async fn plans_bind_actor_scope_expiry_source_and_exact_prepared_set() {
 
     // Keep otherwise-unused actor visible in this test's ownership set.
     assert_ne!(operator_a, operator_b);
+    let _ = sqlx::query("UPDATE system_settings SET `value`=? WHERE `key`='operating_mode'")
+        .bind(prior_mode)
+        .execute(&*pool)
+        .await;
 }

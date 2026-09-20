@@ -15,9 +15,19 @@ impl PreparationReader for CannedReader {
     fn read_one<'a>(
         &'a self,
         _: u64,
-        _: &'a str,
+        command: &'a str,
     ) -> rerouter_controller::ssh::BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async { Ok(String::new()) })
+        // IOS exact filtered route lookup: this is affirmative absence evidence,
+        // unlike an empty/unsupported response which must remain unproven.
+        Box::pin(async move {
+            Ok(if command.starts_with("show ip route ") {
+                "% Network not in table".into()
+            } else if command.starts_with("show running-config | include ") {
+                String::new()
+            } else {
+                anyhow::bail!("unhandled fixture command: {command}")
+            })
+        })
     }
     fn read_many<'a>(
         &'a self,
@@ -32,6 +42,11 @@ impl PreparationReader for CannedReader {
 async fn observe_preview_is_exact_authorized_and_never_writes() {
     let db = common::test_database().await;
     let pool = db.pool();
+    let prior_mode: String =
+        sqlx::query_scalar("SELECT `value` FROM system_settings WHERE `key`='operating_mode'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
     sqlx::query("UPDATE system_settings SET `value`='observe' WHERE `key`='operating_mode'")
         .execute(pool)
         .await
@@ -120,4 +135,8 @@ async fn observe_preview_is_exact_authorized_and_never_writes() {
         .execute(pool)
         .await
         .unwrap();
+    let _ = sqlx::query("UPDATE system_settings SET `value`=? WHERE `key`='operating_mode'")
+        .bind(prior_mode)
+        .execute(pool)
+        .await;
 }

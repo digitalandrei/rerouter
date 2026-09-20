@@ -72,11 +72,17 @@ impl LockedDeviceSetPort for FakeLocks {
             }
             Ok(CommandResult {
                 command: command.into(),
-                output: if shutdown {
-                    " shutdown".into()
-                } else {
-                    String::new()
-                },
+                output: format!(
+                    "interface {}\n{}",
+                    command
+                        .strip_prefix("show running-config interface ")
+                        .unwrap_or("GigabitEthernet0/0"),
+                    if shutdown {
+                        " shutdown"
+                    } else {
+                        " no shutdown"
+                    }
+                ),
             })
         })
     }
@@ -229,25 +235,33 @@ async fn verified_noop_has_no_inverse_and_creates_no_rollback_attempt() {
 async fn dropped_policy_fence_closes_its_session_and_releases_the_advisory_lock() {
     let test_db = common::test_database().await;
     let pool = test_db.pool().clone();
-    let fence = guard::policy_fence(&pool)
-        .await
-        .expect("acquire first policy fence");
-    let mut observer = pool.acquire().await.expect("acquire lock observer");
-    let lock_name =
-        rerouter_controller::db::scoped_advisory_lock_name(&mut observer, "execution:policy")
+    let cfg = Config::default();
+    let runtime = cfg.advisory_runtime(&pool).await.unwrap();
+    rerouter_controller::db::advisory::foreground_scope(runtime, async {
+        let fence = guard::policy_fence(&pool)
             .await
-            .unwrap();
-    let owner: Option<u64> = sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS UNSIGNED)")
-        .bind(lock_name)
-        .fetch_one(&mut *observer)
+            .expect("acquire first policy fence");
+        let mut observer = pool.acquire().await.expect("acquire lock observer");
+        let lock_name = rerouter_controller::db::scoped_advisory_lock_name(
+            &mut observer,
+            "10:execution:policy",
+        )
         .await
-        .expect("inspect policy lock");
-    assert!(owner.is_some(), "policy advisory lock must be held");
-    drop(fence);
-    let second = guard::policy_fence(&pool)
-        .await
-        .expect("drop must close detached session and release lock");
-    second.release().await.expect("release second policy fence");
+        .unwrap();
+        let owner: Option<u64> = sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS UNSIGNED)")
+            .bind(lock_name)
+            .fetch_one(&mut *observer)
+            .await
+            .expect("inspect policy lock");
+        assert!(owner.is_some(), "policy advisory lock must be held");
+        drop(fence);
+        let second = guard::policy_fence(&pool)
+            .await
+            .expect("poisoned idle session must be replaced");
+        second.release().await.expect("release second policy fence");
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -478,7 +492,11 @@ async fn destructive_step_is_blocked_when_replacement_flaps_after_its_own_verifi
         &fake,
     )
     .await;
-    assert_eq!(outcome.state, "compensation_blocked");
+    assert_eq!(
+        outcome.state, "compensation_blocked",
+        "{:?}",
+        outcome.failure_reason
+    );
     assert_eq!(
         *writes.lock().unwrap(),
         vec![device_a],
@@ -526,6 +544,13 @@ async fn destructive_step_is_blocked_when_replacement_flaps_after_its_own_verifi
     .await
     .ok();
 
+    // This fixture intentionally discards the first scenario's quarantine;
+    // remove its explicit membership as well before reusing the same devices.
+    sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+        .bind(bundle_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     // A one-action additive bundle has no following destructive boundary, so
     // the final all-set proof is the only place a post-verification flap can be
     // caught before success is reported.
@@ -578,7 +603,11 @@ async fn destructive_step_is_blocked_when_replacement_flaps_after_its_own_verifi
         &final_fake,
     )
     .await;
-    assert_eq!(final_outcome.state, "compensation_blocked");
+    assert_eq!(
+        final_outcome.state, "compensation_blocked",
+        "{:?}",
+        final_outcome.failure_reason
+    );
     assert_eq!(*final_writes.lock().unwrap(), vec![device_a]);
     let uncertain: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reroutes WHERE bundle_id = ? \
@@ -1060,8 +1089,8 @@ async fn successful_recovery_closes_original_ownership_and_releases_all_source_w
     .last_insert_id();
     let original = sqlx::query(
         "INSERT INTO reroutes \
-            (device_id, bundle_id, trigger_type, state, mutation_effect, started_at, finished_at) \
-         VALUES (?, ?, 'manual', 'succeeded', 'changed', UTC_TIMESTAMP(), UTC_TIMESTAMP())",
+            (device_id, bundle_id, bundle_position, trigger_type, state, mutation_effect, started_at, finished_at) \
+         VALUES (?, ?, 0, 'manual', 'succeeded', 'changed', UTC_TIMESTAMP(), UTC_TIMESTAMP())",
     )
     .bind(device_a)
     .bind(source_bundle)
@@ -1069,6 +1098,21 @@ async fn successful_recovery_closes_original_ownership_and_releases_all_source_w
     .await
     .unwrap()
     .last_insert_id();
+    sqlx::query(
+        "INSERT INTO reroute_bundle_actions \
+            (bundle_id,position,device_id,template_snapshot_json,canonical_params_json, \
+             rendered_plan_json,prepared_action_json,state,mutation_effect,reroute_id) VALUES \
+            (?,0,?,'{}','{}','{}','{}','succeeded','changed',?), \
+            (?,1,?,'{}','{}','{}','{}','queued','pending',NULL)",
+    )
+    .bind(source_bundle)
+    .bind(device_a)
+    .bind(original)
+    .bind(source_bundle)
+    .bind(device_c)
+    .execute(&pool)
+    .await
+    .unwrap();
     for device in [device_a, device_c] {
         sqlx::query(
             "INSERT INTO device_change_windows (device_id, bundle_id, owner_token, phase) \
@@ -1088,6 +1132,18 @@ async fn successful_recovery_closes_original_ownership_and_releases_all_source_w
     .await
     .unwrap()
     .last_insert_id();
+    let mut claim_tx = pool.begin().await.unwrap();
+    rerouter_controller::reroute::recovery::claim_sources_for_child_on(
+        &mut claim_tx,
+        recovery_bundle,
+        &[source_bundle],
+        &[original],
+        "recovery-owner",
+        true,
+    )
+    .await
+    .unwrap();
+    claim_tx.commit().await.unwrap();
     sqlx::query(
         "INSERT INTO reroute_bundle_actions \
             (bundle_id, position, original_reroute_id, device_id, template_snapshot_json, \
@@ -1161,6 +1217,11 @@ async fn successful_recovery_closes_original_ownership_and_releases_all_source_w
     .await;
     assert!(inverse_of_inverse.is_err());
 
+    sqlx::query("DELETE FROM recovery_attempt_sources WHERE recovery_bundle_id=?")
+        .bind(recovery_bundle)
+        .execute(&pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM reroute_bundles WHERE id = ?")
         .bind(recovery_bundle)
         .execute(&pool)
@@ -1183,4 +1244,431 @@ async fn successful_recovery_closes_original_ownership_and_releases_all_source_w
         .execute(&pool)
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn multi_source_claim_records_shared_device_membership_and_never_repeats_success() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'127.0.0.1')")
+        .bind(format!("shared-recovery-{}", uuid::Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let mut sources = Vec::new();
+    let mut originals = Vec::new();
+    for position in 0..2_u32 {
+        let source=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,remaining_mutations,lifecycle_state) VALUES('automatic','succeeded',1,1,'active')")
+            .execute(&pool).await.unwrap().last_insert_id();
+        let original=sqlx::query("INSERT INTO reroutes(device_id,bundle_id,bundle_position,trigger_type,state,mutation_effect,started_at,finished_at) VALUES(?,?,?,'automatic','succeeded','changed',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+            .bind(device).bind(source).bind(position).execute(&pool).await.unwrap().last_insert_id();
+        sources.push(source);
+        originals.push(original);
+    }
+    originals.sort_unstable_by(|a, b| b.cmp(a));
+    let child=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions) VALUES('automatic','planned',2)")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let mut tx = pool.begin().await.unwrap();
+    let ownership = rerouter_controller::reroute::recovery::claim_sources_for_child_on(
+        &mut tx,
+        child,
+        &sources,
+        &originals,
+        "multi-source-claim",
+        false,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ownership.source_bundle_ids, sources);
+    let mappings:i64=sqlx::query_scalar("SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=? AND settlement='active'")
+        .bind(child).fetch_one(&pool).await.unwrap();
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_change_window_sources WHERE device_id=?")
+            .bind(device)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mappings, 2);
+    assert_eq!(
+        memberships, 2,
+        "one device must retain both source quarantines"
+    );
+
+    let restored = originals[0];
+    sqlx::query("INSERT INTO reroutes(device_id,bundle_id,rollback_of_reroute_id,trigger_type,state,mutation_effect,started_at,finished_at) VALUES(?,?,?,'rollback','succeeded','noop',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+        .bind(device).bind(child).bind(restored).execute(&pool).await.unwrap();
+    let remaining = rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &sources)
+        .await
+        .unwrap();
+    assert!(
+        !remaining.original_reroute_ids.contains(&restored),
+        "a successful inverse must never be selected again"
+    );
+    assert_eq!(remaining.original_reroute_ids.len(), 1);
+
+    for (position, original) in originals.iter().enumerate() {
+        sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,original_reroute_id,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,prepared_action_json,state,mutation_effect) VALUES(?,?,?,?, '{}','{}','{}','{}',?,?)")
+            .bind(child).bind(position as u32).bind(original).bind(device)
+            .bind(if *original == restored { "succeeded" } else { "failed" })
+            .bind("noop")
+            .execute(&pool).await.unwrap();
+    }
+    sqlx::query("UPDATE reroute_bundles SET state='failed' WHERE id=?")
+        .bind(child)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_change_windows(device_id,bundle_id,owner_token,phase) VALUES(?,?,?,'applying')")
+        .bind(device).bind(child).bind("multi-source-claim").execute(&pool).await.unwrap();
+    rerouter_controller::reroute::recovery::finalize_recovery_child(
+        &pool,
+        child,
+        "failed",
+        Some("one source restored; one source was not written"),
+        "multi-source-claim",
+    )
+    .await
+    .unwrap();
+    let settlements: Vec<(u64, String)> = sqlx::query_as(
+        "SELECT source_bundle_id,settlement FROM recovery_attempt_sources WHERE recovery_bundle_id=? ORDER BY source_bundle_id",
+    )
+    .bind(child).fetch_all(&pool).await.unwrap();
+    let restored_source: u64 = sqlx::query_scalar("SELECT bundle_id FROM reroutes WHERE id=?")
+        .bind(restored)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for (source, settlement) in settlements {
+        assert_eq!(
+            settlement,
+            if source == restored_source {
+                "restored"
+            } else {
+                "known_no_write"
+            },
+            "each source is settled from its own immutable inverse evidence"
+        );
+    }
+    let retained_memberships: Vec<u64> = sqlx::query_scalar(
+        "SELECT source_bundle_id FROM device_change_window_sources WHERE device_id=?",
+    )
+    .bind(device)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_memberships,
+        vec![*sources.iter().find(|id| **id != restored_source).unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn reconciled_inverse_reopens_blocked_mapping_and_settles_source() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'127.0.0.1')")
+        .bind(format!("reconciled-recovery-{}", uuid::Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,remaining_mutations,lifecycle_state,recovery_claim_token) VALUES('manual','compensation_blocked',1,1,'recovery_blocked','reconcile-token')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let original = sqlx::query("INSERT INTO reroutes(device_id,bundle_id,trigger_type,state,mutation_effect,started_at,finished_at) VALUES(?,?,'manual','succeeded','changed',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+        .bind(device).bind(source).execute(&pool).await.unwrap().last_insert_id();
+    let child = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions) VALUES('manual','compensation_blocked',1)")
+        .execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("UPDATE reroute_bundles SET recovery_bundle_id=? WHERE id=?")
+        .bind(child)
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO recovery_attempt_sources(recovery_bundle_id,source_bundle_id,claim_token,settlement,settled_at) VALUES(?,?,?,'blocked',UTC_TIMESTAMP())")
+        .bind(child).bind(source).bind("reconcile-token").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)")
+        .bind(device)
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_change_windows(device_id,bundle_id,owner_token,phase) VALUES(NULLIF(?,0),NULL,CONCAT('quarantine:device:',?),'uncertain')")
+        .bind(device).bind(device).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,original_reroute_id,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,prepared_action_json,state,mutation_effect) VALUES(?,0,?,?,'{}','{}','{}','{}','succeeded','changed')")
+        .bind(child).bind(original).bind(device).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO reroutes(device_id,bundle_id,rollback_of_reroute_id,trigger_type,state,mutation_effect,started_at,finished_at) VALUES(?,?,?,'rollback','succeeded','changed',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+        .bind(device).bind(child).bind(original).execute(&pool).await.unwrap();
+
+    rerouter_controller::reroute::recovery::finalize_recovery_child(
+        &pool,
+        child,
+        "succeeded",
+        Some("reconciliation proved restore"),
+        "reconcile-repair",
+    )
+    .await
+    .unwrap();
+    let settlement: String = sqlx::query_scalar("SELECT settlement FROM recovery_attempt_sources WHERE recovery_bundle_id=? AND source_bundle_id=?")
+        .bind(child).bind(source).fetch_one(&pool).await.unwrap();
+    assert_eq!(settlement, "restored");
+    let source_state: (String, u32, Option<String>) = sqlx::query_as("SELECT lifecycle_state,remaining_mutations,recovery_claim_token FROM reroute_bundles WHERE id=?")
+        .bind(source).fetch_one(&pool).await.unwrap();
+    assert_eq!(source_state, ("inactive".into(), 0, None));
+    let windows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_change_windows WHERE device_id=?")
+            .bind(device)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(windows, 0);
+}
+
+#[tokio::test]
+async fn stale_child_terminalizes_without_clearing_newer_claim() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'127.0.0.1')")
+        .bind(format!("stale-child-{}", uuid::Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let child = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions) VALUES('manual','running',0)")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let mut sources = Vec::new();
+    for token in ["newer-token", "old-token"] {
+        let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state,recovery_claim_token,recovery_bundle_id) VALUES('manual','succeeded',0,'recovery_running',?,?)")
+            .bind(token).bind(child).execute(&pool).await.unwrap().last_insert_id();
+        sqlx::query("INSERT INTO recovery_attempt_sources(recovery_bundle_id,source_bundle_id,claim_token) VALUES(?,?, 'old-token')")
+            .bind(child).bind(source).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)",
+        )
+        .bind(device)
+        .bind(source)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sources.push(source);
+    }
+    sqlx::query("INSERT INTO device_change_windows(device_id,bundle_id,owner_token,phase) VALUES(?,?, 'old-token','applying')")
+        .bind(device).bind(child).execute(&pool).await.unwrap();
+    rerouter_controller::reroute::recovery::finalize_recovery_child(
+        &pool,
+        child,
+        "failed",
+        Some("superseded child"),
+        "old-token",
+    )
+    .await
+    .unwrap();
+    let child_state: String = sqlx::query_scalar("SELECT state FROM reroute_bundles WHERE id=?")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(child_state, "compensation_blocked");
+    let newer: String =
+        sqlx::query_scalar("SELECT recovery_claim_token FROM reroute_bundles WHERE id=?")
+            .bind(sources[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(newer, "newer-token");
+    let unaffected: String =
+        sqlx::query_scalar("SELECT lifecycle_state FROM reroute_bundles WHERE id=?")
+            .bind(sources[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unaffected, "recovery_blocked");
+    let window: (Option<u64>, String) =
+        sqlx::query_as("SELECT bundle_id,phase FROM device_change_windows WHERE device_id=?")
+            .bind(device)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(window, (None, "uncertain".into()));
+}
+
+#[tokio::test]
+async fn scheduled_ledger_failure_never_exposes_child_association() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state,recovery_claim_token) VALUES('manual','succeeded',0,'recovery_claimed','ledger-token')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let child = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions) VALUES('automatic','planned',1)")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let failed = rerouter_controller::reroute::recovery::persist_and_associate_scheduled_child(
+        &pool,
+        child,
+        source,
+        &[],
+        "ledger-token",
+        &[],
+        json!({"kind":"recovery"}),
+    )
+    .await;
+    assert!(failed.is_err());
+    let mappings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+    )
+    .bind(child)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let pointer: Option<u64> =
+        sqlx::query_scalar("SELECT recovery_bundle_id FROM reroute_bundles WHERE id=?")
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mappings, 0);
+    assert_eq!(
+        pointer, None,
+        "a failed ledger cannot become recovery ownership"
+    );
+}
+
+#[tokio::test]
+async fn missing_source_activation_evidence_stays_blocked_and_startup_repair_is_idempotent() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let source = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','compensation_blocked',0,'recovery_blocked')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let child = sqlx::query("INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,state,total_actions) VALUES(?,'manual','aborted',0)")
+        .bind(source).execute(&pool).await.unwrap().last_insert_id();
+    let token = format!("legacy:child:{child}");
+    sqlx::query("INSERT INTO recovery_attempt_sources(recovery_bundle_id,source_bundle_id,claim_token) VALUES(?,?,?)")
+        .bind(child).bind(source).bind(&token).execute(&pool).await.unwrap();
+
+    let ownership =
+        rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &[source]).await;
+    assert!(ownership
+        .unwrap_err()
+        .to_string()
+        .contains("no durable activation coverage"));
+    rerouter_controller::reroute::recovery::finalize_recovery_child(
+        &pool,
+        child,
+        "failed",
+        Some("first durable startup diagnosis"),
+        "startup-repair",
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE recovery_attempt_sources SET settled_at='2001-02-03 04:05:06' WHERE recovery_bundle_id=? AND source_bundle_id=?")
+        .bind(child).bind(source).execute(&pool).await.unwrap();
+    rerouter_controller::reroute::recovery::finalize_recovery_child(
+        &pool,
+        child,
+        "failed",
+        Some("later startup diagnosis must not replace history"),
+        "startup-repair",
+    )
+    .await
+    .unwrap();
+    let settlement:String=sqlx::query_scalar("SELECT settlement FROM recovery_attempt_sources WHERE recovery_bundle_id=? AND source_bundle_id=?")
+        .bind(child).bind(source).fetch_one(&pool).await.unwrap();
+    let states:(String,String)=sqlx::query_as("SELECT child.state,source.lifecycle_state FROM reroute_bundles child JOIN reroute_bundles source ON source.id=? WHERE child.id=?")
+        .bind(source).bind(child).fetch_one(&pool).await.unwrap();
+    assert_eq!(settlement, "blocked");
+    assert_eq!(
+        states,
+        ("compensation_blocked".into(), "recovery_blocked".into())
+    );
+    let stable_history: (String, Option<String>) = sqlx::query_as(
+        "SELECT DATE_FORMAT(ras.settled_at,'%Y-%m-%d %H:%i:%s'),child.failure_reason \
+         FROM recovery_attempt_sources ras JOIN reroute_bundles child ON child.id=ras.recovery_bundle_id \
+         WHERE ras.recovery_bundle_id=? AND ras.source_bundle_id=?",
+    )
+    .bind(child)
+    .bind(source)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stable_history,
+        (
+            "2001-02-03 04:05:06".into(),
+            Some("first durable startup diagnosis".into())
+        ),
+        "idempotent startup repair preserves its first terminal evidence"
+    );
+    let audits:i64=sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE event_type='recovery_blocked' AND entity_type='reroute_bundle' AND entity_id=?")
+        .bind(child).fetch_one(&pool).await.unwrap();
+    let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE dedup_key=?")
+        .bind(format!("recovery_degraded:child:{child}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (audits, alerts),
+        (1, 1),
+        "repeated startup repair stays idempotent"
+    );
+}
+
+#[tokio::test]
+async fn complete_terminal_skipped_ledger_is_positive_no_write_coverage() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'127.0.0.1')")
+        .bind(format!("skipped-coverage-{}", uuid::Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let source=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','failed',1,'inactive')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,prepared_action_json,state,mutation_effect) VALUES(?,0,?,'{}','{}','{}','{}','queued','pending')")
+        .bind(source).bind(device).execute(&pool).await.unwrap();
+    let ownership = rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &[source])
+        .await
+        .unwrap();
+    assert!(ownership.original_reroute_ids.is_empty());
+
+    let incomplete=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','succeeded',2,'active')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO reroutes(device_id,bundle_id,trigger_type,state,mutation_effect) VALUES(?,?,'manual','succeeded','changed')")
+        .bind(device).bind(incomplete).execute(&pool).await.unwrap();
+    let missing_slot =
+        rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &[incomplete]).await;
+    assert!(missing_slot
+        .unwrap_err()
+        .to_string()
+        .contains("no durable activation coverage"));
+}
+
+#[tokio::test]
+async fn complete_sized_but_unknown_or_unlinked_slots_are_not_coverage() {
+    let test_db = common::test_database().await;
+    let pool = test_db.pool().clone();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'127.0.0.1')")
+        .bind(format!("invalid-slot-{}", uuid::Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let unknown=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','failed',1,'recovery_blocked')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,prepared_action_json,state,mutation_effect) VALUES(?,0,?,'{}','{}','{}','{}','uncertain','unknown')")
+        .bind(unknown).bind(device).execute(&pool).await.unwrap();
+    let error = rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &[unknown])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no durable activation coverage"));
+
+    let pending=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions,lifecycle_state) VALUES('manual','failed',1,'recovery_blocked')")
+        .execute(&pool).await.unwrap().last_insert_id();
+    let root=sqlx::query("INSERT INTO reroutes(device_id,bundle_id,bundle_position,trigger_type,state,mutation_effect) VALUES(?,?,0,'manual','pending','pending')")
+        .bind(device).bind(pending).execute(&pool).await.unwrap().last_insert_id();
+    sqlx::query("INSERT INTO reroute_bundle_actions(bundle_id,position,device_id,template_snapshot_json,canonical_params_json,rendered_plan_json,prepared_action_json,state,mutation_effect,reroute_id) VALUES(?,0,?,'{}','{}','{}','{}','running','pending',?)")
+        .bind(pending).bind(device).bind(root).execute(&pool).await.unwrap();
+    let error = rerouter_controller::reroute::recovery::ownership_for_sources(&pool, &[pending])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("in-flight or ambiguous"));
 }

@@ -24,9 +24,11 @@ pub const EVENT_TYPES: &[&str] = &[
     "reroute_succeeded",
     "reroute_failed",
     "reroute_uncertain",
+    "reroute_bundle_partial",
     "operating_mode_changed",
     "automatic_actions_changed",
     "automatic_action_failed",
+    "automatic_recovery_planned",
     "recovery_degraded",
     "global_lock_changed",
     "rule_auto_disarmed",
@@ -254,7 +256,7 @@ fn email_test_response(result: anyhow::Result<()>) -> JsonResp {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
         Err(e) => {
             // Display alone only returns the outer "smtp send" context.
-            let detail = format!("{e:#}");
+            let detail = crate::alerts::safe_diagnostic(&e);
             tracing::warn!(event_type = "test_email_failed", error = %detail, "test email delivery failed");
             err(StatusCode::BAD_GATEWAY, &format!("send failed: {detail}"))
         }
@@ -466,7 +468,11 @@ pub async fn test_webhook(
     .await
     {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
-        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("post failed: {e}")),
+        Err(e) => {
+            let detail = crate::alerts::safe_diagnostic(&e);
+            tracing::warn!(event_type = "test_webhook_failed", error = %detail, "test Teams delivery failed");
+            err(StatusCode::BAD_GATEWAY, &format!("post failed: {detail}"))
+        }
     }
 }
 
@@ -563,5 +569,11 @@ mod tests {
         let (status, Json(body)) = email_test_response(Ok(()));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({ "ok": true }));
+    }
+
+    #[test]
+    fn event_catalog_includes_critical_partial_bundle() {
+        assert!(EVENT_TYPES.contains(&"reroute_bundle_partial"));
+        assert!(crate::alerts::ALWAYS_IMMEDIATE.contains(&"reroute_bundle_partial"));
     }
 }

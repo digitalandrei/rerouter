@@ -1,4 +1,4 @@
-import type { PresetRunSummary, RerouteBundle } from "@/lib/api";
+import type { PresetRunSummary, RunSummary, RerouteBundle } from "@/lib/api";
 import { bundleVerificationMode } from "@/lib/api";
 import type { Tone } from "@/components/status-badge";
 
@@ -11,8 +11,8 @@ export type RunPresentation = {
   unknown: number;
 };
 
-export function presentMitigationRun(run: RerouteBundle): RunPresentation {
-  const remaining = run.remaining_changes ?? run.remaining_mutations ?? run.still_applied_reroute_ids?.length ?? 0;
+export function presentMitigationRun(run: RunSummary): RunPresentation {
+  const remaining = run.remaining_changes ?? run.remaining_mutations ?? 0;
   const unknown = run.unknown_effects ?? 0;
   const lifecycle = run.lifecycle_state ?? (remaining > 0 ? "active" : "inactive");
   const execution = run.execution_state ?? run.state;
@@ -36,11 +36,11 @@ export function presentMitigationRun(run: RerouteBundle): RunPresentation {
   return { label, detail, tone, remaining, known: Math.max(0, remaining), unknown };
 }
 
-export function recentRunAsBundle(run: PresetRunSummary): RerouteBundle {
-  return { ...run, id: run.id ?? run.bundle_id, rule_id: run.rule_id ?? null, trigger_type: run.trigger_type ?? "manual", state: run.state as RerouteBundle["state"], failure_policy: run.failure_policy ?? "abort_and_compensate", total_actions: run.total_actions ?? 0, completed_actions: run.completed_actions ?? 0, failure_reason: run.failure_reason ?? null, started_at: run.started_at ?? null, finished_at: run.finished_at ?? null, actions: run.actions ?? [], still_applied_reroute_ids: run.still_applied_reroute_ids ?? [] };
+export function recentRunAsBundle(run: PresetRunSummary): RunSummary {
+  return { ...run, id: run.id ?? run.bundle_id, rule_id: run.rule_id ?? null, trigger_type: run.trigger_type ?? "manual", state: run.state as RunSummary["state"], failure_policy: run.failure_policy ?? "abort_and_compensate", total_actions: run.total_actions ?? 0, completed_actions: run.completed_actions ?? 0, failure_reason: run.failure_reason ?? null, started_at: run.started_at ?? null, finished_at: run.finished_at ?? null };
 }
 
-export function runSourceName(run: RerouteBundle): string {
+export function runSourceName(run: RunSummary): string {
   return run.source_preset_name ?? run.source?.preset_name ?? run.source?.name ?? `Run #${run.id}`;
 }
 
@@ -66,5 +66,6 @@ export function recoveryFieldLabel(source: RerouteBundle, child?: RerouteBundle 
   if (id && ["planned", "pending", "running", "verifying", "compensating"].includes(state ?? "")) return `Revert in progress · recovery #${id}`;
   if (id) return `Revert accepted · recovery #${id}`;
   if (source.recovery_deadline) return `Revert scheduled for ${new Date(source.recovery_deadline).toLocaleString()} · pending until automatic recovery is allowed`;
-  return source.automatic_recovery_cancelled_at ? "Manual control" : "Until manually reverted";
+  if (source.take_control?.available) return "Rule-driven automatic recovery eligible";
+  return source.automatic_recovery_cancelled_at ? "Automatic recovery cancelled · manual revert only" : "Until manually reverted";
 }

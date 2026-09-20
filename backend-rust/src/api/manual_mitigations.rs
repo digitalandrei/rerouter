@@ -35,6 +35,21 @@ pub(crate) struct RunSnapshot {
     pub revert_after_seconds: Option<u32>,
 }
 
+fn canonicalize_source_timer(source: &mut Value, revert_after_seconds: Option<u32>) {
+    if let Some(seconds) = revert_after_seconds {
+        source["revert_after_seconds"] = json!(seconds);
+    } else if let Some(object) = source.as_object_mut() {
+        object.remove("revert_after_seconds");
+    }
+}
+
+fn source_timer_consistent(snapshot: &RunSnapshot) -> bool {
+    match snapshot.revert_after_seconds {
+        Some(seconds) => snapshot.source.get("revert_after_seconds") == Some(&json!(seconds)),
+        None => snapshot.source.get("revert_after_seconds").is_none(),
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewBody {
@@ -398,6 +413,10 @@ async fn preview_actions_core(
         source["verification_label"] =
             json!("Configuration-only test; routing will not be verified");
     }
+    // The timer is part of the authority-bearing source identity. Canonicalize
+    // it before snapshot serialization and hashing so admission persists the
+    // exact source that the operator previewed.
+    canonicalize_source_timer(&mut source, revert_after_seconds);
     let enforce = super::settings::operating_mode(&state.pool, &state.config).await == "enforce";
     let _policy = match guard::policy_fence(&state.pool).await {
         Ok(fence) => Some(fence),
@@ -603,6 +622,57 @@ pub async fn preview_actions_with_reader_mode<R: crate::reroute::device_plan::Pr
     actor: &Session,
     scope: &str,
     scope_id: Option<u64>,
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    revert_after_seconds: Option<u32>,
+    reader: &R,
+    verification_mode: VerificationMode,
+) -> JsonResp {
+    let runtime = match state.config.advisory_runtime(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("lock runtime unavailable: {error}"),
+            )
+        }
+    };
+    match crate::db::advisory::foreground_scope(
+        runtime,
+        preview_actions_with_reader_mode_inner(
+            state,
+            actor,
+            scope,
+            scope_id,
+            actions,
+            source,
+            reason,
+            request,
+            revert_after_seconds,
+            reader,
+            verification_mode,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("execution capacity unavailable: {error}"),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preview_actions_with_reader_mode_inner<
+    R: crate::reroute::device_plan::PreparationReader,
+>(
+    state: &AppState,
+    actor: &Session,
+    scope: &str,
+    scope_id: Option<u64>,
     mut actions: Vec<BundleAction>,
     source: Value,
     reason: String,
@@ -668,7 +738,8 @@ pub async fn preview_actions_with_reader_mode<R: crate::reroute::device_plan::Pr
     .await
 }
 
-pub(crate) fn hash_snapshot(value: &Value) -> String {
+#[doc(hidden)]
+pub fn hash_snapshot(value: &Value) -> String {
     hex::encode(Sha256::digest(value.to_string().as_bytes()))
 }
 
@@ -702,7 +773,12 @@ pub async fn accept_plan(
     scope: &str,
     scope_id: Option<u64>,
 ) -> anyhow::Result<AcceptedPlan> {
-    accept_plan_inner(state, actor, plan_id, token, scope, scope_id, false).await
+    let runtime = state.config.advisory_runtime(&state.pool).await?;
+    crate::db::advisory::foreground_scope(
+        runtime,
+        accept_plan_inner(state, actor, plan_id, token, scope, scope_id, false),
+    )
+    .await?
 }
 
 #[doc(hidden)]
@@ -714,7 +790,12 @@ pub async fn accept_plan_with_persist_failure_for_test(
     scope: &str,
     scope_id: Option<u64>,
 ) -> anyhow::Result<AcceptedPlan> {
-    accept_plan_inner(state, actor, plan_id, token, scope, scope_id, true).await
+    let runtime = state.config.advisory_runtime(&state.pool).await?;
+    crate::db::advisory::foreground_scope(
+        runtime,
+        accept_plan_inner(state, actor, plan_id, token, scope, scope_id, true),
+    )
+    .await?
 }
 
 async fn accept_plan_inner(
@@ -744,6 +825,23 @@ async fn accept_plan_inner(
         "stored preview integrity check failed"
     );
     let snapshot: RunSnapshot = serde_json::from_value(row.snapshot_json.0)?;
+    if row.consumed_at.is_some() {
+        let bundle_id = row
+            .bundle_id
+            .context("consumed preview has no execution; reconcile before retrying")?;
+        let accepted = AcceptedPlan {
+            bundle_id,
+            plan_id,
+            snapshot,
+            already_accepted: true,
+        };
+        policy_fence.release().await?;
+        return Ok(accepted);
+    }
+    ensure!(
+        source_timer_consistent(&snapshot),
+        "execution snapshot timer differs from its source identity"
+    );
     if snapshot.verification_mode == VerificationMode::ConfigurationOnly {
         ensure!(
             matches!(
@@ -781,19 +879,6 @@ async fn accept_plan_inner(
         source_id == row.scope_id && (source_kind == Some("manual") || source_id.is_some()),
         "preview source identity does not match its authorization scope"
     );
-    if row.consumed_at.is_some() {
-        let bundle_id = row
-            .bundle_id
-            .context("consumed preview has no execution; reconcile before retrying")?;
-        let accepted = AcceptedPlan {
-            bundle_id,
-            plan_id,
-            snapshot,
-            already_accepted: true,
-        };
-        policy_fence.release().await?;
-        return Ok(accepted);
-    }
     ensure!(
         row.expires_at > Utc::now(),
         "preview_expired; prepare a fresh preview"
@@ -885,24 +970,35 @@ async fn accept_plan_inner(
     } else {
         None
     };
-    if let Some(parent_id) = parent_bundle_id {
-        let claimed=sqlx::query("UPDATE reroute_bundles SET recovery_claim_token=?,recovery_claimed_at=UTC_TIMESTAMP(),lifecycle_state='recovery_claimed' \
-            WHERE id=? AND recovery_claim_token IS NULL AND lifecycle_state NOT IN ('recovery_claimed','recovery_running')")
-            .bind(format!("manual:plan:{plan_id}")).bind(parent_id).execute(&mut *tx).await?;
-        ensure!(
-            claimed.rows_affected() == 1,
-            "run recovery was already claimed or started"
-        );
-    }
     let row = sqlx::query("INSERT INTO reroute_bundles (parent_bundle_id, rule_id, trigger_type, triggered_by_user_id, reason, state, failure_policy, total_actions, source_json) \
         VALUES (?, ?, 'manual', ?, ?, 'planned', 'abort_and_compensate', ?, ?)")
         .bind(parent_bundle_id)
         .bind(rule_id).bind(actor.user_id).bind(&snapshot.reason).bind(snapshot.actions.len() as u32)
         .bind(sqlx::types::Json(&snapshot.source)).execute(&mut *tx).await?;
     let bundle_id = row.last_insert_id();
-    if let Some(seconds) = snapshot.revert_after_seconds {
-        sqlx::query("UPDATE reroute_bundles SET source_json = JSON_SET(COALESCE(source_json, JSON_OBJECT()), '$.revert_after_seconds', ?) WHERE id = ?")
-            .bind(seconds).bind(bundle_id).execute(&mut *tx).await?;
+    let expected_originals = snapshot
+        .actions
+        .iter()
+        .filter_map(|action| action.original_reroute_id)
+        .collect::<Vec<_>>();
+    if !expected_originals.is_empty() {
+        let mut source_ids = Vec::new();
+        for original_id in &expected_originals {
+            let source: Option<u64> = sqlx::query_scalar("SELECT bundle_id FROM reroutes WHERE id=? AND rollback_of_reroute_id IS NULL FOR UPDATE")
+                .bind(original_id).fetch_optional(&mut *tx).await?.flatten();
+            source_ids.push(source.context("recovery original has no source activation")?);
+        }
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        crate::reroute::recovery::claim_sources_for_child_on(
+            &mut tx,
+            bundle_id,
+            &source_ids,
+            &expected_originals,
+            &format!("manual:plan:{plan_id}"),
+            true,
+        )
+        .await?;
     }
     sqlx::query("UPDATE execution_plans SET consumed_at = UTC_TIMESTAMP(), bundle_id = ? WHERE id = ? AND consumed_at IS NULL")
         .bind(bundle_id).bind(plan_id).execute(&mut *tx).await?;
@@ -944,16 +1040,24 @@ async fn accept_plan_inner(
     }
     .await;
     if let Err(error) = admitted {
-        sqlx::query("UPDATE reroute_bundles SET state = 'failed', finished_at = UTC_TIMESTAMP(), failure_reason = ? WHERE id = ? AND state = 'planned'")
-            .bind(format!("admission refused before any router write: {error:#}")).bind(bundle_id).execute(&state.pool).await?;
-        if let Some(parent_id) = parent_bundle_id {
-            crate::reroute::recovery::release_claim_if_proven_no_write(
+        let reason = format!("admission refused before any router write: {error:#}");
+        let mapped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM recovery_attempt_sources WHERE recovery_bundle_id=?",
+        )
+        .bind(bundle_id)
+        .fetch_one(&state.pool)
+        .await?;
+        if mapped > 0 {
+            crate::reroute::recovery::finalize_recovery_child(
                 &state.pool,
-                parent_id,
-                Some(bundle_id),
-                &format!("admission refused: {error:#}"),
+                bundle_id,
+                "failed",
+                Some(&reason),
+                &format!("plan:{plan_id}"),
             )
             .await?;
+        } else {
+            sqlx::query("UPDATE reroute_bundles SET state='failed',finished_at=UTC_TIMESTAMP(),failure_reason=? WHERE id=? AND state='planned'").bind(&reason).bind(bundle_id).execute(&state.pool).await?;
         }
         return Err(error.context(format!(
             "bundle #{bundle_id} was not admitted; no router command was sent"
@@ -975,26 +1079,9 @@ pub(crate) fn spawn_accepted(state: &AppState, actor: &Session, accepted: Accept
     }
     let pool = state.pool.clone();
     let cfg = state.config.clone();
-    let source_bundle_id = accepted
-        .snapshot
-        .source
-        .get("original_bundle_id")
-        .and_then(Value::as_u64);
     let run = run_context(actor, &accepted);
     tokio::spawn(async move {
-        let outcome = bundle::run(&pool, &cfg, run, accepted.snapshot.actions).await;
-        if outcome.state != "succeeded" {
-            if let Some(source_id) = source_bundle_id {
-                let reason = outcome
-                    .failure_reason
-                    .unwrap_or_else(|| format!("revert ended {}", outcome.state));
-                match crate::reroute::recovery::release_claim_if_proven_no_write(&pool,source_id,Some(outcome.bundle_id),&reason).await {
-                    Ok(true)=>{},
-                    Ok(false)=>if let Err(e)=sqlx::query("UPDATE reroute_bundles SET lifecycle_state='recovery_blocked',automatic_recovery_block_reason=? WHERE id=?").bind(reason).bind(source_id).execute(&pool).await {tracing::error!(event_type="source_recovery_finalize_failed",source_bundle_id=source_id,error=%e);},
-                    Err(e)=>tracing::error!(event_type="source_recovery_finalize_failed",source_bundle_id=source_id,error=%e),
-                }
-            }
-        }
+        let _ = bundle::run(&pool, &cfg, run, accepted.snapshot.actions).await;
     });
 }
 
@@ -1076,4 +1163,33 @@ pub(crate) async fn plan_for_token(
     ).bind(actor).bind(crate::auth::sessions::hash_token(token)).bind(scope).bind(scope_id).fetch_optional(pool).await?;
     let (id, snapshot) = row.context("preview_required_or_changed")?;
     Ok((id, serde_json::from_value(snapshot.0)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_is_canonicalized_into_source_and_mismatch_fails_closed() {
+        let mut source = json!({"kind":"manual"});
+        canonicalize_source_timer(&mut source, Some(300));
+        let mut snapshot = RunSnapshot {
+            verification_mode: VerificationMode::Routing,
+            actions: vec![],
+            device_actions: vec![],
+            source,
+            reason: "test".into(),
+            request: json!({}),
+            revert_after_seconds: Some(300),
+        };
+        assert!(source_timer_consistent(&snapshot));
+        snapshot.revert_after_seconds = Some(600);
+        assert!(!source_timer_consistent(&snapshot));
+
+        snapshot.revert_after_seconds = None;
+        canonicalize_source_timer(&mut snapshot.source, None);
+        assert!(source_timer_consistent(&snapshot));
+        snapshot.source["revert_after_seconds"] = Value::Null;
+        assert!(!source_timer_consistent(&snapshot));
+    }
 }

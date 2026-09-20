@@ -142,7 +142,7 @@ async fn timer_is_anchored_once_and_disabled_automation_leaves_it_pending() {
 }
 
 #[tokio::test]
-async fn restart_releases_only_a_prestart_claim() {
+async fn restart_preserves_a_legacy_claim_without_an_explicit_child_marker() {
     let db = common::test_database().await;
     let pool = db.pool();
     sqlx::query("UPDATE system_settings SET `value`='observe' WHERE `key`='operating_mode'")
@@ -162,8 +162,8 @@ async fn restart_releases_only_a_prestart_claim() {
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(row.0, "recovery_scheduled");
-    assert!(row.1.is_none());
+    assert_eq!(row.0, "recovery_claimed");
+    assert_eq!(row.1.as_deref(), Some("crashed"));
     sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
         .bind(bundle)
         .execute(pool)
@@ -185,7 +185,7 @@ async fn timer_claim_excludes_second_timer_manual_revert_and_takeover() {
     .execute(pool)
     .await
     .unwrap();
-    let bundle=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,lifecycle_state,recovery_deadline) VALUES('manual','succeeded','abort_and_compensate',0,'recovery_scheduled',DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND))").execute(pool).await.unwrap().last_insert_id();
+    let bundle=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,lifecycle_state,recovery_deadline,source_json) VALUES('manual','succeeded','abort_and_compensate',0,'recovery_scheduled',DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND),JSON_OBJECT('revert_after_seconds',60))").execute(pool).await.unwrap().last_insert_id();
     let cfg = Config::default();
     let (a, b) = tokio::join!(
         recovery::claim_one_due(pool, &cfg),
@@ -259,18 +259,29 @@ async fn prewrite_timer_preparation_failure_releases_claim_for_takeover() {
         .await
         .unwrap()
         .last_insert_id();
-    let bundle=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,recovery_deadline) VALUES('manual','succeeded','abort_and_compensate',1,1,'recovery_scheduled',1,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND))").execute(pool).await.unwrap().last_insert_id();
+    let bundle=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions,completed_actions,lifecycle_state,remaining_mutations,recovery_deadline,source_json) VALUES('manual','succeeded','abort_and_compensate',1,1,'recovery_scheduled',1,DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND),JSON_OBJECT('revert_after_seconds',60))").execute(pool).await.unwrap().last_insert_id();
     let reroute=sqlx::query("INSERT INTO reroutes(bundle_id,bundle_position,device_id,trigger_type,state,mutation_effect) VALUES(?,0,?,'manual','succeeded','changed')").bind(bundle).bind(device).execute(pool).await.unwrap().last_insert_id();
     assert!(recovery::process_one_due(pool, &Config::default())
         .await
         .unwrap());
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT lifecycle_state,recovery_claim_token FROM reroute_bundles WHERE id=?",
-    )
-    .bind(bundle)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let row: (String, Option<String>) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let row: (String, Option<String>) = sqlx::query_as(
+                    "SELECT lifecycle_state,recovery_claim_token FROM reroute_bundles WHERE id=?",
+                )
+                .bind(bundle)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if row.0 != "recovery_claimed" {
+                    break row;
+                }
+                tokio::task::yield_now().await
+            }
+        })
+        .await
+        .unwrap();
     assert_eq!(row.0, "active");
     assert!(row.1.is_none());
     recovery::claim_source_bundles(pool, &[bundle], "fresh-whole-plan")
@@ -281,6 +292,35 @@ async fn prewrite_timer_preparation_failure_releases_claim_for_takeover() {
         .unwrap();
     let takeover=sqlx::query("UPDATE reroute_bundles SET automatic_recovery_cancelled_at=UTC_TIMESTAMP() WHERE id=? AND lifecycle_state='active' AND recovery_claim_token IS NULL").bind(bundle).execute(pool).await.unwrap();
     assert_eq!(takeover.rows_affected(), 1);
+    let children: Vec<u64> = sqlx::query_scalar(
+        "SELECT recovery_bundle_id FROM recovery_attempt_sources WHERE source_bundle_id=?",
+    )
+    .bind(bundle)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM recovery_attempt_sources WHERE source_bundle_id=?")
+        .bind(bundle)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+        .bind(bundle)
+        .execute(pool)
+        .await
+        .unwrap();
+    for child in children {
+        sqlx::query("DELETE FROM reroute_bundle_actions WHERE bundle_id=?")
+            .bind(child)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+            .bind(child)
+            .execute(pool)
+            .await
+            .ok();
+    }
     sqlx::query("DELETE FROM reroutes WHERE id=?")
         .bind(reroute)
         .execute(pool)
