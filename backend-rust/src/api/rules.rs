@@ -97,6 +97,8 @@ struct RuleRow {
     // re-arms, so the reason survives a self-heal that clears the action marker.
     auto_disarmed_at: Option<chrono::DateTime<chrono::Utc>>,
     auto_disarmed_reason: Option<String>,
+    active_run_id: Option<u64>,
+    active_run_count: i64,
 }
 
 /// Rule columns + resolved target names + the latest evaluation snapshot
@@ -112,7 +114,11 @@ const RULE_SELECT: &str =
      r.auto_disarmed_at, r.auto_disarmed_reason, \
      i.if_name AS interface_name, d.name AS device_name, \
      rs.current_state, rs.last_metric_value, rs.last_evaluated_at, \
-     rs.consecutive_match_count, rs.first_matched_at \
+     rs.consecutive_match_count, rs.first_matched_at, \
+     (SELECT MAX(b.id) FROM reroute_bundles b WHERE b.rule_id=r.id AND b.parent_bundle_id IS NULL \
+        AND (b.remaining_mutations>0 OR b.state IN ('planned','running','compensating') OR b.lifecycle_state<>'inactive')) AS active_run_id, \
+     (SELECT COUNT(*) FROM reroute_bundles b WHERE b.rule_id=r.id AND b.parent_bundle_id IS NULL \
+        AND (b.remaining_mutations>0 OR b.state IN ('planned','running','compensating') OR b.lifecycle_state<>'inactive')) AS active_run_count \
      FROM rules r \
      LEFT JOIN device_interfaces i ON i.id = r.interface_id \
      LEFT JOIN devices d ON d.id = r.device_id \
@@ -156,6 +162,8 @@ fn rule_json(r: &RuleRow, actions: Vec<Value>, member_interface_ids: Vec<u64>) -
         "last_evaluated_at": r.last_evaluated_at.map(|t| t.to_rfc3339()),
         "consecutive_match_count": r.consecutive_match_count,
         "first_matched_at": r.first_matched_at.map(|t| t.to_rfc3339()),
+        "active_run_id": r.active_run_id,
+        "active_run_count": r.active_run_count,
         "action_count": actions.len(),
         "actions": actions,
     })
@@ -1350,6 +1358,11 @@ pub struct ApplyBody {
     /// One-time token returned by the immediately preceding enforce-mode preview.
     #[serde(default)]
     preview_token: Option<String>,
+    /// Publish a durable server-owned run before router preparation.
+    #[serde(default)]
+    direct_run: bool,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// Manual rule application uses the same immutable preview and runner as named
@@ -1363,6 +1376,12 @@ pub async fn apply(
     Json(body): Json<ApplyBody>,
 ) -> JsonResp {
     use super::manual_mitigations as manual;
+    if body.direct_run && (body.dry_run || body.preview_token.is_some()) {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "direct run cannot include preview authority",
+        );
+    }
     if !body.dry_run && body.preview_token.is_some() {
         let Some(token) = body.preview_token.as_deref() else {
             return err(StatusCode::CONFLICT, "preview_required");
@@ -1433,6 +1452,8 @@ pub async fn apply(
             "manual apply is disabled for this rule",
         );
     }
+    let direct_run = body.direct_run;
+    let direct_request_id = body.request_id.clone();
     let reason = body
         .reason
         .unwrap_or_else(|| format!("manual apply of rule '{}' (#{id})", context.name))
@@ -1499,6 +1520,27 @@ pub async fn apply(
     }
     let source = json!({"kind":"rule","rule_id":id,"name":context.name,"actions_revision":context.actions_revision});
     let request = json!({"rule_id":id,"reason":reason,"actions_revision":context.actions_revision});
+    if direct_run {
+        let Some(request_id) = direct_request_id.as_deref() else {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "direct run requires request_id",
+            );
+        };
+        return manual::run_direct_actions(
+            &state,
+            &g.session,
+            actions,
+            source,
+            reason,
+            request,
+            None,
+            None,
+            crate::reroute::device_plan::VerificationMode::Routing,
+            request_id,
+        )
+        .await;
+    }
     manual::preview_actions(
         &state,
         &g.session,
@@ -1802,7 +1844,8 @@ async fn lock_action_edit(
         "resolve the firing or matching rule before changing its actions"
     );
     let active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM reroute_bundles WHERE rule_id = ? AND state IN ('planned','running','compensating','compensation_blocked')",
+        "SELECT COUNT(*) FROM reroute_bundles WHERE rule_id = ? AND parent_bundle_id IS NULL \
+         AND (remaining_mutations>0 OR state IN ('planned','running','compensating','compensation_blocked') OR lifecycle_state<>'inactive')",
     ).bind(rule_id).fetch_one(&mut *conn).await?;
     anyhow::ensure!(
         active == 0,

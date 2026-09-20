@@ -271,6 +271,7 @@ pub async fn manual(
                 actions,
                 reason: Some(reason),
                 revert_after_seconds: None,
+                request_id: None,
             },
             "legacy_manual",
         )
@@ -831,6 +832,11 @@ pub struct BundleRevertBody {
     plan_id: Option<u64>,
     #[serde(default)]
     preview_token: Option<String>,
+    /// Publish a durable server-side recovery before router preparation.
+    #[serde(default)]
+    direct_run: bool,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// Preview or confirm the inverse of every mutation owned by a run. Originals
@@ -846,6 +852,42 @@ pub async fn bundle_revert(
     let reason = body
         .reason
         .unwrap_or_else(|| format!("revert mitigation run #{id}"));
+    if body.direct_run {
+        if body.dry_run || body.plan_id.is_some() || body.preview_token.is_some() {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "direct revert cannot include preview authority",
+            );
+        }
+        let Some(request_id) = body.request_id.as_deref() else {
+            return err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "direct revert requires request_id",
+            );
+        };
+        return match manual::admit_direct_recovery(
+            &state.pool,
+            &g.session,
+            id,
+            reason.trim(),
+            request_id,
+        )
+        .await
+        {
+            Ok(admission) => {
+                manual::spawn_direct_recovery(&state, &g.session, admission);
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "bundle_id":admission.bundle_id,
+                        "async":true,
+                        "already_admitted":admission.already_admitted
+                    })),
+                )
+            }
+            Err(e) => err(StatusCode::CONFLICT, &format!("{e:#}")),
+        };
+    }
     if body.dry_run || body.preview_token.is_none() {
         let originals = match crate::reroute::recovery::owned_original_ids(&state.pool, id).await {
             Ok(ids) => ids,

@@ -352,6 +352,10 @@ pub fn router(state: AppState) -> Router {
             post(manual_mitigations::preview),
         )
         .route(
+            "/api/manual-mitigations/run",
+            post(manual_mitigations::run_direct),
+        )
+        .route(
             "/api/manual-mitigations/capabilities",
             get(manual_mitigations::capabilities),
         )

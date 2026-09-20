@@ -47,8 +47,8 @@ engine. Run once is an unsaved Manual Mitigation and has no reusable source id.
   action is uncertain. Further writes and blind compensation stop; ownership and
   quarantine remain until reconciliation.
 - Revert uses the original persisted inverse, verifies current ownership/state,
-  and requires a fresh exact prepared plan. The UI can pause for review or
-  explicitly prepare and submit that one-use plan in a single operator action.
+  and requires fresh exact preparation. Reviewed reverts use a one-use plan;
+  direct reverts publish a server-owned recovery child before preparation.
 
 ## Concurrency and duplicate controls
 

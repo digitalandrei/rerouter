@@ -65,14 +65,15 @@ the in-flight request.
 Every manual apply and revert performs that exact preparation. **Preview
 changes** and **Preview revert** pause afterward so the operator can inspect the
 commands and explicitly submit the prepared plan. **Run now** and **Revert now**
-show preparation as the first status step, then immediately submit the same
-one-use plan. A preparation error or missing execution authority stops either
-flow before router writes.
+first publish a durable server-owned workflow, then the server prepares and
+executes it in the background. Refresh, logout, connection loss, and another
+operator's browser all resolve the same bundle. A preparation error stops the
+durable workflow before router writes and remains visible in history.
 
-A five-minute, one-use preview credential binds the operator, reason, source
-revision, ordered actions, and exact prepared snapshot. Submitting that prepared
-plan creates a durable execution identity before handing work to the background
-runner. Repeating the same submission returns the same bundle; it cannot run twice.
+A reviewed path uses a five-minute, one-use preview credential binding the
+operator, reason, source revision, ordered actions, and exact prepared snapshot.
+A direct path binds the explicit operator request to a durable bundle before
+preparation. Repeating either submission returns the same bundle; it cannot run twice.
 Edits or archival invalidate unconsumed previews. Admitted runs keep their own
 immutable definition.
 

@@ -20,6 +20,249 @@ use crate::reroute::{guard, templates};
 
 pub(crate) type JsonResp = (StatusCode, Json<Value>);
 
+#[derive(Debug, Clone, Copy)]
+pub struct DirectAdmission {
+    pub bundle_id: u64,
+    pub already_admitted: bool,
+}
+
+/// Publish a manual whole-run recovery before any router read. The source claim,
+/// recovery child and association commit together, so every client and startup
+/// repair can observe the operator's action even if the HTTP connection drops.
+#[doc(hidden)]
+pub async fn admit_direct_recovery(
+    pool: &sqlx::MySqlPool,
+    actor: &Session,
+    source_id: u64,
+    reason: &str,
+    request_id: &str,
+) -> anyhow::Result<DirectAdmission> {
+    ensure!(
+        !reason.trim().is_empty() && reason.chars().count() <= 4000,
+        "provide an audit reason of 1–4000 characters"
+    );
+    ensure!(
+        !request_id.trim().is_empty() && request_id.len() <= 191,
+        "direct request id is invalid"
+    );
+    let fence = guard::policy_fence(pool).await?;
+    let result = async {
+        let mut tx = pool.begin().await?;
+        let existing: Option<u64> = sqlx::query_scalar(
+            "SELECT ras.recovery_bundle_id FROM recovery_attempt_sources ras \
+             JOIN reroute_bundles child ON child.id=ras.recovery_bundle_id \
+             WHERE ras.source_bundle_id=? AND ras.settlement IN ('active','blocked') \
+             ORDER BY ras.recovery_bundle_id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(bundle_id) = existing {
+            tx.commit().await?;
+            return Ok(DirectAdmission {
+                bundle_id,
+                already_admitted: true,
+            });
+        }
+        let ownership = crate::reroute::recovery::ownership_for_sources_on(
+            &mut tx,
+            &[source_id],
+        )
+        .await?;
+        ensure!(
+            !ownership.original_reroute_ids.is_empty(),
+            "run owns no remaining invertible mutations"
+        );
+        let originals = ownership.original_reroute_ids;
+        let claim_token = format!("mdir:{}", crate::auth::sessions::generate_token());
+        let source = json!({
+            "kind":"recovery",
+            "admission_kind":"direct",
+            "operator_request_id":request_id,
+            "original_bundle_id":source_id,
+            "source_bundle_ids":[source_id],
+            "original_reroute_ids":originals,
+            "reason":reason,
+            "preparation_phase":"published"
+        });
+        let bundle_id = sqlx::query(
+            "INSERT INTO reroute_bundles(parent_bundle_id,trigger_type,triggered_by_user_id,reason,state,failure_policy,total_actions,source_json) \
+             VALUES(?,'manual',?,?,'planned','abort_and_compensate',?,?)",
+        )
+        .bind(source_id)
+        .bind(actor.user_id)
+        .bind(reason)
+        .bind(originals.len() as u32)
+        .bind(sqlx::types::Json(source))
+        .execute(&mut *tx)
+        .await?
+        .last_insert_id();
+        crate::reroute::recovery::claim_sources_for_child_on(
+            &mut tx,
+            bundle_id,
+            &[source_id],
+            &originals,
+            &claim_token,
+            true,
+        )
+        .await?;
+        super::audit_mutation_on(
+            &mut tx,
+            actor,
+            "manual_recovery_admitted",
+            "reroute_bundle",
+            bundle_id,
+            &format!("published direct recovery of mitigation run #{source_id}"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(DirectAdmission {
+            bundle_id,
+            already_admitted: false,
+        })
+    }
+    .await;
+    let released = fence.release().await;
+    match (result, released) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("releasing direct recovery policy fence"),
+    }
+}
+
+/// Start the already-published recovery in a server-owned supervised task.
+/// Losing the API connection cannot cancel this work; a panic or preparation
+/// failure settles the durable child with proven no-write evidence.
+pub fn spawn_direct_recovery(state: &AppState, actor: &Session, admission: DirectAdmission) {
+    if admission.already_admitted {
+        return;
+    }
+    let pool = state.pool.clone();
+    let cfg = state.config.clone();
+    let bundle_id = admission.bundle_id;
+    let user_id = actor.user_id;
+    let actor_context = ActorContext {
+        ip_address: actor.ip_address.clone(),
+        user_agent: actor.user_agent.clone(),
+    };
+    tokio::spawn(async move {
+        let worker_pool = pool.clone();
+        let supervisor_pool = pool.clone();
+        let worker = tokio::spawn(async move {
+            let claimed = sqlx::query(
+                "UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','preparing') \
+                 WHERE id=? AND state='planned' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase'))='published'",
+            )
+            .bind(bundle_id)
+            .execute(&worker_pool)
+            .await?;
+            if claimed.rows_affected() != 1 {
+                return Ok::<(), anyhow::Error>(());
+            }
+            let port = cfg
+                .automatic_work_port
+                .clone()
+                .unwrap_or_else(|| crate::detection::engine::production_work_port(&worker_pool));
+            let runtime = cfg.advisory_runtime(&worker_pool).await?;
+            let work = async {
+                let source: sqlx::types::Json<Value> = sqlx::query_scalar(
+                    "SELECT source_json FROM reroute_bundles WHERE id=? AND state='planned'",
+                )
+                .bind(bundle_id)
+                .fetch_one(&worker_pool)
+                .await?;
+                let originals = source.0["original_reroute_ids"]
+                    .as_array()
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                ensure!(
+                    !originals.is_empty(),
+                    "direct recovery lost its original action set"
+                );
+                let reason = source
+                    .0
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("manual recovery")
+                    .to_string();
+                let actions = port
+                    .prepare_recovery(&worker_pool, &originals, &reason)
+                    .await?;
+                ensure!(
+                    actions.len() == originals.len(),
+                    "direct recovery preparation omitted an owned action"
+                );
+                let fence = guard::policy_fence(&worker_pool).await?;
+                let claim_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM recovery_attempt_sources ras \
+                     JOIN reroute_bundles source ON source.id=ras.source_bundle_id \
+                     WHERE ras.recovery_bundle_id=? AND ras.settlement='active' \
+                       AND source.recovery_claim_token=ras.claim_token",
+                )
+                .bind(bundle_id)
+                .fetch_one(&worker_pool)
+                .await?;
+                ensure!(
+                    claim_count > 0,
+                    "direct recovery ownership changed during preparation"
+                );
+                let devices = actions
+                    .iter()
+                    .map(|action| action.device_id)
+                    .collect::<Vec<_>>();
+                let identities = port.transport_identities(&devices).await?;
+                fence.release().await?;
+                let mut next = source.0;
+                next["transport_identities"] = json!(identities);
+                next["preparation_phase"] = json!("prepared");
+                bundle::persist_actions(&worker_pool, bundle_id, &actions).await?;
+                sqlx::query(
+                    "UPDATE reroute_bundles SET source_json=? WHERE id=? AND state='planned'",
+                )
+                .bind(sqlx::types::Json(next))
+                .bind(bundle_id)
+                .execute(&worker_pool)
+                .await?;
+                let _ = port
+                    .run_bundle(
+                        &worker_pool,
+                        &cfg,
+                        BundleRun::manual_recovery(
+                            bundle_id,
+                            FailurePolicy::AbortAndCompensate,
+                            user_id,
+                            actor_context,
+                        ),
+                        actions,
+                    )
+                    .await;
+                Ok::<(), anyhow::Error>(())
+            };
+            let result = crate::db::advisory::foreground_scope(runtime, work).await;
+            if let Err(error) = result.and_then(|value| value) {
+                crate::reroute::recovery::finalize_recovery_child(
+                    &worker_pool,
+                    bundle_id,
+                    "failed",
+                    Some(&format!("direct recovery preparation failed: {error:#}")),
+                    &format!("recovery:bundle:{bundle_id}"),
+                )
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        if worker.await.is_err() {
+            crate::detection::engine::settle_supervised_manual_failure(
+                &supervisor_pool,
+                bundle_id,
+                true,
+                "direct recovery worker panicked before completion",
+            )
+            .await;
+        }
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunSnapshot {
     #[serde(default)]
@@ -64,6 +307,9 @@ pub struct PreviewBody {
     pub reason: Option<String>,
     #[serde(default)]
     pub revert_after_seconds: Option<u32>,
+    /// Required only by the durable Run now endpoint.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,12 +411,21 @@ async fn validate_configuration_only_scope(
     Ok(())
 }
 
-pub(crate) async fn preview_manual(
+struct ResolvedManualRequest {
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    preset_id: Option<u64>,
+    revert_after_seconds: Option<u32>,
+    verification_mode: VerificationMode,
+    request_id: Option<String>,
+}
+
+async fn resolve_manual_request(
     state: &AppState,
-    actor: &Session,
     body: PreviewBody,
-    scope: &str,
-) -> JsonResp {
+) -> Result<ResolvedManualRequest, JsonResp> {
     let reason = body
         .reason
         .as_deref()
@@ -178,19 +433,19 @@ pub(crate) async fn preview_manual(
         .trim()
         .to_string();
     if reason.is_empty() || reason.chars().count() > 4000 {
-        return err(
+        return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "provide an audit reason of 1–4000 characters",
-        );
+        ));
     }
     if body
         .revert_after_seconds
         .is_some_and(|seconds| !(60..=604_800).contains(&seconds))
     {
-        return err(
+        return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "revert_after_seconds must be null or 60–604800",
-        );
+        ));
     }
     let source = if let Some(id) = body.preset_id {
         let row: Option<(String, u64, Option<DateTime<Utc>>)> = match sqlx::query_as(
@@ -201,37 +456,37 @@ pub(crate) async fn preview_manual(
         .await
         {
             Ok(row) => row,
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            Err(_) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")),
         };
         let Some((name, revision, None)) = row else {
-            return err(StatusCode::CONFLICT, "template_missing_or_archived");
+            return Err(err(StatusCode::CONFLICT, "template_missing_or_archived"));
         };
         if Some(revision) != body.preset_revision {
-            return err(
+            return Err(err(
                 StatusCode::CONFLICT,
                 "template_changed; reload before previewing",
-            );
+            ));
         }
         let saved = match super::mitigation_presets::load_actions(&state.pool, id).await {
             Ok(saved) => saved,
-            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"),
+            Err(_) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")),
         };
         if let Err(e) = preparation::validate_overrides(&saved, &body.actions) {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+            return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()));
         }
         json!({"kind":"preset", "preset_id":id, "preset_revision":revision, "preset_name":name, "saved_actions":saved})
     } else {
         if body.preset_revision.is_some() {
-            return err(
+            return Err(err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "preset_revision requires preset_id",
-            );
+            ));
         }
         json!({"kind":"manual", "name":"Run once"})
     };
     let validated = match preparation::validate_drafts(&state.pool, &body.actions, false).await {
         Ok(actions) => actions,
-        Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e:#}")),
+        Err(e) => return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e:#}"))),
     };
     let actions: Vec<BundleAction> = validated
         .into_iter()
@@ -251,13 +506,13 @@ pub(crate) async fn preview_manual(
         .collect();
     if body.verification_mode == VerificationMode::ConfigurationOnly {
         if body.revert_after_seconds.is_some() {
-            return err(
+            return Err(err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "configuration-only verification does not allow timed reverts",
-            );
+            ));
         }
         if let Err(e) = validate_configuration_only_scope(state, &actions).await {
-            return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+            return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()));
         }
         let device_id = actions[0].device_id;
         let action_limit = state
@@ -269,28 +524,407 @@ pub(crate) async fn preview_manual(
             .map(|device| device.action_rate_limit_count)
             .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT);
         if actions.len() as u32 > action_limit {
-            return err(
+            return Err(err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!(
                     "configuration-only action set has {} actions; approved-device limit is {}",
                     actions.len(),
                     action_limit
                 ),
-            );
+            ));
         }
     }
     let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason,"revert_after_seconds":body.revert_after_seconds,"verification_mode":body.verification_mode});
-    preview_actions_mode(
-        state,
-        actor,
-        scope,
-        body.preset_id,
+    Ok(ResolvedManualRequest {
         actions,
         source,
         reason,
         request,
-        body.revert_after_seconds,
-        body.verification_mode,
+        preset_id: body.preset_id,
+        revert_after_seconds: body.revert_after_seconds,
+        verification_mode: body.verification_mode,
+        request_id: body.request_id,
+    })
+}
+
+async fn admit_direct_apply(
+    state: &AppState,
+    actor: &Session,
+    resolved: &ResolvedManualRequest,
+    request_id: &str,
+) -> anyhow::Result<DirectAdmission> {
+    ensure!(
+        !request_id.trim().is_empty() && request_id.len() <= 191,
+        "direct request id is invalid"
+    );
+    let fence = guard::policy_fence(&state.pool).await?;
+    let result = async {
+        let mut tx = state.pool.begin().await?;
+        let duplicate: Option<u64> = sqlx::query_scalar(
+            "SELECT id FROM reroute_bundles WHERE trigger_type='manual' AND triggered_by_user_id=? \
+             AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.operator_request_id'))=? \
+             ORDER BY id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(actor.user_id)
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(bundle_id) = duplicate {
+            tx.commit().await?;
+            return Ok(DirectAdmission { bundle_id, already_admitted: true });
+        }
+        let source_kind = resolved.source.get("kind").and_then(Value::as_str);
+        let source_id = resolved
+            .source
+            .get("preset_id")
+            .and_then(Value::as_u64)
+            .or_else(|| resolved.source.get("rule_id").and_then(Value::as_u64));
+        if source_kind == Some("preset") {
+            let preset_id = source_id.context("direct preset run has no source id")?;
+            let current: Option<(u64, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT revision,archived_at FROM mitigation_presets WHERE id=? FOR UPDATE",
+            )
+            .bind(preset_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            ensure!(
+                matches!(current, Some((revision,None)) if Some(revision)==resolved.source.get("preset_revision").and_then(Value::as_u64)),
+                "saved mitigation changed; reload before running"
+            );
+        }
+        if source_kind == Some("rule") {
+            let rule_id = source_id.context("direct rule run has no source id")?;
+            let current: Option<(bool, u64)> = sqlx::query_as(
+                "SELECT manual_apply_enabled,actions_revision FROM rules WHERE id=? FOR UPDATE",
+            )
+            .bind(rule_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            ensure!(
+                matches!(current, Some((true,revision)) if Some(revision)==resolved.source.get("actions_revision").and_then(Value::as_u64)),
+                "rule changed or manual apply is disabled"
+            );
+        }
+        if let Some(source_id) = source_id {
+            let json_field = if source_kind == Some("preset") {
+                "preset_id"
+            } else {
+                "rule_id"
+            };
+            let sql = format!(
+                "SELECT id FROM reroute_bundles WHERE parent_bundle_id IS NULL \
+                 AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.{json_field}'))=? \
+                 AND (remaining_mutations>0 OR state IN ('planned','running','compensating') OR lifecycle_state<>'inactive') \
+                 ORDER BY id DESC LIMIT 1 FOR UPDATE"
+            );
+            let active: Option<u64> = sqlx::query_scalar(&sql)
+                .bind(source_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(bundle_id) = active {
+                tx.commit().await?;
+                return Ok(DirectAdmission { bundle_id, already_admitted: true });
+            }
+        }
+        let mut source = resolved.source.clone();
+        canonicalize_source_timer(&mut source, resolved.revert_after_seconds);
+        source["admission_kind"] = json!("direct");
+        source["operator_request_id"] = json!(request_id);
+        source["preparation_phase"] = json!("published");
+        source["verification_mode"] = json!(resolved.verification_mode);
+        source["routing_verified"] = json!(if resolved.verification_mode == VerificationMode::ConfigurationOnly { Some(false) } else { None });
+        source["input_actions"] = serde_json::to_value(&resolved.actions)?;
+        let rule_id = source.get("rule_id").and_then(Value::as_u64);
+        let bundle_id = sqlx::query(
+            "INSERT INTO reroute_bundles(rule_id,trigger_type,triggered_by_user_id,reason,state,failure_policy,total_actions,source_json) \
+             VALUES(?,'manual',?,?,'planned','abort_and_compensate',?,?)",
+        )
+        .bind(rule_id)
+        .bind(actor.user_id)
+        .bind(&resolved.reason)
+        .bind(resolved.actions.len() as u32)
+        .bind(sqlx::types::Json(source))
+        .execute(&mut *tx)
+        .await?
+        .last_insert_id();
+        super::audit_mutation_on(
+            &mut tx,
+            actor,
+            "manual_run_admitted",
+            "reroute_bundle",
+            bundle_id,
+            "published direct manual run before router preparation",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(DirectAdmission { bundle_id, already_admitted: false })
+    }
+    .await;
+    let released = fence.release().await;
+    match (result, released) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("releasing direct apply policy fence"),
+    }
+}
+
+#[doc(hidden)]
+pub async fn admit_direct_apply_for_test(
+    state: &AppState,
+    actor: &Session,
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: &str,
+    request_id: &str,
+) -> anyhow::Result<DirectAdmission> {
+    let resolved = ResolvedManualRequest {
+        actions,
+        source,
+        reason: reason.to_string(),
+        request: json!({"reason":reason}),
+        preset_id: None,
+        revert_after_seconds: None,
+        verification_mode: VerificationMode::Routing,
+        request_id: Some(request_id.to_string()),
+    };
+    admit_direct_apply(state, actor, &resolved, request_id).await
+}
+
+fn spawn_direct_apply(
+    state: &AppState,
+    actor: &Session,
+    admission: DirectAdmission,
+    mut actions: Vec<BundleAction>,
+    verification_mode: VerificationMode,
+) {
+    if admission.already_admitted {
+        return;
+    }
+    let pool = state.pool.clone();
+    let cfg = state.config.clone();
+    let bundle_id = admission.bundle_id;
+    let user_id = actor.user_id;
+    let actor_context = ActorContext {
+        ip_address: actor.ip_address.clone(),
+        user_agent: actor.user_agent.clone(),
+    };
+    tokio::spawn(async move {
+        let worker_pool = pool.clone();
+        let supervisor_pool = pool.clone();
+        let worker = tokio::spawn(async move {
+            let claimed = sqlx::query(
+                "UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','preparing') \
+                 WHERE id=? AND state='planned' AND JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase'))='published'",
+            )
+            .bind(bundle_id)
+            .execute(&worker_pool)
+            .await?;
+            if claimed.rows_affected() != 1 {
+                return Ok::<(), anyhow::Error>(());
+            }
+            let port = cfg
+                .automatic_work_port
+                .clone()
+                .unwrap_or_else(|| crate::detection::engine::production_work_port(&worker_pool));
+            let runtime = cfg.advisory_runtime(&worker_pool).await?;
+            let work = async {
+                port.prepare_manual_activation(&worker_pool, &mut actions, verification_mode)
+                    .await?;
+                let fence = guard::policy_fence(&worker_pool).await?;
+                let source: sqlx::types::Json<Value> = sqlx::query_scalar(
+                    "SELECT source_json FROM reroute_bundles WHERE id=? AND state='planned'",
+                )
+                .bind(bundle_id)
+                .fetch_one(&worker_pool)
+                .await?;
+                if let Some(preset_id) = source.0.get("preset_id").and_then(Value::as_u64) {
+                    let current: Option<(u64, Option<DateTime<Utc>>)> = sqlx::query_as(
+                        "SELECT revision,archived_at FROM mitigation_presets WHERE id=?",
+                    )
+                    .bind(preset_id)
+                    .fetch_optional(&worker_pool)
+                    .await?;
+                    ensure!(
+                        matches!(current, Some((revision,None)) if Some(revision)==source.0.get("preset_revision").and_then(Value::as_u64)),
+                        "saved mitigation changed during preparation"
+                    );
+                }
+                let source_rule_id = source.0.get("rule_id").and_then(Value::as_u64);
+                if let Some(rule_id) = source_rule_id {
+                    let current: Option<(bool, u64)> = sqlx::query_as(
+                        "SELECT manual_apply_enabled,actions_revision FROM rules WHERE id=?",
+                    )
+                    .bind(rule_id)
+                    .fetch_optional(&worker_pool)
+                    .await?;
+                    ensure!(
+                        matches!(current, Some((true,revision)) if Some(revision)==source.0.get("actions_revision").and_then(Value::as_u64)),
+                        "rule action set changed during preparation"
+                    );
+                }
+                let devices = actions
+                    .iter()
+                    .map(|action| action.device_id)
+                    .collect::<Vec<_>>();
+                let identities = port.transport_identities(&devices).await?;
+                fence.release().await?;
+                let mut next = source.0;
+                next["transport_identities"] = json!(identities);
+                next["preparation_phase"] = json!("prepared");
+                bundle::persist_actions(&worker_pool, bundle_id, &actions).await?;
+                sqlx::query(
+                    "UPDATE reroute_bundles SET source_json=? WHERE id=? AND state='planned'",
+                )
+                .bind(sqlx::types::Json(next))
+                .bind(bundle_id)
+                .execute(&worker_pool)
+                .await?;
+                guard::admit_bundle(&worker_pool, &cfg, bundle_id, actions.len() as u32)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let _ = port
+                    .run_bundle(
+                        &worker_pool,
+                        &cfg,
+                        BundleRun::direct_manual(
+                            bundle_id,
+                            FailurePolicy::AbortAndCompensate,
+                            source_rule_id,
+                            user_id,
+                            actor_context,
+                        ),
+                        actions,
+                    )
+                    .await;
+                Ok::<(), anyhow::Error>(())
+            };
+            let result = crate::db::advisory::foreground_scope(runtime, work).await;
+            if let Err(error) = result.and_then(|value| value) {
+                bundle::finish_and_release(
+                    &worker_pool,
+                    bundle_id,
+                    "failed",
+                    Some(&format!("direct run preparation failed: {error:#}")),
+                    &format!("bundle:{bundle_id}"),
+                )
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        if worker.await.is_err() {
+            crate::detection::engine::settle_supervised_manual_failure(
+                &supervisor_pool,
+                bundle_id,
+                false,
+                "direct run worker panicked before completion",
+            )
+            .await;
+        }
+    });
+}
+
+pub async fn run_direct(
+    g: RequirePermission<markers::TriggerManualReroute>,
+    State(state): State<AppState>,
+    Json(body): Json<PreviewBody>,
+) -> JsonResp {
+    let resolved = match resolve_manual_request(&state, body).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Some(request_id) = resolved.request_id.clone() else {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "direct run requires request_id",
+        );
+    };
+    run_direct_actions(
+        &state,
+        &g.session,
+        resolved.actions,
+        resolved.source,
+        resolved.reason,
+        resolved.request,
+        resolved.preset_id,
+        resolved.revert_after_seconds,
+        resolved.verification_mode,
+        &request_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_direct_actions(
+    state: &AppState,
+    actor: &Session,
+    actions: Vec<BundleAction>,
+    source: Value,
+    reason: String,
+    request: Value,
+    preset_id: Option<u64>,
+    revert_after_seconds: Option<u32>,
+    verification_mode: VerificationMode,
+    request_id: &str,
+) -> JsonResp {
+    if actions.is_empty() {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no enabled actions to prepare",
+        );
+    }
+    let resolved = ResolvedManualRequest {
+        actions,
+        source,
+        reason,
+        request,
+        preset_id,
+        revert_after_seconds,
+        verification_mode,
+        request_id: Some(request_id.to_string()),
+    };
+    let total_actions = resolved.actions.len();
+    match admit_direct_apply(state, actor, &resolved, request_id).await {
+        Ok(admission) => {
+            spawn_direct_apply(
+                state,
+                actor,
+                admission,
+                resolved.actions,
+                resolved.verification_mode,
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(
+                    json!({"bundle_id":admission.bundle_id,"async":true,"already_admitted":admission.already_admitted,
+                    "state":"planned","total_actions":total_actions,"failure_policy":"abort_and_compensate","results":[]}),
+                ),
+            )
+        }
+        Err(error) => err(StatusCode::CONFLICT, &format!("{error:#}")),
+    }
+}
+
+pub(crate) async fn preview_manual(
+    state: &AppState,
+    actor: &Session,
+    body: PreviewBody,
+    scope: &str,
+) -> JsonResp {
+    let resolved = match resolve_manual_request(state, body).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    preview_actions_mode(
+        state,
+        actor,
+        scope,
+        resolved.preset_id,
+        resolved.actions,
+        resolved.source,
+        resolved.reason,
+        resolved.request,
+        resolved.revert_after_seconds,
+        resolved.verification_mode,
     )
     .await
 }

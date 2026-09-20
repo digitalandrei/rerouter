@@ -88,4 +88,19 @@ describe("RuleActionsDialog", () => {
     await user.click(screen.getByRole("tab", { name: "Overview & run" }));
     expect(router.state.location.hash).toBe("#overview");
   });
+
+  it("reconstructs a rule's active run and blocks another manual start", async () => {
+    mocks(["view_asset", "trigger_manual_reroute"]);
+    vi.spyOn(api.rules, "list").mockResolvedValue([{ ...rule, current_state: "clear", active_run_id: 77, active_run_count: 1 }]);
+    vi.spyOn(api.settings, "get").mockResolvedValue({ operating_mode: "observe", automatic_actions_enabled: false, global_lock: false });
+    const router = createMemoryRouter([
+      { path: "/rules", element: <Rules /> },
+      { path: "/rules/:id", element: <Rules /> },
+    ], { initialEntries: ["/rules/9"] });
+    render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+
+    const runButton = await screen.findByRole("button", { name: "Run manually" }) as HTMLButtonElement;
+    expect(runButton.disabled).toBe(true);
+    expect(screen.getByRole("link", { name: "View active run / revert" }).getAttribute("href")).toBe("/mitigations?tab=active&rule_id=9&run=77");
+  });
 });

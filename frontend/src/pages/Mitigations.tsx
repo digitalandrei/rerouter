@@ -552,6 +552,7 @@ export function ActiveRunsTab() {
   const lastSelectedRunRef = useRef<number | null>(null);
   const previewGeneration = useRef(0);
   const actionGeneration = useRef(0);
+  const directRevertRequestId = useRef<string | null>(null);
   const listAbort = useRef<AbortController | null>(null);
   const detailAbort = useRef<AbortController | null>(null);
   const recoveryAbort = useRef<AbortController | null>(null);
@@ -605,7 +606,7 @@ export function ActiveRunsTab() {
   }, [selected]);
 
   async function open(id: number) { if (busy || openingRunId !== null) return; detailAbort.current?.abort(); const controller=new AbortController();detailAbort.current=controller; recoveryIdRef.current = null; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); setOpeningRunId(id); const next = new URLSearchParams(pageParams); next.set("tab", "active"); next.set("run", String(id)); setPageParams(next, { replace: true }); const generation = ++previewGeneration.current; selectedIdRef.current = id; setBusy(true); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.get(id,controller.signal); if (generation === previewGeneration.current && selectedIdRef.current === id) { setSelected(value); await refreshRecovery(value, generation); } } catch (cause) { if(!controller.signal.aborted)toast.error(cause instanceof Error ? cause.message : "Could not load run"); } finally { setBusy(false); setOpeningRunId(null); } }
-  function closeSelectedRun() { previewGeneration.current += 1; actionGeneration.current += 1; detailAbort.current?.abort(); recoveryAbort.current?.abort(); closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; recoveryIdRef.current = null; recoveryRunRef.current = null; setSelected(null); setRecoveryRun(null); setRecoveryError(null); setPreview(null); setPreviewReason(null); setDirectRevertStage(null); setBusy(false); setPendingAction(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
+  function closeSelectedRun() { previewGeneration.current += 1; actionGeneration.current += 1; directRevertRequestId.current = null; detailAbort.current?.abort(); recoveryAbort.current?.abort(); closedRunRef.current = selectedIdRef.current ?? selected?.id ?? null; selectedIdRef.current = null; recoveryIdRef.current = null; recoveryRunRef.current = null; setSelected(null); setRecoveryRun(null); setRecoveryError(null); setPreview(null); setPreviewReason(null); setDirectRevertStage(null); setBusy(false); setPendingAction(null); const next = new URLSearchParams(pageParams); next.delete("run"); setPageParams(next, { replace: true }); }
   async function previewRevert() { if (!selected || busy || pendingAction) return; const runId = selected.id; const requestedReason = reason; const generation = ++actionGeneration.current; setBusy(true); setPendingAction("preview_revert"); setPreview(null); setPreviewReason(null); try { const value = await api.bundles.revert(runId, { dry_run: true, reason: requestedReason || undefined }); if (generation === actionGeneration.current && selectedIdRef.current === runId && reason === requestedReason && "plan_id" in value) { setPreview(value); setPreviewReason(requestedReason); } } catch (cause) { if (generation === actionGeneration.current) toast.error(cause instanceof Error ? cause.message : "Revert preview failed"); } finally { if (generation === actionGeneration.current) { setBusy(false); setPendingAction(null); } } }
   async function confirmRevert() { if (!selected || busy || pendingAction || !preview?.plan_id || !preview.preview_token || previewReason !== reason) return; const generation=++actionGeneration.current; setBusy(true); setPendingAction("confirm_revert"); try { const value = await api.bundles.revert(selected.id, { dry_run: false, reason: previewReason || undefined, plan_id: preview.plan_id, preview_token: preview.preview_token }); if(generation!==actionGeneration.current)return; setPreview(null); setPreviewReason(null); if ("bundle_id" in value) { recoveryIdRef.current = value.bundle_id; recoveryRunRef.current = null; setRecoveryRun(null); setRecoveryError(null); toast.success(`Revert run #${value.bundle_id} started`); } await load(true); } catch (cause) { if(generation===actionGeneration.current){setPreview(null); setPreviewReason(null); toast.error(`${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh preview.`);} } finally { if(generation===actionGeneration.current){setBusy(false); setPendingAction(null);} } }
   async function revertNow() {
@@ -618,31 +619,18 @@ export function ActiveRunsTab() {
     setDirectRevertStage("calculating");
     setPreview(null);
     setPreviewReason(null);
-    let prepared = false;
     try {
-      const exact = await api.bundles.revert(runId, {
-        dry_run: true,
-        reason: requestedReason || undefined,
-      });
-      if (generation !== actionGeneration.current || selectedIdRef.current !== runId || reason !== requestedReason) return;
-      if (!("plan_id" in exact) || !exact.plan_id || !exact.preview_token) {
-        if ("plan_id" in exact) {
-          setPreview(exact);
-          setPreviewReason(requestedReason);
-        }
-        toast.error("The controller did not authorize this prepared revert. Nothing was started.");
-        return;
-      }
-      prepared = true;
-      setDirectRevertStage("starting");
+      const requestId = directRevertRequestId.current ?? crypto.randomUUID();
+      directRevertRequestId.current = requestId;
       const value = await api.bundles.revert(runId, {
         dry_run: false,
         reason: requestedReason || undefined,
-        plan_id: exact.plan_id,
-        preview_token: exact.preview_token,
+        direct_run: true,
+        request_id: requestId,
       });
-      if (generation !== actionGeneration.current || selectedIdRef.current !== runId) return;
+      if (generation !== actionGeneration.current || selectedIdRef.current !== runId || reason !== requestedReason) return;
       if ("bundle_id" in value) {
+        directRevertRequestId.current = null;
         recoveryIdRef.current = value.bundle_id;
         recoveryRunRef.current = null;
         setRecoveryRun(null);
@@ -652,9 +640,7 @@ export function ActiveRunsTab() {
       await load(true);
     } catch (cause) {
       if (generation === actionGeneration.current) {
-        toast.error(prepared
-          ? `${cause instanceof Error ? cause.message : "Revert failed"}. Prepare a fresh exact plan before retrying.`
-          : cause instanceof Error ? cause.message : "The exact revert could not be calculated.");
+        toast.error(cause instanceof Error ? cause.message : "The server could not admit the revert.");
       }
     } finally {
       if (generation === actionGeneration.current) {
@@ -685,7 +671,7 @@ export function ActiveRunsTab() {
       {directRevertStage && <ExecutionStartStatus kind="revert" stage={directRevertStage} />}
       {!preview && <p className="text-xs text-muted-foreground">The controller always reads current router configuration and calculates the exact inverse first. Preview revert pauses for review; Revert now prepares and starts the same exact plan.</p>}
       {preview && <div className="space-y-2 rounded-md border p-3"><strong>Review the exact revert</strong>{preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}<p className="text-xs text-muted-foreground">The persisted inverses run in reverse order with the original verification scope. Apply reviewed revert submits this exact prepared plan.</p></div>}
-      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} disabled={busy} onChange={(event) => { actionGeneration.current += 1; setReason(event.target.value); setPreview(null); setPreviewReason(null); setDirectRevertStage(null); setBusy(false); setPendingAction(null); }} placeholder="Why is this run being reverted?" /></label>}
+      {canAct && <label className="block space-y-1 text-sm font-medium">Audit reason<Input value={reason} disabled={busy} onChange={(event) => { actionGeneration.current += 1; directRevertRequestId.current = null; setReason(event.target.value); setPreview(null); setPreviewReason(null); setDirectRevertStage(null); setBusy(false); setPendingAction(null); }} placeholder="Why is this run being reverted?" /></label>}
       <DialogFooter className="flex-wrap items-center gap-2"><Button variant="outline" onClick={closeSelectedRun} disabled={busy}>Close</Button>{canAct && selected.take_control?.available && <Button variant="outline" onClick={() => void takeControl()} disabled={busy} loading={pendingAction === "take_control"} loadingLabel="Cancelling automatic recovery…">Cancel automatic recovery</Button>}{canAct && !preview && <Button variant="outline" onClick={() => void previewRevert()} disabled={busy || selected.revert?.available === false} loading={pendingAction === "preview_revert"} loadingLabel="Preparing revert preview…">Preview revert</Button>}{canAct && !preview && <Button variant="destructive" onClick={() => void revertNow()} disabled={busy || selected.revert?.available === false} loading={pendingAction === "direct_revert"} loadingLabel={directRevertStage === "starting" ? "Starting revert…" : "Calculating exact revert…"}>Revert now</Button>}{canAct && preview && <Button variant="destructive" onClick={() => void confirmRevert()} disabled={busy || !preview.plan_id || !preview.preview_token} loading={pendingAction === "confirm_revert"} loadingLabel="Starting revert…">Apply reviewed revert</Button>}</DialogFooter>
     </div>}</DialogContent></Dialog>
   </>;

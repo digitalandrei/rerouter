@@ -72,8 +72,8 @@ it("shows one honest pending state while preparing and confirming a whole-run re
 
 it("calculates the exact inverse before starting a direct whole-run revert", async () => {
   auth(); vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [run], page: 1, per_page: 200, total: 1 }); vi.spyOn(api.bundles, "get").mockResolvedValue(run);
-  let resolveExact!: (value: ManualMitigationPreview) => void;
-  const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveExact = resolve as (value: ManualMitigationPreview) => void; })).mockResolvedValueOnce({ bundle_id: 100, async: true });
+  let resolveAdmission!: (value: Awaited<ReturnType<typeof api.bundles.revert>>) => void;
+  const revert = vi.spyOn(api.bundles, "revert").mockImplementationOnce(() => new Promise((resolve) => { resolveAdmission = resolve; }));
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
   await user.click(await screen.findByRole("button", { name: "Review run 7" }));
   await user.type(await screen.findByLabelText("Audit reason"), "Immediate recovery");
@@ -81,9 +81,40 @@ it("calculates the exact inverse before starting a direct whole-run revert", asy
   const status = await screen.findByRole("status");
   expect(status.textContent).toContain("Calculate exact revert");
   expect(revert).toHaveBeenCalledTimes(1);
-  resolveExact(preview);
-  await waitFor(() => expect(revert).toHaveBeenCalledTimes(2));
-  expect(revert).toHaveBeenLastCalledWith(7, { dry_run: false, reason: "Immediate recovery", plan_id: 12, preview_token: "token-b" });
+  expect(revert).toHaveBeenLastCalledWith(7, expect.objectContaining({ dry_run: false, reason: "Immediate recovery", direct_run: true, request_id: expect.any(String) }));
+  resolveAdmission({ bundle_id: 100, async: true });
+  expect((await screen.findAllByText(/recovery #100/i)).length).toBeGreaterThan(0);
+});
+
+it("reconstructs a preparing revert from server state after a page reload", async () => {
+  auth();
+  const recovering = {
+    ...run,
+    lifecycle_state: "recovery_claimed",
+    latest_recovery_bundle_id: 100,
+    latest_recovery: { id: 100, parent_bundle_id: 7, state: "planned", total_actions: 1, completed_actions: 0, started_at: null, finished_at: null, failure_reason: null },
+    revert: { available: false, block_reasons: ["recovery is already claimed or running"] },
+  } as RerouteBundle;
+  const child = {
+    ...run,
+    id: 100,
+    parent_bundle_id: 7,
+    state: "planned",
+    execution_state: "planned",
+    lifecycle_state: "inactive",
+    remaining_mutations: 0,
+    remaining_changes: 0,
+    completed_actions: 0,
+    source: { kind: "recovery", admission_kind: "direct", preparation_phase: "preparing" },
+  } as RerouteBundle;
+  vi.spyOn(api.bundles, "list").mockResolvedValue({ items: [recovering], page: 1, per_page: 25, total: 1 });
+  vi.spyOn(api.bundles, "get").mockImplementation(async (id) => id === 100 ? child : recovering);
+  render(<AuthProvider><MemoryRouter initialEntries={["/mitigations?tab=active&run=7"]}><ActiveRunsTab /></MemoryRouter></AuthProvider>);
+
+  expect(await screen.findByText("Preparing revert")).toBeTruthy();
+  expect(screen.getByText(/calculating the exact inverse before any router write/i)).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Revert now" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Preview revert" }) as HTMLButtonElement).disabled).toBe(true);
   expect((await screen.findAllByText(/recovery #100/i)).length).toBeGreaterThan(0);
 });
 

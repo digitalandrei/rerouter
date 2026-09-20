@@ -340,9 +340,8 @@ it("calculates the exact plan before a direct manual run", async () => {
   vi.spyOn(api.templates, "list").mockResolvedValue([labTemplate]);
   vi.spyOn(api.devices, "list").mockResolvedValue([{ id: 3, name: "Lab router" }] as never);
   vi.spyOn(api.manualMitigations, "capabilities").mockResolvedValue({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] });
-  let resolveExact!: (value: Awaited<ReturnType<typeof api.manualMitigations.preview>>) => void;
-  const preview = vi.spyOn(api.manualMitigations, "preview").mockImplementation(() => new Promise((resolve) => { resolveExact = resolve; }));
-  const apply = vi.spyOn(api.manualMitigations, "apply").mockResolvedValue({ bundle_id: 44, async: true });
+  let resolveAdmission!: (value: Awaited<ReturnType<typeof api.manualMitigations.run>>) => void;
+  const run = vi.spyOn(api.manualMitigations, "run").mockImplementation(() => new Promise((resolve) => { resolveAdmission = resolve; }));
   vi.spyOn(api.bundles, "get").mockResolvedValue({ id: 44, state: "planned", lifecycle_state: "active", total_actions: 1, completed_actions: 0, actions: [], still_applied_reroute_ids: [] } as never);
   const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
   const user = userEvent.setup();
@@ -351,9 +350,8 @@ it("calculates the exact plan before a direct manual run", async () => {
   await user.click(await screen.findByRole("button", { name: "Run now" }));
   const status = await screen.findByRole("status");
   expect(status.textContent).toContain("Calculate exact changes");
-  expect(apply).not.toHaveBeenCalled();
-  resolveExact({ plan_id: 18, preview_token: "direct-token", results: [], operating_mode: "observe", verification_mode: "configuration_only", routing_verified: false });
-  await waitFor(() => expect(apply).toHaveBeenCalledWith({ plan_id: 18, preview_token: "direct-token" }));
-  expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only" }));
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(run).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only", request_id: expect.any(String) }));
+  resolveAdmission({ bundle_id: 44, async: true });
   expect((await screen.findAllByText(/run #44/i)).length).toBeGreaterThan(0);
 });

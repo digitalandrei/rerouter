@@ -15,7 +15,14 @@ use rerouter_controller::reroute::device_plan::{
     DeviceStateSnapshot, PreparedDeviceAction, PreparedEffect, PreparedInverse,
     PREPARED_DEVICE_ACTION_SCHEMA_VERSION,
 };
-use rerouter_controller::{api, auth::sessions, config::Config};
+use rerouter_controller::reroute::executor::{
+    ActionRequest, ActorContext, BundleMembership, ExecutionAuthorization,
+};
+use rerouter_controller::{
+    api,
+    auth::sessions::{self, Session},
+    config::Config,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
@@ -188,6 +195,170 @@ fn snapshot(action: &BundleAction, prepared: &PreparedDeviceAction, source: Valu
         "reason":"authorization test",
         "request":{"actions":[],"reason":"authorization test"}
     })
+}
+
+#[tokio::test]
+async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
+    let pool = common::test_database().await;
+    let key = Key::from(&[90_u8; 64]);
+    let (user_id, _cookie) = user(&pool, "operator", &key).await;
+    let state = api::AppState {
+        pool: (*pool).clone(),
+        config: Config::default(),
+        cookie_key: key,
+    };
+    let (_device, action, _prepared) = fixture(&pool).await;
+    let execution_action = action.clone();
+    let actor = Session {
+        id: 1,
+        user_id,
+        totp_verified: true,
+        expires_at: Utc::now() + Duration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-apply-test".into(),
+    };
+    let request_id = unique_token("direct-apply");
+    let first = rerouter_controller::db::advisory::foreground_scope(
+        state.config.advisory_runtime(&state.pool).await.unwrap(),
+        api::manual_mitigations::admit_direct_apply_for_test(
+            &state,
+            &actor,
+            vec![action.clone()],
+            json!({"kind":"manual","name":"Run once"}),
+            "direct apply",
+            &request_id,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let durable: (String, String, i64) = sqlx::query_as(
+        "SELECT state,CAST(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.preparation_phase')) AS CHAR), \
+         (SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=reroute_bundles.id) \
+         FROM reroute_bundles WHERE id=?",
+    )
+    .bind(first.bundle_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(durable, ("planned".into(), "published".into(), 0));
+
+    let second = rerouter_controller::db::advisory::foreground_scope(
+        state.config.advisory_runtime(&state.pool).await.unwrap(),
+        api::manual_mitigations::admit_direct_apply_for_test(
+            &state,
+            &actor,
+            vec![action],
+            json!({"kind":"manual","name":"Run once"}),
+            "duplicate direct apply",
+            &request_id,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.bundle_id, first.bundle_id);
+    assert!(second.already_admitted);
+
+    sqlx::query("UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','prepared') WHERE id=?")
+        .bind(first.bundle_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    rerouter_controller::reroute::bundle::persist_actions(
+        &state.pool,
+        first.bundle_id,
+        std::slice::from_ref(&execution_action),
+    )
+    .await
+    .unwrap();
+    let snapshot_action_id: u64 = sqlx::query_scalar(
+        "SELECT id FROM reroute_bundle_actions WHERE bundle_id=? AND position=0",
+    )
+    .bind(first.bundle_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    rerouter_controller::reroute::executor::validate_execution_authorization_for_test(
+        &state.pool,
+        &state.config,
+        &ActionRequest {
+            device_id: execution_action.device_id,
+            template: execution_action.template,
+            params: execution_action.params,
+            trigger_type: "manual",
+            rule_id: None,
+            rule_event_id: None,
+            rollback_of_reroute_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(ActorContext {
+                ip_address: "127.0.0.1".into(),
+                user_agent: "direct-apply-test".into(),
+            }),
+            reason: Some("direct apply".into()),
+            defer_cooldown: true,
+            bundle: Some(BundleMembership {
+                bundle_id: first.bundle_id,
+                position: 0,
+            }),
+            authorization: Some(ExecutionAuthorization::manual_bundle(
+                first.bundle_id,
+                format!("bundle:{}", first.bundle_id),
+                Some(snapshot_action_id),
+            )),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn startup_closes_a_published_direct_apply_with_proven_no_write() {
+    let pool = common::test_database().await;
+    let key = Key::from(&[89_u8; 64]);
+    let (user_id, _cookie) = user(&pool, "operator", &key).await;
+    let state = api::AppState {
+        pool: (*pool).clone(),
+        config: Config::default(),
+        cookie_key: key,
+    };
+    let (_device, action, _prepared) = fixture(&pool).await;
+    let actor = Session {
+        id: 1,
+        user_id,
+        totp_verified: true,
+        expires_at: Utc::now() + Duration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-apply-crash-test".into(),
+    };
+    let admission = rerouter_controller::db::advisory::foreground_scope(
+        state.config.advisory_runtime(&state.pool).await.unwrap(),
+        api::manual_mitigations::admit_direct_apply_for_test(
+            &state,
+            &actor,
+            vec![action],
+            json!({"kind":"manual","name":"Run once"}),
+            "crash before direct apply preparation",
+            &unique_token("direct-apply-crash"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    rerouter_controller::reroute::bundle::recover_on_startup(&state.pool)
+        .await
+        .unwrap();
+    let repaired: (String, i64, i64) = sqlx::query_as(
+        "SELECT state,(SELECT COUNT(*) FROM reroutes WHERE bundle_id=reroute_bundles.id), \
+         (SELECT COUNT(*) FROM locks WHERE reroute_id IN (SELECT id FROM reroutes WHERE bundle_id=reroute_bundles.id) AND cleared_at IS NULL) \
+         FROM reroute_bundles WHERE id=?",
+    )
+    .bind(admission.bundle_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(repaired, ("aborted".into(), 0, 0));
 }
 
 #[tokio::test]

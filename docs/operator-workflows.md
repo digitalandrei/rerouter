@@ -10,9 +10,10 @@ statements that describe Observe as blocking all manual execution.
    before/after projection, inverse, commands, and verification evidence.
 3. Resolve every blocker. A preview never grants standing execution authority.
 4. Record a reason and choose either **Preview changes** to inspect and confirm
-   the exact commands or **Run now** to prepare and immediately submit them.
-   Both paths use the same short-lived one-use plan. Manual runs and reverts work
-   in Observe and Enforce and re-check every gate at admission.
+   the exact commands or **Run now** to publish a server-owned workflow
+   immediately. Reviewed confirmation binds a short-lived one-use plan; direct
+   execution binds the operator request to a durable bundle before preparation.
+   Manual runs and reverts work in Observe and Enforce and re-check every gate.
 5. Follow the bundle until every action is verified. Execution success and
    remaining owned changes are separate facts.
 
@@ -81,8 +82,10 @@ substituted for Configuration only.
 Use the persisted original inverses in reverse order. Drift or uncertain state
 freezes recovery; inspect and reconcile rather than inventing an inverse.
 Cancelling automatic recovery cancels a future automatic deadline. A manual
-revert always gets a fresh exact prepared plan; Preview revert pauses for review,
-while Revert now submits that plan immediately.
+revert always gets fresh exact preparation. Preview revert pauses for review,
+while Revert now publishes a durable recovery child before preparation.
+Reloading or reconnecting shows that same recovery child and never starts a
+second revert.
 
 The **Active Runs** view is server-paginated at 25 logical runs per page. Search
 matches run id, saved/source name, trigger, lifecycle, or operator. Device accepts

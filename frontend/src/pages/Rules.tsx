@@ -1163,14 +1163,14 @@ export default function Rules() {
     );
   }
 
-  // Quietly refresh the live above/below status every 20s (no loading flicker).
+  // Refresh detection and server-owned execution state without loading flicker.
   useEffect(() => {
     const t = setInterval(() => {
       api.rules
         .list()
         .then(setRules)
         .catch(() => {});
-    }, 20000);
+    }, 5000);
     return () => clearInterval(t);
   }, []);
 
@@ -1243,9 +1243,9 @@ export default function Rules() {
               {detailDisarmed && <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200"><strong>Automatic execution disarmed</strong><p className="mt-1">{detailDisarmed.reason ?? "An attached action no longer matches discovered inventory."} · {timeAgo(detailDisarmed.at)}</p><p className="mt-1 text-xs">{DISARM_CONSEQUENCE}</p></div>}
               {detailDrifted.length > 0 && <div className="rounded-md border p-3 text-sm"><strong>{detailDrifted.length} drifted action{detailDrifted.length === 1 ? "" : "s"}</strong><ul className="mt-1 list-disc pl-5 text-muted-foreground">{detailDrifted.map((action) => <li key={action.id}>{action.inventory_drift_reason ?? "Saved parameters no longer match router inventory."}</li>)}</ul></div>}
               <Card><CardHeader><CardTitle className="text-lg">Operations</CardTitle></CardHeader><CardContent className="space-y-2"><div className="flex flex-wrap gap-2">
-                {canApply && (detailRule.action_count ?? 0) > 0 && <Button variant="destructive" disabled={!detailRule.manual_apply_enabled} title={detailRule.manual_apply_enabled ? "Preview and run this rule's defined mitigation manually" : "Enable manual apply in Configuration first"} onClick={() => setApplyRule(detailRule)}>Run manually</Button>}
+                {canApply && (detailRule.action_count ?? 0) > 0 && <Button variant="destructive" disabled={!detailRule.manual_apply_enabled || (detailRule.active_run_count ?? 0) > 0} title={(detailRule.active_run_count ?? 0) > 0 ? "Review the active run before starting another" : detailRule.manual_apply_enabled ? "Preview and run this rule's defined mitigation manually" : "Enable manual apply in Configuration first"} onClick={() => setApplyRule(detailRule)}>Run manually</Button>}
                 {canEdit && detailRule.current_state === "firing" && <Button variant="outline" onClick={() => setClearRuleTarget(detailRule)}>Review &amp; clear</Button>}
-                {detailRule.current_state === "recovered_awaiting_revert" && <Button variant="outline" asChild><Link to={`/mitigations?tab=active&rule_id=${detailRule.id}`}>View active run / revert</Link></Button>}
+                {((detailRule.active_run_count ?? 0) > 0 || detailRule.current_state === "recovered_awaiting_revert") && <Button variant="outline" asChild><Link to={`/mitigations?tab=active&rule_id=${detailRule.id}${detailRule.active_run_id ? `&run=${detailRule.active_run_id}` : ""}`}>View active run / revert</Link></Button>}
                 <Button variant="outline" onClick={() => setManageRule(detailRule)}><Workflow className="size-4" /> {canEdit ? "Manage mitigation actions" : "Inspect mitigation actions"}</Button>
               </div>{(detailRule.action_count ?? 0) > 0 && !detailRule.manual_apply_enabled && <p className="text-xs text-muted-foreground">The mitigation is defined, but manual apply is disabled. Enable it in Configuration before running manually.</p>}{detailRule.manual_apply_enabled && (detailRule.action_count ?? 0) > 0 && <p className="text-xs text-muted-foreground">Manual execution uses the same prepared actions and action-specific verification as automatic execution. Preview changes pauses for review; Run now prepares and starts the exact plan.</p>}</CardContent></Card>
             </TabsContent>

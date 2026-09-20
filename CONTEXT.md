@@ -86,8 +86,9 @@ _Avoid_: debounce, throttle, backoff.
 
 **Preview Token**:
 A short-lived, single-use server credential bound to the exact rendered action
-plan, audit reason, operator, and action scope. Manual Runs, supervised rule
-applies, and Manual Reverts consume one immediately before execution in either mode.
+plan, audit reason, operator, and action scope. Reviewed Manual Runs and Manual
+Reverts consume one immediately before execution. Direct actions instead publish
+a durable server-owned bundle before preparation.
 _Avoid_: confirmation flag, UI confirmation.
 
 **Automatic Master Switch**:

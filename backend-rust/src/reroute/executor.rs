@@ -4,7 +4,8 @@
 //!
 //! Gate order (device_cli, device-scoped — any failure aborts and is logged):
 //!   GATE 0 — unattended execution requires operating_mode == enforce. Manual
-//!   apply/revert remains available only through an actor-bound preview token.
+//!   reviewed apply/revert uses an actor-bound preview token; direct operator
+//!   actions use a durable actor-bound bundle published before preparation.
 //!   `execute` returns the would-run plan instead. Then: not dry-run | no global
 //!   maintenance lock | device not locked | no action already running on the
 //!   device | no unresolved `uncertain` on the device | not in cooldown. The
@@ -145,6 +146,8 @@ pub struct ActionRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionAuthorityKind {
     Manual,
+    ManualBundle,
+    ManualRecovery,
     Automatic,
     Compensation,
     Recovery,
@@ -191,6 +194,20 @@ impl ExecutionAuthorization {
         }
     }
 
+    pub fn manual_bundle(
+        bundle_id: u64,
+        owner_token: impl Into<String>,
+        snapshot_action_id: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::ManualBundle,
+            plan_id: None,
+            bundle_id: Some(bundle_id),
+            owner_token: owner_token.into(),
+            snapshot_action_id,
+        }
+    }
+
     pub fn compensation(bundle_id: u64, owner_token: impl Into<String>) -> Self {
         Self {
             kind: ExecutionAuthorityKind::Compensation,
@@ -198,6 +215,20 @@ impl ExecutionAuthorization {
             bundle_id: Some(bundle_id),
             owner_token: owner_token.into(),
             snapshot_action_id: None,
+        }
+    }
+
+    pub fn manual_recovery(
+        bundle_id: u64,
+        owner_token: impl Into<String>,
+        snapshot_action_id: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: ExecutionAuthorityKind::ManualRecovery,
+            plan_id: None,
+            bundle_id: Some(bundle_id),
+            owner_token: owner_token.into(),
+            snapshot_action_id,
         }
     }
 
@@ -803,6 +834,42 @@ async fn validate_execution_authorization(
                 anyhow::ensure!(owned == 1, "original action is not safely invertible");
             }
         }
+        ExecutionAuthorityKind::ManualBundle => {
+            anyhow::ensure!(req.trigger_type == "manual");
+            let bundle_id = auth
+                .bundle_id
+                .ok_or_else(|| anyhow::anyhow!("direct manual execution has no bundle"))?;
+            let user_id = req
+                .user_id
+                .ok_or_else(|| anyhow::anyhow!("direct manual execution has no actor"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM reroute_bundles b \
+                 WHERE b.id=? AND b.trigger_type='manual' AND b.triggered_by_user_id=? \
+                   AND b.state IN ('planned','running') \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.admission_kind'))='direct' \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.preparation_phase'))='prepared'",
+            )
+            .bind(bundle_id)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(valid == 1, "direct manual bundle is not runnable");
+            if let Some(rule_id) = req.rule_id {
+                let current: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM reroute_bundles b JOIN rules r ON r.id=b.rule_id \
+                     WHERE b.id=? AND b.rule_id=? AND r.manual_apply_enabled=1 \
+                       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.actions_revision')) AS UNSIGNED)=r.actions_revision",
+                )
+                .bind(bundle_id)
+                .bind(rule_id)
+                .fetch_one(pool)
+                .await?;
+                anyhow::ensure!(
+                    current == 1,
+                    "rule actions changed or manual apply was disabled after admission"
+                );
+            }
+        }
         ExecutionAuthorityKind::Automatic => {
             anyhow::ensure!(req.trigger_type == "automatic");
             let bundle_id = auth
@@ -893,6 +960,40 @@ async fn validate_execution_authorization(
                     "condition recovery evidence is stale or no longer recovered"
                 );
             }
+        }
+        ExecutionAuthorityKind::ManualRecovery => {
+            anyhow::ensure!(req.trigger_type == "rollback");
+            let bundle_id = auth
+                .bundle_id
+                .ok_or_else(|| anyhow::anyhow!("manual recovery has no bundle"))?;
+            let original_id = req
+                .rollback_of_reroute_id
+                .ok_or_else(|| anyhow::anyhow!("manual recovery has no original reroute"))?;
+            let user_id = req
+                .user_id
+                .ok_or_else(|| anyhow::anyhow!("manual recovery has no actor"))?;
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM reroute_bundles b \
+                 JOIN reroute_bundle_actions ba ON ba.bundle_id=b.id AND ba.original_reroute_id=? \
+                 JOIN reroutes original ON original.id=ba.original_reroute_id \
+                 JOIN reroute_bundles source_owner ON source_owner.id=original.bundle_id \
+                 JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=b.id \
+                   AND ras.source_bundle_id=source_owner.id AND ras.settlement='active' \
+                 WHERE b.id=? AND b.trigger_type='manual' AND b.triggered_by_user_id=? \
+                   AND b.state IN ('planned','running') \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.kind'))='recovery' \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.admission_kind'))='direct' \
+                   AND original.mutation_effect='changed' \
+                   AND source_owner.recovery_claim_token=ras.claim_token \
+                   AND NOT EXISTS (SELECT 1 FROM reroutes inverse WHERE inverse.rollback_of_reroute_id=original.id \
+                     AND inverse.state IN ('planned','pending','running','verifying','succeeded'))",
+            )
+            .bind(original_id)
+            .bind(bundle_id)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+            anyhow::ensure!(valid == 1, "manual recovery ownership check failed");
         }
     }
     if req.rollback_of_reroute_id.is_none() {

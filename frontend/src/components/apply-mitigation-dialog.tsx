@@ -17,7 +17,7 @@
  *   terminal state. If the bundle ends with siblings STILL APPLIED, that is
  *   shown as a critical, unmissable block: traffic is still diverted.
  */
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { presentMitigationRun } from "@/lib/mitigation-run-state";
 import {
@@ -411,6 +411,7 @@ export function ApplyMitigationDialog({
   const [bundle, setBundle] = useState<RerouteBundle | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
   const [directStage, setDirectStage] = useState<ExecutionStartStage | null>(null);
+  const directRequestId = useRef<string | null>(null);
 
   const isObserve = operatingMode === "observe";
   const isUnknown = operatingMode === "unknown";
@@ -507,26 +508,14 @@ export function ApplyMitigationDialog({
     setError(null);
     setDirectStage("calculating");
     try {
-      const prepared = await api.rules.apply(rule.id, {
-        reason: reason.trim() || undefined,
-        dry_run: true,
-      });
-      if (isBundleAccepted(prepared)) {
-        handleApplyResponse(prepared, false);
-        return;
-      }
-      setResults(prepared.results);
-      if (!prepared.preview_token) {
-        setPreviewToken(null);
-        setPhase("results");
-        return;
-      }
-      setDirectStage("starting");
+      const requestId = directRequestId.current ?? crypto.randomUUID();
+      directRequestId.current = requestId;
       const accepted = await api.rules.apply(rule.id, {
         reason: reason.trim() || undefined,
-        dry_run: false,
-        preview_token: prepared.preview_token,
+        direct_run: true,
+        request_id: requestId,
       });
+      directRequestId.current = null;
       handleApplyResponse(accepted, false);
     } catch (e) {
       handleApplyError(e);
@@ -581,7 +570,7 @@ export function ApplyMitigationDialog({
               value={reason}
               disabled={busy}
               placeholder="Why are you applying this mitigation?"
-              onChange={(e) => setReason(e.target.value)}
+              onChange={(e) => { directRequestId.current = null; setReason(e.target.value); }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !busy) void apply(true);
               }}

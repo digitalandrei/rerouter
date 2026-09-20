@@ -400,6 +400,30 @@ impl BundleRun {
         }
     }
 
+    /// A manual run whose durable bundle was published before preparation.
+    /// Its prepared action ledger is the authority instead of a browser-held
+    /// preview token.
+    pub fn direct_manual(
+        bundle_id: u64,
+        policy: FailurePolicy,
+        rule_id: Option<u64>,
+        user_id: u64,
+        actor_context: ActorContext,
+    ) -> Self {
+        Self {
+            bundle_id,
+            policy,
+            rule_id,
+            rule_event_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(actor_context),
+            trigger_type: "direct_manual",
+            authorization_plan_id: None,
+            owner_token: format!("bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
+        }
+    }
+
     /// An unattended rule activation. Binds `trigger_type` to `"automatic"`, which
     /// is what keeps the `automatic_actions_enabled` master switch and
     /// verify-or-refuse in force for every sibling. Passing `"manual"` here would
@@ -468,6 +492,28 @@ impl BundleRun {
             user_id: None,
             actor_context: None,
             trigger_type: "recovery",
+            authorization_plan_id: None,
+            owner_token: format!("recovery:bundle:{bundle_id}"),
+            force_terminal_persistence_failure: false,
+        }
+    }
+
+    /// An operator-requested recovery published before its router reads begin.
+    /// It uses durable recovery authority while retaining user attribution.
+    pub fn manual_recovery(
+        bundle_id: u64,
+        policy: FailurePolicy,
+        user_id: u64,
+        actor_context: ActorContext,
+    ) -> Self {
+        Self {
+            bundle_id,
+            policy,
+            rule_id: None,
+            rule_event_id: None,
+            user_id: Some(user_id),
+            actor_context: Some(actor_context),
+            trigger_type: "manual_recovery",
             authorization_plan_id: None,
             owner_token: format!("recovery:bundle:{bundle_id}"),
             force_terminal_persistence_failure: false,
@@ -569,7 +615,7 @@ async fn run_with_ssh_inner<S: SshExecutor>(
     debug_assert!(
         matches!(
             trigger_type,
-            "manual" | "automatic" | "rollback" | "recovery"
+            "manual" | "direct_manual" | "automatic" | "rollback" | "recovery" | "manual_recovery"
         ),
         "bundle trigger_type must be manual, automatic, rollback or recovery, got {trigger_type}"
     );
@@ -830,6 +876,11 @@ async fn run_with_ssh_inner<S: SshExecutor>(
                     snapshot_action_id,
                 )
             }),
+            "direct_manual" => Some(ExecutionAuthorization::manual_bundle(
+                bundle_id,
+                owner_token.clone(),
+                snapshot_action_id,
+            )),
             "automatic" => Some(ExecutionAuthorization::automatic(
                 bundle_id,
                 owner_token.clone(),
@@ -848,12 +899,18 @@ async fn run_with_ssh_inner<S: SshExecutor>(
                 owner_token.clone(),
                 snapshot_action_id,
             )),
+            "manual_recovery" => Some(ExecutionAuthorization::manual_recovery(
+                bundle_id,
+                owner_token.clone(),
+                snapshot_action_id,
+            )),
             _ => None,
         };
-        let action_trigger_type = if trigger_type == "recovery" {
-            "rollback"
-        } else {
-            trigger_type
+        let action_trigger_type = match trigger_type {
+            "recovery" => "rollback",
+            "manual_recovery" => "rollback",
+            "direct_manual" => "manual",
+            other => other,
         };
 
         let req = ActionRequest {

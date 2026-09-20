@@ -64,7 +64,8 @@ export interface TotpResponse {
 /**
  * Operating mode (docs/reroute-engine.md "Operating mode"):
  * - "observe" (default): autonomous response is disabled. Authorized manual
- *   runs and reverts still require an exact server-prepared one-use plan.
+ *   runs and reverts still require exact server preparation. Reviewed actions
+ *   use one-use plans; direct actions publish durable bundles first.
  * - "enforce": execution allowed, still gated by every other safety rule.
  */
 export type OperatingMode = "observe" | "enforce";
@@ -482,6 +483,8 @@ export interface Rule {
    *  it goes back through the normal arming gate. null/absent = not disarmed. */
   auto_disarmed_at?: string | null;
   auto_disarmed_reason?: string | null;
+  active_run_id?: number | null;
+  active_run_count?: number;
 }
 
 export interface Alert {
@@ -685,6 +688,7 @@ export interface ManualMitigationCapabilities {
 export interface ManualMitigationAccepted {
   bundle_id: number;
   async: true;
+  already_admitted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +844,7 @@ export interface RoutingPolicyInventory {
 }
 
 export interface ActionSource {
-  kind: "manual" | "preset" | "rule" | "rollback";
+  kind: "manual" | "preset" | "rule" | "rollback" | "recovery";
   preset_id?: number | null;
   preset_name?: string | null;
   preset_revision?: number | null;
@@ -848,9 +852,12 @@ export interface ActionSource {
   name?: string | null;
   verification_mode?: VerificationMode;
   routing_verified?: boolean;
+  admission_kind?: "direct";
+  preparation_phase?: "published" | "preparing" | "prepared";
+  operator_request_id?: string;
 }
 
-/** 202 from a confirmed manual rule apply: the bundle runs in background. */
+/** 202 after reviewed confirmation or direct durable admission. */
 export interface BundleAcceptedResponse {
   bundle_id: number;
   async: true;
@@ -861,8 +868,7 @@ export interface BundleAcceptedResponse {
   results: RerouteResult[];
 }
 
-/** A rule apply answers either with a synchronous preview or a bundle handle
- *  after token-bound manual confirmation. */
+/** A rule apply answers with a preview or a durable background bundle handle. */
 export type RuleApplyResponse = ActionResultsResponse | BundleAcceptedResponse;
 
 export function isBundleAccepted(
@@ -1228,7 +1234,7 @@ export const api = {
      *  autonomous execution. */
     apply: (
       id: number,
-      body?: { reason?: string; dry_run?: boolean; preview_token?: string },
+      body?: { reason?: string; dry_run?: boolean; preview_token?: string; direct_run?: boolean; request_id?: string },
     ) =>
       request<RuleApplyResponse>(`/api/rules/${id}/apply`, {
         method: "POST",
@@ -1318,6 +1324,15 @@ export const api = {
         method: "POST",
         body,
       }),
+    run: (body: {
+      preset_id?: number;
+      preset_revision?: number;
+      actions: ActionDraft[];
+      reason?: string;
+      revert_after_seconds?: number;
+      verification_mode?: VerificationMode;
+      request_id: string;
+    }) => request<ManualMitigationAccepted>("/api/manual-mitigations/run", { method: "POST", body }),
   },
 
   /** Progress and lifecycle of an ordered mitigation bundle. */
@@ -1328,7 +1343,7 @@ export const api = {
       return request<RerouteBundlePage | RunSummary[]>(`/api/reroute-bundles${query.size ? `?${query}` : ""}`, { signal: opts?.signal });
     },
     get: (id: number, signal?: AbortSignal) => request<RunDetail>(`/api/reroute-bundles/${id}`, { signal }),
-    revert: (id: number, body: { dry_run: boolean; reason?: string; plan_id?: number; preview_token?: string }) =>
+    revert: (id: number, body: { dry_run: boolean; reason?: string; plan_id?: number; preview_token?: string; direct_run?: boolean; request_id?: string }) =>
       request<ManualMitigationPreview | ManualMitigationAccepted>(`/api/reroute-bundles/${id}/revert`, { method: "POST", body }),
     takeControl: (id: number) => request<{ ok: true; bundle_id: number; automatic_recovery_cancelled: true }>(`/api/reroute-bundles/${id}/take-control`, { method: "POST" }),
   },

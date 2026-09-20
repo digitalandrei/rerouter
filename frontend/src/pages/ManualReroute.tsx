@@ -105,6 +105,7 @@ export default function ManualReroute() {
   const [search, setSearch] = useState("");
   const [activeByPreset, setActiveByPreset] = useState<Record<number, number>>({});
   const requestGeneration = useRef(0);
+  const directRequestId = useRef<string | null>(null);
   const loadGeneration = useRef(0);
   const allowNavigation = useRef(false);
 
@@ -151,6 +152,7 @@ export default function ManualReroute() {
 
   function invalidatePreview() {
     requestGeneration.current += 1;
+    directRequestId.current = null;
     setPreview(null);
   }
 
@@ -242,19 +244,42 @@ export default function ManualReroute() {
   useEffect(() => {
     if (!listMode) return;
     let cancelled = false;
-    void (async () => {
+    let inFlight = false;
+    async function refreshActiveCounts() {
+      if (inFlight) return;
+      inFlight = true;
       const counts: Record<number, number> = {}; let page = 1;
-      while (true) {
-        const response = await api.bundles.list({ lifecycle: "active", page, per_page: 200 });
-        const items = Array.isArray(response) ? response : response.items;
-        for (const run of items) { const presetId = run.source?.preset_id; if (presetId) counts[presetId] = (counts[presetId] ?? 0) + 1; }
-        if (Array.isArray(response) || page * response.per_page >= response.total) break;
-        page += 1;
-      }
-      if (!cancelled) setActiveByPreset(counts);
-    })().catch(() => { if (!cancelled) setActiveByPreset({}); });
-    return () => { cancelled = true; };
+      try {
+        while (true) {
+          const response = await api.bundles.list({ lifecycle: "active", page, per_page: 200 });
+          const items = Array.isArray(response) ? response : response.items;
+          for (const run of items) { const presetId = run.source?.preset_id; if (presetId) counts[presetId] = (counts[presetId] ?? 0) + 1; }
+          if (Array.isArray(response) || page * response.per_page >= response.total) break;
+          page += 1;
+        }
+        if (!cancelled) setActiveByPreset(counts);
+      } finally { inFlight = false; }
+    }
+    void refreshActiveCounts().catch(() => { if (!cancelled) setActiveByPreset({}); });
+    const timer = setInterval(() => void refreshActiveCounts().catch(() => {}), 5000);
+    return () => { cancelled = true; clearInterval(timer); };
   }, [listMode]);
+
+  useEffect(() => {
+    if (listMode || selectedId === null || bundleId !== null || editorMode) return;
+    let cancelled = false;
+    let inFlight = false;
+    async function refreshSelectedSource() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const fresh = await api.mitigationPresets.get(selectedId!);
+        if (!cancelled) setPresets((current) => current.map((item) => item.id === fresh.id ? fresh : item));
+      } finally { inFlight = false; }
+    }
+    const timer = setInterval(() => void refreshSelectedSource().catch(() => {}), 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [listMode, selectedId, bundleId, editorMode]);
 
   useEffect(() => {
     if (location.pathname.endsWith("/new")) startNew();
@@ -402,6 +427,7 @@ export default function ManualReroute() {
   }
 
   function openAcceptedBundle(accepted: { bundle_id: number }) {
+    directRequestId.current = null;
     setPreview(null);
     setBundleId(accepted.bundle_id);
     setSearchParams({ bundle: String(accepted.bundle_id) }, { replace: true });
@@ -456,32 +482,23 @@ export default function ManualReroute() {
     setPreview(null);
     setBundleId(null);
     setBundle(null);
-    let prepared = false;
     try {
-      const exact = await requestExactPreview();
-      if (!isCurrentPreview(generation, requestGeneration.current)) return;
-      if (!previewMatchesVerificationMode(exact, verificationMode)) {
-        toast.error("The prepared plan returned a different verification scope. Nothing was started.");
-        return;
-      }
-      if (!exact.plan_id || !exact.preview_token) {
-        setPreview(exact);
-        toast.error("The controller did not authorize this prepared plan. Review the result; nothing was started.");
-        return;
-      }
-      prepared = true;
-      setDirectStage("starting");
-      const accepted = await api.manualMitigations.apply({
-        plan_id: exact.plan_id,
-        preview_token: exact.preview_token,
+      const requestId = directRequestId.current ?? crypto.randomUUID();
+      directRequestId.current = requestId;
+      const accepted = await api.manualMitigations.run({
+        preset_id: selectedPreset?.id,
+        preset_revision: selectedPreset?.revision,
+        actions: effectiveActions.map(actionDraftPayload),
+        reason: reason.trim() || undefined,
+        revert_after_seconds: undefined,
+        verification_mode: verificationMode,
+        request_id: requestId,
       });
       if (isCurrentPreview(generation, requestGeneration.current)) openAcceptedBundle(accepted);
     } catch (error) {
       if (isCurrentPreview(generation, requestGeneration.current)) {
         setPreview(null);
-        toast.error(prepared
-          ? `${error instanceof ApiError ? error.message : "Execution failed"}. Prepare a fresh exact plan before retrying.`
-          : error instanceof ApiError ? error.message : "The exact plan could not be calculated.");
+        toast.error(error instanceof ApiError ? error.message : "The server could not admit the run.");
       }
     } finally {
       if (isCurrentPreview(generation, requestGeneration.current)) {

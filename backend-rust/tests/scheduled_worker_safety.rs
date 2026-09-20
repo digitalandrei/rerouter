@@ -1,6 +1,10 @@
 mod common;
 
+use axum_extra::extract::cookie::Key;
+use chrono::{Duration as ChronoDuration, Utc};
 use rerouter_controller::{
+    api::manual_mitigations,
+    auth::sessions::Session,
     config::Config,
     detection::engine::InjectedAutomaticWorkPort,
     reroute::{
@@ -229,6 +233,247 @@ async fn wait_for<T>(
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn direct_manual_recovery_is_durable_and_idempotent_before_router_reads() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let (source, _) = source_fixture(pool).await;
+    let user = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('direct recovery fixture',?,'unused')",
+    )
+    .bind(format!(
+        "direct-recovery-{}@example.test",
+        uuid::Uuid::new_v4()
+    ))
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let actor = Session {
+        id: 1,
+        user_id: user,
+        totp_verified: true,
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-recovery-test".into(),
+    };
+
+    let cfg = Config::default();
+    let first = rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        manual_mitigations::admit_direct_recovery(
+            pool,
+            &actor,
+            source,
+            "operator requested immediate revert",
+            "request-one",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let durable: (String, String, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT child.state,source.lifecycle_state,source.recovery_claim_token,COUNT(ras.source_bundle_id),CAST(JSON_UNQUOTE(JSON_EXTRACT(child.source_json,'$.preparation_phase')) AS CHAR) \
+         FROM reroute_bundles child JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=child.id \
+         JOIN reroute_bundles source ON source.id=ras.source_bundle_id WHERE child.id=? GROUP BY child.id,source.id",
+    )
+    .bind(first.bundle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(durable.0, "planned");
+    assert_eq!(durable.1, "recovery_claimed");
+    assert!(durable.2.is_some());
+    assert_eq!(durable.3, 1);
+    assert_eq!(durable.4, "published");
+
+    let second = rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        manual_mitigations::admit_direct_recovery(
+            pool,
+            &actor,
+            source,
+            "a duplicate click must find the existing workflow",
+            "request-two",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.bundle_id, first.bundle_id);
+    assert!(second.already_admitted);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM recovery_attempt_sources WHERE source_bundle_id=? AND settlement='active'")
+            .bind(source)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn direct_manual_recovery_continues_in_server_task_after_admission() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let (source, _) = source_fixture(pool).await;
+    let user = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('direct worker fixture',?,'unused')",
+    )
+    .bind(format!(
+        "direct-worker-{}@example.test",
+        uuid::Uuid::new_v4()
+    ))
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let actor = Session {
+        id: 1,
+        user_id: user,
+        totp_verified: true,
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-worker-test".into(),
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reader = Arc::new(Reader {
+        entered: entered.clone(),
+        release: release.clone(),
+        delay: AtomicBool::new(true),
+        panic_once: AtomicBool::new(false),
+    });
+    let writes = Arc::new(AtomicUsize::new(0));
+    let ssh = Arc::new(FakeSsh {
+        writes: writes.clone(),
+        panic_after_write: Arc::new(AtomicBool::new(false)),
+        state: Arc::new(AtomicBool::new(true)),
+    });
+    let cfg = injected_config(reader, ssh);
+    let state = rerouter_controller::api::AppState {
+        pool: pool.clone(),
+        config: cfg.clone(),
+        cookie_key: Key::from(&[87; 64]),
+    };
+    let admission = rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        manual_mitigations::admit_direct_recovery(
+            pool,
+            &actor,
+            source,
+            "server-owned direct recovery",
+            "server-owned-request",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let entered_wait = entered.notified();
+    manual_mitigations::spawn_direct_recovery(&state, &actor, admission);
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_wait)
+        .await
+        .unwrap();
+    let visible: (String, String, String, i64) = sqlx::query_as(
+        "SELECT child.state,source.lifecycle_state,CAST(JSON_UNQUOTE(JSON_EXTRACT(child.source_json,'$.preparation_phase')) AS CHAR), \
+         (SELECT COUNT(*) FROM reroutes WHERE bundle_id=child.id) FROM reroute_bundles child \
+         JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=child.id \
+         JOIN reroute_bundles source ON source.id=ras.source_bundle_id WHERE child.id=?",
+    )
+    .bind(admission.bundle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        visible,
+        (
+            "planned".into(),
+            "recovery_claimed".into(),
+            "preparing".into(),
+            0
+        )
+    );
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+
+    release.notify_waiters();
+    let pool2 = pool.clone();
+    let child_id = admission.bundle_id;
+    let settled = wait_for(
+        move || {
+            let pool = pool2.clone();
+            Box::pin(async move {
+                Ok(sqlx::query_as::<_, (String, String, u32)>(
+                    "SELECT child.state,source.lifecycle_state,source.remaining_mutations \
+                     FROM reroute_bundles child JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=child.id \
+                     JOIN reroute_bundles source ON source.id=ras.source_bundle_id WHERE child.id=?",
+                )
+                .bind(child_id)
+                .fetch_one(&pool)
+                .await?)
+            })
+        },
+        |value| value.0 == "succeeded",
+    )
+    .await;
+    assert_eq!(settled, ("succeeded".into(), "inactive".into(), 0));
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn startup_repairs_a_published_direct_recovery_as_proven_no_write() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let (source, _) = source_fixture(pool).await;
+    let user = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('direct crash fixture',?,'unused')",
+    )
+    .bind(format!(
+        "direct-crash-{}@example.test",
+        uuid::Uuid::new_v4()
+    ))
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    let actor = Session {
+        id: 1,
+        user_id: user,
+        totp_verified: true,
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+        ip_address: "127.0.0.1".into(),
+        user_agent: "direct-crash-test".into(),
+    };
+    let cfg = Config::default();
+    let admission = rerouter_controller::db::advisory::foreground_scope(
+        cfg.advisory_runtime(pool).await.unwrap(),
+        manual_mitigations::admit_direct_recovery(
+            pool,
+            &actor,
+            source,
+            "crash before preparation",
+            "crash-before-preparation",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    reroute::bundle::recover_on_startup(pool).await.unwrap();
+    let repaired: (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT child.state,source.lifecycle_state,source.recovery_claim_token,ras.settlement \
+         FROM reroute_bundles child JOIN recovery_attempt_sources ras ON ras.recovery_bundle_id=child.id \
+         JOIN reroute_bundles source ON source.id=ras.source_bundle_id WHERE child.id=?",
+    )
+    .bind(admission.bundle_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_ne!(repaired.0, "planned");
+    assert_eq!(repaired.1, "active");
+    assert!(repaired.2.is_none());
+    assert_eq!(repaired.3, "known_no_write");
 }
 
 #[tokio::test]

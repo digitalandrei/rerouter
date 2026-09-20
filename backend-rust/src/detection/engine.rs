@@ -1408,6 +1408,12 @@ pub struct AutomaticWorkQueue {
 /// publication/admission is intentionally outside this seam.
 #[doc(hidden)]
 pub trait AutomaticWorkPort: Send + Sync + std::fmt::Debug {
+    fn prepare_manual_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+        mode: crate::reroute::device_plan::VerificationMode,
+    ) -> crate::ssh::BoxFuture<'a, Result<()>>;
     fn prepare_activation<'a>(
         &'a self,
         pool: &'a MySqlPool,
@@ -1453,7 +1459,21 @@ impl ProductionAutomaticWorkPort {
         }
     }
 }
+
+pub(crate) fn production_work_port(pool: &MySqlPool) -> Arc<dyn AutomaticWorkPort> {
+    Arc::new(ProductionAutomaticWorkPort::new(pool))
+}
 impl AutomaticWorkPort for ProductionAutomaticWorkPort {
+    fn prepare_manual_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+        mode: crate::reroute::device_plan::VerificationMode,
+    ) -> crate::ssh::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::reroute::preparation::inspect_actions_for_mode(pool, actions, mode).await
+        })
+    }
     fn prepare_activation<'a>(
         &'a self,
         pool: &'a MySqlPool,
@@ -1518,6 +1538,23 @@ where
     R: crate::reroute::device_plan::PreparationReader + 'static,
     S: crate::ssh::SshExecutor + 'static,
 {
+    fn prepare_manual_activation<'a>(
+        &'a self,
+        pool: &'a MySqlPool,
+        actions: &'a mut [crate::reroute::bundle::BundleAction],
+        mode: crate::reroute::device_plan::VerificationMode,
+    ) -> crate::ssh::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::reroute::preparation::inspect_actions_with_reader_for_mode(
+                pool,
+                actions,
+                false,
+                &*self.reader,
+                mode,
+            )
+            .await
+        })
+    }
     fn prepare_activation<'a>(
         &'a self,
         pool: &'a MySqlPool,
@@ -1661,6 +1698,25 @@ async fn settle_worker_failure(pool: &MySqlPool, bundle_id: u64, kind: JobKind, 
             .await;
         }
     }
+}
+
+pub(crate) async fn settle_supervised_manual_failure(
+    pool: &MySqlPool,
+    bundle_id: u64,
+    recovery: bool,
+    reason: &str,
+) {
+    settle_worker_failure(
+        pool,
+        bundle_id,
+        if recovery {
+            JobKind::Recovery
+        } else {
+            JobKind::Activation
+        },
+        reason,
+    )
+    .await;
 }
 
 async fn quarantine_interrupted_worker_bundle(

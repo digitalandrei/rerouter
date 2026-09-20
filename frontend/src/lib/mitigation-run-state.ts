@@ -16,11 +16,16 @@ export function presentMitigationRun(run: RunSummary): RunPresentation {
   const unknown = run.unknown_effects ?? 0;
   const lifecycle = run.lifecycle_state ?? (remaining > 0 ? "active" : "inactive");
   const execution = run.execution_state ?? run.state;
+  const preparation = run.source?.preparation_phase;
+  const preparing = execution === "planned" && (preparation === "published" || preparation === "preparing");
+  const preparingRecovery = preparing && (run.parent_bundle_id != null || run.source?.kind === "recovery");
   const reverting = ["recovery_claimed", "recovery_running"].includes(lifecycle) || execution === "compensating";
   let label = "Status unavailable";
   let detail = "Refresh this run before making a decision.";
   let tone: RunPresentation["tone"] = "neutral";
-  if (run.parent_bundle_id && ["planned", "pending", "running", "verifying", "compensating"].includes(execution)) { label = "Reverting"; detail = `${run.completed_actions}/${run.total_actions} restore steps completed.`; tone = "warn"; }
+  if (preparingRecovery) { label = "Preparing revert"; detail = "Calculating the exact inverse before any router write."; tone = "warn"; }
+  else if (preparing) { label = "Preparing run"; detail = "Calculating the exact configuration before any router write."; tone = "warn"; }
+  else if (run.parent_bundle_id && ["planned", "pending", "running", "verifying", "compensating"].includes(execution)) { label = "Reverting"; detail = `${run.completed_actions}/${run.total_actions} restore steps completed.`; tone = "warn"; }
   else if (run.parent_bundle_id && ["failed", "aborted", "compensation_blocked"].includes(execution)) { label = "Revert failed"; detail = "Inspect the source mitigation for remaining changes and unknown outcomes."; tone = "bad"; }
   else if (run.parent_bundle_id && execution === "compensated") { label = "Revert failed—restoration undone"; detail = "Inspect the source mitigation for remaining changes and unknown outcomes."; tone = "bad"; }
   else if (["planned", "running"].includes(execution)) { label = "Applying"; detail = `${run.completed_actions}/${run.total_actions} steps completed.`; }
