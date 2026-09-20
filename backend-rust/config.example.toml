@@ -67,6 +67,9 @@ same_device_cooldown_seconds = 300
 # Configuration-only verification is restricted to explicitly designated lab
 # routers whose complete current transport identity matches one of these entries.
 # Keep empty in normal installations. Example:
+# All enabled devices with a pinned SSH identity are eligible for manual
+# Configuration only. Entries below are optional stricter identity and rate
+# overrides for individual devices.
 # [[safety.configuration_test_devices]]
 # device_id = 3
 # host = "lab-router.example.invalid"

@@ -167,11 +167,14 @@ pub struct LabDevice {
     pub action_rate_limit_window_seconds: u64,
 }
 
+pub(crate) const DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT: u32 = 32;
+pub(crate) const DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_WINDOW_SECONDS: u64 = 600;
+
 fn default_lab_action_rate_limit_count() -> u32 {
-    32
+    DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT
 }
 fn default_lab_action_rate_limit_window_seconds() -> u64 {
-    600
+    DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_WINDOW_SECONDS
 }
 
 #[derive(Debug, Clone, Deserialize)]

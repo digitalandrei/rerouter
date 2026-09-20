@@ -706,26 +706,31 @@ async fn real_preview_consume_and_locked_execution_verify_configuration_without_
         routing_accept.is_err(),
         "ordinary eight-action routing bundle must still respect global limit 3"
     );
-    let undesignated_state = api::AppState {
+    let implicit_device_state = api::AppState {
         pool: pool.clone(),
         config: Config::default(),
         cookie_key: Key::from(&[42; 64]),
     };
-    let (undesignated_status, _) = manual_mitigations::preview_actions_with_reader_mode(
-        &undesignated_state,
-        &actor(user),
-        "manual_mitigation",
-        None,
-        actions.clone(),
-        json!({"kind":"manual","name":"Run once"}),
-        "lab proof".into(),
-        json!({"actions":[],"verification_mode":"configuration_only"}),
-        None,
-        &MssReader(None, "no-export"),
-        VerificationMode::ConfigurationOnly,
-    )
-    .await;
-    assert!(undesignated_status.is_client_error());
+    let (implicit_device_status, implicit_device_preview) =
+        manual_mitigations::preview_actions_with_reader_mode(
+            &implicit_device_state,
+            &actor(user),
+            "manual_mitigation",
+            None,
+            actions.clone(),
+            json!({"kind":"manual","name":"Run once"}),
+            "lab proof".into(),
+            json!({"actions":[],"verification_mode":"configuration_only"}),
+            None,
+            &MssReader(None, "no-export"),
+            VerificationMode::ConfigurationOnly,
+        )
+        .await;
+    assert_eq!(
+        implicit_device_status,
+        axum::http::StatusCode::OK,
+        "every enabled device with a pinned SSH identity is implicitly eligible: {implicit_device_preview:?}"
+    );
     let mut mixed_targets = actions.clone();
     mixed_targets[1].device_id = device + 1;
     let (mixed_status, _) = manual_mitigations::preview_actions_with_reader_mode(

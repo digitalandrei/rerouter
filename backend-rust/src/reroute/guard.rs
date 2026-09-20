@@ -45,27 +45,31 @@ async fn bundle_rate_scope(
     let (mode, device_id) =
         row.ok_or_else(|| BlockReason::GateReadFailed("bundle missing".into()))?;
     if mode.as_deref() == Some("configuration_only") {
-        let device_id = device_id
-            .ok_or_else(|| BlockReason::GateReadFailed("lab bundle has no device".into()))?;
+        let device_id = device_id.ok_or_else(|| {
+            BlockReason::GateReadFailed("configuration-only bundle has no device".into())
+        })?;
         let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND (device_id<>? OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'configuration_only')")
             .bind(bundle_id).bind(device_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
         if invalid != 0 {
             return Err(BlockReason::GateReadFailed(
-                "lab bundle ledger has mixed scope or targets".into(),
+                "configuration-only bundle ledger has mixed scope or targets".into(),
             ));
         }
-        let lab = cfg
+        let rate_override = cfg
             .safety
             .configuration_test_devices
             .iter()
-            .find(|d| d.device_id == device_id)
-            .ok_or_else(|| {
-                BlockReason::GateReadFailed("lab device is no longer designated".into())
-            })?;
+            .find(|d| d.device_id == device_id);
         Ok(RateScope::ConfigurationOnly {
             device_id,
-            limit: lab.action_rate_limit_count,
-            window: lab.action_rate_limit_window_seconds,
+            limit: rate_override
+                .map(|device| device.action_rate_limit_count)
+                .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT),
+            window: rate_override
+                .map(|device| device.action_rate_limit_window_seconds)
+                .unwrap_or(
+                    crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_WINDOW_SECONDS,
+                ),
         })
     } else if mode.as_deref().is_none() || mode.as_deref() == Some("routing") {
         let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'routing'")
@@ -93,7 +97,11 @@ fn rate_values(scope: &RateScope) -> (u32, u64, String) {
             device_id,
             limit,
             window,
-        } => (*limit, *window, format!("20:reroute:rate-lab:{device_id}")),
+        } => (
+            *limit,
+            *window,
+            format!("20:reroute:rate-config-only:{device_id}"),
+        ),
     }
 }
 

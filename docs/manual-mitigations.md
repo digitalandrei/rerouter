@@ -38,11 +38,13 @@ state, typed verification requirements, device host/port/pinned identity, and
 the exact inverse. A failed sibling refuses the whole set; there is no silent
 skip or best-effort execution policy.
 
-For a manual run, **Configuration only** is the first and default verification
-scope when every effective action and target is eligible for the configured lab
-scope; other sets use **Routing verification**. Starting an exact preview locks
-the page controls until the request settles, so its action set, scope, reason,
-and recovery schedule cannot change beneath the in-flight request.
+For the current release, the manual-run UI uses **Configuration only**. It shows
+the exact configuration and inverse, then reads the resulting configuration
+back. BGP advertisements are not verified. The disabled **Additional checks**
+option reserves the future action-specific routing/BGP/operational verification
+workflow. Starting an exact preview locks the page controls until the request
+settles, so its action set, reason, and recovery behavior cannot change beneath
+the in-flight request.
 
 A five-minute, one-use preview credential binds the operator, reason, source
 revision, ordered actions, and exact prepared snapshot. Confirmation creates a

@@ -475,12 +475,13 @@ async fn execute_with_inner<S: SshExecutor>(
                 "configuration-only verification cannot run through automatic authority, recovery, or rules".into(),
             );
         }
-        let designated = self::configuration_test_identity_matches(pool, cfg, req.device_id).await;
-        if !designated {
+        let identity_allowed =
+            self::configuration_test_identity_matches(pool, cfg, req.device_id).await;
+        if !identity_allowed {
             return blocked(
                 &req,
                 device_name,
-                "configuration-only lab device identity changed before execution".into(),
+                "configuration-only device identity changed before execution".into(),
             );
         }
     }
@@ -703,14 +704,11 @@ async fn configuration_test_identity_matches(
     cfg: &Config,
     device_id: u64,
 ) -> bool {
-    let Some(expected) = cfg
+    let expected = cfg
         .safety
         .configuration_test_devices
         .iter()
-        .find(|device| device.device_id == device_id)
-    else {
-        return false;
-    };
+        .find(|device| device.device_id == device_id);
     let actual = RusshExecutor::new(pool.clone())
         .transport_identities(&[device_id])
         .await;
@@ -718,9 +716,11 @@ async fn configuration_test_identity_matches(
         .ok()
         .and_then(|ids| ids.get(&device_id).cloned())
         .is_some_and(|actual| {
-            actual.host == expected.host
-                && actual.port == expected.port
-                && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
+            expected.is_none_or(|expected| {
+                actual.host == expected.host
+                    && actual.port == expected.port
+                    && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
+            })
         })
 }
 

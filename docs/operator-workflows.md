@@ -26,16 +26,17 @@ restricts new automatic activation rather than corrective owned work.
 Disarming pauses new autonomous work and autonomous-origin compensation. An
 already authorized manual-origin compensation may finish its failure policy.
 
-## Configuration-only lab verification
+## Configuration-only verification
 
-Configuration-only verification is an explicit per-run choice for approved lab
-routers. It never activates automatically. Configure each approved transport
-identity with all four fields; placeholders are shown here deliberately:
+Configuration-only verification is the manual-run scope for enabled routers in
+the current release. Every enabled device with a pinned SSH host identity is
+eligible implicitly. It never activates automatically. The following entries
+are optional stricter identity and rate-limit overrides:
 
 ```toml
 [[safety.configuration_test_devices]]
 device_id = 3
-host = "lab-router.example.invalid"
+host = "router.example.invalid"
 port = 22
 pinned_host_fingerprint = "SHA256:..."
 # Optional; defaults shown.
@@ -43,13 +44,13 @@ action_rate_limit_count = 32
 action_rate_limit_window_seconds = 600
 ```
 
-The current database identity must match the device id, host, port, and pinned
-fingerprint at capability lookup, preview, confirmation, and execution. A run
-may target one approved device and may use only `bgp_export_policy_set` and
-`iface_tcp_adjust_mss` actions. The manual-run page lists **Configuration only**
-first and selects it by default when every effective action is eligible. An
-ineligible set falls back to **Routing verification**. Review the exact
-projection and commands, and confirm the short-lived preview token normally.
+When an override exists, the current database identity must match its device id,
+host, port, and pinned fingerprint at capability lookup, preview, confirmation,
+and execution. A run may target one enabled device and may use only `bgp_export_policy_set` and
+`iface_tcp_adjust_mss` actions. The manual-run page selects **Configuration
+only**. Ineligible sets remain blocked. **Additional checks** is visible but
+disabled for a future version. Review the exact projection and commands, and
+confirm the short-lived preview token normally.
 
 This mode proves the exact configuration before and after each action. An Idle
 BGP peer is allowed because advertised-route and Established-state evidence is
@@ -63,16 +64,10 @@ persisted configuration-only scope and restores owned changes in reverse order.
 Immediate compensation after a failed manual run inherits the same scope. Older
 stored snapshots with no `verification_mode` deserialize as `routing`.
 
-**Routing verification** repeats the exact prepared configuration read-back and
-adds the typed operational evidence relevant to each action: route resolution
-and next hop, BGP route or advertised-prefix presence, expected community,
-neighbor state, or interface state. The controller holds the native device lock
-and retries ordinary IOS convergence for up to 30 seconds. Empty, malformed,
-unsupported, wrong-object, and mismatched responses cannot produce success. If
-commands may have run but this proof is unavailable, the action is uncertain
-and keeps its ownership quarantine. This evidence proves the enrolled ASR's
-local state only; it does not prove that a remote peer accepted the update or
-that the route propagated beyond that peer.
+The action-specific route, BGP, and interface checks already present in the
+engine remain unavailable as a manual-run scope until their operator contract is
+completed and certified against the enrolled ASR images. They are not silently
+substituted for Configuration only.
 
 ## Recovery
 
@@ -121,7 +116,7 @@ inspect the complete 16-action set, and confirm that Akamai receives only
 The 19 September read-only eMA3 inspection found the same direct IPv4-AF policy
 shape as eMA1. All nine BGP peers were Idle and Po1 had no MSS clamp, so the
 configuration parser evidence is useful but does not certify activation or
-verification against an operational peer. The user controls lab execution after
+verification against an operational peer. The user controls live execution after
 deployment. Existing removed SSH write permissions on eMA1/eMA2 are intentional;
 deployment preserves them and does not re-enroll accounts or repair permissions.
 

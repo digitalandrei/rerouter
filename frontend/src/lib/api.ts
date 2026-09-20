@@ -723,10 +723,10 @@ export function isBundleTerminal(state: string): boolean {
 export function configurationOnlyRunStatus(state: string): string {
   switch (state) {
     case "succeeded": return "Configuration verified; routing not verified.";
-    case "compensated": return "Configuration-only test failed; changes were reverted; routing not verified.";
+    case "compensated": return "Configuration verification failed; changes were reverted; routing not verified.";
     case "compensation_blocked": return "Configuration recovery is blocked and needs review; routing not verified.";
-    case "failed": case "aborted": return "Configuration-only test failed; routing was not verified.";
-    default: return "Configuration-only test in progress; neither configuration nor routing is verified yet.";
+    case "failed": case "aborted": return "Configuration verification failed; routing was not verified.";
+    default: return "Configuration verification is in progress; routing is not being verified.";
   }
 }
 

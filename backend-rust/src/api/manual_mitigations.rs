@@ -95,35 +95,39 @@ pub async fn capabilities(
         ),
         Err(e) => err(
             StatusCode::SERVICE_UNAVAILABLE,
-            &format!("configuration-test capabilities unavailable: {e:#}"),
+            &format!("configuration-only capabilities unavailable: {e:#}"),
         ),
     }
 }
 
 async fn eligible_configuration_test_device_ids(state: &AppState) -> anyhow::Result<Vec<u64>> {
-    let ids = state
-        .config
-        .safety
-        .configuration_test_devices
-        .iter()
-        .map(|d| d.device_id)
-        .collect::<Vec<_>>();
+    let ids: Vec<u64> = sqlx::query_scalar(
+        "SELECT id FROM devices WHERE enabled=1 AND ssh_host_fingerprint IS NOT NULL \
+         AND TRIM(ssh_host_fingerprint)<>'' ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
     let current = crate::ssh::RusshExecutor::new(state.pool.clone())
         .transport_identities(&ids)
         .await?;
-    Ok(state
-        .config
-        .safety
-        .configuration_test_devices
-        .iter()
-        .filter(|expected| {
-            current.get(&expected.device_id).is_some_and(|actual| {
-                actual.host == expected.host
-                    && actual.port == expected.port
-                    && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
-            })
+    Ok(ids
+        .into_iter()
+        .filter(|device_id| {
+            let Some(actual) = current.get(device_id) else {
+                return false;
+            };
+            state
+                .config
+                .safety
+                .configuration_test_devices
+                .iter()
+                .find(|expected| expected.device_id == *device_id)
+                .is_none_or(|expected| {
+                    actual.host == expected.host
+                        && actual.port == expected.port
+                        && actual.pinned_host_fingerprint == expected.pinned_host_fingerprint
+                })
         })
-        .map(|d| d.device_id)
         .collect())
 }
 
@@ -138,7 +142,7 @@ async fn validate_configuration_only_scope(
     let device_id = actions[0].device_id;
     ensure!(
         actions.iter().all(|a| a.device_id == device_id),
-        "configuration-only verification requires one designated lab device"
+        "configuration-only verification requires one approved device"
     );
     ensure!(
         actions.iter().all(|a| {
@@ -156,7 +160,7 @@ async fn validate_configuration_only_scope(
         eligible_configuration_test_device_ids(state)
             .await?
             .contains(&device_id),
-        "lab device transport identity is not currently designated"
+        "device is disabled, lacks a pinned SSH identity, or no longer matches its optional identity override"
     );
     Ok(())
 }
@@ -256,21 +260,21 @@ pub(crate) async fn preview_manual(
             return err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
         }
         let device_id = actions[0].device_id;
-        let lab_limit = state
+        let action_limit = state
             .config
             .safety
             .configuration_test_devices
             .iter()
             .find(|device| device.device_id == device_id)
             .map(|device| device.action_rate_limit_count)
-            .unwrap_or(0);
-        if actions.len() as u32 > lab_limit {
+            .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT);
+        if actions.len() as u32 > action_limit {
             return err(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &format!(
-                    "configuration-only action set has {} actions; lab limit is {}",
+                    "configuration-only action set has {} actions; approved-device limit is {}",
                     actions.len(),
-                    lab_limit
+                    action_limit
                 ),
             );
         }
@@ -411,7 +415,7 @@ async fn preview_actions_core(
         source["verification_mode"] = json!(verification_mode);
         source["routing_verified"] = json!(false);
         source["verification_label"] =
-            json!("Configuration-only test; routing will not be verified");
+            json!("Configuration only; BGP advertisements are not verified");
     }
     // The timer is part of the authority-bearing source identity. Canonicalize
     // it before snapshot serialization and hashing so admission persists the
@@ -575,7 +579,7 @@ async fn preview_actions_core(
             Json(
                 json!({"plan_id":row.last_insert_id(),"preview_token":token,"results":results,"projections":projections,"revert_after_seconds":revert_after_seconds,
             "verification_mode":verification_mode,"routing_verified":if verification_mode == VerificationMode::ConfigurationOnly {Some(false)} else {None},
-            "verification_label":if verification_mode == VerificationMode::ConfigurationOnly {Some("Configuration-only test; routing will not be verified")} else {None},
+            "verification_label":if verification_mode == VerificationMode::ConfigurationOnly {Some("Configuration only; BGP advertisements are not verified")} else {None},
             "source":source,"expires_at":Utc::now()+chrono::Duration::minutes(5),"operating_mode":if enforce {"enforce"} else {"observe"}}),
             ),
         ),

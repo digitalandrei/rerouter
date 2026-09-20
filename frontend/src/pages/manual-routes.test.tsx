@@ -211,24 +211,27 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   const configurationOnly = await screen.findByRole("radio", { name: /^configuration only/i }) as HTMLInputElement;
   await waitFor(() => expect(configurationOnly.checked).toBe(true));
   expect(screen.getAllByRole("radio")[0]).toBe(configurationOnly);
-  expect(screen.getByText(/does not verify advertised routes or the routing outcome/i)).toBeTruthy();
+  expect(screen.getByText("BGP advertisements are not verified.")).toBeTruthy();
+  expect((screen.getByRole("radio", { name: /^additional checks/i }) as HTMLInputElement).disabled).toBe(true);
+  expect(screen.getByText(/available in a future version/i)).toBeTruthy();
   const schedule = screen.getByRole("combobox", { name: /revert schedule/i }) as HTMLSelectElement;
   expect(schedule.disabled).toBe(true);
   expect(schedule.className).toContain("disabled:bg-muted");
   await user.click(screen.getByRole("button", { name: "Refresh" }));
-  expect(await screen.findByText(/lab eligibility is unavailable/i)).toBeTruthy();
+  expect(await screen.findByText(/configuration-only eligibility is unavailable/i)).toBeTruthy();
   expect((screen.getByRole("radio", { name: /^configuration only/i }) as HTMLInputElement).checked).toBe(true);
   expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
   expect(preview).not.toHaveBeenCalled();
-  await user.click(screen.getByRole("button", { name: "Retry lab eligibility" }));
-  await waitFor(() => expect(screen.queryByText(/lab eligibility is unavailable/i)).toBeNull());
+  await user.click(screen.getByRole("button", { name: "Retry eligibility" }));
+  await waitFor(() => expect(screen.queryByText(/configuration-only eligibility is unavailable/i)).toBeNull());
   await user.click(screen.getByRole("button", { name: "Preview changes" }));
   await waitFor(() => expect(preview).toHaveBeenCalledWith(expect.objectContaining({ verification_mode: "configuration_only", revert_after_seconds: undefined })));
   expect(screen.queryByRole("button", { name: "Apply reviewed changes" })).toBeNull();
   await user.click(screen.getByRole("button", { name: "Override action 1" }));
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
-  await waitFor(() => expect((screen.getByRole("radio", { name: /^routing verification/i }) as HTMLInputElement).checked).toBe(true));
-  expect(screen.queryByText(/router configuration will change; BGP advertisement is not verified/i)).toBeNull();
+  expect((screen.getByRole("radio", { name: /^configuration only/i }) as HTMLInputElement).checked).toBe(true);
+  expect(await screen.findByText(/supported actions on one enabled router/i)).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
 });
 
 it("locks every run control while an exact preview is pending and keeps the action in one layout slot", async () => {
@@ -249,7 +252,7 @@ it("locks every run control while an exact preview is pending and keeps the acti
 
   const configurationOnly = await screen.findByRole("radio", { name: /^configuration only/i }) as HTMLInputElement;
   await waitFor(() => expect(configurationOnly.checked).toBe(true));
-  const routing = screen.getByRole("radio", { name: /^routing verification/i }) as HTMLInputElement;
+  const additionalChecks = screen.getByRole("radio", { name: /^additional checks/i }) as HTMLInputElement;
   const previewButton = screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement;
   expect(previewButton.className).toContain("sm:w-[22rem]");
   await user.click(previewButton);
@@ -259,9 +262,9 @@ it("locks every run control while an exact preview is pending and keeps the acti
   expect(preparing.className).toContain("sm:w-[22rem]");
   for (const button of screen.getAllByRole("button")) expect((button as HTMLButtonElement).disabled).toBe(true);
   expect(configurationOnly.matches(":disabled")).toBe(true);
-  expect(routing.matches(":disabled")).toBe(true);
+  expect(additionalChecks.matches(":disabled")).toBe(true);
   expect((screen.getByRole("combobox", { name: /revert schedule/i }) as HTMLSelectElement).matches(":disabled")).toBe(true);
-  await user.click(routing);
+  await user.click(additionalChecks);
   await user.click(screen.getByRole("button", { name: "Inspect" }));
   expect(configurationOnly.checked).toBe(true);
   expect(inspect).not.toHaveBeenCalled();
