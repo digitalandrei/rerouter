@@ -515,13 +515,17 @@ pub async fn rollback(
         .map(str::to_string)
         .unwrap_or_else(|| format!("manual rollback of reroute #{id}"));
     if body.dry_run || body.preview_token.is_none() {
-        let actions =
-            match crate::reroute::preparation::prepare_rollbacks(&state.pool, &[id], &reason, true)
-                .await
-            {
-                Ok(actions) => actions,
-                Err(e) => return err(StatusCode::CONFLICT, &format!("{e:#}")),
-            };
+        let actions = match crate::reroute::preparation::prepare_rollbacks(
+            &state.pool,
+            &[id],
+            &reason,
+            false,
+        )
+        .await
+        {
+            Ok(actions) => actions,
+            Err(e) => return err(StatusCode::CONFLICT, &format!("{e:#}")),
+        };
         if actions.is_empty() {
             return (
                 StatusCode::OK,
@@ -910,7 +914,7 @@ pub async fn bundle_revert(
             &state.pool,
             &originals,
             &reason,
-            true,
+            false,
         )
         .await
         {

@@ -300,14 +300,26 @@ pub fn spawn_direct_recovery(state: &AppState, actor: &Session, admission: Direc
             }
             Ok::<(), anyhow::Error>(())
         });
-        if worker.await.is_err() {
-            crate::detection::engine::settle_supervised_manual_failure(
-                &supervisor_pool,
-                bundle_id,
-                true,
-                "direct recovery worker panicked before completion",
-            )
-            .await;
+        match worker.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                crate::detection::engine::settle_supervised_manual_failure(
+                    &supervisor_pool,
+                    bundle_id,
+                    true,
+                    &format!("direct recovery worker failed before settlement: {error:#}"),
+                )
+                .await;
+            }
+            Err(error) => {
+                crate::detection::engine::settle_supervised_manual_failure(
+                    &supervisor_pool,
+                    bundle_id,
+                    true,
+                    &format!("direct recovery worker panicked before completion: {error}"),
+                )
+                .await;
+            }
         }
     });
 }
@@ -381,18 +393,66 @@ pub async fn capabilities(
     State(state): State<AppState>,
 ) -> JsonResp {
     match eligible_configuration_test_device_ids(&state).await {
-        Ok(ids) => (
-            StatusCode::OK,
-            Json(json!({
-                "configuration_test_device_ids": ids,
-                "configuration_test_templates": ["bgp_export_policy_set", "iface_tcp_adjust_mss"]
-            })),
-        ),
+        Ok(ids) => {
+            let cooldown_rows = match sqlx::query_as::<_, (String, DateTime<Utc>)>(
+                "SELECT scope_ref,MAX(`until`) FROM cooldowns WHERE scope='device' AND `until`>UTC_TIMESTAMP() GROUP BY scope_ref",
+            )
+            .fetch_all(&state.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &format!("configuration-only cooldowns unavailable: {error}"),
+                    )
+                }
+            };
+            let cooldowns = cooldown_rows
+                .into_iter()
+                .filter_map(|(device, until)| device.parse::<u64>().ok().map(|id| (id, until)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "configuration_test_device_ids": ids,
+                    "configuration_test_templates": ["bgp_export_policy_set", "iface_tcp_adjust_mss"],
+                    "device_cooldown_until": cooldowns,
+                })),
+            )
+        }
         Err(e) => err(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("configuration-only capabilities unavailable: {e:#}"),
         ),
     }
+}
+
+async fn ensure_forward_devices_not_cooling(
+    pool: &sqlx::MySqlPool,
+    actions: &[BundleAction],
+) -> anyhow::Result<()> {
+    if actions
+        .iter()
+        .any(|action| action.original_reroute_id.is_some())
+    {
+        return Ok(());
+    }
+    let devices = actions
+        .iter()
+        .map(|action| action.device_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for device_id in devices {
+        if let Some(until) =
+            crate::detection::cooldown::active_until(pool, "device", &device_id.to_string()).await?
+        {
+            anyhow::bail!(
+                "device {device_id} is in cooldown until {}",
+                until.to_rfc3339()
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn eligible_configuration_test_device_ids(state: &AppState) -> anyhow::Result<Vec<u64>> {
@@ -434,11 +494,6 @@ async fn validate_configuration_only_scope(
         !actions.is_empty(),
         "configuration-only verification needs enabled actions"
     );
-    let device_id = actions[0].device_id;
-    ensure!(
-        actions.iter().all(|a| a.device_id == device_id),
-        "configuration-only verification requires one approved device"
-    );
     ensure!(
         actions.iter().all(|a| {
             matches!(
@@ -451,11 +506,18 @@ async fn validate_configuration_only_scope(
         }),
         "configuration-only verification supports only bgp_export_policy_set and iface_tcp_adjust_mss"
     );
+    let eligible = eligible_configuration_test_device_ids(state)
+        .await?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let requested = actions
+        .iter()
+        .map(|action| action.device_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unavailable = requested.difference(&eligible).copied().collect::<Vec<_>>();
     ensure!(
-        eligible_configuration_test_device_ids(state)
-            .await?
-            .contains(&device_id),
-        "device is disabled, lacks a pinned SSH identity, or no longer matches its optional identity override"
+        unavailable.is_empty(),
+        "devices {unavailable:?} are disabled, lack a pinned SSH identity, or no longer match their optional identity overrides"
     );
     Ok(())
 }
@@ -563,24 +625,27 @@ async fn resolve_manual_request(
         if let Err(e) = validate_configuration_only_scope(state, &actions).await {
             return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()));
         }
-        let device_id = actions[0].device_id;
-        let action_limit = state
-            .config
-            .safety
-            .configuration_test_devices
-            .iter()
-            .find(|device| device.device_id == device_id)
-            .map(|device| device.action_rate_limit_count)
-            .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT);
-        if actions.len() as u32 > action_limit {
-            return Err(err(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &format!(
-                    "configuration-only action set has {} actions; approved-device limit is {}",
-                    actions.len(),
-                    action_limit
-                ),
-            ));
+        let mut actions_per_device = std::collections::BTreeMap::<u64, u32>::new();
+        for action in &actions {
+            *actions_per_device.entry(action.device_id).or_default() += 1;
+        }
+        for (device_id, count) in actions_per_device {
+            let action_limit = state
+                .config
+                .safety
+                .configuration_test_devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+                .map(|device| device.action_rate_limit_count)
+                .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT);
+            if action_limit > 0 && count > action_limit {
+                return Err(err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!(
+                        "configuration-only action set has {count} actions on device {device_id}; device limit is {action_limit}"
+                    ),
+                ));
+            }
         }
     }
     let request = json!({"actions":body.actions,"preset_id":body.preset_id,"preset_revision":body.preset_revision,"reason":reason,"revert_after_seconds":body.revert_after_seconds,"verification_mode":body.verification_mode});
@@ -675,6 +740,7 @@ async fn admit_direct_apply(
                 return Ok(DirectAdmission { bundle_id, already_admitted: true });
             }
         }
+        ensure_forward_devices_not_cooling(&state.pool, &resolved.actions).await?;
         let mut source = resolved.source.clone();
         canonicalize_source_timer(&mut source, resolved.revert_after_seconds);
         source["admission_kind"] = json!("direct");
@@ -860,14 +926,26 @@ fn spawn_direct_apply(
             }
             Ok::<(), anyhow::Error>(())
         });
-        if worker.await.is_err() {
-            crate::detection::engine::settle_supervised_manual_failure(
-                &supervisor_pool,
-                bundle_id,
-                false,
-                "direct run worker panicked before completion",
-            )
-            .await;
+        match worker.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                crate::detection::engine::settle_supervised_manual_failure(
+                    &supervisor_pool,
+                    bundle_id,
+                    false,
+                    &format!("direct run worker failed before settlement: {error:#}"),
+                )
+                .await;
+            }
+            Err(error) => {
+                crate::detection::engine::settle_supervised_manual_failure(
+                    &supervisor_pool,
+                    bundle_id,
+                    false,
+                    &format!("direct run worker panicked before completion: {error}"),
+                )
+                .await;
+            }
         }
     });
 }
@@ -1637,6 +1715,7 @@ async fn accept_plan_inner(
                 .is_some_and(|prepared| prepared.verification_mode == snapshot.verification_mode)),
         "execution snapshot contains a missing or mixed verification scope"
     );
+    ensure_forward_devices_not_cooling(&state.pool, &snapshot.actions).await?;
     for (action, prepared) in snapshot.actions.iter().zip(&snapshot.device_actions) {
         let owned = action
             .prepared

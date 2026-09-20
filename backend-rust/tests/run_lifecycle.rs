@@ -39,10 +39,29 @@ async fn configuration_only_run_never_schedules_or_claims_automatic_recovery() {
             .unwrap();
     assert!(deadline.is_none());
     sqlx::query("UPDATE reroute_bundles SET lifecycle_state='recovery_scheduled',recovery_deadline=DATE_SUB(UTC_TIMESTAMP(),INTERVAL 1 SECOND) WHERE id=?").bind(bundle).execute(pool).await.unwrap();
-    assert!(recovery::claim_one_due(pool, &Config::default())
+    let unrelated_claim = recovery::claim_one_due(pool, &Config::default())
         .await
-        .unwrap()
-        .is_none());
+        .unwrap();
+    assert_ne!(
+        unrelated_claim.as_ref().map(|claim| claim.0),
+        Some(bundle),
+        "configuration-only source must never be selected by timer recovery"
+    );
+    let claim: Option<String> =
+        sqlx::query_scalar("SELECT recovery_claim_token FROM reroute_bundles WHERE id=?")
+            .bind(bundle)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(claim.is_none());
+    if let Some((other, token)) = unrelated_claim {
+        sqlx::query("UPDATE reroute_bundles SET recovery_claim_token=NULL,recovery_claimed_at=NULL,lifecycle_state='recovery_scheduled' WHERE id=? AND recovery_claim_token=?")
+            .bind(other)
+            .bind(token)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM reroutes WHERE id=?")
         .bind(reroute)
         .execute(pool)

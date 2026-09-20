@@ -19,6 +19,7 @@
  */
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { toast } from "sonner";
 import { presentMitigationRun } from "@/lib/mitigation-run-state";
 import {
   api,
@@ -450,6 +451,7 @@ export function ApplyMitigationDialog({
 
   function handleApplyResponse(res: RuleApplyResponse, dryRun: boolean) {
     if (isBundleAccepted(res)) {
+      if (res.already_admitted) toast.info(`Continuing existing run #${res.bundle_id}.`);
       setPreviewToken(null);
       setResults(res.results ?? []);
       setBundleTotal(res.total_actions);
@@ -515,6 +517,7 @@ export function ApplyMitigationDialog({
         direct_run: true,
         request_id: requestId,
       });
+      setDirectStage("starting");
       directRequestId.current = null;
       handleApplyResponse(accepted, false);
     } catch (e) {

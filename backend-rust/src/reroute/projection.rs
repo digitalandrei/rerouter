@@ -202,6 +202,7 @@ fn render(states: &[DeviceStateSnapshot]) -> String {
             route_map,
             prefix_lists: lists,
             route_maps: maps,
+            ..
         } = state
         {
             let lines = attachments
@@ -289,7 +290,7 @@ fn render_state(s: &DeviceStateSnapshot) -> String {
         DeviceStateSnapshot::RouteResolution{prefix,next_hop,present}=>format!("! route {prefix} via {next_hop} {}present",if *present{""}else{"not "}),
         DeviceStateSnapshot::BgpNeighborState{neighbor,administratively_shutdown,state}=>format!("! neighbor {neighbor}: admin_shutdown={administratively_shutdown}, state={}",state.as_deref().unwrap_or("unknown")),
         DeviceStateSnapshot::InterfaceOperational{interface,administratively_down}=>format!("! interface {interface}: administratively_down={administratively_down}"),
-        DeviceStateSnapshot::ExportPolicyAttachment{local_asn,neighbor,address_family,prefix_list,route_map,prefix_lists,route_maps} => {
+        DeviceStateSnapshot::ExportPolicyAttachment{local_asn,neighbor,address_family,prefix_list,route_map,prefix_lists,route_maps,..} => {
             let mut lines=vec![format!("router bgp {local_asn}"),format!(" address-family {address_family}")];
             if let Some(name)=prefix_list {lines.push(format!("  neighbor {neighbor} prefix-list {name} out"));}
             if let Some(name)=route_map {lines.push(format!("  neighbor {neighbor} route-map {name} out"));}
@@ -390,6 +391,8 @@ mod tests {
             route_map: None,
             prefix_lists: vec![list.clone()],
             route_maps: vec![],
+            required_prefix_lists: None,
+            required_route_maps: None,
         };
         let rendered = render(&[state("192.0.2.1"), state("192.0.2.2")]);
         assert_eq!(rendered.matches("router bgp 34501").count(), 1);
@@ -451,6 +454,8 @@ mod tests {
             route_map: map.map(Into::into),
             prefix_lists: vec![],
             route_maps: vec![],
+            required_prefix_lists: None,
+            required_route_maps: None,
         };
         let projection = project_action_set(&[
             mk("null_route_prefix", vec![route_before], vec![route_after]),

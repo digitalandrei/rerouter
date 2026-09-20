@@ -287,7 +287,7 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
   await user.click(screen.getByRole("tab", { name: "Overview & run" }));
   expect((screen.getByRole("radio", { name: /^configuration only/i }) as HTMLInputElement).checked).toBe(true);
-  expect(await screen.findByText(/supported actions on one enabled router/i)).toBeTruthy();
+  expect(await screen.findByText(/pinned SSH identity for every selected router/i)).toBeTruthy();
   expect((screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement).disabled).toBe(true);
 });
 

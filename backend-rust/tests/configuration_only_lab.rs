@@ -731,23 +731,79 @@ async fn real_preview_consume_and_locked_execution_verify_configuration_without_
         axum::http::StatusCode::OK,
         "every enabled device with a pinned SSH identity is implicitly eligible: {implicit_device_preview:?}"
     );
-    let mut mixed_targets = actions.clone();
-    mixed_targets[1].device_id = device + 1;
-    let (mixed_status, _) = manual_mitigations::preview_actions_with_reader_mode(
+    let second_device = sqlx::query("INSERT INTO devices(name,hostname,ssh_port,ssh_host_fingerprint,ssh_status,last_ssh_ok_at,ssh_reachable_since) VALUES(?,?,22,?,'reachable',UTC_TIMESTAMP(),DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE))")
+        .bind(format!("lab-device-two-{}", uuid::Uuid::new_v4()))
+        .bind("192.0.2.43")
+        .bind("SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let mut multi_device = actions.clone();
+    multi_device[1].device_id = second_device;
+    multi_device[1].prepared.as_mut().unwrap().device_id = second_device;
+    let (multi_status, multi_preview) = manual_mitigations::preview_actions_with_reader_mode(
         &state,
         &actor(user),
         "manual_mitigation",
         None,
-        mixed_targets,
+        multi_device,
         json!({"kind":"manual","name":"Run once"}),
-        "mixed lab targets".into(),
+        "two-router configuration-only proof".into(),
         json!({"actions":[],"verification_mode":"configuration_only"}),
         None,
         &MssReader(None, "no-export"),
         VerificationMode::ConfigurationOnly,
     )
     .await;
-    assert_eq!(mixed_status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        multi_status,
+        axum::http::StatusCode::OK,
+        "{multi_preview:?}"
+    );
+    let multi_accepted = manual_mitigations::accept_plan(
+        &state,
+        &actor(user),
+        multi_preview["plan_id"].as_u64().unwrap(),
+        multi_preview["preview_token"].as_str().unwrap(),
+        "manual_mitigation",
+        None,
+    )
+    .await
+    .unwrap();
+    let multi_reserved: u32 =
+        sqlx::query_scalar("SELECT rate_reserved_actions FROM reroute_bundles WHERE id=?")
+            .bind(multi_accepted.bundle_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(multi_reserved, 2);
+    sqlx::query("UPDATE reroute_bundles SET state='failed',rate_reserved_actions=0 WHERE id=?")
+        .bind(multi_accepted.bundle_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut unavailable_target = actions.clone();
+    unavailable_target[1].device_id = second_device + 1;
+    unavailable_target[1].prepared.as_mut().unwrap().device_id = second_device + 1;
+    let (unavailable_status, _) = manual_mitigations::preview_actions_with_reader_mode(
+        &state,
+        &actor(user),
+        "manual_mitigation",
+        None,
+        unavailable_target,
+        json!({"kind":"manual","name":"Run once"}),
+        "unavailable target".into(),
+        json!({"actions":[],"verification_mode":"configuration_only"}),
+        None,
+        &MssReader(None, "no-export"),
+        VerificationMode::ConfigurationOnly,
+    )
+    .await;
+    assert_eq!(
+        unavailable_status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
     let (status, axum::Json(preview)) = manual_mitigations::preview_actions_with_reader_mode(
         &state,
         &actor(user),

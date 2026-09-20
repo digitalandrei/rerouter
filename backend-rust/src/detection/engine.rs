@@ -1671,15 +1671,28 @@ async fn settle_worker_failure(pool: &MySqlPool, bundle_id: u64, kind: JobKind, 
             JobKind::Activation => format!("bundle:{bundle_id}"),
             JobKind::Recovery => format!("recovery:bundle:{bundle_id}"),
         };
-        if let Err(error) = crate::reroute::bundle::finish_and_release(
-            pool,
-            bundle_id,
-            "failed",
-            Some(reason),
-            &owner_token,
-        )
-        .await
-        {
+        let settled = match kind {
+            JobKind::Activation => crate::reroute::bundle::finish_and_release(
+                pool,
+                bundle_id,
+                "failed",
+                Some(reason),
+                &owner_token,
+            )
+            .await
+            .map(|_| ()),
+            JobKind::Recovery => {
+                crate::reroute::recovery::finalize_recovery_child(
+                    pool,
+                    bundle_id,
+                    "failed",
+                    Some(reason),
+                    &owner_token,
+                )
+                .await
+            }
+        };
+        if let Err(error) = settled {
             tracing::error!(event_type="automatic_worker_settlement_failed",bundle_id,error=%error);
         }
         return;
@@ -1706,17 +1719,32 @@ pub(crate) async fn settle_supervised_manual_failure(
     recovery: bool,
     reason: &str,
 ) {
-    settle_worker_failure(
-        pool,
+    let kind = if recovery {
+        JobKind::Recovery
+    } else {
+        JobKind::Activation
+    };
+    for attempt in 0..4_u32 {
+        settle_worker_failure(pool, bundle_id, kind, reason).await;
+        let in_flight: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reroute_bundles child WHERE child.id=? AND (child.state IN ('planned','running','compensating') OR (? AND EXISTS(SELECT 1 FROM recovery_attempt_sources ras WHERE ras.recovery_bundle_id=child.id AND ras.settlement='active')))",
+        )
+        .bind(bundle_id)
+        .bind(recovery)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(1);
+        if in_flight == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250 * (1_u64 << attempt))).await;
+    }
+    tracing::error!(
+        event_type = "manual_worker_settlement_exhausted",
         bundle_id,
-        if recovery {
-            JobKind::Recovery
-        } else {
-            JobKind::Activation
-        },
-        reason,
-    )
-    .await;
+        recovery,
+        "manual worker remained unsettled after bounded retries; startup repair retains the durable evidence"
+    );
 }
 
 async fn quarantine_interrupted_worker_bundle(

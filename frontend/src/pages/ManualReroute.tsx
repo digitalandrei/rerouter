@@ -124,6 +124,14 @@ export default function ManualReroute() {
     [actions, overrides],
   );
   const configurationOnlyEligible = useMemo(() => isConfigurationOnlyEligible(effectiveActions, templates, capabilities), [effectiveActions, capabilities, templates]);
+  const cooldownUntil = useMemo(() => {
+    const values = new Set(effectiveActions.filter((action) => action.enabled !== false).map((action) => action.device_id));
+    return [...values]
+      .map((deviceId) => capabilities.device_cooldown_until?.[String(deviceId)])
+      .filter((value): value is string => typeof value === "string" && Date.parse(value) > Date.now())
+      .sort()
+      .at(-1) ?? null;
+  }, [effectiveActions, capabilities]);
   const dirty = selectedPreset
     ? name !== selectedPreset.name ||
       description !== (selectedPreset.description ?? "") ||
@@ -273,8 +281,15 @@ export default function ManualReroute() {
       if (inFlight) return;
       inFlight = true;
       try {
-        const fresh = await api.mitigationPresets.get(selectedId!);
-        if (!cancelled) setPresets((current) => current.map((item) => item.id === fresh.id ? fresh : item));
+        const [fresh, currentCapabilities] = await Promise.all([
+          api.mitigationPresets.get(selectedId!),
+          api.manualMitigations.capabilities(),
+        ]);
+        if (!cancelled) {
+          setPresets((current) => current.map((item) => item.id === fresh.id ? fresh : item));
+          setCapabilities(currentCapabilities);
+          setCapabilitiesState("ready");
+        }
       } finally { inFlight = false; }
     }
     const timer = setInterval(() => void refreshSelectedSource().catch(() => {}), 5000);
@@ -458,6 +473,10 @@ export default function ManualReroute() {
 
   async function applyPreview() {
     if (!preview?.plan_id || !preview.preview_token) return;
+    if (cooldownUntil) {
+      toast.error(`A selected router is in cooldown until ${new Date(cooldownUntil).toLocaleString()}.`);
+      return;
+    }
     const generation = ++requestGeneration.current;
     setBusy(true);
     try {
@@ -476,6 +495,10 @@ export default function ManualReroute() {
 
   async function runNow() {
     if (!canPrepareRun()) return;
+    if (cooldownUntil) {
+      toast.error(`A selected router is in cooldown until ${new Date(cooldownUntil).toLocaleString()}.`);
+      return;
+    }
     const generation = ++requestGeneration.current;
     setBusy(true);
     setDirectStage("calculating");
@@ -494,7 +517,11 @@ export default function ManualReroute() {
         verification_mode: verificationMode,
         request_id: requestId,
       });
-      if (isCurrentPreview(generation, requestGeneration.current)) openAcceptedBundle(accepted);
+      if (isCurrentPreview(generation, requestGeneration.current)) {
+        setDirectStage("starting");
+        if (accepted.already_admitted) toast.info(`Continuing existing run #${accepted.bundle_id}.`);
+        openAcceptedBundle(accepted);
+      }
     } catch (error) {
       if (isCurrentPreview(generation, requestGeneration.current)) {
         setPreview(null);
@@ -626,7 +653,8 @@ export default function ManualReroute() {
                       <label className="flex items-start gap-2 text-sm opacity-60"><input className="mt-1" type="radio" name="verification-mode" disabled /><span><strong>Additional checks</strong><span className="block max-w-3xl text-xs text-muted-foreground">Action-specific routing, BGP, and operational checks will be available in a future version.</span></span></label>
                       <p className="rounded-md border border-border bg-muted/40 p-3 text-sm">BGP advertisements are not verified.</p>
                       {capabilitiesState === "loading" && <p role="status" className="text-xs text-muted-foreground">Checking Configuration-only eligibility…</p>}
-                      {capabilitiesState === "ready" && !configurationOnlyEligible && <p role="alert" className="text-xs text-destructive">Configuration only requires supported actions on one enabled router with a pinned SSH identity.</p>}
+                      {capabilitiesState === "ready" && !configurationOnlyEligible && <p role="alert" className="text-xs text-destructive">Configuration only requires supported actions and a pinned SSH identity for every selected router.</p>}
+                      {cooldownUntil && <p role="status" className="text-xs text-amber-800 dark:text-amber-300">A selected router is in cooldown until {new Date(cooldownUntil).toLocaleString()}. You may prepare a preview now; execution becomes available after that time.</p>}
                       {(capabilitiesState === "error" || retryingCapabilities) && <div className="flex flex-wrap items-center gap-2 text-xs text-amber-800 dark:text-amber-300" role="alert"><span>{retryingCapabilities ? "Checking eligibility…" : "Configuration-only eligibility is unavailable, so preview and execution remain blocked."}</span><Button type="button" size="sm" variant="outline" onClick={() => void retryCapabilities()} loading={retryingCapabilities} loadingLabel="Checking eligibility…">Retry eligibility</Button></div>}
                     </section>}
                     {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
@@ -647,8 +675,8 @@ export default function ManualReroute() {
                       <div className={`grid gap-2 ${preview ? "sm:grid-cols-[auto_22rem]" : "sm:grid-cols-[auto_11rem_11rem]"}`}>
                         <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}#overview`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
                         {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="outline" onClick={() => void preparePreview()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={busy && directStage === null} loadingLabel="Preparing exact preview…">Preview changes</Button>}
-                        {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="destructive" onClick={() => void runNow()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={directStage !== null} loadingLabel={directStage === "starting" ? "Starting run…" : "Calculating changes…"}>Run now</Button>}
-                        {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
+                        {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="destructive" onClick={() => void runNow()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || Boolean(cooldownUntil) || busy} loading={directStage !== null} loadingLabel={directStage === "starting" ? "Starting run…" : "Calculating changes…"}>Run now</Button>}
+                        {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible || Boolean(cooldownUntil)} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
                       </div>
                     </div>
                   </div>}

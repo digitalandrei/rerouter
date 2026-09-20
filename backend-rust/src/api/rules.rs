@@ -1173,7 +1173,7 @@ pub async fn clear(
             &state.pool,
             &originals,
             &reason,
-            true,
+            false,
         )
         .await
         {

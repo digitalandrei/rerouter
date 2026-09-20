@@ -683,6 +683,7 @@ export type VerificationMode = "routing" | "configuration_only";
 export interface ManualMitigationCapabilities {
   configuration_test_device_ids: number[];
   configuration_test_templates: string[];
+  device_cooldown_until?: Record<string, string>;
 }
 
 export interface ManualMitigationAccepted {
@@ -862,6 +863,7 @@ export interface ActionSource {
 export interface BundleAcceptedResponse {
   bundle_id: number;
   async: true;
+  already_admitted?: boolean;
   state: string;
   total_actions: number;
   failure_policy: string;

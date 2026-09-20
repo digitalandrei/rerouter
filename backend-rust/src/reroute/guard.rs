@@ -23,15 +23,15 @@ use crate::reroute::templates::{RenderedPlan, Template};
 
 #[derive(Debug, Clone)]
 enum RateScope {
-    Routing {
-        limit: u32,
-        window: u64,
-    },
-    ConfigurationOnly {
-        device_id: u64,
-        limit: u32,
-        window: u64,
-    },
+    Routing { limit: u32, window: u64 },
+    ConfigurationOnly { devices: Vec<ConfigurationRate> },
+}
+
+#[derive(Debug, Clone)]
+struct ConfigurationRate {
+    device_id: u64,
+    limit: u32,
+    window: u64,
 }
 
 async fn bundle_rate_scope(
@@ -39,38 +39,54 @@ async fn bundle_rate_scope(
     cfg: &Config,
     bundle_id: u64,
 ) -> Result<RateScope, BlockReason> {
-    let row: Option<(Option<String>, Option<u64>)> = sqlx::query_as(
-        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(b.source_json,'$.verification_mode')) AS CHAR), MIN(a.device_id) FROM reroute_bundles b LEFT JOIN reroute_bundle_actions a ON a.bundle_id=b.id WHERE b.id=? GROUP BY b.id",
+    let mode: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(source_json,'$.verification_mode')) AS CHAR) FROM reroute_bundles WHERE id=?",
     ).bind(bundle_id).fetch_optional(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
-    let (mode, device_id) =
-        row.ok_or_else(|| BlockReason::GateReadFailed("bundle missing".into()))?;
+    let mode = mode.ok_or_else(|| BlockReason::GateReadFailed("bundle missing".into()))?;
     if mode.as_deref() == Some("configuration_only") {
-        let device_id = device_id.ok_or_else(|| {
-            BlockReason::GateReadFailed("configuration-only bundle has no device".into())
-        })?;
-        let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND (device_id<>? OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'configuration_only')")
-            .bind(bundle_id).bind(device_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
+        let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'configuration_only'")
+            .bind(bundle_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
         if invalid != 0 {
             return Err(BlockReason::GateReadFailed(
-                "configuration-only bundle ledger has mixed scope or targets".into(),
+                "configuration-only bundle ledger has mixed verification scope".into(),
             ));
         }
-        let rate_override = cfg
-            .safety
-            .configuration_test_devices
-            .iter()
-            .find(|d| d.device_id == device_id);
-        Ok(RateScope::ConfigurationOnly {
-            device_id,
-            limit: rate_override
-                .map(|device| device.action_rate_limit_count)
-                .unwrap_or(crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT),
-            window: rate_override
-                .map(|device| device.action_rate_limit_window_seconds)
-                .unwrap_or(
-                    crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_WINDOW_SECONDS,
-                ),
-        })
+        let device_ids: Vec<u64> = sqlx::query_scalar(
+            "SELECT DISTINCT device_id FROM reroute_bundle_actions WHERE bundle_id=? ORDER BY device_id",
+        )
+        .bind(bundle_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| BlockReason::GateReadFailed(e.to_string()))?;
+        if device_ids.is_empty() {
+            return Err(BlockReason::GateReadFailed(
+                "configuration-only bundle has no device".into(),
+            ));
+        }
+        let devices = device_ids
+            .into_iter()
+            .map(|device_id| {
+                let rate_override = cfg
+                    .safety
+                    .configuration_test_devices
+                    .iter()
+                    .find(|device| device.device_id == device_id);
+                ConfigurationRate {
+                    device_id,
+                    limit: rate_override
+                        .map(|device| device.action_rate_limit_count)
+                        .unwrap_or(
+                            crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_COUNT,
+                        ),
+                    window: rate_override
+                        .map(|device| device.action_rate_limit_window_seconds)
+                        .unwrap_or(
+                            crate::config::DEFAULT_CONFIGURATION_ONLY_ACTION_RATE_LIMIT_WINDOW_SECONDS,
+                        ),
+                }
+            })
+            .collect();
+        Ok(RateScope::ConfigurationOnly { devices })
     } else if mode.as_deref().is_none() || mode.as_deref() == Some("routing") {
         let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(prepared_action_json,'$.verification_mode')),'routing')<>'routing'")
             .bind(bundle_id).fetch_one(pool).await.map_err(|e|BlockReason::GateReadFailed(e.to_string()))?;
@@ -87,21 +103,6 @@ async fn bundle_rate_scope(
         Err(BlockReason::GateReadFailed(
             "bundle has unknown verification scope".into(),
         ))
-    }
-}
-
-fn rate_values(scope: &RateScope) -> (u32, u64, String) {
-    match scope {
-        RateScope::Routing { limit, window } => (*limit, *window, "20:reroute:rate-global".into()),
-        RateScope::ConfigurationOnly {
-            device_id,
-            limit,
-            window,
-        } => (
-            *limit,
-            *window,
-            format!("20:reroute:rate-config-only:{device_id}"),
-        ),
     }
 }
 
@@ -575,36 +576,82 @@ async fn admit_bundle_inner(
     size: u32,
 ) -> Result<(), BlockReason> {
     let scope = bundle_rate_scope(pool, cfg, bundle_id).await?;
-    let (limit, window, rate_lock_suffix) = rate_values(&scope);
-    if limit == 0 {
-        return Ok(());
-    }
-    let rate_guard = crate::db::advisory::acquire(&rate_lock_suffix)
-        .await
-        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     let mut conn = pool
         .acquire()
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-
-    let lab_device = match scope {
-        RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
-        _ => None,
-    };
-    let already = scoped_recent_reroute_count(&mut conn, window, Some(bundle_id), lab_device).await;
-    let outstanding =
-        scoped_outstanding_bundle_actions(&mut conn, window, bundle_id, lab_device).await;
-    let projected = already.saturating_add(outstanding);
-    if projected.saturating_add(size as i64) > limit as i64 {
-        rate_guard
-            .release()
-            .await
-            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
-        return Err(BlockReason::RateLimit {
-            recent: projected,
-            window_secs: window,
-            max: limit,
-        });
+    let mut rate_guards = Vec::new();
+    match &scope {
+        RateScope::Routing { limit, window } if *limit > 0 => {
+            rate_guards.push(
+                crate::db::advisory::acquire("20:reroute:rate-global")
+                    .await
+                    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?,
+            );
+            let already =
+                scoped_recent_reroute_count(&mut conn, *window, Some(bundle_id), None).await;
+            let outstanding =
+                scoped_outstanding_bundle_actions(&mut conn, *window, bundle_id, None).await;
+            let projected = already.saturating_add(outstanding);
+            if projected.saturating_add(size as i64) > *limit as i64 {
+                release_rate_guards(rate_guards).await?;
+                return Err(BlockReason::RateLimit {
+                    recent: projected,
+                    window_secs: *window,
+                    max: *limit,
+                });
+            }
+        }
+        RateScope::ConfigurationOnly { devices } => {
+            for device in devices {
+                if device.limit == 0 {
+                    continue;
+                }
+                rate_guards.push(
+                    crate::db::advisory::acquire(&format!(
+                        "20:reroute:rate-config-only:{}",
+                        device.device_id
+                    ))
+                    .await
+                    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?,
+                );
+                let already = scoped_recent_reroute_count(
+                    &mut conn,
+                    device.window,
+                    Some(bundle_id),
+                    Some(device.device_id),
+                )
+                .await;
+                let outstanding = scoped_outstanding_configuration_actions(
+                    &mut conn,
+                    device.window,
+                    bundle_id,
+                    device.device_id,
+                )
+                .await;
+                let requested: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM reroute_bundle_actions WHERE bundle_id=? AND device_id=?",
+                )
+                .bind(bundle_id)
+                .bind(device.device_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+                let projected = already.saturating_add(outstanding);
+                if projected.saturating_add(requested) > device.limit as i64 {
+                    release_rate_guards(rate_guards).await?;
+                    return Err(BlockReason::RateLimit {
+                        recent: projected,
+                        window_secs: device.window,
+                        max: device.limit,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    if rate_guards.is_empty() {
+        return Ok(());
     }
     let reserved = sqlx::query(
         "UPDATE reroute_bundles SET rate_reserved_actions = ? \
@@ -623,20 +670,47 @@ async fn admit_bundle_inner(
                 .await
                 .map_err(|e| BlockReason::PersistFailed(e.to_string()))?;
         if existing != Some(size) {
-            rate_guard
-                .release()
-                .await
-                .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+            release_rate_guards(rate_guards).await?;
             return Err(BlockReason::PersistFailed(
                 "bundle was not in an admissible planned state".into(),
             ));
         }
     }
-    rate_guard
-        .release()
-        .await
-        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    release_rate_guards(rate_guards).await?;
     Ok(())
+}
+
+async fn release_rate_guards(
+    guards: Vec<crate::db::advisory::AdvisoryGuard>,
+) -> Result<(), BlockReason> {
+    for guard in guards.into_iter().rev() {
+        guard
+            .release()
+            .await
+            .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn scoped_outstanding_configuration_actions(
+    conn: &mut MySqlConnection,
+    window_secs: u64,
+    exclude_bundle: u64,
+    device_id: u64,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM reroute_bundle_actions action JOIN reroute_bundles bundle ON bundle.id=action.bundle_id \
+         WHERE bundle.state IN ('planned','running','compensating') AND bundle.id<>? \
+           AND bundle.created_at>DATE_SUB(UTC_TIMESTAMP(),INTERVAL ? SECOND) \
+           AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(bundle.source_json,'$.verification_mode')),'routing')='configuration_only' \
+           AND action.device_id=?",
+    )
+    .bind(exclude_bundle)
+    .bind(window_secs as i64)
+    .bind(device_id)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(i64::MAX)
 }
 
 /// Scoped recent action count. Fails closed on a read error.
@@ -759,7 +833,27 @@ async fn reserve_and_persist_inner(
             window: cfg.safety.global_action_rate_limit_window_seconds,
         },
     };
-    let (rate_limit, rate_window, rate_lock_suffix) = rate_values(&rate_scope);
+    let (rate_limit, rate_window, rate_lock_suffix, lab_device) = match &rate_scope {
+        RateScope::Routing { limit, window } => {
+            (*limit, *window, "20:reroute:rate-global".to_string(), None)
+        }
+        RateScope::ConfigurationOnly { devices } => {
+            let device = devices
+                .iter()
+                .find(|device| device.device_id == req.device_id)
+                .ok_or_else(|| {
+                    BlockReason::GateReadFailed(
+                        "configuration-only action device is absent from its bundle ledger".into(),
+                    )
+                })?;
+            (
+                device.limit,
+                device.window,
+                format!("20:reroute:rate-config-only:{}", device.device_id),
+                Some(device.device_id),
+            )
+        }
+    };
     // Global rate-limit critical section. Every non-corrective trigger participates
     // so concurrent manual and automatic requests share one authoritative budget.
     let use_global = req.trigger_type != "rollback" && rate_limit > 0;
@@ -779,10 +873,6 @@ async fn reserve_and_persist_inner(
         .await
         .map_err(|e| BlockReason::GuardConnection(e.to_string()))?;
     if use_global {
-        let lab_device = match rate_scope {
-            RateScope::ConfigurationOnly { device_id, .. } => Some(device_id),
-            _ => None,
-        };
         let recent = scoped_recent_reroute_count(
             &mut conn,
             rate_window,
@@ -790,12 +880,12 @@ async fn reserve_and_persist_inner(
             lab_device,
         )
         .await;
-        let reserved_elsewhere = if lab_device.is_some() {
-            scoped_outstanding_bundle_actions(
+        let reserved_elsewhere = if let Some(device_id) = lab_device {
+            scoped_outstanding_configuration_actions(
                 &mut conn,
                 rate_window,
                 req.bundle.map(|b| b.bundle_id).unwrap_or(0),
-                lab_device,
+                device_id,
             )
             .await
         } else {

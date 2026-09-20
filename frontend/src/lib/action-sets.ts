@@ -2,9 +2,9 @@ import type { ActionDraft, ManualMitigationCapabilities, ManualMitigationPreview
 
 export function configurationOnlyEligible(actions: ActionDraft[], templates: Template[], capabilities: ManualMitigationCapabilities): boolean {
   const enabled = actions.filter((action) => action.enabled !== false);
+  const eligibleDevices = new Set(capabilities.configuration_test_device_ids);
   return enabled.length > 0
-    && new Set(enabled.map((action) => action.device_id)).size === 1
-    && capabilities.configuration_test_device_ids.includes(enabled[0].device_id)
+    && enabled.every((action) => eligibleDevices.has(action.device_id))
     && enabled.every((action) => capabilities.configuration_test_templates.includes(templates.find((template) => template.id === action.reroute_template_id)?.name ?? ""));
 }
 

@@ -633,11 +633,13 @@ export function ActiveRunsTab() {
       if (generation !== actionGeneration.current || selectedIdRef.current !== runId || reason !== requestedReason) return;
       if ("bundle_id" in value) {
         directRevertRequestId.current = null;
+        setDirectRevertStage("starting");
         recoveryIdRef.current = value.bundle_id;
         recoveryRunRef.current = null;
         setRecoveryRun(null);
         setRecoveryError(null);
-        toast.success(`Revert run #${value.bundle_id} started`);
+        if (value.already_admitted) toast.info(`Continuing existing revert run #${value.bundle_id}.`);
+        else toast.success(`Revert run #${value.bundle_id} started`);
       }
       await load(true);
     } catch (cause) {

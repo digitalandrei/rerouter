@@ -35,3 +35,18 @@ Private stopped-window data and deployment evidence remain on EMDD under
 `/root/rerouter-deployment-evidence/hardening-20260920`. The application account
 was used for deployment capture, fencing, data snapshot, and migration access.
 The data snapshot is not an older application version and was not restored.
+
+## Later 20 September releases
+
+The controller and frontend were subsequently advanced through `4fcb7cc` and
+schema 76. Durable direct runs now publish server state before router reads, and
+direct recovery inherits the source verification scope. Recovery bundle 9
+successfully restored eMA3 run 7; both are inactive, with no remaining mutation,
+device window, source membership, or open lock.
+
+The policy inventories were refreshed after the operator installed the reviewed
+single-prefix policies. `e-manuel-apply` is revision 5 and
+`e-manuel-apply-ema3-test` is revision 2; both validate Ready. Their Akamai
+actions select `rr-194105142-only`, their COLT actions select
+`rr-colt-without-194105142`, and their Po1 actions set MSS 1436. These definition
+updates created no execution plan or router run.

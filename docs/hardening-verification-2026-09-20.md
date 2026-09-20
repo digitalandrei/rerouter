@@ -1,8 +1,9 @@
 # ASR hardening verification — 20 September 2026
 
-Baseline: `441f93d2f8f34a0036230f37ab37cf666e548022`. The implementation remains
-reviewable in the working tree. No deployment, router actuation, real notification
-send, automation arming, or live interval change was performed.
+Baseline: `441f93d2f8f34a0036230f37ab37cf666e548022`. This document originally
+recorded the pre-deployment software gate. The implementation was subsequently
+committed and deployed through `4fcb7ccad8cd1854b841c5ca19c515acd8589ce0` with
+schema 76. No automatic action was armed by those deployments.
 
 ## Scope delivered
 
@@ -65,3 +66,21 @@ repairs; it preserves legitimate nonzero locks, windows, and frozen claims.
 Production preflight/deployment remains a separate step and must defer during
 active execution. Cisco certification still requires owner-controlled evidence
 from the exact enrolled IOS/IOS-XE images and router-load checks.
+
+## Follow-up deployment and recovery evidence
+
+The later releases added active-definition locking, direct prepared execution,
+durable server-owned manual workflows, and configuration-only recovery scope.
+The first direct recovery attempt (bundle 8) was proven `known_no_write`; the
+scope repair then allowed bundle 9 to restore all eight eMA3 changes successfully.
+Bundle 7 is inactive with zero remaining mutations, and its device windows and
+source memberships were released. Production deployment evidence is retained in
+`/root/rerouter-deployment-evidence/recovery-scope-repair-20260920`.
+
+The subsequent adversarial-review fixes passed the complete MariaDB software
+gate: strict formatting and Clippy, 232 Rust unit tests, every integration suite,
+89 frontend tests, tooling checks, production frontend build, and embedded UI
+build. The MySQL 8.4 all-target run passed through the corrected lifecycle test;
+after the final multi-device rate-scope change, the affected Configuration-only,
+bundle-admission, and manual-plan suites passed again on MySQL 8.4. All database
+tests used the restricted task schemas and existing services.

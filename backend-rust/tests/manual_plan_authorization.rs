@@ -207,7 +207,7 @@ async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
         config: Config::default(),
         cookie_key: key,
     };
-    let (_device, action, _prepared) = fixture(&pool).await;
+    let (device, action, _prepared) = fixture(&pool).await;
     let execution_action = action.clone();
     let actor = Session {
         id: 1,
@@ -243,12 +243,22 @@ async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
     .unwrap();
     assert_eq!(durable, ("planned".into(), "published".into(), 0));
 
+    rerouter_controller::detection::cooldown::record(
+        &state.pool,
+        "device",
+        &device.to_string(),
+        300,
+        "test post-revert cooldown",
+    )
+    .await
+    .unwrap();
+
     let second = rerouter_controller::db::advisory::foreground_scope(
         state.config.advisory_runtime(&state.pool).await.unwrap(),
         api::manual_mitigations::admit_direct_apply_for_test(
             &state,
             &actor,
-            vec![action],
+            vec![action.clone()],
             json!({"kind":"manual","name":"Run once"}),
             "duplicate direct apply",
             &request_id,
@@ -259,6 +269,26 @@ async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
     .unwrap();
     assert_eq!(second.bundle_id, first.bundle_id);
     assert!(second.already_admitted);
+    let refused = rerouter_controller::db::advisory::foreground_scope(
+        state.config.advisory_runtime(&state.pool).await.unwrap(),
+        api::manual_mitigations::admit_direct_apply_for_test(
+            &state,
+            &actor,
+            vec![action],
+            json!({"kind":"manual","name":"Run once"}),
+            "new activation during cooldown",
+            &unique_token("direct-apply-cooldown"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(refused.to_string().contains("cooldown until"));
+    sqlx::query("DELETE FROM cooldowns WHERE scope='device' AND scope_ref=?")
+        .bind(device.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
     sqlx::query("UPDATE reroute_bundles SET source_json=JSON_SET(source_json,'$.preparation_phase','prepared') WHERE id=?")
         .bind(first.bundle_id)

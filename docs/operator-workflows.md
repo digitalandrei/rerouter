@@ -124,6 +124,18 @@ inspect the complete 16-action set, and confirm that Akamai receives only
 `194.105.142.0/24` while COLT retains `194.102.117.0/24` and excludes
 `194.105.142.0/24`. Until then, keep the draft blocked as Needs setup.
 
+Configuration-only manual mitigations may span several routers. Every selected
+router must be enabled and have a pinned SSH identity, and every action must use
+one of the supported structured templates. The controller validates all routers
+before issuing a preview or admitting a run. A device cooldown is reported with
+its exact expiry; preview remains available, while execution waits for expiry.
+
+Direct and reviewed runs use the same bundle-level safety proofs. Before an
+action withdraws an existing export, the controller re-proves all successful
+replacement attachments. Recovery compares only the neighbor attachments and
+policy definitions owned by that run; unrelated policy additions do not prevent
+an otherwise valid revert, while edits to an owned policy still refuse it.
+
 The 19 September read-only eMA3 inspection found the same direct IPv4-AF policy
 shape as eMA1. All nine BGP peers were Idle and Po1 had no MSS clamp, so the
 configuration parser evidence is useful but does not certify activation or

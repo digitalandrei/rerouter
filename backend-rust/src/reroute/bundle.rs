@@ -38,6 +38,14 @@ use crate::reroute::rollback;
 use crate::reroute::templates::Template;
 use crate::ssh::{RusshExecutor, SshExecutor};
 
+fn requires_replacement_reproof(trigger_type: &str) -> bool {
+    matches!(trigger_type, "manual" | "direct_manual" | "automatic")
+}
+
+fn requires_corrective_closure(trigger_type: &str) -> bool {
+    matches!(trigger_type, "rollback" | "recovery" | "manual_recovery")
+}
+
 /// What to do when a sibling does not succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailurePolicy {
@@ -832,8 +840,7 @@ async fn run_with_ssh_inner<S: SshExecutor>(
         } else {
             safety_phase(&action.template.name).1
         };
-        let destructive_forward =
-            matches!(trigger_type, "manual" | "automatic") && prepared_rank == 2;
+        let destructive_forward = requires_replacement_reproof(trigger_type) && prepared_rank == 2;
         if destructive_forward && !succeeded_prepared.is_empty() {
             match locked_ssh.verify_projected_after(&succeeded_prepared).await {
                 Ok(true) => {}
@@ -1031,7 +1038,7 @@ async fn run_with_ssh_inner<S: SshExecutor>(
             }
         }
     }
-    if stopped_at.is_none() && matches!(trigger_type, "rollback" | "recovery") {
+    if stopped_at.is_none() && requires_corrective_closure(trigger_type) {
         match outstanding_owned_originals(pool, bundle_id).await {
             Ok(outstanding) if outstanding.is_empty() => {}
             Ok(_) => {
@@ -1991,5 +1998,18 @@ mod tests {
         assert_eq!(safety_phase("bgp_advertise_add").1, 0);
         assert_eq!(safety_phase("bgp_advertise_remove").1, 2);
         assert_eq!(safety_phase("iface_tcp_adjust_mss_remove").1, 2);
+    }
+
+    #[test]
+    fn direct_workflows_keep_reviewed_bundle_level_proofs() {
+        assert!(requires_replacement_reproof("manual"));
+        assert!(requires_replacement_reproof("direct_manual"));
+        assert!(requires_replacement_reproof("automatic"));
+        assert!(!requires_replacement_reproof("manual_recovery"));
+
+        assert!(requires_corrective_closure("rollback"));
+        assert!(requires_corrective_closure("recovery"));
+        assert!(requires_corrective_closure("manual_recovery"));
+        assert!(!requires_corrective_closure("direct_manual"));
     }
 }

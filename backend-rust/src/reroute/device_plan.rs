@@ -307,6 +307,15 @@ pub enum DeviceStateSnapshot {
         route_map: Option<String>,
         prefix_lists: Vec<crate::reroute::policy::NamedPrefixList>,
         route_maps: Vec<crate::reroute::policy::NamedRouteMap>,
+        /// Policy definitions whose exact contents authorize this attachment.
+        /// `None` means a legacy snapshot and retains the historical full-catalog
+        /// comparison. New snapshots list only the current/restore objects; an
+        /// empty list deliberately means this policy kind has no owned definition, so
+        /// unrelated policy additions cannot strand a valid inverse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_prefix_lists: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_route_maps: Option<Vec<String>>,
     },
     InterfaceAdmin {
         interface: String,
@@ -1098,6 +1107,8 @@ pub async fn verify_current(
                 route_map,
                 prefix_lists,
                 route_maps,
+                required_prefix_lists,
+                required_route_maps,
             } => {
                 let bgp = locked
                     .read(device_id, "show running-config | section ^router bgp")
@@ -1138,11 +1149,29 @@ pub async fn verify_current(
                     inventory.prefix_lists,
                     inventory.route_maps,
                 );
+                let required_lists_match = if let Some(required) = required_prefix_lists {
+                    required.iter().all(|name| {
+                        let expected = prefix_lists.iter().find(|item| item.name == *name);
+                        expected.is_some()
+                            && actual_lists.iter().find(|item| item.name == *name) == expected
+                    })
+                } else {
+                    actual_lists == *prefix_lists
+                };
+                let required_maps_match = if let Some(required) = required_route_maps {
+                    required.iter().all(|name| {
+                        let expected = route_maps.iter().find(|item| item.name == *name);
+                        expected.is_some()
+                            && actual_maps.iter().find(|item| item.name == *name) == expected
+                    })
+                } else {
+                    actual_maps == *route_maps
+                };
                 inventory.blockers.is_empty()
                     && actual_prefix == *prefix_list
                     && actual_map == *route_map
-                    && actual_lists == *prefix_lists
-                    && actual_maps == *route_maps
+                    && required_lists_match
+                    && required_maps_match
             }
             DeviceStateSnapshot::InterfaceAdmin {
                 interface,
@@ -1208,7 +1237,7 @@ pub async fn verify_snapshots_read_only(
     device_id: u64,
     expected: &[DeviceStateSnapshot],
 ) -> Result<bool> {
-    let mut port = ReadOnlySnapshotPort { pool: pool.clone() };
+    let mut port = ReadOnlySnapshotPort::new(pool.clone());
     verify_current(&mut port, device_id, expected).await
 }
 
@@ -1218,7 +1247,7 @@ pub async fn verify_sequence_read_only(
     pool: &MySqlPool,
     actions: &[PreparedDeviceAction],
 ) -> Result<bool> {
-    let mut port = ReadOnlySnapshotPort { pool: pool.clone() };
+    let mut port = ReadOnlySnapshotPort::new(pool.clone());
     verify_prepared_sequence(&mut port, actions).await
 }
 
@@ -1230,7 +1259,7 @@ pub async fn prepare_inverse_sequence_read_only(
     pool: &MySqlPool,
     actions: &mut [PreparedDeviceAction],
 ) -> Result<()> {
-    let mut port = ReadOnlySnapshotPort { pool: pool.clone() };
+    let mut port = ReadOnlySnapshotPort::new(pool.clone());
     reconcile_inverse_sequence(&mut port, actions).await
 }
 
@@ -1341,6 +1370,16 @@ async fn states_match_with_projection(
 
 struct ReadOnlySnapshotPort {
     pool: MySqlPool,
+    cache: BTreeMap<(u64, String), crate::ssh::CommandResult>,
+}
+
+impl ReadOnlySnapshotPort {
+    fn new(pool: MySqlPool) -> Self {
+        Self {
+            pool,
+            cache: BTreeMap::new(),
+        }
+    }
 }
 
 impl crate::ssh::LockedDeviceSetPort for ReadOnlySnapshotPort {
@@ -1354,13 +1393,19 @@ impl crate::ssh::LockedDeviceSetPort for ReadOnlySnapshotPort {
         command: &'a str,
     ) -> crate::ssh::BoxFuture<'a, Result<crate::ssh::CommandResult>> {
         Box::pin(async move {
+            let key = (device_id, command.to_string());
+            if let Some(result) = self.cache.get(&key) {
+                return Ok(result.clone());
+            }
             let outcome =
                 crate::ssh::run_commands(&self.pool, device_id, &[command.to_string()]).await?;
-            outcome
+            let result = outcome
                 .results
                 .into_iter()
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("device returned no result for {command:?}"))
+                .ok_or_else(|| anyhow::anyhow!("device returned no result for {command:?}"))?;
+            self.cache.insert(key, result.clone());
+            Ok(result)
         })
     }
 
@@ -1818,7 +1863,7 @@ async fn prepare_export_policy(
         (key.starts_with(&format!("{}:export_policy:{neighbor}:", input.device_id)))
             .then_some(state.clone())
     });
-    let before = if let Some(state) = projected_state {
+    let mut before = if let Some(state) = projected_state {
         state
     } else {
         let reads = reader
@@ -1886,6 +1931,8 @@ async fn prepare_export_policy(
             route_map,
             prefix_lists,
             route_maps,
+            required_prefix_lists: None,
+            required_route_maps: None,
         }
     };
     let (local_asn, family, current_prefix, current_map, prefix_lists, route_maps) = match &before {
@@ -1926,6 +1973,29 @@ async fn prepare_export_policy(
             current_map.clone(),
         ),
     };
+    let mut required_prefix_lists = [current_prefix.as_ref(), desired_prefix.as_ref()]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    required_prefix_lists.sort();
+    required_prefix_lists.dedup();
+    let mut required_route_maps = [current_map.as_ref(), desired_map.as_ref()]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    required_route_maps.sort();
+    required_route_maps.dedup();
+    if let DeviceStateSnapshot::ExportPolicyAttachment {
+        required_prefix_lists: before_required_lists,
+        required_route_maps: before_required_maps,
+        ..
+    } = &mut before
+    {
+        *before_required_lists = Some(required_prefix_lists.clone());
+        *before_required_maps = Some(required_route_maps.clone());
+    }
     let after = DeviceStateSnapshot::ExportPolicyAttachment {
         local_asn,
         neighbor: neighbor.clone(),
@@ -1934,6 +2004,8 @@ async fn prepare_export_policy(
         route_map: desired_map,
         prefix_lists: prefix_lists.clone(),
         route_maps: route_maps.clone(),
+        required_prefix_lists: Some(required_prefix_lists),
+        required_route_maps: Some(required_route_maps),
     };
     let effect = if before == after {
         PreparedEffect::AlreadySatisfied
@@ -3916,6 +3988,81 @@ mod tests {
         assert!(!verify_projected_after(&mut fake, &[action]).await.unwrap());
     }
 
+    #[tokio::test]
+    async fn export_policy_proof_ignores_unrelated_definitions_but_binds_owned_policies() {
+        use crate::reroute::policy::{NamedPrefixList, PermitDeny, PrefixListEntry};
+        let named = |name: &str, prefix: &str| NamedPrefixList {
+            name: name.into(),
+            entries: vec![
+                PrefixListEntry {
+                    sequence: 10,
+                    action: PermitDeny::Permit,
+                    prefix: prefix.into(),
+                    ge: None,
+                    le: None,
+                },
+                PrefixListEntry {
+                    sequence: 20,
+                    action: PermitDeny::Deny,
+                    prefix: "0.0.0.0/0".into(),
+                    ge: None,
+                    le: Some(32),
+                },
+            ],
+            referenced_by: vec![],
+        };
+        let expected = DeviceStateSnapshot::ExportPolicyAttachment {
+            local_asn: 34501,
+            neighbor: "192.0.2.9".into(),
+            address_family: "ipv4".into(),
+            prefix_list: Some("DESIRED".into()),
+            route_map: None,
+            prefix_lists: vec![
+                named("CURRENT", "198.51.100.0/24"),
+                named("DESIRED", "194.105.142.0/24"),
+            ],
+            route_maps: vec![],
+            required_prefix_lists: Some(vec!["CURRENT".into(), "DESIRED".into()]),
+            required_route_maps: Some(vec![]),
+        };
+        let bgp = "router bgp 34501\n address-family ipv4\n neighbor 192.0.2.9 activate\n neighbor 192.0.2.9 prefix-list DESIRED out\n exit-address-family";
+        let prefix_lists = "ip prefix-list CURRENT seq 10 permit 198.51.100.0/24\nip prefix-list CURRENT seq 20 deny 0.0.0.0/0 le 32\nip prefix-list DESIRED seq 10 permit 194.105.142.0/24\nip prefix-list DESIRED seq 20 deny 0.0.0.0/0 le 32\nip prefix-list UNRELATED seq 10 permit 203.0.113.0/24\nip prefix-list UNRELATED seq 20 deny 0.0.0.0/0 le 32";
+        let outputs = BTreeMap::from([
+            (
+                "show running-config | section ^router bgp".into(),
+                bgp.into(),
+            ),
+            (
+                "show running-config | section ^route-map".into(),
+                String::new(),
+            ),
+            (
+                "show running-config | section ^ip prefix-list".into(),
+                prefix_lists.into(),
+            ),
+        ]);
+        assert!(verify_current(
+            &mut FakeLocked {
+                outputs: outputs.clone(),
+            },
+            1,
+            std::slice::from_ref(&expected)
+        )
+        .await
+        .unwrap());
+
+        let mut changed = outputs;
+        changed.insert(
+            "show running-config | section ^ip prefix-list".into(),
+            prefix_lists.replace("194.105.142.0/24", "194.105.143.0/24"),
+        );
+        assert!(
+            !verify_current(&mut FakeLocked { outputs: changed }, 1, &[expected])
+                .await
+                .unwrap()
+        );
+    }
+
     #[test]
     fn export_attachment_commands_keep_the_proven_scope() {
         let af = export_attachment_commands(
@@ -3999,6 +4146,8 @@ mod tests {
             route_map: None,
             prefix_lists: lists.clone(),
             route_maps: vec![],
+            required_prefix_lists: None,
+            required_route_maps: None,
         };
         let action = PreparedDeviceAction {
             schema_version: 1,
@@ -4112,6 +4261,8 @@ mod tests {
             route_map: name.map(Into::into),
             prefix_lists: vec![],
             route_maps: vec![safe.clone()],
+            required_prefix_lists: None,
+            required_route_maps: None,
         };
         let action = PreparedDeviceAction {
             schema_version: 1,

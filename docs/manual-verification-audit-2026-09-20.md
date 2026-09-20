@@ -7,8 +7,9 @@ Prolexic test scheduled for 21 September 2026 at 08:00 Europe/Bucharest.
 
 The manual-run UI offers **Configuration only**. **Additional checks** is shown
 disabled for a future version. Configuration-only preview and execution are
-restricted to one enabled router with a pinned SSH identity and the currently approved
-`bgp_export_policy_set` and `iface_tcp_adjust_mss` actions. The preview shows the
+restricted to enabled routers with pinned SSH identities and the currently approved
+`bgp_export_policy_set` and `iface_tcp_adjust_mss` actions. Multi-router action sets
+validate every router independently. The preview shows the
 exact apply and inverse command lists. BGP advertisements are not verified.
 
 No router command sequence, soft-clear behavior, recovery rule, or migration is

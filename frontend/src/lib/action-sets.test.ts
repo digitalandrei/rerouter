@@ -72,9 +72,10 @@ describe("ordered action sets", () => {
 
   it("re-evaluates configuration-only eligibility from effective targets and templates", () => {
     const templates = [{ id: 1, name: "bgp_export_policy_set" }, { id: 2, name: "iface_tcp_adjust_mss" }] as never;
-    const capabilities = { configuration_test_device_ids: [3], configuration_test_templates: ["bgp_export_policy_set", "iface_tcp_adjust_mss"] };
+    const capabilities = { configuration_test_device_ids: [3, 4], configuration_test_templates: ["bgp_export_policy_set", "iface_tcp_adjust_mss"] };
     expect(configurationOnlyEligible([{ reroute_template_id: 1, device_id: 3, params: {} }, { reroute_template_id: 2, device_id: 3, params: {} }], templates, capabilities)).toBe(true);
-    expect(configurationOnlyEligible([{ reroute_template_id: 1, device_id: 4, params: {} }], templates, capabilities)).toBe(false);
+    expect(configurationOnlyEligible([{ reroute_template_id: 1, device_id: 3, params: {} }, { reroute_template_id: 2, device_id: 4, params: {} }], templates, capabilities)).toBe(true);
+    expect(configurationOnlyEligible([{ reroute_template_id: 1, device_id: 5, params: {} }], templates, capabilities)).toBe(false);
     expect(configurationOnlyEligible([{ reroute_template_id: 9, device_id: 3, params: {} }], templates, capabilities)).toBe(false);
   });
 
