@@ -627,7 +627,7 @@ export default function ManualReroute() {
           {(selectedPreset || canEdit || canRun) && <Card>
             <CardHeader><div className="flex flex-wrap items-start justify-between gap-3"><div>
               <CardTitle>{bundleId !== null ? bundle?.source?.preset_name ?? bundle?.source?.name ?? `Mitigation run #${bundleId}` : selectedPreset ? selectedPreset.name : runMode ? "Run once" : "New manual mitigation"}</CardTitle>
-              <CardDescription>{runMode ? "Run a temporary copy. Saved targets and parameters remain unchanged." : "Actions execute from top to bottom as one run."}</CardDescription>
+              <CardDescription>{runMode ? "Run a temporary copy. Saved targets and parameters remain unchanged." : "Review this saved mitigation, its configuration, and run history."}</CardDescription>
             </div>{selectedPreset && <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="tabular-nums">revision {selectedPreset.revision}</Badge>
               {presetInvalid && <Badge variant="destructive">{selectedPreset.definition_status === "draft" ? "draft" : "needs setup"}</Badge>}
@@ -646,6 +646,11 @@ export default function ManualReroute() {
                 </TabsList>
 
                 <TabsContent value="overview" className="mt-4 space-y-5">
+                  {!runMode && selectedPreset && <section className="min-w-0 space-y-1 rounded-md border border-border bg-muted/20 p-4" aria-labelledby="mitigation-description-heading">
+                    <h3 id="mitigation-description-heading" className="text-sm font-medium">Description</h3>
+                    <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{selectedPreset.description?.trim() || "No description provided."}</p>
+                    <p className="text-xs text-muted-foreground">Actions execute from top to bottom as one run.</p>
+                  </section>}
                   {runMode && <div className="space-y-4 rounded-md border border-border p-4">
                     {runLocked && <div role="status" className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"><strong>This mitigation already has an active run.</strong><p className="mt-1">Starting another run and changing temporary values are disabled until the active run is settled.</p><div className="mt-2 flex flex-wrap gap-2">{activePresetRuns.map((run) => <Button key={run.bundle_id} size="sm" variant="outline" asChild><Link to={`/mitigations?tab=active&run=${run.bundle_id}`}>Review run #{run.bundle_id}</Link></Button>)}</div></div>}
                     {bundleId === null && <section className="space-y-3" aria-labelledby="verification-heading"><div><h3 id="verification-heading" className="text-sm font-medium">Verification</h3><p className="mt-1 max-w-3xl text-xs text-muted-foreground">The preview reads current configuration and shows the exact configuration commands and inverse. Execution reads the resulting configuration back.</p></div>
@@ -667,14 +672,15 @@ export default function ManualReroute() {
                       {preview.operating_mode === "observe" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode disables automatic response. This one-use preview can authorize this explicit manual run after confirmation.</p>}
                     </div>}
                     {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
-                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
-                      <div className="space-y-3">
+                    <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end" data-testid="manual-run-actions">
+                      <div className="min-w-0 space-y-2">
                         {directStage && <ExecutionStartStatus kind="apply" stage={directStage} />}
-                        <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Review the exact commands, then apply the reviewed plan." : bundleId === null ? "The controller always reads current router configuration and calculates the exact commands first. Preview changes pauses for review; Run now prepares and starts the same exact plan." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
+                        <p className="max-w-3xl whitespace-pre-wrap break-words text-sm text-muted-foreground">{selectedPreset?.description?.trim() || bundle?.source?.preset_name || "No description provided."}</p>
+                        <p className="text-xs text-muted-foreground">{preview ? "Actions execute from top to bottom as one run. Review the exact commands, then apply the reviewed plan." : bundleId === null ? "Actions execute from top to bottom as one run." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
                       </div>
-                      <div className={`grid gap-2 ${preview ? "sm:grid-cols-[auto_22rem]" : "sm:grid-cols-[auto_11rem_11rem]"}`}>
-                        <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}#overview`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
-                        {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="outline" onClick={() => void preparePreview()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={busy && directStage === null} loadingLabel="Preparing exact preview…">Preview changes</Button>}
+                      <div className="flex min-w-0 flex-wrap justify-end gap-2">
+                        <Button className="w-full sm:w-auto" variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}#overview`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
+                        {!preview && bundleId === null && <Button className="w-full sm:w-64" variant="outline" onClick={() => void preparePreview()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || busy} loading={busy && directStage === null} loadingLabel="Preparing exact preview…">Preview changes</Button>}
                         {!preview && bundleId === null && <Button className="w-full sm:w-44" variant="destructive" onClick={() => void runNow()} disabled={runLocked || effectiveActions.length === 0 || presetInvalid || capabilitiesState !== "ready" || !configurationOnlyEligible || Boolean(cooldownUntil) || busy} loading={directStage !== null} loadingLabel={directStage === "starting" ? "Starting run…" : "Calculating changes…"}>Run now</Button>}
                         {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || capabilitiesState !== "ready" || !configurationOnlyEligible || Boolean(cooldownUntil)} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
                       </div>

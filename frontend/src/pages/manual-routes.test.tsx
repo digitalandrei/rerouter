@@ -101,6 +101,8 @@ it("defaults a run to Overview and preserves path and query while tabs update th
   render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
   const overview = await screen.findByRole("tab", { name: "Overview & run" });
   expect(overview.getAttribute("aria-selected")).toBe("true");
+  expect(screen.getByText("Reviewed set").className).toContain("break-words");
+  expect(screen.getByText("Actions execute from top to bottom as one run.")).toBeTruthy();
   expect(router.state.location.hash).toBe("");
   await user.click(screen.getByRole("tab", { name: "Configuration" }));
   expect(router.state.location.pathname).toBe("/manual-mitigations/4/run");
@@ -125,6 +127,8 @@ it("navigates list to URL-owned detail/edit and saves one deliberate draft", asy
   await user.click(await screen.findByRole("link", { name: "Details" }));
   await waitFor(() => expect(router.state.location.pathname).toBe("/manual-mitigations/4"));
   expect((await screen.findAllByText("Edge diversion")).length).toBeGreaterThan(0);
+  expect(await screen.findByRole("heading", { name: "Description" })).toBeTruthy();
+  expect(screen.getByText("Reviewed set").className).toContain("break-words");
   await user.click(screen.getByRole("link", { name: "Edit mitigation" }));
   const name = await screen.findByLabelText("Name");
   await user.clear(name); await user.type(name, "Edge diversion revised");
@@ -311,12 +315,14 @@ it("locks every run control while an exact preview is pending and keeps the acti
   await waitFor(() => expect(configurationOnly.checked).toBe(true));
   const additionalChecks = screen.getByRole("radio", { name: /^additional checks/i }) as HTMLInputElement;
   const previewButton = screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement;
-  expect(previewButton.className).toContain("sm:w-44");
+  expect(previewButton.className).toContain("sm:w-64");
+  const actionRow = screen.getByTestId("manual-run-actions");
+  expect(actionRow.className).toContain("xl:grid-cols-[minmax(0,1fr)_auto]");
   await user.click(previewButton);
 
   const preparing = await screen.findByRole("button", { name: "Preparing exact preview…" }) as HTMLButtonElement;
   expect(preparing).toBe(previewButton);
-  expect(preparing.className).toContain("sm:w-44");
+  expect(preparing.className).toContain("sm:w-64");
   for (const button of screen.getAllByRole("button")) expect((button as HTMLButtonElement).disabled).toBe(true);
   expect(configurationOnly.matches(":disabled")).toBe(true);
   expect(additionalChecks.matches(":disabled")).toBe(true);
