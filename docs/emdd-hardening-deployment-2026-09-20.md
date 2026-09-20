@@ -45,8 +45,9 @@ successfully restored eMA3 run 7; both are inactive, with no remaining mutation,
 device window, source membership, or open lock.
 
 The policy inventories were refreshed after the operator installed the reviewed
-single-prefix policies. `e-manuel-apply` is revision 5 and
-`e-manuel-apply-ema3-test` is revision 2; both validate Ready. Their Akamai
-actions select `rr-194105142-only`, their COLT actions select
-`rr-colt-without-194105142`, and their Po1 actions set MSS 1436. These definition
-updates created no execution plan or router run.
+single-prefix policies. `e-manuel-apply` is revision 6 and
+`e-manuel-apply-ema3-test` is revision 3; both validate Ready. Every Akamai action
+selects `rr-194105142-only`. eMA1 and eMA3 withdraw the attacked prefix from COLT
+with `no-export`; eMA2 uses `rr-colt-without-194105142` so
+`194.102.117.0/24` remains eligible there. Every Po1 action sets MSS 1436. These
+definition updates created no execution plan or router run.

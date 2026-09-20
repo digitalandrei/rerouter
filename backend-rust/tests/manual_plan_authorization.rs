@@ -274,7 +274,7 @@ async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
         api::manual_mitigations::admit_direct_apply_for_test(
             &state,
             &actor,
-            vec![action],
+            vec![action.clone()],
             json!({"kind":"manual","name":"Run once"}),
             "new activation during cooldown",
             &unique_token("direct-apply-cooldown"),
@@ -286,6 +286,32 @@ async fn direct_manual_apply_is_durable_and_idempotent_before_router_reads() {
     assert!(refused.to_string().contains("cooldown until"));
     sqlx::query("DELETE FROM cooldowns WHERE scope='device' AND scope_ref=?")
         .bind(device.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let history = sqlx::query("INSERT INTO reroutes(device_id,trigger_type,state,mutation_effect,started_at,finished_at) VALUES(?,'manual','succeeded','changed',UTC_TIMESTAMP(),UTC_TIMESTAMP())")
+        .bind(device)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let history_refusal = rerouter_controller::db::advisory::foreground_scope(
+        state.config.advisory_runtime(&state.pool).await.unwrap(),
+        api::manual_mitigations::admit_direct_apply_for_test(
+            &state,
+            &actor,
+            vec![action],
+            json!({"kind":"manual","name":"Run once"}),
+            "new activation during durable fallback cooldown",
+            &unique_token("direct-apply-history-cooldown"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(history_refusal.to_string().contains("cooldown until"));
+    sqlx::query("DELETE FROM reroutes WHERE id=?")
+        .bind(history)
         .execute(&state.pool)
         .await
         .unwrap();

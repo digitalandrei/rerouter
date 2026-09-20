@@ -41,6 +41,31 @@ impl PreparationReader for Ema3Snapshot {
     }
 }
 
+struct MixedColtSnapshot;
+impl PreparationReader for MixedColtSnapshot {
+    fn read_one<'a>(
+        &'a self,
+        _: u64,
+        _: &'a str,
+    ) -> rerouter_controller::ssh::BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async { anyhow::bail!("unexpected unbatched read") })
+    }
+    fn read_many<'a>(
+        &'a self,
+        _: u64,
+        commands: &'a [String],
+    ) -> rerouter_controller::ssh::BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        Box::pin(async move {
+            assert_eq!(commands.len(), 3);
+            Ok(vec![
+                "router bgp 34501\n neighbor 213.249.122.145 remote-as 3356\n address-family ipv4\n neighbor 213.249.122.145 activate\n neighbor 213.249.122.145 prefix-list pfx-to-viva out\n exit-address-family".into(),
+                String::new(),
+                "ip prefix-list pfx-to-viva seq 10 permit 194.105.142.0/24\nip prefix-list pfx-to-viva seq 20 deny 0.0.0.0/0 le 32\nip prefix-list rr-colt-without-194105142 seq 10 permit 194.102.117.0/24\nip prefix-list rr-colt-without-194105142 seq 20 deny 0.0.0.0/0 le 32".into(),
+            ])
+        })
+    }
+}
+
 #[tokio::test]
 async fn sanitized_ema3_snapshot_prepares_exact_additive_replacement() {
     let _serial = SERIAL.lock().await;
@@ -139,6 +164,64 @@ async fn sanitized_ema3_snapshot_prepares_exact_additive_replacement() {
         .execute(pool)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn mixed_colt_policy_swap_is_refused_with_its_action_number() {
+    let _serial = SERIAL.lock().await;
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let device = sqlx::query("INSERT INTO devices(name,hostname) VALUES(?,'192.0.2.243')")
+        .bind(format!("mixed-colt-fixture-{}", uuid::Uuid::new_v4()))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    sqlx::query("INSERT INTO device_bgp_peers(device_id,peer_remote_addr,last_polled_at) VALUES(?,'213.249.122.145',UTC_TIMESTAMP())")
+        .bind(device)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO routing_policy_snapshots(device_id,inventory_json,completeness,blockers_json,read_at) VALUES(?,?,'complete',JSON_ARRAY(),UTC_TIMESTAMP())")
+        .bind(device)
+        .bind(sqlx::types::Json(json!({"prefix_lists":[{"name":"rr-colt-without-194105142","entries":[]}],"route_maps":[]})))
+        .execute(pool)
+        .await
+        .unwrap();
+    let template_id: u64 =
+        sqlx::query_scalar("SELECT id FROM reroute_templates WHERE name='bgp_export_policy_set'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let template = rerouter_controller::reroute::templates::load(pool, template_id)
+        .await
+        .unwrap();
+    let mut actions = vec![BundleAction {
+        device_id: device,
+        template,
+        params: json!({"neighbor_ip":"213.249.122.145","policy_kind":"prefix_list","policy_name":"rr-colt-without-194105142"}),
+        reason: "mixed policy proof".into(),
+        position: 0,
+        auto_target: None,
+        auto_target_low_confidence: None,
+        prepared: None,
+        original_reroute_id: None,
+    }];
+    let error = preparation::inspect_actions_with_reader_for_mode(
+        pool,
+        &mut actions,
+        false,
+        &MixedColtSnapshot,
+        VerificationMode::ConfigurationOnly,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("action 1: export policy effect is mixed or cannot be proved"),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]

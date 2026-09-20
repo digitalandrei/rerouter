@@ -394,24 +394,23 @@ pub async fn capabilities(
 ) -> JsonResp {
     match eligible_configuration_test_device_ids(&state).await {
         Ok(ids) => {
-            let cooldown_rows = match sqlx::query_as::<_, (String, DateTime<Utc>)>(
-                "SELECT scope_ref,MAX(`until`) FROM cooldowns WHERE scope='device' AND `until`>UTC_TIMESTAMP() GROUP BY scope_ref",
-            )
-            .fetch_all(&state.pool)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    return err(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("configuration-only cooldowns unavailable: {error}"),
-                    )
+            let mut cooldowns = std::collections::BTreeMap::new();
+            for device_id in &ids {
+                match guard::manual_device_cooldown_until(&state.pool, &state.config, *device_id)
+                    .await
+                {
+                    Ok(Some(until)) => {
+                        cooldowns.insert(*device_id, until);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &format!("configuration-only cooldowns unavailable: {error}"),
+                        )
+                    }
                 }
-            };
-            let cooldowns = cooldown_rows
-                .into_iter()
-                .filter_map(|(device, until)| device.parse::<u64>().ok().map(|id| (id, until)))
-                .collect::<std::collections::BTreeMap<_, _>>();
+            }
             (
                 StatusCode::OK,
                 Json(json!({
@@ -430,6 +429,7 @@ pub async fn capabilities(
 
 async fn ensure_forward_devices_not_cooling(
     pool: &sqlx::MySqlPool,
+    cfg: &crate::config::Config,
     actions: &[BundleAction],
 ) -> anyhow::Result<()> {
     if actions
@@ -443,9 +443,7 @@ async fn ensure_forward_devices_not_cooling(
         .map(|action| action.device_id)
         .collect::<std::collections::BTreeSet<_>>();
     for device_id in devices {
-        if let Some(until) =
-            crate::detection::cooldown::active_until(pool, "device", &device_id.to_string()).await?
-        {
+        if let Some(until) = guard::manual_device_cooldown_until(pool, cfg, device_id).await? {
             anyhow::bail!(
                 "device {device_id} is in cooldown until {}",
                 until.to_rfc3339()
@@ -740,7 +738,7 @@ async fn admit_direct_apply(
                 return Ok(DirectAdmission { bundle_id, already_admitted: true });
             }
         }
-        ensure_forward_devices_not_cooling(&state.pool, &resolved.actions).await?;
+        ensure_forward_devices_not_cooling(&state.pool, &state.config, &resolved.actions).await?;
         let mut source = resolved.source.clone();
         canonicalize_source_timer(&mut source, resolved.revert_after_seconds);
         source["admission_kind"] = json!("direct");
@@ -1715,7 +1713,7 @@ async fn accept_plan_inner(
                 .is_some_and(|prepared| prepared.verification_mode == snapshot.verification_mode)),
         "execution snapshot contains a missing or mixed verification scope"
     );
-    ensure_forward_devices_not_cooling(&state.pool, &snapshot.actions).await?;
+    ensure_forward_devices_not_cooling(&state.pool, &state.config, &snapshot.actions).await?;
     for (action, prepared) in snapshot.actions.iter().zip(&snapshot.device_actions) {
         let owned = action
             .prepared

@@ -78,9 +78,15 @@ source memberships were released. Production deployment evidence is retained in
 `/root/rerouter-deployment-evidence/recovery-scope-repair-20260920`.
 
 The subsequent adversarial-review fixes passed the complete MariaDB software
-gate: strict formatting and Clippy, 232 Rust unit tests, every integration suite,
+gate: strict formatting and Clippy, 233 Rust unit tests, every integration suite,
 89 frontend tests, tooling checks, production frontend build, and embedded UI
 build. The MySQL 8.4 all-target run passed through the corrected lifecycle test;
 after the final multi-device rate-scope change, the affected Configuration-only,
 bundle-admission, and manual-plan suites passed again on MySQL 8.4. All database
 tests used the restricted task schemas and existing services.
+
+The final re-audit added a complete two-router Configuration-only fake execution,
+durable-history cooldown admission, lexical rate-lock ordering for device IDs 3
+and 10, and an explicit mixed export-policy refusal regression. The complete
+MariaDB gate and the affected MySQL 8.4 suites pass. No Cisco command is part of
+these software tests.

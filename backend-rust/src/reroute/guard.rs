@@ -34,6 +34,10 @@ struct ConfigurationRate {
     window: u64,
 }
 
+fn configuration_rate_lock_label(device_id: u64) -> String {
+    format!("20:reroute:rate-config-only:{device_id:020}")
+}
+
 async fn bundle_rate_scope(
     pool: &MySqlPool,
     cfg: &Config,
@@ -532,6 +536,26 @@ async fn effective_cooldown(
         .max())
 }
 
+/// Admission/UI cooldown view for a fresh operator activation. This deliberately
+/// uses the same explicit-row plus durable-history calculation as the executor,
+/// so a failed cooldown INSERT cannot make the earlier admission look available.
+pub(crate) async fn manual_device_cooldown_until(
+    pool: &MySqlPool,
+    cfg: &Config,
+    device_id: u64,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    effective_cooldown(
+        pool,
+        "device",
+        &device_id.to_string(),
+        device_id,
+        None,
+        cfg.safety.same_device_cooldown_seconds,
+        None,
+    )
+    .await
+}
+
 /// Admit a whole bundle against the global rate budget, ALL-OR-NOTHING.
 ///
 /// The budget is still spent per action — a 14-action bundle costs 14 — but it is
@@ -608,12 +632,9 @@ async fn admit_bundle_inner(
                     continue;
                 }
                 rate_guards.push(
-                    crate::db::advisory::acquire(&format!(
-                        "20:reroute:rate-config-only:{}",
-                        device.device_id
-                    ))
-                    .await
-                    .map_err(|e| BlockReason::GuardConnection(e.to_string()))?,
+                    crate::db::advisory::acquire(&configuration_rate_lock_label(device.device_id))
+                        .await
+                        .map_err(|e| BlockReason::GuardConnection(e.to_string()))?,
                 );
                 let already = scoped_recent_reroute_count(
                     &mut conn,
@@ -849,7 +870,7 @@ async fn reserve_and_persist_inner(
             (
                 device.limit,
                 device.window,
-                format!("20:reroute:rate-config-only:{}", device.device_id),
+                configuration_rate_lock_label(device.device_id),
                 Some(device.device_id),
             )
         }
@@ -1376,6 +1397,16 @@ mod tests {
             ..GateInputs::clear("manual")
         };
         assert!(decide(&i).is_ok());
+    }
+
+    #[test]
+    fn configuration_rate_lock_labels_follow_lexical_lock_order() {
+        let numeric = [3_u64, 10_u64]
+            .into_iter()
+            .map(configuration_rate_lock_label)
+            .collect::<Vec<_>>();
+        assert!(numeric.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(numeric[0].len(), numeric[1].len());
     }
 
     #[test]

@@ -18,6 +18,7 @@ use rerouter_controller::{
     },
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 const HOST: &str = "192.0.2.233";
@@ -185,6 +186,125 @@ impl SshExecutor for StatefulMssSsh {
                 state: self.state.clone(),
                 device: self.device,
                 fail_mss: self.fail_mss,
+            }) as Box<dyn LockedDeviceSetPort>)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MultiDeviceMssSsh {
+    states: Arc<Mutex<BTreeMap<u64, Option<u32>>>>,
+}
+
+struct MultiDeviceMssLocks {
+    states: Arc<Mutex<BTreeMap<u64, Option<u32>>>>,
+}
+
+impl LockedDeviceSetPort for MultiDeviceMssLocks {
+    fn device_ids(&self) -> Vec<u64> {
+        self.states.lock().unwrap().keys().copied().collect()
+    }
+
+    fn transport_identity(
+        &self,
+        device_id: u64,
+    ) -> anyhow::Result<device_plan::DeviceTransportIdentity> {
+        anyhow::ensure!(self.states.lock().unwrap().contains_key(&device_id));
+        Ok(device_plan::DeviceTransportIdentity {
+            host: HOST.into(),
+            port: 22,
+            pinned_host_fingerprint: PIN.into(),
+        })
+    }
+
+    fn read<'a>(
+        &'a mut self,
+        device_id: u64,
+        command: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<CommandResult>> {
+        Box::pin(async move {
+            let value = self
+                .states
+                .lock()
+                .unwrap()
+                .get(&device_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unknown fake device"))?;
+            let output = value
+                .map(|mss| format!("interface Port-channel1\n ip tcp adjust-mss {mss}"))
+                .unwrap_or_else(|| "interface Port-channel1".into());
+            Ok(CommandResult {
+                command: command.into(),
+                output,
+            })
+        })
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        device_id: u64,
+        commands: &'a [String],
+    ) -> BoxFuture<'a, anyhow::Result<SshOutcome>> {
+        Box::pin(async move {
+            for command in commands {
+                if let Some(value) = command.strip_prefix("ip tcp adjust-mss ") {
+                    self.states
+                        .lock()
+                        .unwrap()
+                        .insert(device_id, Some(value.parse()?));
+                } else if command == "no ip tcp adjust-mss" {
+                    self.states.lock().unwrap().insert(device_id, None);
+                }
+            }
+            Ok(SshOutcome {
+                results: commands
+                    .iter()
+                    .map(|command| CommandResult {
+                        command: command.clone(),
+                        output: String::new(),
+                    })
+                    .collect(),
+                fingerprint: PIN.into(),
+                pinned_now: false,
+            })
+        })
+    }
+
+    fn unlock_all(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SshExecutor for MultiDeviceMssSsh {
+    async fn apply(&self, _: u64, _: &[String]) -> anyhow::Result<SshOutcome> {
+        anyhow::bail!("unprepared apply")
+    }
+    async fn verify_read(&self, _: u64, _: &str) -> anyhow::Result<String> {
+        anyhow::bail!("unprepared verify")
+    }
+    async fn apply_resolved<'a>(
+        &'a self,
+        _: u64,
+        _: &'a str,
+        _: SessionResolver<'a>,
+    ) -> anyhow::Result<ResolvedApply> {
+        anyhow::bail!("unprepared resolver")
+    }
+    fn lock_devices<'a>(
+        &'a self,
+        ids: &'a [u64],
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn LockedDeviceSetPort>>> {
+        Box::pin(async move {
+            let expected = self
+                .states
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            anyhow::ensure!(ids == expected.as_slice());
+            Ok(Box::new(MultiDeviceMssLocks {
+                states: self.states.clone(),
             }) as Box<dyn LockedDeviceSetPort>)
         })
     }
@@ -414,6 +534,166 @@ async fn untimed_preview_accept_and_successful_fake_ssh_run_stays_active() {
 #[tokio::test]
 async fn terminal_persistence_failure_after_fake_write_is_never_reported_succeeded() {
     successful_fake_ssh_run_with_timer(None, true).await;
+}
+
+#[tokio::test]
+async fn two_router_configuration_only_bundle_executes_and_verifies_both_devices() {
+    let db = common::test_database().await;
+    let pool = db.pool();
+    let user = sqlx::query(
+        "INSERT INTO users(name,email,password) VALUES('two router fixture',?,'unused')",
+    )
+    .bind(format!("two-router-{}@example.test", uuid::Uuid::new_v4()))
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_id();
+    unsafe {
+        std::env::set_var(
+            "SECRETS_KEY",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+    };
+    let password = rerouter_controller::crypto::seal_str("fixture-password").unwrap();
+    let mut devices = Vec::new();
+    for ordinal in 1..=2 {
+        let device = sqlx::query("INSERT INTO devices(name,hostname,ssh_username,ssh_port,ssh_auth_method,ssh_password_encrypted,ssh_host_fingerprint,ssh_status,last_ssh_ok_at,ssh_reachable_since) VALUES(?,?,'fixture',22,'password',?,?,'reachable',UTC_TIMESTAMP(),DATE_SUB(UTC_TIMESTAMP(),INTERVAL 10 MINUTE))")
+            .bind(format!("two-router-{ordinal}-{}", uuid::Uuid::new_v4()))
+            .bind(HOST)
+            .bind(password.clone())
+            .bind(PIN)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_id();
+        rerouter_controller::reroute::reachability::stamp_ssh_ok(pool, device)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO device_interfaces(device_id,if_index,if_name,if_descr,last_seen_at) VALUES(?,1,'Po1','Port-channel1',UTC_TIMESTAMP())")
+            .bind(device)
+            .execute(pool)
+            .await
+            .unwrap();
+        devices.push(device);
+    }
+    let template_id: u64 =
+        sqlx::query_scalar("SELECT id FROM reroute_templates WHERE name='iface_tcp_adjust_mss'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let template = templates::load(pool, template_id).await.unwrap();
+    let inputs = devices
+        .iter()
+        .map(|device_id| device_plan::PrepareInput {
+            device_id: *device_id,
+            template_id,
+            template_name: template.name.clone(),
+            canonical_params: json!({"interface":"Port-channel1","mss":1436}),
+        })
+        .collect::<Vec<_>>();
+    let prepared = device_plan::prepare_actions_read_only_with_reader_for_mode(
+        pool,
+        &inputs,
+        &MssReader(None, "no-export"),
+        VerificationMode::ConfigurationOnly,
+    )
+    .await
+    .unwrap();
+    let actions = inputs
+        .iter()
+        .zip(prepared)
+        .enumerate()
+        .map(|(position, (input, prepared))| BundleAction {
+            device_id: input.device_id,
+            template: template.clone(),
+            params: input.canonical_params.clone(),
+            reason: "two-router execution proof".into(),
+            position: position as u32,
+            auto_target: None,
+            auto_target_low_confidence: None,
+            prepared: Some(prepared),
+            original_reroute_id: None,
+        })
+        .collect::<Vec<_>>();
+    let mut cfg = Config::default();
+    cfg.safety.same_device_cooldown_seconds = 0;
+    let state = api::AppState {
+        pool: pool.clone(),
+        config: cfg.clone(),
+        cookie_key: Key::from(&[44; 64]),
+    };
+    let (status, axum::Json(preview)) = manual_mitigations::preview_actions_with_reader_mode(
+        &state,
+        &actor(user),
+        "manual_mitigation",
+        None,
+        actions,
+        json!({"kind":"manual","name":"Two routers"}),
+        "two-router execution proof".into(),
+        json!({"actions":[],"verification_mode":"configuration_only"}),
+        None,
+        &MssReader(None, "no-export"),
+        VerificationMode::ConfigurationOnly,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{preview:?}");
+    let accepted = manual_mitigations::accept_plan(
+        &state,
+        &actor(user),
+        preview["plan_id"].as_u64().unwrap(),
+        preview["preview_token"].as_str().unwrap(),
+        "manual_mitigation",
+        None,
+    )
+    .await
+    .unwrap();
+    let snapshot: sqlx::types::Json<Value> =
+        sqlx::query_scalar("SELECT snapshot_json FROM execution_plans WHERE id=?")
+            .bind(accepted.plan_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let actions: Vec<BundleAction> = serde_json::from_value(snapshot.0["actions"].clone()).unwrap();
+    let states = Arc::new(Mutex::new(
+        devices
+            .iter()
+            .map(|device| (*device, None))
+            .collect::<BTreeMap<_, _>>(),
+    ));
+    let ssh = MultiDeviceMssSsh {
+        states: states.clone(),
+    };
+    let outcome = bundle::run_with_ssh(
+        pool,
+        &cfg,
+        bundle::BundleRun::manual(
+            accepted.bundle_id,
+            FailurePolicy::AbortAndCompensate,
+            None,
+            user,
+            ActorContext {
+                ip_address: "127.0.0.1".into(),
+                user_agent: "two-router-test".into(),
+            },
+        )
+        .with_authorization(Some(accepted.plan_id), format!("plan:{}", accepted.plan_id)),
+        actions,
+        &ssh,
+    )
+    .await;
+    assert_eq!(outcome.state, "succeeded", "{:?}", outcome.failure_reason);
+    assert!(states
+        .lock()
+        .unwrap()
+        .values()
+        .all(|mss| *mss == Some(1436)));
+    let completed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reroutes WHERE bundle_id=? AND state='succeeded'")
+            .bind(accepted.bundle_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, 2);
 }
 
 #[tokio::test]

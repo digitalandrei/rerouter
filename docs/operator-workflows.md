@@ -124,6 +124,12 @@ inspect the complete 16-action set, and confirm that Akamai receives only
 `194.105.142.0/24` while COLT retains `194.102.117.0/24` and excludes
 `194.105.142.0/24`. Until then, keep the draft blocked as Needs setup.
 
+For the reviewed manual definitions, eMA1 and eMA3 attach `no-export` to COLT
+because their baseline `pfx-to-viva` policy contains only the attacked prefix.
+eMA2 attaches `rr-colt-without-194105142` because its baseline also contains
+`194.102.117.0/24`, which must remain on COLT. Using that preserving policy on
+eMA1/eMA3 would be a mixed permit-set replacement and is deliberately refused.
+
 Configuration-only manual mitigations may span several routers. Every selected
 router must be enabled and have a pinned SSH identity, and every action must use
 one of the supported structured templates. The controller validates all routers
