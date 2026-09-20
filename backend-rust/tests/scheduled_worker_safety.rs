@@ -425,7 +425,7 @@ async fn direct_manual_recovery_continues_in_server_task_after_admission() {
 async fn startup_repairs_a_published_direct_recovery_as_proven_no_write() {
     let db = common::test_database().await;
     let pool = db.pool();
-    let (source, _) = source_fixture(pool).await;
+    let (source, device) = source_fixture(pool).await;
     let user = sqlx::query(
         "INSERT INTO users(name,email,password) VALUES('direct crash fixture',?,'unused')",
     )
@@ -474,6 +474,82 @@ async fn startup_repairs_a_published_direct_recovery_as_proven_no_write() {
     assert_eq!(repaired.1, "active");
     assert!(repaired.2.is_none());
     assert_eq!(repaired.3, "known_no_write");
+    let retained: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM device_change_window_sources WHERE device_id=? AND source_bundle_id=?), \
+                (SELECT COUNT(*) FROM device_change_windows WHERE device_id=?)",
+    )
+    .bind(device)
+    .bind(source)
+    .bind(device)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained,
+        (0, 0),
+        "a proven-no-write attempt restores the source's pre-claim ownership state"
+    );
+    let released_at: Option<chrono::NaiveDateTime> = sqlx::query_scalar(
+        "SELECT released_at FROM recovery_attempt_device_memberships \
+         WHERE recovery_bundle_id=? AND source_bundle_id=? AND device_id=?",
+    )
+    .bind(admission.bundle_id)
+    .bind(source)
+    .bind(device)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(released_at.is_some());
+
+    sqlx::query("INSERT INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)")
+        .bind(device)
+        .bind(source)
+        .execute(pool)
+        .await
+        .unwrap();
+    reroute::bundle::recover_on_startup(pool).await.unwrap();
+    let retained_after_repeat: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_change_window_sources WHERE device_id=? AND source_bundle_id=?",
+    )
+    .bind(device)
+    .bind(source)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_after_repeat, 1,
+        "idempotent startup repair must not remove ownership created after the settled attempt"
+    );
+    sqlx::query(
+        "DELETE FROM device_change_window_sources WHERE device_id=? AND source_bundle_id=?",
+    )
+    .bind(device)
+    .bind(source)
+    .execute(pool)
+    .await
+    .unwrap();
+    let fresh = sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,failure_policy,total_actions) VALUES('manual','planned','abort_and_compensate',1)")
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    let owner = format!("bundle:{fresh}");
+    reroute::locks::acquire_bundle_change_windows(pool, fresh, &owner, &[device])
+        .await
+        .unwrap();
+    reroute::locks::release_bundle_change_windows(pool, fresh, &owner)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM device_change_window_sources WHERE source_bundle_id=?")
+        .bind(fresh)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM reroute_bundles WHERE id=?")
+        .bind(fresh)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

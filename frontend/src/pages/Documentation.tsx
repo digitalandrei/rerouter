@@ -1005,7 +1005,7 @@ export default function Documentation() {
               <Steps>
                 <li>Open <AppLink to="/manual-mitigations">Manual Mitigations</AppLink>.</li>
                 <li>Create or select a named mitigation containing one or more ordered action templates and target routers.</li>
-                <li>Save the complete set, then choose Run once. Temporary router and parameter overrides do not change the saved mitigation.</li>
+                <li>Save the complete set, then open its Overview &amp; run tab and choose Run mitigation.</li>
                 <li>Enter a reason; it becomes part of the audit record and preview binding.</li>
                 <li>Preview the exact complete plan. Changing a field invalidates the preview.</li>
                 <li>Execute. Enforce mode consumes the one-use token and follows bundle progress until every action is terminal.</li>

@@ -18,6 +18,7 @@ it("does not report normal operation when rules fail and keeps tabs URL-owned", 
   const user = userEvent.setup();
   render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
   expect(await screen.findByText(/Detections are unavailable: rules offline/)).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "New manual mitigation" })).toBeNull();
   expect(screen.queryByText(/system is operating normally/i)).toBeNull();
   await user.click(screen.getByRole("tab", { name: "Alerts" }));
   expect(router.state.location.search).toContain("tab=alerts");

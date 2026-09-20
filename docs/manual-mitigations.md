@@ -118,6 +118,10 @@ exact remaining original IDs in one transaction. Execution then transfers all
 claimed device windows together. A separate device/source membership ledger
 retains every quarantine when several source activations touched the same
 device, so settling one root cannot unlock another root's mutation.
+Each recovery attempt also records whether it created a source/device membership
+or inherited one that already existed. A proven no-write child releases only the
+membership it created and marks that release once, so repeated startup repair
+cannot remove ownership established after the failed attempt.
 
 Successful changed and verified-no-op inverses permanently close their original
 and are never selected again. A recovery that provably made no write releases

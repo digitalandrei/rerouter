@@ -79,6 +79,7 @@ describe("RuleActionsDialog", () => {
     render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
     expect(await screen.findByRole("heading", { name: "Edge flood" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Run manually" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Manage mitigation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "View active run / revert" }).getAttribute("href")).toBe("/mitigations?tab=active&rule_id=9");
     await user.click(screen.getByRole("tab", { name: "Configuration" }));
     expect(router.state.location.pathname).toBe("/rules/9");

@@ -210,13 +210,31 @@ pub async fn claim_sources_for_child_on(
             .bind(child_id).bind(source_id).bind(token).execute(&mut **tx).await?;
     }
     for original_id in &ownership.original_reroute_ids {
-        sqlx::query(
-            "INSERT IGNORE INTO device_change_window_sources(device_id,source_bundle_id) \
-            SELECT device_id,bundle_id FROM reroutes WHERE id=? AND bundle_id IS NOT NULL",
+        let original: Option<(u64, Option<u64>)> = sqlx::query_as(
+            "SELECT device_id,bundle_id FROM reroutes WHERE id=? AND bundle_id IS NOT NULL",
         )
         .bind(original_id)
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await?;
+        if let Some((device_id, Some(source_id))) = original {
+            let inserted = sqlx::query(
+                "INSERT IGNORE INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)",
+            )
+            .bind(device_id)
+            .bind(source_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO recovery_attempt_device_memberships(recovery_bundle_id,source_bundle_id,device_id,created_by_attempt) \
+                 VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE created_by_attempt=GREATEST(created_by_attempt,VALUES(created_by_attempt))",
+            )
+            .bind(child_id)
+            .bind(source_id)
+            .bind(device_id)
+            .bind(inserted.rows_affected() == 1)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     Ok(ownership)
 }
@@ -648,6 +666,25 @@ pub async fn finalize_recovery_child(
                     sqlx::query("UPDATE reroute_bundles SET lifecycle_state=IF(remaining_mutations>0,'active','inactive'),recovery_claim_token=NULL,recovery_claimed_at=NULL,recovery_started_at=NULL,recovery_bundle_id=NULL,recovery_deadline=NULL,automatic_recovery_block_reason=? WHERE id=? AND recovery_claim_token=?")
                         .bind(reason.unwrap_or("recovery failed before any router write")).bind(source_id).bind(claim_token).execute(&mut *tx).await?;
                 }
+                sqlx::query(
+                    "DELETE membership FROM device_change_window_sources membership \
+                     JOIN recovery_attempt_device_memberships provenance \
+                       ON provenance.device_id=membership.device_id AND provenance.source_bundle_id=membership.source_bundle_id \
+                     WHERE provenance.recovery_bundle_id=? AND provenance.source_bundle_id=? \
+                       AND provenance.created_by_attempt=1 AND provenance.released_at IS NULL",
+                )
+                .bind(child_id)
+                .bind(source_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE recovery_attempt_device_memberships SET released_at=COALESCE(released_at,UTC_TIMESTAMP()) \
+                     WHERE recovery_bundle_id=? AND source_bundle_id=? AND created_by_attempt=1",
+                )
+                .bind(child_id)
+                .bind(source_id)
+                .execute(&mut *tx)
+                .await?;
             }
             _ => {
                 blocked += 1;
@@ -674,7 +711,9 @@ pub async fn finalize_recovery_child(
         sqlx::query("DELETE w FROM device_change_windows AS w WHERE NOT EXISTS(SELECT 1 FROM device_change_window_sources membership WHERE membership.device_id=w.device_id) AND (w.bundle_id=? OR (w.bundle_id IS NULL AND w.owner_token=CONCAT('quarantine:device:',w.device_id))) AND EXISTS(SELECT 1 FROM reroute_bundle_actions action WHERE action.bundle_id=? AND action.device_id=w.device_id)")
             .bind(child_id).bind(child_id).execute(&mut *tx).await?;
     } else if blocked == 0 {
-        sqlx::query("UPDATE device_change_windows SET bundle_id=NULL,reroute_id=NULL,owner_token=CONCAT('quarantine:device:',device_id),phase='prepared' WHERE bundle_id=? AND owner_token=?")
+        sqlx::query("UPDATE device_change_windows SET bundle_id=NULL,reroute_id=NULL,owner_token=CONCAT('quarantine:device:',device_id),phase='prepared' WHERE bundle_id=? AND owner_token=? AND EXISTS(SELECT 1 FROM device_change_window_sources membership WHERE membership.device_id=device_change_windows.device_id)")
+            .bind(child_id).bind(owner_token).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM device_change_windows WHERE bundle_id=? AND owner_token=? AND NOT EXISTS(SELECT 1 FROM device_change_window_sources membership WHERE membership.device_id=device_change_windows.device_id)")
             .bind(child_id).bind(owner_token).execute(&mut *tx).await?;
     } else {
         sqlx::query("UPDATE device_change_windows SET bundle_id=NULL,reroute_id=NULL,owner_token=CONCAT('quarantine:device:',device_id),phase='uncertain' WHERE bundle_id=?")

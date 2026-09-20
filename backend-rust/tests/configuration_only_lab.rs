@@ -518,6 +518,14 @@ async fn successful_fake_ssh_run_with_timer(
             actions, 1,
             "idempotent legacy replay must not duplicate actions"
         );
+        sqlx::query(
+            "UPDATE reroute_bundles SET recovery_deadline=NULL,lifecycle_state='active', \
+             automatic_recovery_cancelled_at=UTC_TIMESTAMP() WHERE id=?",
+        )
+        .bind(accepted.bundle_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
 

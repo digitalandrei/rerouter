@@ -41,6 +41,7 @@ it("shows the exact setup blocker in the mitigation list", async () => {
   render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
   expect(await screen.findByText("Action 16 needs setup")).toBeTruthy();
   expect(screen.getByText("needs setup")).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "Run once" })).toBeNull();
 });
 
 it("renders every active run for a saved mitigation with an exact selection link", async () => {
@@ -137,7 +138,7 @@ it("navigates list to URL-owned detail/edit and saves one deliberate draft", asy
   await waitFor(() => expect(router.state.location.pathname).toBe("/manual-mitigations/4"));
 });
 
-it("never lets a late detail response overwrite new or run-once routes", async () => {
+it("never lets a late detail response overwrite a new mitigation route", async () => {
   vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "edit_rules", "trigger_manual_reroute"] });
   vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([saved]);
   let resolveOld!: (value: MitigationPreset) => void;
@@ -153,8 +154,8 @@ it("never lets a late detail response overwrite new or run-once routes", async (
   const name = await screen.findByLabelText("Name"); expect((name as HTMLInputElement).value).toBe("");
   await user.type(name, "Fresh draft"); await user.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() => expect(create).toHaveBeenCalled()); expect(update).not.toHaveBeenCalled();
-  await router.navigate("/manual-mitigations/new?run=once");
-  expect(await screen.findByText("Run once")).toBeTruthy();
+  await router.navigate("/manual-mitigations/new");
+  expect(await screen.findByText("New manual mitigation")).toBeTruthy();
   expect(screen.queryByDisplayValue("Edge diversion")).toBeNull();
 });
 

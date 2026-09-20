@@ -1267,6 +1267,12 @@ async fn multi_source_claim_records_shared_device_membership_and_never_repeats_s
         originals.push(original);
     }
     originals.sort_unstable_by(|a, b| b.cmp(a));
+    sqlx::query("INSERT INTO device_change_window_sources(device_id,source_bundle_id) VALUES(?,?)")
+        .bind(device)
+        .bind(sources[0])
+        .execute(&pool)
+        .await
+        .unwrap();
     let child=sqlx::query("INSERT INTO reroute_bundles(trigger_type,state,total_actions) VALUES('automatic','planned',2)")
         .execute(&pool).await.unwrap().last_insert_id();
     let mut tx = pool.begin().await.unwrap();
@@ -1290,10 +1296,22 @@ async fn multi_source_claim_records_shared_device_membership_and_never_repeats_s
             .fetch_one(&pool)
             .await
             .unwrap();
+    let attempt_memberships: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_attempt_device_memberships \
+         WHERE recovery_bundle_id=? AND created_by_attempt=1",
+    )
+    .bind(child)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(mappings, 2);
     assert_eq!(
         memberships, 2,
         "one device must retain both source quarantines"
+    );
+    assert_eq!(
+        attempt_memberships, 1,
+        "the recovery records only the membership absent before its claim"
     );
 
     let restored = originals[0];
@@ -1358,9 +1376,11 @@ async fn multi_source_claim_records_shared_device_membership_and_never_repeats_s
     .fetch_all(&pool)
     .await
     .unwrap();
+    let known_no_write_source = *sources.iter().find(|id| **id != restored_source).unwrap();
     assert_eq!(
         retained_memberships,
-        vec![*sources.iter().find(|id| **id != restored_source).unwrap()]
+        vec![known_no_write_source],
+        "the restored source releases normally while the proven-no-write source retains ownership it held before this attempt"
     );
 }
 

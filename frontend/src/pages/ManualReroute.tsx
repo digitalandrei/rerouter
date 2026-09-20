@@ -298,7 +298,7 @@ export default function ManualReroute() {
 
   useEffect(() => {
     if (location.pathname.endsWith("/new")) startNew();
-    if (routeRunMode || searchParams.get("run") === "once") setRunMode(true);
+    if (routeRunMode) setRunMode(true);
   }, [location.pathname, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -589,7 +589,7 @@ export default function ManualReroute() {
   const shownPresets = presets.filter((preset) => `${preset.name} ${preset.description ?? ""}`.toLowerCase().includes(search.trim().toLowerCase()));
 
   if (listMode) return <div className="space-y-6">
-    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1><p className="mt-1 text-sm text-muted-foreground">Saved ordered action sets. Archiving a definition never reverts an active run.</p></div><div className="flex gap-2">{canRun && <Button variant="outline" asChild><Link to="/manual-mitigations/new?run=once#configuration"><Play className="size-4" /> Run once</Link></Button>}{canEdit && <Button asChild><Link to="/manual-mitigations/new#configuration"><Plus className="size-4" /> Add</Link></Button>}</div></div>
+    <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1><p className="mt-1 text-sm text-muted-foreground">Saved ordered action sets. Archiving a definition never reverts an active run.</p></div>{canEdit && <Button asChild><Link to="/manual-mitigations/new#configuration"><Plus className="size-4" /> Add</Link></Button>}</div>
     <Input aria-label="Search manual mitigations" placeholder="Search by name or description…" value={search} onChange={(event) => setSearch(event.target.value)} />
     {loadError && <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{loadError} <AsyncRetryButton onRetry={load} /></div>}
     <div className="overflow-x-auto rounded-md border"><table className="w-full text-sm"><thead className="bg-muted/50 text-left"><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">Readiness</th><th className="px-3 py-2">Routers</th><th className="px-3 py-2">Steps</th><th className="px-3 py-2">Active runs</th><th className="px-3 py-2">Last result</th><th className="px-3 py-2 text-right">Actions</th></tr></thead><tbody>{shownPresets.map((preset) => { const status = readiness(preset); const activeCount = activeByPreset[preset.id] ?? 0; const locked = activeCount > 0; return <tr key={preset.id} className="border-t"><td className="px-3 py-3"><Link className="font-medium hover:underline" to={`/manual-mitigations/${preset.id}`}>{preset.name}</Link><p className="max-w-xl truncate text-xs text-muted-foreground">{preset.description || "No description"}</p></td><td className="max-w-80 px-3 py-3"><Badge variant={status === "ready" ? "outline" : status === "needs_setup" ? "destructive" : "secondary"} title={preset.validation_error ?? undefined}>{status.replace("_", " ")}</Badge>{status === "needs_setup" && preset.validation_error && <p className="mt-1 break-words text-xs text-destructive">{preset.validation_error}</p>}</td><td className="px-3 py-3">{new Set(preset.actions.map((action) => action.device_id)).size}</td><td className="px-3 py-3 tabular-nums">{preset.actions.length}</td><td className="px-3 py-3 tabular-nums">{activeCount}</td><td className="px-3 py-3">{preset.recent_runs?.[0]?.state ?? "Never run"}</td><td className="px-3 py-3"><div className="flex justify-end gap-1">
@@ -612,7 +612,6 @@ export default function ManualReroute() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => { if (!dirty || window.confirm("Discard unsaved changes and reload?")) void refreshPage(); }} disabled={busy} loading={refreshing} loadingLabel="Refreshing…"><RefreshCw className="size-4" /> Refresh</Button>
-          {canRun && <Button variant="outline" size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new?run=once#configuration" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Play className="size-4" /> Run once</Link></Button>}
           {canEdit && <Button size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new#configuration" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Plus className="size-4" /> New mitigation</Link></Button>}
         </div>
       </div>

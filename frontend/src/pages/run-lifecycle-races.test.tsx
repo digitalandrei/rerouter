@@ -23,7 +23,7 @@ it("keeps a 150-run refresh to one list request and selected detail only", async
   await screen.findByText("Page 1 of 6");
   expect(list).toHaveBeenCalledTimes(1); expect(list).toHaveBeenCalledWith(expect.objectContaining({page:1,per_page:25})); expect(get).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button",{name:"Review run 1"}));
-  await screen.findByRole("dialog"); expect(get.mock.calls.length).toBeLessThanOrEqual(2);
+  await screen.findByRole("heading", { name: "Mitigation run #1" }); expect(get.mock.calls.length).toBeLessThanOrEqual(2);
 });
 
 it("coalesces periodic refreshes while a slow same-filter batch is in flight", async () => {
@@ -196,9 +196,9 @@ it("does not reopen a closed run when a polling response arrives late", async ()
   const user = userEvent.setup(); render(<AuthProvider><MemoryRouter><ActiveRunsTab /></MemoryRouter></AuthProvider>);
   await user.click(await screen.findByRole("button", { name: "Review run 7" }));
   polls.forEach((poll) => poll()); await vi.waitFor(() => expect(resolveSelected).toBeTypeOf("function"));
-  const closeButtons = await screen.findAllByRole("button", { name: "Close" }); await user.click(closeButtons.find((button) => button.textContent === "Close")!);
+  await user.click(await screen.findByRole("button", { name: "Back to active runs" }));
   resolveSelected(run); await new Promise((resolve) => setTimeout(resolve, 0)); polls.forEach((poll) => poll()); await new Promise((resolve) => setTimeout(resolve, 0));
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(screen.queryByRole("heading", { name: "Mitigation run #7" })).toBeNull());
 });
 
 it("refreshes an open run after it leaves the active list", async () => {
@@ -223,7 +223,7 @@ it("retains selected evidence and warns when its independent refresh fails", asy
   await user.click(await screen.findByRole("button", { name: "Review run 7" }));
   polls.forEach((poll) => poll());
   expect(await screen.findByText(/Selected run could not be refreshed/i)).toBeTruthy();
-  expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Mitigation run #7" })).toBeTruthy();
 });
 
 it("shows recovery child progress instead of original apply progress through completion", async () => {

@@ -126,7 +126,7 @@ def main():
             run_migrator(baseline, environment, fixture)
             run_migrator(current, environment)
     assert_equal(command, environment, "SELECT COUNT(*) FROM _sqlx_migrations WHERE success=1", expected_current, "dynamic migration manifest")
-    for table in ("recovery_attempt_sources", "device_change_window_sources", "flow_bucket_quality", "flow_publication_barrier"):
+    for table in ("recovery_attempt_sources", "recovery_attempt_device_memberships", "device_change_window_sources", "flow_bucket_quality", "flow_publication_barrier"):
         assert_equal(command, environment, f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='{table}'", 1, f"current table {table}")
     if args.mode != "fresh":
         verify_common(command, environment)

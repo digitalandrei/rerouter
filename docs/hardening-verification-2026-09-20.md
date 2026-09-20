@@ -90,3 +90,14 @@ durable-history cooldown admission, lexical rate-lock ordering for device IDs 3
 and 10, and an explicit mixed export-policy refusal regression. The complete
 MariaDB gate and the affected MySQL 8.4 suites pass. No Cisco command is part of
 these software tests.
+
+The 21 September follow-up adds recovery-attempt membership provenance as
+migration 77. A proven no-write child now returns only the source/device
+membership it created to its pre-claim state, releases an empty child window,
+and records the release so repeated startup repair cannot remove later
+ownership. Fresh installation and baseline-69 upgrade passed on MySQL 8.4; the
+complete MariaDB release gate and affected recovery/lifecycle suites passed.
+The same release renders Active Run/revert as a URL-owned page, removes the
+redundant rule action shortcut, and removes unsaved Run once and the manual-
+mitigation shortcut from the operational Mitigations page. No router command or
+mitigation was run by this verification.
