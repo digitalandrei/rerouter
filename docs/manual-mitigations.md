@@ -38,6 +38,12 @@ state, typed verification requirements, device host/port/pinned identity, and
 the exact inverse. A failed sibling refuses the whole set; there is no silent
 skip or best-effort execution policy.
 
+For a manual run, **Configuration only** is the first and default verification
+scope when every effective action and target is eligible for the configured lab
+scope; other sets use **Routing verification**. Starting an exact preview locks
+the page controls until the request settles, so its action set, scope, reason,
+and recovery schedule cannot change beneath the in-flight request.
+
 A five-minute, one-use preview credential binds the operator, reason, source
 revision, ordered actions, and exact prepared snapshot. Confirmation creates a
 durable execution identity before handing work to the background runner.

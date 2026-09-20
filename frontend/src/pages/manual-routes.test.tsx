@@ -208,7 +208,9 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   const preview = vi.spyOn(api.manualMitigations, "preview").mockResolvedValue({ plan_id: 8, preview_token: "token", results: [], operating_mode: "observe", verification_mode: "routing", routing_verified: false });
   const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
   const user = userEvent.setup(); render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
-  await user.click(await screen.findByRole("radio", { name: /^configuration only/i }));
+  const configurationOnly = await screen.findByRole("radio", { name: /^configuration only/i }) as HTMLInputElement;
+  await waitFor(() => expect(configurationOnly.checked).toBe(true));
+  expect(screen.getAllByRole("radio")[0]).toBe(configurationOnly);
   expect(screen.getByText(/does not verify advertised routes or the routing outcome/i)).toBeTruthy();
   const schedule = screen.getByRole("combobox", { name: /revert schedule/i }) as HTMLSelectElement;
   expect(schedule.disabled).toBe(true);
@@ -227,4 +229,44 @@ it("sends an explicit configuration-only scope without a deadline and rejects a 
   await user.selectOptions(screen.getByLabelText("Target router"), "4");
   await waitFor(() => expect((screen.getByRole("radio", { name: /^routing verification/i }) as HTMLInputElement).checked).toBe(true));
   expect(screen.queryByText(/router configuration will change; BGP advertisement is not verified/i)).toBeNull();
+});
+
+it("locks every run control while an exact preview is pending and keeps the action in one layout slot", async () => {
+  const labTemplate = { ...editableTemplate, id: 20, name: "iface_tcp_adjust_mss", display_name: "Set MSS", parameter_schema: { interface: { type: "string", label: "Interface" }, mss: { type: "integer", label: "MSS" } } };
+  const labPreset: MitigationPreset = { ...saved, definition_status: "ready", validation_status: "valid", actions: [{ reroute_template_id: 20, template_name: labTemplate.name, device_id: 3, device_name: "Lab router", params: { interface: "Bundle-Ether3", mss: "1436" }, enabled: true }] };
+  vi.spyOn(api.auth, "me").mockResolvedValue({ id: 1, email: "operator@example.test", name: "Operator", roles: ["operator"], permissions: ["view_asset", "trigger_manual_reroute"] });
+  vi.spyOn(api.mitigationPresets, "list").mockResolvedValue([labPreset]);
+  vi.spyOn(api.mitigationPresets, "get").mockResolvedValue(labPreset);
+  vi.spyOn(api.templates, "list").mockResolvedValue([labTemplate]);
+  vi.spyOn(api.devices, "list").mockResolvedValue([{ id: 3, name: "Lab router" }] as never);
+  vi.spyOn(api.manualMitigations, "capabilities").mockResolvedValue({ configuration_test_device_ids: [3], configuration_test_templates: [labTemplate.name] });
+  const inspect = vi.spyOn(api.actionSets, "inspect");
+  let resolvePreview!: (value: Awaited<ReturnType<typeof api.manualMitigations.preview>>) => void;
+  const preview = vi.spyOn(api.manualMitigations, "preview").mockImplementation(() => new Promise((resolve) => { resolvePreview = resolve; }));
+  const router = createMemoryRouter([{ path: "/manual-mitigations/:id/run", element: <ManualReroute /> }], { initialEntries: ["/manual-mitigations/4/run"] });
+  const user = userEvent.setup();
+  render(<AuthProvider><RouterProvider router={router} /></AuthProvider>);
+
+  const configurationOnly = await screen.findByRole("radio", { name: /^configuration only/i }) as HTMLInputElement;
+  await waitFor(() => expect(configurationOnly.checked).toBe(true));
+  const routing = screen.getByRole("radio", { name: /^routing verification/i }) as HTMLInputElement;
+  const previewButton = screen.getByRole("button", { name: "Preview changes" }) as HTMLButtonElement;
+  expect(previewButton.className).toContain("sm:w-[22rem]");
+  await user.click(previewButton);
+
+  const preparing = await screen.findByRole("button", { name: "Preparing exact preview…" }) as HTMLButtonElement;
+  expect(preparing).toBe(previewButton);
+  expect(preparing.className).toContain("sm:w-[22rem]");
+  for (const button of screen.getAllByRole("button")) expect((button as HTMLButtonElement).disabled).toBe(true);
+  expect(configurationOnly.matches(":disabled")).toBe(true);
+  expect(routing.matches(":disabled")).toBe(true);
+  expect((screen.getByRole("combobox", { name: /revert schedule/i }) as HTMLSelectElement).matches(":disabled")).toBe(true);
+  await user.click(routing);
+  await user.click(screen.getByRole("button", { name: "Inspect" }));
+  expect(configurationOnly.checked).toBe(true);
+  expect(inspect).not.toHaveBeenCalled();
+  expect(preview).toHaveBeenCalledTimes(1);
+
+  resolvePreview({ plan_id: 8, preview_token: "token", results: [], operating_mode: "observe", verification_mode: "configuration_only", routing_verified: false });
+  expect(await screen.findByRole("button", { name: "Apply reviewed changes" })).toBeTruthy();
 });

@@ -46,9 +46,10 @@ action_rate_limit_window_seconds = 600
 The current database identity must match the device id, host, port, and pinned
 fingerprint at capability lookup, preview, confirmation, and execution. A run
 may target one approved device and may use only `bgp_export_policy_set` and
-`iface_tcp_adjust_mss` actions. Select **Configuration only** for that run,
-review the exact projection and commands, and confirm the short-lived preview
-token normally.
+`iface_tcp_adjust_mss` actions. The manual-run page lists **Configuration only**
+first and selects it by default when every effective action is eligible. An
+ineligible set falls back to **Routing verification**. Review the exact
+projection and commands, and confirm the short-lived preview token normally.
 
 This mode proves the exact configuration before and after each action. An Idle
 BGP peer is allowed because advertised-route and Established-state evidence is
@@ -61,6 +62,17 @@ path. Use the explicit manual **Revert** workflow; its fresh preview inherits th
 persisted configuration-only scope and restores owned changes in reverse order.
 Immediate compensation after a failed manual run inherits the same scope. Older
 stored snapshots with no `verification_mode` deserialize as `routing`.
+
+**Routing verification** repeats the exact prepared configuration read-back and
+adds the typed operational evidence relevant to each action: route resolution
+and next hop, BGP route or advertised-prefix presence, expected community,
+neighbor state, or interface state. The controller holds the native device lock
+and retries ordinary IOS convergence for up to 30 seconds. Empty, malformed,
+unsupported, wrong-object, and mismatched responses cannot produce success. If
+commands may have run but this proof is unavailable, the action is uncertain
+and keeps its ownership quarantine. This evidence proves the enrolled ASR's
+local state only; it does not prove that a remote peer accepted the update or
+that the route propagated beyond that peer.
 
 ## Recovery
 

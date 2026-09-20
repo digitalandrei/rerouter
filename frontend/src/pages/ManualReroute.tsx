@@ -95,7 +95,7 @@ export default function ManualReroute() {
   const [reason, setReason] = useState("");
   const [revertAfter, setRevertAfter] = useState("");
   const [preview, setPreview] = useState<ManualMitigationPreview | null>(null);
-  const [verificationMode, setVerificationMode] = useState<VerificationMode>("routing");
+  const [verificationMode, setVerificationMode] = useState<VerificationMode>("configuration_only");
   const [capabilities, setCapabilities] = useState<ManualMitigationCapabilities>({ configuration_test_device_ids: [], configuration_test_templates: [] });
   const [capabilitiesState, setCapabilitiesState] = useState<"loading" | "ready" | "error">("loading");
   const [bundleId, setBundleId] = useState<number | null>(initialBundleId);
@@ -106,6 +106,7 @@ export default function ManualReroute() {
   const requestGeneration = useRef(0);
   const loadGeneration = useRef(0);
   const allowNavigation = useRef(false);
+  const verificationModeSelected = useRef(false);
 
   const selectedPreset = presets.find((preset) => preset.id === selectedId) ?? null;
   const activePresetRuns = selectedPreset?.active_runs ?? selectedPreset?.recent_runs?.filter((run) => run.active || (run.lifecycle_state && run.lifecycle_state !== "inactive") || (run.remaining_changes ?? run.remaining_mutations ?? 0) > 0 || (run.unknown_effects ?? 0) > 0) ?? [];
@@ -152,6 +153,9 @@ export default function ManualReroute() {
     setOverrides({});
     setRunMode(false);
     setReason("");
+    setRevertAfter("");
+    verificationModeSelected.current = false;
+    setVerificationMode("configuration_only");
     invalidatePreview();
   }
 
@@ -165,6 +169,9 @@ export default function ManualReroute() {
     setOverrides({});
     setRunMode(false);
     setReason("");
+    setRevertAfter("");
+    verificationModeSelected.current = false;
+    setVerificationMode("configuration_only");
     invalidatePreview();
   }
 
@@ -246,11 +253,21 @@ export default function ManualReroute() {
   useEffect(() => { if (blocker.state === "blocked") { if (window.confirm("Discard unsaved changes?")) blocker.proceed(); else blocker.reset(); } }, [blocker]);
 
   useEffect(() => {
-    if (capabilitiesState === "ready" && verificationMode === "configuration_only" && !configurationOnlyEligible) {
+    if (capabilitiesState !== "ready") return;
+    if (!verificationModeSelected.current) {
+      const defaultMode: VerificationMode = configurationOnlyEligible ? "configuration_only" : "routing";
+      if (verificationMode !== defaultMode) {
+        setVerificationMode(defaultMode);
+        setRevertAfter("");
+        invalidatePreview();
+      }
+      return;
+    }
+    if (verificationMode === "configuration_only" && !configurationOnlyEligible) {
       setVerificationMode("routing");
       setRevertAfter("");
       invalidatePreview();
-      toast.error("Configuration-only test was cleared because the effective actions are no longer eligible for the EMA3 lab target.");
+      toast.error("Configuration only was cleared because the effective actions are no longer eligible for that scope.");
     }
   }, [configurationOnlyEligible, verificationMode, capabilitiesState]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -469,7 +486,7 @@ export default function ManualReroute() {
   </div>;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" aria-busy={busy || undefined}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Manual mitigations</h1>
@@ -479,8 +496,8 @@ export default function ManualReroute() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => { if (!dirty || window.confirm("Discard unsaved changes and reload?")) void refreshPage(); }} disabled={busy} loading={refreshing} loadingLabel="Refreshing…"><RefreshCw className="size-4" /> Refresh</Button>
-          {canRun && <Button variant="outline" size="sm" asChild><Link to="/manual-mitigations/new?run=once"><Play className="size-4" /> Run once</Link></Button>}
-          {canEdit && <Button size="sm" asChild><Link to="/manual-mitigations/new"><Plus className="size-4" /> New mitigation</Link></Button>}
+          {canRun && <Button variant="outline" size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new?run=once" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Play className="size-4" /> Run once</Link></Button>}
+          {canEdit && <Button size="sm" asChild className={busy ? "pointer-events-none opacity-50" : undefined}><Link to="/manual-mitigations/new" aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => { if (busy) event.preventDefault(); }}><Plus className="size-4" /> New mitigation</Link></Button>}
         </div>
       </div>
 
@@ -501,7 +518,7 @@ export default function ManualReroute() {
               {!presetInvalid && presetNeedsPreview && <Badge variant="outline">validation on preview</Badge>}
               {!runMode && !editorMode && canEdit && <Button size="sm" asChild><Link to={`/manual-mitigations/${selectedPreset.id}/edit`}>Edit mitigation</Link></Button>}
             </div>}</div></CardHeader>
-            <CardContent className="space-y-5">
+            <CardContent className="space-y-5"><fieldset className="contents" disabled={busy}>
               {presetInvalid && <div className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive" role="alert">
                 <p className="font-medium">{selectedPreset?.definition_status === "draft" ? "Draft — add and configure every step before running." : "Needs setup — the complete action set is blocked."}</p>
                 <p className="mt-1 break-words">{selectedPreset?.validation_error ?? "One or more steps are incomplete. All saved steps remain visible; none will be silently omitted."}</p>
@@ -557,7 +574,7 @@ export default function ManualReroute() {
                 </div>
               </div>}
 
-              {bundleId === null && <ActionsAndRevert actions={runMode ? effectiveActions : actions} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} />}
+              {bundleId === null && <ActionsAndRevert actions={runMode ? effectiveActions : actions} deviceNames={Object.fromEntries(devices.map((device) => [device.id, device.name]))} disabled={busy} />}
               {!runMode ? <div className="flex flex-wrap justify-between gap-2 border-t border-border pt-4"><div>
                 {selectedPreset && editorMode && canEdit && <Button variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setDeleteOpen(true)} disabled={busy}><Archive className="size-4" /> Archive</Button>}
               </div><div className="flex flex-wrap gap-2">
@@ -567,8 +584,8 @@ export default function ManualReroute() {
                 {editorMode && canEdit && <Button onClick={() => void save()} disabled={!name.trim()} loading={busy} loadingLabel="Saving…"><Save className="size-4" /> Save</Button>}
               </div></div> : <div className="space-y-4 border-t border-border pt-4">
                 {bundleId === null && <fieldset className="space-y-3"><legend className="text-sm font-medium">Verification scope</legend>
-                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "routing"} onChange={() => { setVerificationMode("routing"); invalidatePreview(); }} /><span><strong>Routing verification</strong><span className="block max-w-3xl text-xs text-muted-foreground">Apply the reviewed configuration, then read the relevant operational routing or BGP state. The run succeeds only when the intended routing outcome is confirmed.</span></span></label>
-                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "configuration_only"} disabled={capabilitiesState !== "ready" || !configurationOnlyEligible} onChange={() => { setVerificationMode("configuration_only"); setRevertAfter(""); invalidatePreview(); }} /><span><strong>Configuration only</strong><span className="block max-w-3xl text-xs text-muted-foreground">Apply and read back the reviewed configuration on a configured lab router. This does not verify advertised routes or the routing outcome.</span>{!configurationOnlyEligible && <span className="block text-xs text-muted-foreground">Available when every enabled action targets an eligible lab router and uses an approved template.</span>}</span></label>
+                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "configuration_only"} disabled={busy || capabilitiesState !== "ready" || !configurationOnlyEligible} onChange={() => { verificationModeSelected.current = true; setVerificationMode("configuration_only"); setRevertAfter(""); invalidatePreview(); }} /><span><strong>Configuration only</strong><span className="block max-w-3xl text-xs text-muted-foreground">Apply and read back the reviewed configuration on a configured lab router. This does not verify advertised routes or the routing outcome.</span>{!configurationOnlyEligible && <span className="block text-xs text-muted-foreground">Available when every enabled action targets an eligible lab router and uses an approved template.</span>}</span></label>
+                  <label className="flex items-start gap-2 text-sm"><input className="mt-1" type="radio" name="verification-mode" checked={verificationMode === "routing"} disabled={busy} onChange={() => { verificationModeSelected.current = true; setVerificationMode("routing"); invalidatePreview(); }} /><span><strong>Routing verification</strong><span className="block max-w-3xl text-xs text-muted-foreground">Apply and read back the exact reviewed configuration, then prove the relevant local route, next hop, neighbor state, or advertised prefix and community. IOS convergence is retried for up to 30 seconds; missing or mismatched evidence is not accepted. This does not prove remote-peer receipt or Internet propagation.</span></span></label>
                   {capabilitiesState === "loading" && <p role="status" className="text-xs text-muted-foreground">Checking configuration-only lab eligibility…</p>}
                   {(capabilitiesState === "error" || retryingCapabilities) && <div className="flex flex-wrap items-center gap-2 text-xs text-amber-800 dark:text-amber-300" role="alert"><span>{retryingCapabilities ? "Checking lab eligibility…" : "Lab eligibility is unavailable. Normal routing runs remain available; a selected lab scope is retained but cannot be previewed or confirmed."}</span><Button type="button" size="sm" variant="outline" onClick={() => void retryCapabilities()} loading={retryingCapabilities} loadingLabel="Checking lab eligibility…">Retry lab eligibility</Button></div>}
                   {verificationMode === "configuration_only" && <p role="alert" className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Configuration-only test — router configuration will change; BGP advertisement is not verified.</p>}
@@ -576,7 +593,7 @@ export default function ManualReroute() {
                 {bundleId === null && <label className="block space-y-1 text-sm font-medium">Run reason <span className="font-normal text-muted-foreground">(recorded in audit history)</span>
                   <Input value={reason} maxLength={500} disabled={busy} onChange={(event) => { setReason(event.target.value); invalidatePreview(); }} placeholder="Why is this mitigation being run?" />
                 </label>}
-                {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select aria-describedby="revert-schedule-help" className={inputClass} value={revertAfter} disabled={verificationMode === "configuration_only"} onChange={(event) => { setRevertAfter(event.target.value); invalidatePreview(); }}><option value="">Until manually reverted</option><option value="900">After 15 minutes</option><option value="3600">After 1 hour</option><option value="14400">After 4 hours</option><option value="86400">After 24 hours</option></select><span id="revert-schedule-help" className="block text-xs font-normal text-muted-foreground">{verificationMode === "configuration_only" ? "Automatic recovery is unavailable for configuration-only runs. Revert the reviewed run manually." : "Timed recovery is paused unless Enforce mode and the automatic master switch are both enabled. Manual revert remains available."}</span></label>}
+                {bundleId === null && <label className="block max-w-sm space-y-1 text-sm font-medium">Revert schedule<select aria-describedby="revert-schedule-help" className={inputClass} value={revertAfter} disabled={busy || verificationMode === "configuration_only"} onChange={(event) => { setRevertAfter(event.target.value); invalidatePreview(); }}><option value="">Until manually reverted</option><option value="900">After 15 minutes</option><option value="3600">After 1 hour</option><option value="14400">After 4 hours</option><option value="86400">After 24 hours</option></select><span id="revert-schedule-help" className="block text-xs font-normal text-muted-foreground">{verificationMode === "configuration_only" ? "Automatic recovery is unavailable for configuration-only runs. Revert the reviewed run manually." : "Timed recovery is paused unless Enforce mode and the automatic master switch are both enabled. Manual revert remains available."}</span></label>}
                 {preview && <div className="space-y-3" aria-live="polite"><div className="flex items-center gap-2 text-sm font-medium"><ShieldCheck className="size-4" /> Exact server preview</div>
                   {(preview.verification_mode ?? "routing") === "configuration_only" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Configuration-only test — router configuration will change; BGP advertisement is not verified.</p>}
                   {preview.results.map((result, index) => <ApplyResultRow key={index} r={result} />)}
@@ -584,16 +601,16 @@ export default function ManualReroute() {
                   {preview.operating_mode === "observe" && <p className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">Observe mode disables automatic response. This one-use preview can authorize this explicit manual run after confirmation.</p>}
                 </div>}
                 {bundleId !== null && <BundleProgressView bundle={bundle} bundleId={bundleId} totalHint={effectiveActions.length} pollError={pollError} />}
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
                   <p className="max-w-3xl text-xs text-muted-foreground">{preview ? "Step 2 · Review and explicitly confirm the exact changes." : bundleId === null ? "Step 1 · Preview changes — reads current router configuration; no configuration changes are made. Preview time depends on router response times and the number of actions." : "The run continues on the controller. You can leave this view without interrupting it."}</p>
-                  <div className="flex flex-wrap justify-end gap-2">
+                  <div className="grid gap-2 sm:grid-cols-[auto_22rem]">
                     <Button variant="outline" disabled={busy} onClick={() => { const presetId = selectedPreset?.id ?? bundle?.source?.preset_id; setBundleId(null); setBundle(null); setPollError(null); setRunMode(false); if (presetId) navigate(`/manual-mitigations/${presetId}`); else navigate("/manual-mitigations"); }}>{(selectedPreset?.id ?? bundle?.source?.preset_id) ? "Return to mitigation details" : "Return to manual mitigations"}</Button>
-                    {!preview && bundleId === null && <Button onClick={() => void preparePreview()} disabled={effectiveActions.length === 0 || presetInvalid || (verificationMode === "configuration_only" && capabilitiesState !== "ready")} loading={busy} loadingLabel="Preparing exact preview…">Preview changes</Button>}
-                    {preview && <Button variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || (verificationMode === "configuration_only" && capabilitiesState !== "ready")} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
+                    {!preview && bundleId === null && <Button className="w-full sm:w-[22rem]" onClick={() => void preparePreview()} disabled={effectiveActions.length === 0 || presetInvalid || (verificationMode === "configuration_only" && capabilitiesState !== "ready")} loading={busy} loadingLabel="Preparing exact preview…">Preview changes</Button>}
+                    {preview && <Button className="w-full sm:w-[22rem]" variant="destructive" onClick={() => void applyPreview()} disabled={!preview.plan_id || !preview.preview_token || (verificationMode === "configuration_only" && capabilitiesState !== "ready")} loading={busy} loadingLabel="Starting mitigation…">Apply reviewed changes</Button>}
                   </div>
                 </div>
               </div>}
-            </CardContent>
+            </fieldset></CardContent>
           </Card>}
         </div>
       </div>
